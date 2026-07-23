@@ -355,6 +355,8 @@ export interface JudgeView {
   breakEvenMoves: number;
   trailingMoves: number;
   endOfDayFlattens: number;
+  verifiedNoTickGapEvents: number;
+  verifiedNoTickMinutes: number;
 }
 
 export interface ExportRequest {

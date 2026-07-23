@@ -446,7 +446,7 @@ impl ChallengeReport {
         }
 
         let expected_multiple_testing = multiple_testing_report(&self.baseline, &self.config);
-        if self.multiple_testing != expected_multiple_testing {
+        if !same_multiple_testing_report(&self.multiple_testing, &expected_multiple_testing) {
             return Err(ChallengeError::InvalidReport(
                 "multiple-testing report is inconsistent".into(),
             ));
@@ -1110,6 +1110,35 @@ fn same_float(left: f64, right: f64) -> bool {
     (left - right).abs() <= 1.0e-12
 }
 
+fn same_optional_float(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_float(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn same_multiple_testing_report(
+    stored: &MultipleTestingReport,
+    expected: &MultipleTestingReport,
+) -> bool {
+    stored.evaluations_touched == expected.evaluations_touched
+        && same_optional_float(
+            stored.observed_trade_sharpe_proxy,
+            expected.observed_trade_sharpe_proxy,
+        )
+        && same_float(
+            stored.expected_max_lucky_sharpe,
+            expected.expected_max_lucky_sharpe,
+        )
+        && same_optional_float(
+            stored.deflated_trade_sharpe_proxy,
+            expected.deflated_trade_sharpe_proxy,
+        )
+        && stored.warning_level == expected.warning_level
+        && stored.passed == expected.passed
+}
+
 #[derive(Debug, Error)]
 pub enum ChallengeError {
     #[error("invalid Challenge configuration: {0}")]
@@ -1302,6 +1331,21 @@ mod tests {
         let mut report = run_challenge(&strategy(), &dataset, &broker(), &plan, config()).unwrap();
         report.passing_fold_fraction = 0.0;
 
+        assert!(matches!(
+            report.validate_integrity(),
+            Err(ChallengeError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn report_integrity_tolerates_json_scale_float_rounding_only() {
+        let dataset = dataset(500);
+        let plan = DataSplitPlan::chronological(&dataset, 0.2, 0.2).unwrap();
+        let mut report = run_challenge(&strategy(), &dataset, &broker(), &plan, config()).unwrap();
+        report.multiple_testing.expected_max_lucky_sharpe += 5.0e-13;
+        assert!(report.validate_integrity().is_ok());
+
+        report.multiple_testing.expected_max_lucky_sharpe += 1.0e-6;
         assert!(matches!(
             report.validate_integrity(),
             Err(ChallengeError::InvalidReport(_))

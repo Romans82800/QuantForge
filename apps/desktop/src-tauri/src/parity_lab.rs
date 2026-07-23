@@ -53,6 +53,8 @@ pub struct JudgeView {
     break_even_moves: usize,
     trailing_moves: usize,
     end_of_day_flattens: usize,
+    verified_no_tick_gap_events: usize,
+    verified_no_tick_minutes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -274,6 +276,8 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
         break_even_moves: telemetry.break_even_moves,
         trailing_moves: telemetry.trailing_stop_moves,
         end_of_day_flattens: telemetry.end_of_day_flattens,
+        verified_no_tick_gap_events: telemetry.verified_no_tick_gap_events,
+        verified_no_tick_minutes: telemetry.verified_no_tick_minutes,
     })
 }
 

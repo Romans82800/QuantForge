@@ -23,8 +23,8 @@ pub const ENGINE_TIER: &str = "m1-judge";
 pub struct JudgeConfig {
     pub initial_balance: f64,
     pub costs: CostModel,
-    /// Missing in-session minute bars are a hard error by default. This flag is
-    /// an explicit research-only override and is surfaced in telemetry.
+    /// Minute gaps whose H1 and M1 volumes do not reconcile are a hard error by
+    /// default. This explicit research-only override is surfaced in telemetry.
     pub allow_execution_gaps: bool,
 }
 
@@ -55,6 +55,8 @@ pub struct JudgeTelemetry {
     pub decision_bars_replayed: usize,
     pub m1_bars_replayed: usize,
     pub m1_gap_events: usize,
+    pub verified_no_tick_gap_events: usize,
+    pub verified_no_tick_minutes: usize,
     pub same_minute_stop_target_collisions: usize,
     pub conflicting_entry_signals: usize,
     pub skipped_outside_session: usize,
@@ -195,7 +197,10 @@ pub fn evaluate_strategy_m1(
         while m1_cursor < m1_bars.len() && m1_bars[m1_cursor].timestamp_ms < start {
             m1_cursor += 1;
         }
-        if m1_bars.get(m1_cursor).map(|bar| bar.timestamp_ms) != Some(start) {
+        if m1_bars
+            .get(m1_cursor)
+            .is_none_or(|bar| bar.timestamp_ms >= end)
+        {
             return Err(JudgeError::MissingM1Open {
                 timestamp_ms: start,
             });
@@ -205,23 +210,23 @@ pub fn evaluate_strategy_m1(
             m1_cursor += 1;
         }
         let execution_bars = &m1_bars[slice_start..m1_cursor];
-        let expected_last = end - execution_interval_ms;
-        if execution_bars.last().map(|bar| bar.timestamp_ms) != Some(expected_last) {
-            return Err(JudgeError::IncompleteM1Coverage {
-                decision_timestamp_ms: start,
-                expected_last_timestamp_ms: expected_last,
-            });
-        }
-        let gap_events = execution_bars
-            .windows(2)
-            .filter(|pair| pair[1].timestamp_ms - pair[0].timestamp_ms != execution_interval_ms)
-            .count();
-        telemetry.m1_gap_events += gap_events;
-        if gap_events > 0 && !config.allow_execution_gaps {
-            return Err(JudgeError::M1Gap {
-                decision_timestamp_ms: start,
-                gap_events,
-            });
+        let (gap_events, missing_minutes) =
+            execution_gap_summary(execution_bars, start, end, execution_interval_ms);
+        if gap_events > 0 {
+            let tick_volume: u64 = execution_bars.iter().map(|bar| bar.tick_volume).sum();
+            let real_volume: u64 = execution_bars.iter().map(|bar| bar.real_volume).sum();
+            if tick_volume == decision_bar.tick_volume && real_volume == decision_bar.real_volume {
+                telemetry.verified_no_tick_gap_events += gap_events;
+                telemetry.verified_no_tick_minutes += missing_minutes;
+            } else {
+                telemetry.m1_gap_events += gap_events;
+                if !config.allow_execution_gaps {
+                    return Err(JudgeError::M1Gap {
+                        decision_timestamp_ms: start,
+                        gap_events,
+                    });
+                }
+            }
         }
         validate_m1_aggregate(decision_bar, execution_bars, broker.tick_size)?;
         telemetry.decision_bars_replayed += 1;
@@ -1363,6 +1368,46 @@ fn validate_m1_aggregate(
     Ok(())
 }
 
+fn execution_gap_summary(
+    execution: &[Bar],
+    start_ms: i64,
+    end_ms: i64,
+    interval_ms: i64,
+) -> (usize, usize) {
+    let first = execution
+        .first()
+        .expect("execution gap summary requires at least one bar")
+        .timestamp_ms;
+    let last = execution
+        .last()
+        .expect("execution gap summary requires at least one bar")
+        .timestamp_ms;
+    let leading_minutes = ((first - start_ms) / interval_ms).max(0) as usize;
+    let trailing_minutes = ((end_ms - interval_ms - last) / interval_ms).max(0) as usize;
+    let leading_events = usize::from(leading_minutes > 0);
+    let trailing_events = usize::from(trailing_minutes > 0);
+    let (internal_events, internal_minutes) =
+        execution
+            .windows(2)
+            .fold((0, 0), |(events, minutes), pair| {
+                let delta = pair[1].timestamp_ms - pair[0].timestamp_ms;
+                if delta == interval_ms {
+                    (events, minutes)
+                } else {
+                    let missing = if delta > interval_ms {
+                        (delta / interval_ms - 1) as usize
+                    } else {
+                        0
+                    };
+                    (events + 1, minutes + missing)
+                }
+            });
+    (
+        leading_events + internal_events + trailing_events,
+        leading_minutes + internal_minutes + trailing_minutes,
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum JudgeError {
     #[error("at least two decision-timeframe bars are required")]
@@ -1519,6 +1564,37 @@ mod tests {
             ),
             Err(JudgeError::M1Gap { .. })
         ));
+    }
+
+    #[test]
+    fn volume_reconciled_no_tick_minutes_are_accepted_and_audited() {
+        let mut decisions = decision_dataset(97.0);
+        let mut execution = m1_dataset(false, false);
+        execution.bars.remove(7);
+        execution.bars.remove(8);
+        decisions.bars[1].tick_volume = execution
+            .bars
+            .iter()
+            .filter(|bar| (300_000..600_000).contains(&bar.timestamp_ms))
+            .map(|bar| bar.tick_volume)
+            .sum();
+
+        let judge = evaluate_strategy_m1(
+            &strategy(false),
+            &decisions,
+            &execution,
+            &broker(),
+            &JudgeConfig {
+                initial_balance: 100.0,
+                costs: CostModel::default(),
+                allow_execution_gaps: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(judge.telemetry.m1_gap_events, 0);
+        assert_eq!(judge.telemetry.verified_no_tick_gap_events, 2);
+        assert_eq!(judge.telemetry.verified_no_tick_minutes, 2);
     }
 
     #[test]
