@@ -29,6 +29,22 @@ impl Default for GateConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PrecisionGateConfig {
+    /// A positive M1 return must retain at least this fraction of the H1
+    /// screening return. Values above one are allowed and mean M1 improved.
+    pub minimum_return_retention: f64,
+}
+
+impl Default for PrecisionGateConfig {
+    fn default() -> Self {
+        Self {
+            minimum_return_retention: 0.95,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DiscoverConfig {
     pub initial_candidates: usize,
     pub batch_size: usize,
@@ -38,6 +54,7 @@ pub struct DiscoverConfig {
     pub structural_mutation_probability: f64,
     pub seed: u64,
     pub gates: GateConfig,
+    pub precision: PrecisionGateConfig,
     pub scout: ScoutConfig,
 }
 
@@ -52,6 +69,7 @@ impl Default for DiscoverConfig {
             structural_mutation_probability: 0.18,
             seed: 42,
             gates: GateConfig::default(),
+            precision: PrecisionGateConfig::default(),
             scout: ScoutConfig::default(),
         }
     }
@@ -91,6 +109,13 @@ impl DiscoverConfig {
         if !self.novelty_weight.is_finite() || self.novelty_weight < 0.0 {
             return Err(DiscoverError::InvalidConfig(
                 "novelty_weight must be finite and non-negative".into(),
+            ));
+        }
+        if !self.precision.minimum_return_retention.is_finite()
+            || !(0.0..=1.0).contains(&self.precision.minimum_return_retention)
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "minimum_return_retention must be finite and between 0 and 1".into(),
             ));
         }
         if !self.gates.maximum_drawdown_percent.is_finite()
@@ -188,6 +213,7 @@ pub enum DepositDecision {
     RejectedClone,
     RejectedCorrelated,
     RejectedNicheNotImproved,
+    RejectedPrecision,
     RejectedEvaluation,
 }
 
@@ -199,6 +225,7 @@ pub struct DiscoverTelemetry {
     pub rejected_clone: u64,
     pub rejected_correlated: u64,
     pub rejected_niche_not_improved: u64,
+    pub rejected_precision: u64,
     pub rejected_evaluation: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
 }
@@ -214,6 +241,7 @@ impl DiscoverTelemetry {
             DepositDecision::RejectedNicheNotImproved => {
                 self.rejected_niche_not_improved += 1;
             }
+            DepositDecision::RejectedPrecision => self.rejected_precision += 1,
             DepositDecision::RejectedEvaluation => self.rejected_evaluation += 1,
         }
     }
@@ -224,6 +252,9 @@ pub struct Databank {
     pub schema_version: u16,
     pub grammar_version: String,
     pub data_hash: ContentHash,
+    /// M1 chronology used to decide which candidates were allowed into the
+    /// archive. A databank without this binding is not promotion grade.
+    pub execution_data_hash: ContentHash,
     pub broker_spec_hash: ContentHash,
     pub config: DiscoverConfig,
     pub completed_generations: u64,

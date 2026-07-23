@@ -703,6 +703,9 @@ function DiscoverWorkspace({
     dataPath: "",
     metadataPath: null,
     sourceTimezone: "Etc/UTC",
+    m1DataPath: "",
+    m1MetadataPath: null,
+    m1SourceTimezone: "Etc/UTC",
     brokerPath: "",
     databankPath: "",
     generations: 5,
@@ -715,6 +718,7 @@ function DiscoverWorkspace({
     maximumDrawdownPercent: 30,
     minimumReturnPercent: 0,
     minimumProfitFactor: 1,
+    minimumM1ReturnRetention: 0.95,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
     fallbackSpreadPoints: null,
@@ -766,6 +770,7 @@ function DiscoverWorkspace({
             maximumDrawdownPercent: null,
             minimumReturnPercent: null,
             minimumProfitFactor: null,
+            minimumM1ReturnRetention: null,
             commissionPerLotRoundTurn: null,
             slippagePointsPerSide: null,
             fallbackSpreadPoints: null,
@@ -809,6 +814,9 @@ function DiscoverWorkspace({
             <PathField label="OHLC data" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required />
             <PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : current.sourceTimezone ?? "Etc/UTC" }))} />
             {!form.metadataPath && <label className="field-row"><span>Source timezone</span><input value={form.sourceTimezone ?? ""} onChange={(event) => update("sourceTimezone", event.target.value || null)} /></label>}
+            <PathField label="M1 execution data" path={form.m1DataPath} choose={chooseDataFile} onChange={(value) => update("m1DataPath", value)} required />
+            <PathField label="M1 exporter metadata" path={form.m1MetadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, m1MetadataPath: value || null, m1SourceTimezone: value ? null : current.m1SourceTimezone ?? "Etc/UTC" }))} />
+            {!form.m1MetadataPath && <label className="field-row"><span>M1 source timezone</span><input value={form.m1SourceTimezone ?? ""} onChange={(event) => update("m1SourceTimezone", event.target.value || null)} /></label>}
             <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
             <PathField label={form.mode === "new" ? "New databank" : "Existing databank"} path={form.databankPath} choose={chooseOutput} onChange={(value) => update("databankPath", value)} required />
           </div>
@@ -832,6 +840,7 @@ function DiscoverWorkspace({
                 <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
                 <NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value)} step={0.1} />
                 <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
+                <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
                 <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                 <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
                 <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
@@ -845,8 +854,8 @@ function DiscoverWorkspace({
           {form.mode === "new" && <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Certification-grade search: evaluate development partition only</span></label>}
         </fieldset>
         <div className="form-footer">
-          <p>New jobs refuse to overwrite a file. Continued jobs create a versioned checkpoint and preserve the original.</p>
-          <button className="primary" disabled={active || busy || !form.dataPath || !form.brokerPath || !form.databankPath} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
+          <p>H1 screens quickly; every survivor is replayed through M1 and discarded unless it retains the configured result before entering the databank.</p>
+          <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
         </div>
       </section>
 

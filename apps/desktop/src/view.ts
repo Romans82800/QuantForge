@@ -64,5 +64,6 @@ export function bindDiscoverTimezone(request: DiscoverRequest): DiscoverRequest 
   return {
     ...request,
     sourceTimezone: request.metadataPath ? null : request.sourceTimezone,
+    m1SourceTimezone: request.m1MetadataPath ? null : request.m1SourceTimezone,
   };
 }

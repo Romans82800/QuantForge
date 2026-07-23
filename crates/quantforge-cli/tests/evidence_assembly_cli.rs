@@ -175,6 +175,9 @@ fn write_databank(
             minimum_return_percent: challenge.baseline.metrics.return_percent - 1.0,
             minimum_profit_factor: 0.0,
         },
+        precision: quantforge_discover::PrecisionGateConfig {
+            minimum_return_retention: 0.0,
+        },
         scout,
     };
     let bucket = |value: f64, first: f64, second: f64| {
@@ -224,6 +227,7 @@ fn write_databank(
         schema_version: quantforge_discover::DATABANK_SCHEMA_VERSION,
         grammar_version: quantforge_discover::GRAMMAR_VERSION.into(),
         data_hash: split.plan.development.data_hash.clone(),
+        execution_data_hash: split.plan.development.data_hash.clone(),
         broker_spec_hash: broker_hash.clone(),
         config: config.clone(),
         completed_generations: 1,

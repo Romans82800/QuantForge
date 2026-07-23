@@ -187,7 +187,13 @@ fn three_level(value: f64, first: f64, second: f64) -> ThreeLevelBucket {
 }
 
 fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
-    let return_component = result.metrics.return_percent;
+    // Raw compounded returns can become enormous and overwhelm every other
+    // quality term. Rank on bounded log growth while retaining the raw M1
+    // metrics for reporting and gates.
+    let return_component = (1.0 + result.metrics.return_percent.max(-99.0) / 100.0)
+        .ln()
+        .mul_add(100.0, 0.0)
+        .clamp(-100.0, 100.0);
     let effective_profit_factor = result.metrics.profit_factor.unwrap_or({
         if result.metrics.net_profit > 0.0 {
             10.0
@@ -325,6 +331,7 @@ mod tests {
             schema_version: DATABANK_SCHEMA_VERSION,
             grammar_version: GRAMMAR_VERSION.into(),
             data_hash: ContentHash::sha256("data"),
+            execution_data_hash: ContentHash::sha256("m1-data"),
             broker_spec_hash: ContentHash::sha256("broker"),
             config: DiscoverConfig {
                 correlation_threshold,

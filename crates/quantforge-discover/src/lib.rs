@@ -11,8 +11,8 @@ pub use grammar::{generate_seed, mutate_strategy};
 pub use model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError,
     DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, LongShortSkewBucket,
-    NicheKey, ThreeLevelBucket,
+    NicheKey, PrecisionGateConfig, ThreeLevelBucket,
 };
 
-pub const DATABANK_SCHEMA_VERSION: u16 = 1;
-pub const GRAMMAR_VERSION: &str = "export-safe-v1";
+pub const DATABANK_SCHEMA_VERSION: u16 = 2;
+pub const GRAMMAR_VERSION: &str = "m1-verified-v2";

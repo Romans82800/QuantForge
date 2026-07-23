@@ -75,6 +75,7 @@ struct RejectionTelemetry {
     clone: u64,
     correlated: u64,
     niche_not_improved: u64,
+    precision: u64,
     evaluation: u64,
     total: u64,
 }
@@ -269,6 +270,7 @@ fn workspace_view(
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
+        + telemetry.rejected_precision
         + telemetry.rejected_evaluation;
     DatabankWorkspace {
         source_path: source_path.display().to_string(),
@@ -290,6 +292,7 @@ fn workspace_view(
             clone: telemetry.rejected_clone,
             correlated: telemetry.rejected_correlated,
             niche_not_improved: telemetry.rejected_niche_not_improved,
+            precision: telemetry.rejected_precision,
             evaluation: telemetry.rejected_evaluation,
             total: total_rejections,
         },
@@ -470,6 +473,7 @@ mod tests {
             schema_version: quantforge_discover::DATABANK_SCHEMA_VERSION,
             grammar_version: quantforge_discover::GRAMMAR_VERSION.into(),
             data_hash: ContentHash::sha256("data"),
+            execution_data_hash: ContentHash::sha256("m1-data"),
             broker_spec_hash: ContentHash::sha256("broker"),
             config: Default::default(),
             completed_generations: 0,

@@ -28,6 +28,9 @@ pub struct DiscoverRequest {
     data_path: String,
     metadata_path: Option<String>,
     source_timezone: Option<String>,
+    m1_data_path: String,
+    m1_metadata_path: Option<String>,
+    m1_source_timezone: Option<String>,
     broker_path: String,
     databank_path: String,
     generations: u64,
@@ -40,6 +43,7 @@ pub struct DiscoverRequest {
     maximum_drawdown_percent: Option<f64>,
     minimum_return_percent: Option<f64>,
     minimum_profit_factor: Option<f64>,
+    minimum_m1_return_retention: Option<f64>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -247,6 +251,7 @@ pub fn stop_discover(state: State<'_, DiscoverState>) -> Result<DiscoverJobView,
 
 fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     if request.data_path.trim().is_empty()
+        || request.m1_data_path.trim().is_empty()
         || request.broker_path.trim().is_empty()
         || request.databank_path.trim().is_empty()
     {
@@ -276,6 +281,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.maximum_drawdown_percent.is_some(),
             request.minimum_return_percent.is_some(),
             request.minimum_profit_factor.is_some(),
+            request.minimum_m1_return_retention.is_some(),
             request.commission_per_lot_round_turn.is_some(),
             request.slippage_points_per_side.is_some(),
             request.fallback_spread_points.is_some(),
@@ -307,6 +313,11 @@ fn run_discovery(
         request.metadata_path.as_deref(),
         request.source_timezone.as_deref(),
     )?;
+    let m1 = load_data_source(
+        &request.m1_data_path,
+        request.m1_metadata_path.as_deref(),
+        request.m1_source_timezone.as_deref(),
+    )?;
     let quality = quantforge_data::DataQualityReport::analyze(&loaded.dataset);
     if quality.grade == quantforge_data::QualityGrade::Fail {
         return Err(format!(
@@ -315,6 +326,14 @@ fn run_discovery(
         ));
     }
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
+    load_bound_broker(&request.broker_path, m1.metadata.as_ref())?;
+    let m1_quality = quantforge_data::DataQualityReport::analyze(&m1.dataset);
+    if m1_quality.grade == quantforge_data::QualityGrade::Fail {
+        return Err(format!(
+            "Discover refuses failed-quality M1 data (score {})",
+            m1_quality.score
+        ));
+    }
     let promotion_split = request.promotion_split.unwrap_or(false);
     let validation_fraction = request.validation_fraction.unwrap_or(0.2);
     let sealed_fraction = request.sealed_fraction.unwrap_or(0.2);
@@ -330,7 +349,7 @@ fn run_discovery(
                 "Evaluating initial grammar population",
                 "The four seed families are being evaluated in parallel.",
             )?;
-            let bank = evolve_new(new_dataset, &broker, new_config(&request)?, 0)
+            let bank = evolve_new(new_dataset, &m1.dataset, &broker, new_config(&request)?, 0)
                 .map_err(|error| error.to_string())?;
             update_bank(job, &bank, 0, request.generations)?;
             (bank, None, 0)
@@ -373,7 +392,7 @@ fn run_discovery(
                 "this databank was built from a development partition; enable the identical promotion split to continue it".to_owned()
             })?
         };
-        bank = continue_evolution(bank, evaluation_dataset, &broker, 1)
+        bank = continue_evolution(bank, evaluation_dataset, &m1.dataset, &broker, 1)
             .map_err(|error| error.to_string())?;
         completed_now += 1;
         update_bank(job, &bank, completed_now, request.generations)?;
@@ -400,10 +419,14 @@ fn run_discovery(
             json!(display_path(Path::new(&request.broker_path))),
         ),
         (
+            "m1_source".into(),
+            json!(display_path(Path::new(&request.m1_data_path))),
+        ),
+        (
             "databank".into(),
             json!(display_path(Path::new(&request.databank_path))),
         ),
-        ("engine_tier".into(), json!(quantforge_eval::ENGINE_TIER)),
+        ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
         (
             "discover_config".into(),
             serde_json::to_value(&bank.config).map_err(|error| error.to_string())?,
@@ -416,6 +439,9 @@ fn run_discovery(
         ),
         ("data_quality_grade".into(), json!(quality.grade)),
         ("data_quality_score".into(), json!(quality.score)),
+        ("m1_data_hash".into(), json!(&m1.dataset.data_hash)),
+        ("m1_quality_grade".into(), json!(m1_quality.grade)),
+        ("m1_quality_score".into(), json!(m1_quality.score)),
         ("desktop_job".into(), json!(true)),
         (
             "promotion_split".into(),
@@ -430,6 +456,9 @@ fn run_discovery(
     ]);
     if let Some(metadata) = &loaded.metadata {
         manifest_config.insert("metadata_hash".into(), json!(metadata.metadata_hash));
+    }
+    if let Some(metadata) = &m1.metadata {
+        manifest_config.insert("m1_metadata_hash".into(), json!(metadata.metadata_hash));
     }
     if let Some(recipe_hash) = continuation_recipe_hash {
         manifest_config.insert("continued_recipe_hash".into(), json!(recipe_hash));
@@ -524,6 +553,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             minimum_return_percent: request.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: request.minimum_profit_factor.unwrap_or(1.0),
         },
+        precision: quantforge_discover::PrecisionGateConfig {
+            minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.95),
+        },
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -584,6 +616,7 @@ fn update_bank(
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
+        + telemetry.rejected_precision
         + telemetry.rejected_evaluation;
     let mut view = job
         .write()
@@ -619,6 +652,9 @@ mod tests {
             data_path: fixture("EURUSD_M15_sample.tsv"),
             metadata_path: Some(fixture("EURUSD_M15_sample.metadata.csv")),
             source_timezone: None,
+            m1_data_path: fixture("EURUSD_M1_sample.tsv"),
+            m1_metadata_path: Some(fixture("EURUSD_M1_sample.metadata.csv")),
+            m1_source_timezone: None,
             broker_path: fixture("EURUSD_fixture_broker.json"),
             databank_path,
             generations: 1,
@@ -631,6 +667,7 @@ mod tests {
             maximum_drawdown_percent: Some(100.0),
             minimum_return_percent: Some(-100.0),
             minimum_profit_factor: Some(0.0),
+            minimum_m1_return_retention: Some(0.95),
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,

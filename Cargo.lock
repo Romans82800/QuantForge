@@ -2559,6 +2559,7 @@ dependencies = [
  "quantforge-eval",
  "quantforge-ir",
  "quantforge-quality",
+ "quantforge-tick",
  "rand",
  "rand_chacha",
  "rayon",

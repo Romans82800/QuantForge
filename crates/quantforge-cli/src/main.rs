@@ -154,6 +154,23 @@ struct DataSourceArgs {
 struct EvolveArgs {
     #[command(flatten)]
     source: DataSourceArgs,
+    /// M1 execution CSV/TSV used for mandatory higher-precision acceptance.
+    #[arg(long)]
+    m1: PathBuf,
+    #[arg(
+        long,
+        value_name = "IANA_TIMEZONE",
+        required_unless_present = "m1_metadata",
+        conflicts_with = "m1_metadata"
+    )]
+    m1_source_timezone: Option<SourceTimezone>,
+    #[arg(
+        long,
+        value_name = "METADATA_CSV",
+        required_unless_present = "m1_source_timezone",
+        conflicts_with = "m1_source_timezone"
+    )]
+    m1_metadata: Option<PathBuf>,
     /// Broker SymbolSpecification JSON.
     #[arg(long)]
     broker: PathBuf,
@@ -188,6 +205,8 @@ struct EvolveArgs {
     minimum_return_percent: Option<f64>,
     #[arg(long)]
     minimum_profit_factor: Option<f64>,
+    #[arg(long)]
+    minimum_m1_return_retention: Option<f64>,
     /// Required for a new databank; a continuation uses the stored assumption.
     #[arg(long)]
     commission_per_lot_round_turn: Option<f64>,
@@ -3294,6 +3313,12 @@ fn join_windows_relative(base: &Path, relative: &str) -> PathBuf {
 
 fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
     let (dataset, metadata) = load_source(&args.source)?;
+    let m1_source = DataSourceArgs {
+        path: args.m1.clone(),
+        source_timezone: args.m1_source_timezone,
+        metadata: args.m1_metadata.clone(),
+    };
+    let (m1_dataset, m1_metadata) = load_source(&m1_source)?;
     let quality = DataQualityReport::analyze(&dataset);
     if quality.grade == QualityGrade::Fail && !args.allow_failed_data {
         return Err(format!(
@@ -3304,6 +3329,15 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
     }
     let broker_spec: SymbolSpecification = read_json(&args.broker)?;
     validate_metadata_broker_binding(metadata.as_ref(), &broker_spec)?;
+    validate_metadata_broker_binding(m1_metadata.as_ref(), &broker_spec)?;
+    let m1_quality = DataQualityReport::analyze(&m1_dataset);
+    if m1_quality.grade == QualityGrade::Fail && !args.allow_failed_data {
+        return Err(format!(
+            "M1 data quality failed with score {}; pass --allow-failed-data to record an explicit override",
+            m1_quality.score
+        )
+        .into());
+    }
 
     let (bank, continuation_recipe_hash, starting_generation) = if args.continue_existing {
         reject_continuation_overrides(&args)?;
@@ -3311,7 +3345,13 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         let recipe_hash = previous.manifest.recipe_hash.clone();
         let starting_generation = previous.databank.completed_generations;
         (
-            continue_evolution(previous.databank, &dataset, &broker_spec, args.generations)?,
+            continue_evolution(
+                previous.databank,
+                &dataset,
+                &m1_dataset,
+                &broker_spec,
+                args.generations,
+            )?,
             Some(recipe_hash),
             starting_generation,
         )
@@ -3325,7 +3365,13 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         }
         let config = new_discover_config(&args)?;
         (
-            evolve_new(&dataset, &broker_spec, config, args.generations)?,
+            evolve_new(
+                &dataset,
+                &m1_dataset,
+                &broker_spec,
+                config,
+                args.generations,
+            )?,
             None,
             0,
         )
@@ -3335,7 +3381,11 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         ("source".into(), json!(display_path(&args.source.path))),
         ("broker".into(), json!(display_path(&args.broker))),
         ("databank".into(), json!(display_path(&args.databank))),
-        ("engine_tier".into(), json!(quantforge_eval::ENGINE_TIER)),
+        ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
+        ("m1_source".into(), json!(display_path(&args.m1))),
+        ("m1_data_hash".into(), json!(&m1_dataset.data_hash)),
+        ("m1_quality_grade".into(), json!(m1_quality.grade)),
+        ("m1_quality_score".into(), json!(m1_quality.score)),
         (
             "discover_config".into(),
             serde_json::to_value(&bank.config)?,
@@ -3908,6 +3958,9 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: args.minimum_profit_factor.unwrap_or(1.0),
         },
+        precision: quantforge_discover::PrecisionGateConfig {
+            minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
+        },
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
@@ -3934,6 +3987,7 @@ fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>
         || args.maximum_drawdown_percent.is_some()
         || args.minimum_return_percent.is_some()
         || args.minimum_profit_factor.is_some()
+        || args.minimum_m1_return_retention.is_some()
         || args.commission_per_lot_round_turn.is_some()
         || args.slippage_points_per_side.is_some()
         || args.fallback_spread_points.is_some()

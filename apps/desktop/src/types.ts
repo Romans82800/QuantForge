@@ -22,6 +22,7 @@ export interface RejectionTelemetry {
   clone: number;
   correlated: number;
   nicheNotImproved: number;
+  precision: number;
   evaluation: number;
   total: number;
 }
@@ -157,6 +158,9 @@ export interface DiscoverRequest {
   dataPath: string;
   metadataPath: string | null;
   sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
   brokerPath: string;
   databankPath: string;
   generations: number;
@@ -169,6 +173,7 @@ export interface DiscoverRequest {
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
   minimumProfitFactor: number | null;
+  minimumM1ReturnRetention: number | null;
   commissionPerLotRoundTurn: number | null;
   slippagePointsPerSide: number | null;
   fallbackSpreadPoints: number | null;

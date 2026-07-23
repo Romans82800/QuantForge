@@ -5,14 +5,23 @@ use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
 use quantforge_eval::evaluate_strategy;
+use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::StrategyIr;
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
+enum CandidateOutcome {
+    CoarseRejected,
+    PrecisionRejected,
+    Accepted(Box<ScoutResult>),
+}
+
 pub fn evolve_new(
     dataset: &BarDataset,
+    m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     config: DiscoverConfig,
     generations: u64,
@@ -23,6 +32,7 @@ pub fn evolve_new(
         schema_version: DATABANK_SCHEMA_VERSION,
         grammar_version: GRAMMAR_VERSION.into(),
         data_hash: dataset.data_hash.clone(),
+        execution_data_hash: m1_dataset.data_hash.clone(),
         broker_spec_hash: broker.content_hash()?,
         config,
         completed_generations: 0,
@@ -35,32 +45,40 @@ pub fn evolve_new(
     let initial = (0..bank.config.initial_candidates)
         .map(|index| crate::grammar::generate_seed(bank.config.seed, index as u64))
         .collect();
-    evaluate_and_deposit(&mut bank, initial, dataset, broker, 0)?;
-    run_generations(&mut bank, dataset, broker, generations)?;
+    evaluate_and_deposit(&mut bank, initial, dataset, m1_dataset, broker, 0)?;
+    run_generations(&mut bank, dataset, m1_dataset, broker, generations)?;
     Ok(bank)
 }
 
 pub fn continue_evolution(
     mut bank: Databank,
     dataset: &BarDataset,
+    m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     additional_generations: u64,
 ) -> Result<Databank, DiscoverError> {
-    validate_resume(&bank, dataset, broker)?;
-    run_generations(&mut bank, dataset, broker, additional_generations)?;
+    validate_resume(&bank, dataset, m1_dataset, broker)?;
+    run_generations(
+        &mut bank,
+        dataset,
+        m1_dataset,
+        broker,
+        additional_generations,
+    )?;
     Ok(bank)
 }
 
 fn run_generations(
     bank: &mut Databank,
     dataset: &BarDataset,
+    m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     count: u64,
 ) -> Result<(), DiscoverError> {
     for _ in 0..count {
         let generation = bank.completed_generations + 1;
         let batch = breed_generation(bank, generation);
-        evaluate_and_deposit(bank, batch, dataset, broker, generation)?;
+        evaluate_and_deposit(bank, batch, dataset, m1_dataset, broker, generation)?;
         bank.completed_generations = generation;
     }
     Ok(())
@@ -155,15 +173,60 @@ fn evaluate_and_deposit(
     bank: &mut Databank,
     candidates: Vec<StrategyIr>,
     dataset: &BarDataset,
+    m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     generation: u64,
 ) -> Result<(), DiscoverError> {
     let scout = &bank.config.scout;
+    let gates = &bank.config.gates;
+    let discover_config = &bank.config;
+    let minimum_return_retention = bank.config.precision.minimum_return_retention;
     let evaluated: Vec<_> = candidates
         .into_par_iter()
         .map(|strategy| {
-            let result = evaluate_strategy(&strategy, dataset, broker, scout)
-                .map_err(|error| error.to_string());
+            let result = (|| {
+                let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
+                    .map_err(|error| error.to_string())?;
+                if !crate::archive::passes_gates(&coarse, discover_config) {
+                    return Ok::<_, String>(CandidateOutcome::CoarseRejected);
+                }
+                let precise = evaluate_strategy_m1(
+                    &strategy,
+                    dataset,
+                    m1_dataset,
+                    broker,
+                    &JudgeConfig {
+                        initial_balance: scout.initial_balance,
+                        costs: scout.costs.clone(),
+                        allow_execution_gaps: false,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                let precise_result = ScoutResult {
+                    trades: precise.trades,
+                    equity: precise.equity,
+                    metrics: precise.metrics,
+                    telemetry: ScoutTelemetry::default(),
+                };
+                let retention = if coarse.metrics.return_percent > 0.0 {
+                    precise_result.metrics.return_percent / coarse.metrics.return_percent
+                } else if precise_result.metrics.return_percent >= coarse.metrics.return_percent {
+                    1.0
+                } else {
+                    0.0
+                };
+                let precision_passed = precision_passes(
+                    &precise_result.metrics,
+                    retention,
+                    gates,
+                    minimum_return_retention,
+                );
+                Ok(if precision_passed {
+                    CandidateOutcome::Accepted(Box::new(precise_result))
+                } else {
+                    CandidateOutcome::PrecisionRejected
+                })
+            })();
             (strategy, result)
         })
         .collect();
@@ -171,14 +234,16 @@ fn evaluate_and_deposit(
     for (strategy, result) in evaluated {
         bank.evaluation_count += 1;
         let decision = match result {
-            Ok(result) => deposit(
+            Ok(CandidateOutcome::Accepted(result)) => deposit(
                 bank,
                 CandidateEvaluation {
                     strategy,
-                    result,
+                    result: *result,
                     generation,
                 },
             )?,
+            Ok(CandidateOutcome::CoarseRejected) => DepositDecision::RejectedGate,
+            Ok(CandidateOutcome::PrecisionRejected) => DepositDecision::RejectedPrecision,
             Err(error) => {
                 *bank.telemetry.evaluation_errors.entry(error).or_default() += 1;
                 DepositDecision::RejectedEvaluation
@@ -189,9 +254,31 @@ fn evaluate_and_deposit(
     Ok(())
 }
 
+fn precision_passes(
+    metrics: &quantforge_eval::BacktestMetrics,
+    return_retention: f64,
+    gates: &crate::model::GateConfig,
+    minimum_return_retention: f64,
+) -> bool {
+    let effective_profit_factor = metrics.profit_factor.unwrap_or({
+        if metrics.net_profit > 0.0 && metrics.winning_trades > 0 {
+            f64::INFINITY
+        } else {
+            0.0
+        }
+    });
+    metrics.trade_count >= gates.minimum_trades
+        && metrics.return_percent > gates.minimum_return_percent
+        && metrics.max_drawdown_percent <= gates.maximum_drawdown_percent
+        && effective_profit_factor >= gates.minimum_profit_factor
+        && return_retention.is_finite()
+        && return_retention >= minimum_return_retention
+}
+
 fn validate_resume(
     bank: &Databank,
     dataset: &BarDataset,
+    m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
 ) -> Result<(), DiscoverError> {
     bank.config.validate()?;
@@ -210,6 +297,11 @@ fn validate_resume(
     if bank.data_hash != dataset.data_hash {
         return Err(DiscoverError::IncompatibleDatabank(
             "data hash changed".into(),
+        ));
+    }
+    if bank.execution_data_hash != m1_dataset.data_hash {
+        return Err(DiscoverError::IncompatibleDatabank(
+            "M1 execution data hash changed".into(),
         ));
     }
     if bank.broker_spec_hash != broker.content_hash()? {
@@ -305,6 +397,9 @@ mod tests {
                 minimum_return_percent: -100.0,
                 minimum_profit_factor: 0.0,
             },
+            precision: crate::model::PrecisionGateConfig {
+                minimum_return_retention: 0.0,
+            },
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -316,8 +411,8 @@ mod tests {
     #[test]
     fn evolution_is_reproducible_and_illuminates_multiple_niches() {
         let dataset = dataset();
-        let first = evolve_new(&dataset, &broker(), config(), 2).unwrap();
-        let second = evolve_new(&dataset, &broker(), config(), 2).unwrap();
+        let first = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
+        let second = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
         assert_eq!(first, second);
         assert!(first.coverage() >= 4);
         assert_eq!(first.evaluation_count, 64);
@@ -327,18 +422,43 @@ mod tests {
     #[test]
     fn checkpoint_resume_matches_uninterrupted_evolution() {
         let dataset = dataset();
-        let uninterrupted = evolve_new(&dataset, &broker(), config(), 2).unwrap();
-        let checkpoint = evolve_new(&dataset, &broker(), config(), 1).unwrap();
-        let resumed = continue_evolution(checkpoint, &dataset, &broker(), 1).unwrap();
+        let uninterrupted = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
+        let checkpoint = evolve_new(&dataset, &dataset, &broker(), config(), 1).unwrap();
+        let resumed = continue_evolution(checkpoint, &dataset, &dataset, &broker(), 1).unwrap();
         assert_eq!(uninterrupted, resumed);
     }
 
     #[test]
     fn persisted_databank_integrity_rejects_fingerprint_tampering() {
         let dataset = dataset();
-        let mut bank = evolve_new(&dataset, &broker(), config(), 1).unwrap();
+        let mut bank = evolve_new(&dataset, &dataset, &broker(), config(), 1).unwrap();
         bank.validate_integrity().unwrap();
         bank.elites[0].structural_fingerprint = ContentHash::sha256("tampered");
         assert!(bank.validate_integrity().is_err());
+    }
+
+    #[test]
+    fn precision_gate_rejects_the_observed_false_h1_edge() {
+        let metrics = quantforge_eval::BacktestMetrics {
+            initial_balance: 100_000.0,
+            ending_balance: 100_311.5,
+            net_profit: 311.5,
+            return_percent: 0.3115,
+            trade_count: 76,
+            winning_trades: 38,
+            losing_trades: 38,
+            win_rate: 50.0,
+            profit_factor: Some(1.0125),
+            max_drawdown: 8_824.0,
+            max_drawdown_percent: 8.824,
+        };
+        let gates = GateConfig {
+            minimum_trades: 20,
+            maximum_drawdown_percent: 30.0,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+        };
+        let retention = metrics.return_percent / 21.5217;
+        assert!(!precision_passes(&metrics, retention, &gates, 0.95));
     }
 }
