@@ -76,8 +76,8 @@ pub(crate) fn build_seed(family: FamilyStyle, rng: &mut ChaCha8Rng, id: String) 
             Vec::new()
         },
         side,
-        risk: RiskPolicy::PercentBalance {
-            percent: rng.gen_range(0.25..=1.0),
+        risk: RiskPolicy::FixedCurrency {
+            amount: crate::FIXED_RISK_PER_TRADE,
         },
         stops: random_stops(rng),
         manage: random_manage(rng),
@@ -107,9 +107,6 @@ pub(crate) fn crossover(left: &StrategyIr, right: &StrategyIr, rng: &mut ChaCha8
         if rng.gen_bool(0.5) {
             child.filters = right.filters.clone();
         }
-    }
-    if rng.gen_bool(0.5) {
-        child.risk = right.risk.clone();
     }
     if rng.gen_bool(0.5) {
         child.stops = right.stops.clone();
@@ -454,9 +451,6 @@ fn random_manage(rng: &mut ChaCha8Rng) -> ManagePolicy {
 }
 
 fn mutate_policies(strategy: &mut StrategyIr, rng: &mut ChaCha8Rng) {
-    if let RiskPolicy::PercentBalance { percent } = &mut strategy.risk {
-        *percent = (*percent * rng.gen_range(0.8..=1.2)).clamp(0.1, 2.0);
-    }
     match &mut strategy.stops.stop_loss {
         StopLossPolicy::FixedPoints { points } => {
             *points = (*points * rng.gen_range(0.75..=1.25)).clamp(10.0, 1_000.0);
@@ -653,6 +647,9 @@ fn choose_period(rng: &mut ChaCha8Rng) -> u16 {
 }
 
 fn normalize(strategy: &mut StrategyIr) {
+    strategy.risk = RiskPolicy::FixedCurrency {
+        amount: crate::FIXED_RISK_PER_TRADE,
+    };
     if let Ok(canonical) = strategy.canonicalized(FloatPolicy::default()) {
         *strategy = canonical;
     } else {
@@ -683,6 +680,12 @@ mod tests {
         assert_eq!(classify_family(&first[2]), FamilyStyle::Breakout);
         assert_eq!(classify_family(&first[3]), FamilyStyle::MeanReversion);
         for strategy in first {
+            assert_eq!(
+                strategy.risk,
+                RiskPolicy::FixedCurrency {
+                    amount: crate::FIXED_RISK_PER_TRADE
+                }
+            );
             strategy.validate_export_safe(IrLimits::default()).unwrap();
         }
     }
@@ -693,6 +696,12 @@ mod tests {
         let first = mutate_strategy(&seed, 7, 99, 1.0);
         let second = mutate_strategy(&seed, 7, 99, 1.0);
         assert_eq!(first, second);
+        assert_eq!(
+            first.risk,
+            RiskPolicy::FixedCurrency {
+                amount: crate::FIXED_RISK_PER_TRADE
+            }
+        );
         first.validate_export_safe(IrLimits::default()).unwrap();
     }
 
@@ -735,6 +744,12 @@ mod tests {
                 .any(|value| value.manage.flatten_end_of_day)
         );
         for strategy in population {
+            assert_eq!(
+                strategy.risk,
+                RiskPolicy::FixedCurrency {
+                    amount: crate::FIXED_RISK_PER_TRADE
+                }
+            );
             strategy.validate_export_safe(IrLimits::default()).unwrap();
         }
     }

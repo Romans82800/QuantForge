@@ -322,7 +322,13 @@ impl Databank {
                     0.0
                 },
             );
-            if fingerprint != elite.structural_fingerprint
+            let fixed_risk = matches!(
+                elite.strategy.risk,
+                quantforge_ir::RiskPolicy::FixedCurrency { amount }
+                    if (amount - crate::FIXED_RISK_PER_TRADE).abs() <= 1.0e-9
+            );
+            if !fixed_risk
+                || fingerprint != elite.structural_fingerprint
                 || niche_key(&elite.descriptor) != elite.niche
                 || self.coverage_map.get(&niche_label(&elite.niche))
                     != Some(&elite.structural_fingerprint)

@@ -854,7 +854,7 @@ function DiscoverWorkspace({
           {form.mode === "new" && <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Certification-grade search: evaluate development partition only</span></label>}
         </fieldset>
         <div className="form-footer">
-          <p>H1 screens quickly; every survivor is replayed through M1 and discarded unless it retains the configured result before entering the databank.</p>
+          <p>Every strategy risks a fixed $1,000 per trade. H1 screens quickly; each survivor is replayed through M1 and discarded unless it retains the configured result.</p>
           <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
         </div>
       </section>

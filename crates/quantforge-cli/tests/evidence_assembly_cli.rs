@@ -116,7 +116,9 @@ fn strategy() -> StrategyIr {
         exit: None,
         filters: Vec::new(),
         side: Side::LongOnly,
-        risk: RiskPolicy::FixedCurrency { amount: 1.0 },
+        risk: RiskPolicy::FixedCurrency {
+            amount: quantforge_discover::FIXED_RISK_PER_TRADE,
+        },
         stops: ProtectiveStops {
             stop_loss: StopLossPolicy::FixedPoints { points: 1.0 },
             take_profit: TakeProfitPolicy::RiskMultiple { multiple: 1.0 },
