@@ -38,6 +38,13 @@ needed to audit the set. The workspace retains the Evidence × Novelty
 behavioral map for diversity analysis and separately plots cumulative equity
 curves reconstructed from the stored 64-point M1 signatures.
 
+Databank rows expose Return / DD and an M1 equity Sharpe proxy and can be
+ranked by either measure. Return / DD is net return percentage divided by
+maximum drawdown percentage. New discovery jobs can set a minimum Return / DD
+gate; candidates must satisfy it on both the decision-timeframe screen and the
+M1 precision replay. Newly evaluated results persist the Sharpe proxy directly,
+while older databanks derive it from their stored M1 signature.
+
 Selecting an elite also exposes direct handoffs to Challenge and M1 / MT5.
 Those handoffs carry the decision and M1 data paths, metadata, broker profile,
 cost assumptions, initial balance and newly exported Strategy IR forward from

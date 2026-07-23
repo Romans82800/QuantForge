@@ -1,6 +1,8 @@
 use crate::archive::{CandidateEvaluation, deposit};
 use crate::grammar::{build_seed, classify_family, crossover, mutate_with_rng, rng_for};
-use crate::model::{Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite};
+use crate::model::{
+    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, return_drawdown_ratio,
+};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
@@ -287,6 +289,7 @@ fn precision_passes(
         && metrics.return_percent > gates.minimum_return_percent
         && metrics.max_drawdown_percent <= gates.maximum_drawdown_percent
         && effective_profit_factor >= gates.minimum_profit_factor
+        && return_drawdown_ratio(metrics) >= gates.minimum_return_drawdown
         && return_retention.is_finite()
         && return_retention >= minimum_return_retention
 }
@@ -412,6 +415,7 @@ mod tests {
                 maximum_drawdown_percent: 100.0,
                 minimum_return_percent: -100.0,
                 minimum_profit_factor: 0.0,
+                minimum_return_drawdown: 0.0,
             },
             precision: crate::model::PrecisionGateConfig {
                 minimum_return_retention: 0.0,
@@ -468,12 +472,14 @@ mod tests {
             profit_factor: Some(1.0125),
             max_drawdown: 8_824.0,
             max_drawdown_percent: 8.824,
+            sharpe_ratio: Some(0.03),
         };
         let gates = GateConfig {
             minimum_trades: 20,
             maximum_drawdown_percent: 30.0,
             minimum_return_percent: 0.0,
             minimum_profit_factor: 1.0,
+            minimum_return_drawdown: 0.0,
         };
         let retention = metrics.return_percent / 21.5217;
         assert!(!precision_passes(&metrics, retention, &gates, 0.95));

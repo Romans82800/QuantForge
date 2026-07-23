@@ -17,7 +17,9 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
   trades: 20,
   returnPercent: 4,
   drawdownPercent: 6,
+  returnDrawdown: 4 / 6,
   profitFactor: 1.4,
+  sharpeRatio: 0.8,
   complexity: 8,
   generation: 2,
   grade: "illuminated",
@@ -68,6 +70,17 @@ describe("databank view rules", () => {
       "trend-high",
       "trend-low",
     ]);
+  });
+
+  it("ranks return-to-drawdown and Sharpe from strongest to weakest", () => {
+    const rows = [
+      elite({ strategyId: "weak", returnDrawdown: 0.4, sharpeRatio: 0.2 }),
+      elite({ strategyId: "strong", returnDrawdown: 1.8, sharpeRatio: 1.1 }),
+    ];
+    expect(filterAndSortElites(rows, "", "all", "returnDrawdown")[0].strategyId)
+      .toBe("strong");
+    expect(filterAndSortElites(rows, "", "all", "sharpe")[0].strategyId)
+      .toBe("strong");
   });
 
   it("bounds discovery progress while a job transitions", () => {

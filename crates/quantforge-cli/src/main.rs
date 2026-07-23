@@ -206,6 +206,8 @@ struct EvolveArgs {
     #[arg(long)]
     minimum_profit_factor: Option<f64>,
     #[arg(long)]
+    minimum_return_drawdown: Option<f64>,
+    #[arg(long)]
     minimum_m1_return_retention: Option<f64>,
     /// Close positions, cancel pending orders and block entries from 22:00
     /// until the next broker day.
@@ -3961,6 +3963,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(30.0),
             minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: args.minimum_profit_factor.unwrap_or(1.0),
+            minimum_return_drawdown: args.minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
@@ -3992,6 +3995,7 @@ fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>
         || args.maximum_drawdown_percent.is_some()
         || args.minimum_return_percent.is_some()
         || args.minimum_profit_factor.is_some()
+        || args.minimum_return_drawdown.is_some()
         || args.minimum_m1_return_retention.is_some()
         || args.flatten_at_22
         || args.commission_per_lot_round_turn.is_some()

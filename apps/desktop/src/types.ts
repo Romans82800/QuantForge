@@ -51,7 +51,9 @@ export interface EliteRow {
   trades: number;
   returnPercent: number;
   drawdownPercent: number;
+  returnDrawdown: number | null;
   profitFactor: number | null;
+  sharpeRatio: number | null;
   complexity: number;
   generation: number;
   grade: string;
@@ -113,6 +115,8 @@ export type EliteSort =
   | "novelty"
   | "trades"
   | "drawdown"
+  | "returnDrawdown"
+  | "sharpe"
   | "family"
   | "grade";
 
@@ -188,6 +192,7 @@ export interface DiscoverRequest {
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
   minimumProfitFactor: number | null;
+  minimumReturnDrawdown: number | null;
   minimumM1ReturnRetention: number | null;
   flattenAt22: boolean | null;
   commissionPerLotRoundTurn: number | null;

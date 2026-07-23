@@ -14,6 +14,8 @@ pub struct GateConfig {
     pub maximum_drawdown_percent: f64,
     pub minimum_return_percent: f64,
     pub minimum_profit_factor: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub minimum_return_drawdown: f64,
 }
 
 impl Default for GateConfig {
@@ -23,6 +25,7 @@ impl Default for GateConfig {
             maximum_drawdown_percent: 30.0,
             minimum_return_percent: 0.0,
             minimum_profit_factor: 1.0,
+            minimum_return_drawdown: 0.0,
         }
     }
 }
@@ -128,6 +131,8 @@ impl DiscoverConfig {
             || !self.gates.minimum_return_percent.is_finite()
             || !self.gates.minimum_profit_factor.is_finite()
             || self.gates.minimum_profit_factor < 0.0
+            || !self.gates.minimum_return_drawdown.is_finite()
+            || self.gates.minimum_return_drawdown < 0.0
         {
             return Err(DiscoverError::InvalidConfig(
                 "gate thresholds must be finite and non-negative where applicable".into(),
@@ -341,6 +346,7 @@ impl Databank {
                 || elite.metrics.trade_count < self.config.gates.minimum_trades
                 || elite.metrics.return_percent <= self.config.gates.minimum_return_percent
                 || effective_profit_factor < self.config.gates.minimum_profit_factor
+                || return_drawdown_ratio(&elite.metrics) < self.config.gates.minimum_return_drawdown
                 || elite.metrics.max_drawdown_percent > self.config.gates.maximum_drawdown_percent
                 || elite.discovered_generation > self.completed_generations
                 || !elite.evidence.total.is_finite()
@@ -353,6 +359,20 @@ impl Databank {
         }
         Ok(())
     }
+}
+
+pub(crate) fn return_drawdown_ratio(metrics: &BacktestMetrics) -> f64 {
+    if metrics.max_drawdown_percent > 1.0e-12 {
+        metrics.return_percent / metrics.max_drawdown_percent
+    } else if metrics.return_percent > 0.0 {
+        f64::INFINITY
+    } else {
+        metrics.return_percent
+    }
+}
+
+fn is_zero(value: &f64) -> bool {
+    value.abs() <= f64::EPSILON
 }
 
 #[derive(Debug, Error)]

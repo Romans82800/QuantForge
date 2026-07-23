@@ -6,7 +6,7 @@ mod features;
 mod model;
 
 pub use costs::{ResolvedSpread, SpreadSource, SwapAccrual, accrue_swap, resolve_spread};
-pub use engine::{evaluate_strategy, evaluate_strategy_from};
+pub use engine::{equity_sharpe_ratio, evaluate_strategy, evaluate_strategy_from};
 pub use features::{FeatureCache, calculate_indicator_series};
 pub use model::{
     BacktestMetrics, CostModel, EquityPoint, EvalError, ExitReason, PositionSide, SameBarPolicy,

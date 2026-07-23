@@ -1,7 +1,7 @@
 use crate::grammar::classify_family;
 use crate::model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, Elite, EvidenceComponents,
-    LongShortSkewBucket, NicheKey, ThreeLevelBucket,
+    LongShortSkewBucket, NicheKey, ThreeLevelBucket, return_drawdown_ratio,
 };
 use quantforge_core::{FloatPolicy, quantize};
 use quantforge_eval::{PositionSide, ScoutResult};
@@ -123,6 +123,7 @@ pub(crate) fn passes_gates(result: &ScoutResult, config: &DiscoverConfig) -> boo
         && metrics.max_drawdown_percent <= config.gates.maximum_drawdown_percent
         && metrics.return_percent > config.gates.minimum_return_percent
         && effective_profit_factor >= config.gates.minimum_profit_factor
+        && return_drawdown_ratio(metrics) >= config.gates.minimum_return_drawdown
 }
 
 fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor {
@@ -340,6 +341,7 @@ mod tests {
                     maximum_drawdown_percent: 100.0,
                     minimum_return_percent: -100.0,
                     minimum_profit_factor: 0.0,
+                    minimum_return_drawdown: 0.0,
                 },
                 scout: ScoutConfig::default(),
                 ..DiscoverConfig::default()
@@ -384,6 +386,7 @@ mod tests {
                 profit_factor: None,
                 max_drawdown: 0.0,
                 max_drawdown_percent: 0.0,
+                sharpe_ratio: None,
             },
             telemetry: ScoutTelemetry::default(),
         }
@@ -399,6 +402,18 @@ mod tests {
     #[test]
     fn default_grid_contains_972_possible_niches() {
         assert_eq!(4 * 3usize.pow(5), 972);
+    }
+
+    #[test]
+    fn return_drawdown_gate_rejects_weak_efficiency() {
+        let mut result = profitable_result();
+        result.metrics.max_drawdown_percent = 2.0;
+        result.metrics.max_drawdown = 2_000.0;
+        let mut config = bank(0.88).config;
+        config.gates.minimum_return_drawdown = 1.01;
+        assert!(!passes_gates(&result, &config));
+        config.gates.minimum_return_drawdown = 1.0;
+        assert!(passes_gates(&result, &config));
     }
 
     #[test]

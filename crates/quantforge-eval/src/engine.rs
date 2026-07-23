@@ -1113,6 +1113,7 @@ fn calculate_metrics(
     }
 
     let net_profit = ending_balance - initial_balance;
+    let sharpe_ratio = equity_sharpe_ratio(initial_balance, equity);
     BacktestMetrics {
         initial_balance,
         ending_balance,
@@ -1129,7 +1130,34 @@ fn calculate_metrics(
         profit_factor,
         max_drawdown,
         max_drawdown_percent,
+        sharpe_ratio,
     }
+}
+
+pub fn equity_sharpe_ratio(initial_balance: f64, equity: &[EquityPoint]) -> Option<f64> {
+    if equity.len() < 2 || initial_balance <= 0.0 {
+        return None;
+    }
+    let mut previous = initial_balance;
+    let returns: Vec<_> = equity
+        .iter()
+        .filter_map(|point| {
+            let value = (previous > 0.0).then_some(point.equity / previous - 1.0);
+            previous = point.equity;
+            value.filter(|value| value.is_finite())
+        })
+        .collect();
+    if returns.len() < 2 {
+        return None;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance = returns
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (returns.len() - 1) as f64;
+    let deviation = variance.sqrt();
+    (deviation > 1.0e-12).then_some(mean / deviation * (returns.len() as f64).sqrt())
 }
 
 #[cfg(test)]
@@ -1172,6 +1200,29 @@ mod tests {
             margin_currency: "USD".into(),
             synthetic_spreads: vec![],
         }
+    }
+
+    #[test]
+    fn equity_sharpe_requires_variation_and_rewards_positive_path() {
+        let rising = vec![
+            EquityPoint {
+                timestamp_ms: 1,
+                balance: 100.0,
+                equity: 101.0,
+            },
+            EquityPoint {
+                timestamp_ms: 2,
+                balance: 100.0,
+                equity: 103.0,
+            },
+            EquityPoint {
+                timestamp_ms: 3,
+                balance: 100.0,
+                equity: 104.0,
+            },
+        ];
+        assert!(equity_sharpe_ratio(100.0, &rising).is_some_and(|value| value > 0.0));
+        assert_eq!(equity_sharpe_ratio(100.0, &rising[..1]), None);
     }
 
     fn strategy() -> StrategyIr {

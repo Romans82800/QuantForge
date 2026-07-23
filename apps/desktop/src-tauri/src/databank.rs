@@ -126,7 +126,9 @@ struct EliteRow {
     trades: usize,
     return_percent: f64,
     drawdown_percent: f64,
+    return_drawdown: Option<f64>,
     profit_factor: Option<f64>,
+    sharpe_ratio: Option<f64>,
     complexity: usize,
     generation: u64,
     grade: &'static str,
@@ -312,7 +314,12 @@ fn export_elite_strategies_to(
             "strategy_id": elite.strategy.id,
             "family": family_name(elite.niche.family),
             "return_percent": elite.metrics.return_percent,
+            "return_drawdown": finite_return_drawdown(
+                elite.metrics.return_percent,
+                elite.metrics.max_drawdown_percent,
+            ),
             "profit_factor": elite.metrics.profit_factor,
+            "sharpe_ratio": effective_sharpe(elite),
             "maximum_drawdown_percent": elite.metrics.max_drawdown_percent,
             "trades": elite.metrics.trade_count,
             "path": path.canonicalize().unwrap_or_else(|_| path.clone()),
@@ -473,12 +480,12 @@ fn selection_bias(evaluation_count: u64) -> SelectionBiasView {
     let (level, message) = if evaluation_count > 10_000 {
         (
             "high",
-            "A large search space was touched. Treat raw backtest rankings as heavily selected and require the full Challenge, sealed-final and external-parity chain.",
+            "This is not a data failure: more than 10,000 candidate results were compared, so the winner is highly exposed to multiple-testing luck. Require the full Challenge, sealed-final and external-parity chain.",
         )
     } else if evaluation_count > SELECTION_BIAS_WARNING_THRESHOLD {
         (
             "elevated",
-            "The search exceeded the default selection-bias warning threshold. Promotion must retain deflated metrics and robustness evidence.",
+            "This is not a data failure: more than 1,500 candidate results were compared, increasing the chance that a winner benefited from luck. Promotion must retain deflated metrics and robustness evidence.",
         )
     } else {
         (
@@ -503,13 +510,48 @@ fn elite_row(elite: &Elite) -> EliteRow {
         trades: elite.metrics.trade_count,
         return_percent: elite.metrics.return_percent,
         drawdown_percent: elite.metrics.max_drawdown_percent,
+        return_drawdown: finite_return_drawdown(
+            elite.metrics.return_percent,
+            elite.metrics.max_drawdown_percent,
+        ),
         profit_factor: elite.metrics.profit_factor,
+        sharpe_ratio: effective_sharpe(elite),
         complexity: elite.complexity,
         generation: elite.discovered_generation,
         grade: "illuminated",
         parity: "unknown",
         equity_signature: elite.equity_signature.clone(),
     }
+}
+
+fn finite_return_drawdown(return_percent: f64, drawdown_percent: f64) -> Option<f64> {
+    (drawdown_percent > 1.0e-12)
+        .then_some(return_percent / drawdown_percent)
+        .filter(|value| value.is_finite())
+}
+
+fn effective_sharpe(elite: &Elite) -> Option<f64> {
+    elite
+        .metrics
+        .sharpe_ratio
+        .filter(|value| value.is_finite())
+        .or_else(|| signature_sharpe(&elite.equity_signature))
+}
+
+fn signature_sharpe(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    let deviation = variance.sqrt();
+    (deviation > 1.0e-12)
+        .then_some(mean / deviation * (values.len() as f64).sqrt())
+        .filter(|value| value.is_finite())
 }
 
 fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
@@ -693,5 +735,11 @@ mod tests {
             companion_metadata_path(data.to_str().expect("UTF-8 path")),
             Some(canonical_display(&metadata))
         );
+    }
+
+    #[test]
+    fn archived_signature_provides_a_sharpe_fallback() {
+        assert!(signature_sharpe(&[1.0, 2.0, 1.5]).is_some_and(|value| value > 0.0));
+        assert_eq!(signature_sharpe(&[1.0]), None);
     }
 }

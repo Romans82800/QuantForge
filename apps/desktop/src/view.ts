@@ -36,10 +36,43 @@ export function filterAndSortElites(
         return left.grade.localeCompare(right.grade) || right.evidence - left.evidence;
       }
       if (sort === "drawdown") return left.drawdownPercent - right.drawdownPercent;
+      if (sort === "returnDrawdown") {
+        return compareDescending(
+          comparableReturnDrawdown(left),
+          comparableReturnDrawdown(right),
+          left.evidence,
+          right.evidence,
+        );
+      }
+      if (sort === "sharpe") {
+        return compareDescending(
+          left.sharpeRatio ?? Number.NEGATIVE_INFINITY,
+          right.sharpeRatio ?? Number.NEGATIVE_INFINITY,
+          left.evidence,
+          right.evidence,
+        );
+      }
       if (sort === "trades") return right.trades - left.trades;
       if (sort === "novelty") return right.novelty - left.novelty;
       return right.evidence - left.evidence;
     });
+}
+
+function compareDescending(
+  left: number,
+  right: number,
+  leftTieBreaker: number,
+  rightTieBreaker: number,
+): number {
+  if (left === right) return rightTieBreaker - leftTieBreaker;
+  return left > right ? -1 : 1;
+}
+
+function comparableReturnDrawdown(elite: EliteRow): number {
+  if (elite.returnDrawdown !== null) return elite.returnDrawdown;
+  return elite.drawdownPercent <= 1e-12 && elite.returnPercent > 0
+    ? Number.POSITIVE_INFINITY
+    : Number.NEGATIVE_INFINITY;
 }
 
 export function visibleEliteFingerprint(

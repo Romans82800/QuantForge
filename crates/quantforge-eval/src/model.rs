@@ -147,6 +147,8 @@ pub struct BacktestMetrics {
     pub profit_factor: Option<f64>,
     pub max_drawdown: f64,
     pub max_drawdown_percent: f64,
+    #[serde(default)]
+    pub sharpe_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

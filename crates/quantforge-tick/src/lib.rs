@@ -9,7 +9,7 @@ use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
 use quantforge_eval::{
     BacktestMetrics, CostModel, EquityPoint, EvalError, ExitReason, FeatureCache, PositionSide,
-    ScoutConfig, SpreadSource, Trade, accrue_swap, resolve_spread,
+    ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio, resolve_spread,
 };
 use quantforge_ir::{
     EntryDistancePolicy, EntryOrderPolicy, IndicatorExpr, IrError, IrLimits, RiskPolicy,
@@ -1294,6 +1294,7 @@ fn calculate_metrics(
         }
     }
     let net_profit = ending_balance - initial_balance;
+    let sharpe_ratio = equity_sharpe_ratio(initial_balance, equity);
     BacktestMetrics {
         initial_balance,
         ending_balance,
@@ -1310,6 +1311,7 @@ fn calculate_metrics(
         profit_factor,
         max_drawdown,
         max_drawdown_percent,
+        sharpe_ratio,
     }
 }
 

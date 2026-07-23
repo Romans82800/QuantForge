@@ -551,6 +551,8 @@ function App() {
                         <option value="novelty">Novelty ↓</option>
                         <option value="trades">Trades ↓</option>
                         <option value="drawdown">Drawdown ↑</option>
+                        <option value="returnDrawdown">Return / DD ↓</option>
+                        <option value="sharpe">Sharpe ↓</option>
                         <option value="family">Family A–Z</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
@@ -871,6 +873,7 @@ function DiscoverWorkspace({
     maximumDrawdownPercent: 30,
     minimumReturnPercent: 0,
     minimumProfitFactor: 1,
+    minimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.95,
     flattenAt22: false,
     commissionPerLotRoundTurn: 7,
@@ -924,6 +927,7 @@ function DiscoverWorkspace({
             maximumDrawdownPercent: null,
             minimumReturnPercent: null,
             minimumProfitFactor: null,
+            minimumReturnDrawdown: null,
             minimumM1ReturnRetention: null,
             flattenAt22: null,
             commissionPerLotRoundTurn: null,
@@ -995,6 +999,7 @@ function DiscoverWorkspace({
                 <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
                 <NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value)} step={0.1} />
                 <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
+                <NumberField label="Minimum return / DD" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
                 <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
                 <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                 <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
@@ -1547,7 +1552,7 @@ function EliteTable({
     <div className="elite-table">
       <div className="elite-row elite-header">
         <span>Select</span><span>Strategy</span><span>Family</span><span>Evidence</span><span>Novelty</span>
-        <span>Trades</span><span>Return</span><span>DD</span><span>Parity</span>
+        <span>Trades</span><span>Return</span><span>DD</span><span>Ret/DD</span><span>Sharpe</span><span>Parity</span>
       </div>
       <div
         className="elite-viewport"
@@ -1583,6 +1588,8 @@ function EliteTable({
               <span>{formatNumber(row.trades)}</span>
               <span className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</span>
               <span>{row.drawdownPercent.toFixed(2)}%</span>
+              <span>{formatReturnDrawdown(row)}</span>
+              <span>{row.sharpeRatio === null ? "—" : row.sharpeRatio.toFixed(2)}</span>
               <span className="parity-unknown">unknown</span>
             </div>
           ))}
@@ -1644,9 +1651,24 @@ function EliteInspector({
                 <Metric label="Evidence" value={Number(detail.evidence.total).toFixed(2)} />
                 <Metric label="Return" value={`${Number(detail.metrics.return_percent).toFixed(2)}%`} />
                 <Metric label="Max drawdown" value={`${Number(detail.metrics.max_drawdown_percent).toFixed(2)}%`} />
+                <Metric
+                  label="Return / DD"
+                  value={formatReturnDrawdown({
+                    returnPercent: Number(detail.metrics.return_percent),
+                    drawdownPercent: Number(detail.metrics.max_drawdown_percent),
+                    returnDrawdown: finiteRatio(
+                      Number(detail.metrics.return_percent),
+                      Number(detail.metrics.max_drawdown_percent),
+                    ),
+                  })}
+                />
                 <Metric label="Trades" value={formatNumber(Number(detail.metrics.trade_count))} />
                 <Metric label="Win rate" value={`${Number(detail.metrics.win_rate).toFixed(1)}%`} />
                 <Metric label="Profit factor" value={detail.metrics.profit_factor === null ? "—" : Number(detail.metrics.profit_factor).toFixed(2)} />
+                <Metric
+                  label="Sharpe"
+                  value={effectiveDetailSharpe(detail)?.toFixed(2) ?? "—"}
+                />
               </section>
               <section>
                 <p className="eyebrow">Behavioral niche</p>
@@ -1669,6 +1691,35 @@ function EliteInspector({
 
 function Metric({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function finiteRatio(returnPercent: number, drawdownPercent: number): number | null {
+  if (drawdownPercent <= 1e-12) return null;
+  const value = returnPercent / drawdownPercent;
+  return Number.isFinite(value) ? value : null;
+}
+
+function formatReturnDrawdown(
+  value: Pick<EliteRow, "returnPercent" | "drawdownPercent" | "returnDrawdown">,
+): string {
+  if (value.returnDrawdown !== null) return value.returnDrawdown.toFixed(2);
+  return value.drawdownPercent <= 1e-12 && value.returnPercent > 0 ? "∞" : "—";
+}
+
+function effectiveDetailSharpe(detail: EliteDetail): number | null {
+  const persisted = detail.metrics.sharpe_ratio;
+  if (persisted !== null && persisted !== undefined && Number.isFinite(Number(persisted))) {
+    return Number(persisted);
+  }
+  const values = detail.equitySignature;
+  if (values.length < 2) return null;
+  const mean = values.reduce((total, value) => total + value, 0) / values.length;
+  const variance = values.reduce(
+    (total, value) => total + (value - mean) ** 2,
+    0,
+  ) / (values.length - 1);
+  const deviation = Math.sqrt(variance);
+  return deviation > 1e-12 ? mean / deviation * Math.sqrt(values.length) : null;
 }
 
 function equityCurveValues(

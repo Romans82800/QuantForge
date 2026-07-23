@@ -176,6 +176,7 @@ fn write_databank(
             maximum_drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
             minimum_return_percent: challenge.baseline.metrics.return_percent - 1.0,
             minimum_profit_factor: 0.0,
+            minimum_return_drawdown: 0.0,
         },
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: 0.0,
