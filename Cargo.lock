@@ -2540,6 +2540,7 @@ dependencies = [
  "quantforge-quality",
  "quantforge-storage",
  "quantforge-tick",
+ "rayon",
  "serde",
  "serde_json",
  "tauri",

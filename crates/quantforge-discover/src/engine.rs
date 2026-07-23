@@ -18,11 +18,145 @@ use std::collections::BTreeMap;
 enum CandidateOutcome {
     CoarseRejected,
     PrecisionRejected,
-    Accepted(Box<ScoutResult>),
+    Oos1Rejected,
+    Accepted {
+        result: Box<ScoutResult>,
+        is_expectancy: f64,
+        oos1_expectancy: Option<f64>,
+        oos1_expectancy_ratio: Option<f64>,
+    },
+}
+
+fn evaluate_and_deposit(
+    bank: &mut Databank,
+    candidates: Vec<StrategyIr>,
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    generation: u64,
+) -> Result<(), DiscoverError> {
+    let scout = &bank.config.scout;
+    let gates = &bank.config.gates;
+    let discover_config = &bank.config;
+    let minimum_return_retention = bank.config.precision.minimum_return_retention;
+    let oos1_retention = bank.config.oos1_expectancy_retention;
+    let evaluated: Vec<_> = candidates
+        .into_par_iter()
+        .map(|strategy| {
+            let result = (|| {
+                let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
+                    .map_err(|error| error.to_string())?;
+                if !crate::archive::passes_gates(&coarse, discover_config) {
+                    return Ok::<_, String>(CandidateOutcome::CoarseRejected);
+                }
+                let precise = evaluate_strategy_m1(
+                    &strategy,
+                    dataset,
+                    m1_dataset,
+                    broker,
+                    &JudgeConfig {
+                        initial_balance: scout.initial_balance,
+                        costs: scout.costs.clone(),
+                        allow_execution_gaps: false,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                let precise_result = ScoutResult {
+                    trades: precise.trades,
+                    equity: precise.equity,
+                    metrics: precise.metrics,
+                    telemetry: ScoutTelemetry::default(),
+                };
+                let retention = if coarse.metrics.return_percent > 0.0 {
+                    precise_result.metrics.return_percent / coarse.metrics.return_percent
+                } else if precise_result.metrics.return_percent >= coarse.metrics.return_percent {
+                    1.0
+                } else {
+                    0.0
+                };
+                let precision_passed = precision_passes(
+                    &precise_result.metrics,
+                    retention,
+                    gates,
+                    minimum_return_retention,
+                );
+                if !precision_passed {
+                    return Ok(CandidateOutcome::PrecisionRejected);
+                }
+
+                let is_expectancy = precise_result.metrics.expectancy;
+                let (oos1_expectancy, oos1_expectancy_ratio) = if let Some(oos1) = oos1_dataset {
+                    let oos1_result = evaluate_strategy(&strategy, oos1, broker, scout)
+                        .map_err(|error| error.to_string())?;
+                    let oos1_expectancy = oos1_result.metrics.expectancy;
+                    if !passes_oos1_pick(is_expectancy, oos1_expectancy, oos1_retention) {
+                        return Ok(CandidateOutcome::Oos1Rejected);
+                    }
+                    let ratio = (is_expectancy > 0.0)
+                        .then_some(oos1_expectancy / is_expectancy)
+                        .filter(|value| value.is_finite());
+                    (Some(oos1_expectancy), ratio)
+                } else {
+                    (None, None)
+                };
+
+                Ok(CandidateOutcome::Accepted {
+                    result: Box::new(precise_result),
+                    is_expectancy,
+                    oos1_expectancy,
+                    oos1_expectancy_ratio,
+                })
+            })();
+            (strategy, result)
+        })
+        .collect();
+
+    for (strategy, result) in evaluated {
+        bank.evaluation_count += 1;
+        let decision = match result {
+            Ok(CandidateOutcome::Accepted {
+                result,
+                is_expectancy,
+                oos1_expectancy,
+                oos1_expectancy_ratio,
+            }) => deposit(
+                bank,
+                CandidateEvaluation {
+                    strategy,
+                    result: *result,
+                    generation,
+                    is_expectancy,
+                    oos1_expectancy,
+                    oos1_expectancy_ratio,
+                },
+            )?,
+            Ok(CandidateOutcome::CoarseRejected) => DepositDecision::RejectedGate,
+            Ok(CandidateOutcome::PrecisionRejected) => DepositDecision::RejectedPrecision,
+            Ok(CandidateOutcome::Oos1Rejected) => DepositDecision::RejectedOos1,
+            Err(error) => {
+                *bank.telemetry.evaluation_errors.entry(error).or_default() += 1;
+                DepositDecision::RejectedEvaluation
+            }
+        };
+        bank.telemetry.record(decision);
+    }
+    Ok(())
+}
+
+/// Promotion pick gate: OOS1 expectancy must retain at least `retention` of IS
+/// expectancy. Both windows must show positive expectancy.
+pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
+    is_expectancy.is_finite()
+        && oos1_expectancy.is_finite()
+        && is_expectancy > 0.0
+        && oos1_expectancy > 0.0
+        && oos1_expectancy >= retention * is_expectancy
 }
 
 pub fn evolve_new(
     dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     config: DiscoverConfig,
@@ -52,14 +186,30 @@ pub fn evolve_new(
             )
         })
         .collect();
-    evaluate_and_deposit(&mut bank, initial, dataset, m1_dataset, broker, 0)?;
-    run_generations(&mut bank, dataset, m1_dataset, broker, generations)?;
+    evaluate_and_deposit(
+        &mut bank,
+        initial,
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        broker,
+        0,
+    )?;
+    run_generations(
+        &mut bank,
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        broker,
+        generations,
+    )?;
     Ok(bank)
 }
 
 pub fn continue_evolution(
     mut bank: Databank,
     dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     additional_generations: u64,
@@ -68,6 +218,7 @@ pub fn continue_evolution(
     run_generations(
         &mut bank,
         dataset,
+        oos1_dataset,
         m1_dataset,
         broker,
         additional_generations,
@@ -78,6 +229,7 @@ pub fn continue_evolution(
 fn run_generations(
     bank: &mut Databank,
     dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     count: u64,
@@ -85,7 +237,15 @@ fn run_generations(
     for _ in 0..count {
         let generation = bank.completed_generations + 1;
         let batch = breed_generation(bank, generation);
-        evaluate_and_deposit(bank, batch, dataset, m1_dataset, broker, generation)?;
+        evaluate_and_deposit(
+            bank,
+            batch,
+            dataset,
+            oos1_dataset,
+            m1_dataset,
+            broker,
+            generation,
+        )?;
         bank.completed_generations = generation;
     }
     Ok(())
@@ -185,91 +345,6 @@ fn selection_is_better(left: &Elite, right: &Elite, novelty_weight: f64) -> bool
                 .cmp(&right.structural_fingerprint)
         })
         .is_gt()
-}
-
-fn evaluate_and_deposit(
-    bank: &mut Databank,
-    candidates: Vec<StrategyIr>,
-    dataset: &BarDataset,
-    m1_dataset: &BarDataset,
-    broker: &SymbolSpecification,
-    generation: u64,
-) -> Result<(), DiscoverError> {
-    let scout = &bank.config.scout;
-    let gates = &bank.config.gates;
-    let discover_config = &bank.config;
-    let minimum_return_retention = bank.config.precision.minimum_return_retention;
-    let evaluated: Vec<_> = candidates
-        .into_par_iter()
-        .map(|strategy| {
-            let result = (|| {
-                let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
-                    .map_err(|error| error.to_string())?;
-                if !crate::archive::passes_gates(&coarse, discover_config) {
-                    return Ok::<_, String>(CandidateOutcome::CoarseRejected);
-                }
-                let precise = evaluate_strategy_m1(
-                    &strategy,
-                    dataset,
-                    m1_dataset,
-                    broker,
-                    &JudgeConfig {
-                        initial_balance: scout.initial_balance,
-                        costs: scout.costs.clone(),
-                        allow_execution_gaps: false,
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-                let precise_result = ScoutResult {
-                    trades: precise.trades,
-                    equity: precise.equity,
-                    metrics: precise.metrics,
-                    telemetry: ScoutTelemetry::default(),
-                };
-                let retention = if coarse.metrics.return_percent > 0.0 {
-                    precise_result.metrics.return_percent / coarse.metrics.return_percent
-                } else if precise_result.metrics.return_percent >= coarse.metrics.return_percent {
-                    1.0
-                } else {
-                    0.0
-                };
-                let precision_passed = precision_passes(
-                    &precise_result.metrics,
-                    retention,
-                    gates,
-                    minimum_return_retention,
-                );
-                Ok(if precision_passed {
-                    CandidateOutcome::Accepted(Box::new(precise_result))
-                } else {
-                    CandidateOutcome::PrecisionRejected
-                })
-            })();
-            (strategy, result)
-        })
-        .collect();
-
-    for (strategy, result) in evaluated {
-        bank.evaluation_count += 1;
-        let decision = match result {
-            Ok(CandidateOutcome::Accepted(result)) => deposit(
-                bank,
-                CandidateEvaluation {
-                    strategy,
-                    result: *result,
-                    generation,
-                },
-            )?,
-            Ok(CandidateOutcome::CoarseRejected) => DepositDecision::RejectedGate,
-            Ok(CandidateOutcome::PrecisionRejected) => DepositDecision::RejectedPrecision,
-            Err(error) => {
-                *bank.telemetry.evaluation_errors.entry(error).or_default() += 1;
-                DepositDecision::RejectedEvaluation
-            }
-        };
-        bank.telemetry.record(decision);
-    }
-    Ok(())
 }
 
 fn precision_passes(
@@ -420,6 +495,7 @@ mod tests {
             precision: crate::model::PrecisionGateConfig {
                 minimum_return_retention: 0.0,
             },
+            oos1_expectancy_retention: 0.0,
             flatten_at_22: false,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
@@ -432,8 +508,8 @@ mod tests {
     #[test]
     fn evolution_is_reproducible_and_illuminates_multiple_niches() {
         let dataset = dataset();
-        let first = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
-        let second = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
+        let first = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
+        let second = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
         assert_eq!(first, second);
         assert!(first.coverage() >= 4);
         assert_eq!(first.evaluation_count, 64);
@@ -443,16 +519,16 @@ mod tests {
     #[test]
     fn checkpoint_resume_matches_uninterrupted_evolution() {
         let dataset = dataset();
-        let uninterrupted = evolve_new(&dataset, &dataset, &broker(), config(), 2).unwrap();
-        let checkpoint = evolve_new(&dataset, &dataset, &broker(), config(), 1).unwrap();
-        let resumed = continue_evolution(checkpoint, &dataset, &dataset, &broker(), 1).unwrap();
+        let uninterrupted = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
+        let checkpoint = evolve_new(&dataset, None, &dataset, &broker(), config(), 1).unwrap();
+        let resumed = continue_evolution(checkpoint, &dataset, None, &dataset, &broker(), 1).unwrap();
         assert_eq!(uninterrupted, resumed);
     }
 
     #[test]
     fn persisted_databank_integrity_rejects_fingerprint_tampering() {
         let dataset = dataset();
-        let mut bank = evolve_new(&dataset, &dataset, &broker(), config(), 1).unwrap();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 1).unwrap();
         bank.validate_integrity().unwrap();
         bank.elites[0].structural_fingerprint = ContentHash::sha256("tampered");
         assert!(bank.validate_integrity().is_err());
@@ -473,6 +549,7 @@ mod tests {
             max_drawdown: 8_824.0,
             max_drawdown_percent: 8.824,
             sharpe_ratio: Some(0.03),
+            expectancy: 311.5 / 76.0,
         };
         let gates = GateConfig {
             minimum_trades: 20,
@@ -486,11 +563,20 @@ mod tests {
     }
 
     #[test]
+    fn oos1_pick_requires_positive_retention_of_is_expectancy() {
+        assert!(passes_oos1_pick(10.0, 7.0, 0.7));
+        assert!(!passes_oos1_pick(10.0, 6.9, 0.7));
+        assert!(!passes_oos1_pick(10.0, -1.0, 0.7));
+        assert!(!passes_oos1_pick(-2.0, 5.0, 0.7));
+        assert!(!passes_oos1_pick(f64::NAN, 5.0, 0.7));
+    }
+
+    #[test]
     fn close_at_22_is_a_job_policy_not_an_evolvable_gene() {
         let dataset = dataset();
         let mut config = config();
         config.flatten_at_22 = true;
-        let bank = evolve_new(&dataset, &dataset, &broker(), config, 1).unwrap();
+        let bank = evolve_new(&dataset, None, &dataset, &broker(), config, 1).unwrap();
         assert!(
             bank.elites
                 .iter()

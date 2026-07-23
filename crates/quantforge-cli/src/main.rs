@@ -3354,6 +3354,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
             continue_evolution(
                 previous.databank,
                 &dataset,
+                None,
                 &m1_dataset,
                 &broker_spec,
                 args.generations,
@@ -3373,6 +3374,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         (
             evolve_new(
                 &dataset,
+                None,
                 &m1_dataset,
                 &broker_spec,
                 config,
@@ -3968,6 +3970,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
         },
+        oos1_expectancy_retention: 0.7,
         flatten_at_22: args.flatten_at_22,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),

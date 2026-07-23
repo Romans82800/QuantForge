@@ -181,6 +181,7 @@ fn write_databank(
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: 0.0,
         },
+        oos1_expectancy_retention: 0.0,
         flatten_at_22: false,
         scout,
     };

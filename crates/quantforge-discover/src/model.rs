@@ -58,6 +58,10 @@ pub struct DiscoverConfig {
     pub seed: u64,
     pub gates: GateConfig,
     pub precision: PrecisionGateConfig,
+    /// OOS1 expectancy must be at least this fraction of IS expectancy before a
+    /// candidate may enter the databank (promotion-grade IS/OOS1/OOS2 workflow).
+    #[serde(default = "default_oos1_expectancy_retention")]
+    pub oos1_expectancy_retention: f64,
     /// Mandatory portfolio protection applied to every generated strategy.
     /// When enabled, exposure is flattened and entries are blocked from 22:00
     /// until the next broker day.
@@ -65,18 +69,23 @@ pub struct DiscoverConfig {
     pub scout: ScoutConfig,
 }
 
+fn default_oos1_expectancy_retention() -> f64 {
+    0.7
+}
+
 impl Default for DiscoverConfig {
     fn default() -> Self {
         Self {
             initial_candidates: 500,
             batch_size: 200,
-            correlation_threshold: 0.88,
+            correlation_threshold: 0.85,
             novelty_weight: 10.0,
             tournament_size: 4,
             structural_mutation_probability: 0.18,
             seed: 42,
             gates: GateConfig::default(),
             precision: PrecisionGateConfig::default(),
+            oos1_expectancy_retention: default_oos1_expectancy_retention(),
             flatten_at_22: false,
             scout: ScoutConfig::default(),
         }
@@ -124,6 +133,13 @@ impl DiscoverConfig {
         {
             return Err(DiscoverError::InvalidConfig(
                 "minimum_return_retention must be finite and between 0 and 1".into(),
+            ));
+        }
+        if !self.oos1_expectancy_retention.is_finite()
+            || !(0.0..=2.0).contains(&self.oos1_expectancy_retention)
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "oos1_expectancy_retention must be finite and between 0 and 2".into(),
             ));
         }
         if !self.gates.maximum_drawdown_percent.is_finite()
@@ -209,6 +225,15 @@ pub struct Elite {
     pub novelty: f64,
     pub complexity: usize,
     pub metrics: BacktestMetrics,
+    /// IS (development) expectancy used for ranking and the OOS1 pick gate.
+    #[serde(default)]
+    pub is_expectancy: f64,
+    /// OOS1 (first holdout) expectancy when the promotion split was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oos1_expectancy: Option<f64>,
+    /// `oos1_expectancy / is_expectancy` when IS expectancy is positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oos1_expectancy_ratio: Option<f64>,
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
@@ -224,6 +249,7 @@ pub enum DepositDecision {
     RejectedCorrelated,
     RejectedNicheNotImproved,
     RejectedPrecision,
+    RejectedOos1,
     RejectedEvaluation,
 }
 
@@ -236,6 +262,8 @@ pub struct DiscoverTelemetry {
     pub rejected_correlated: u64,
     pub rejected_niche_not_improved: u64,
     pub rejected_precision: u64,
+    #[serde(default)]
+    pub rejected_oos1: u64,
     pub rejected_evaluation: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
 }
@@ -252,6 +280,7 @@ impl DiscoverTelemetry {
                 self.rejected_niche_not_improved += 1;
             }
             DepositDecision::RejectedPrecision => self.rejected_precision += 1,
+            DepositDecision::RejectedOos1 => self.rejected_oos1 += 1,
             DepositDecision::RejectedEvaluation => self.rejected_evaluation += 1,
         }
     }

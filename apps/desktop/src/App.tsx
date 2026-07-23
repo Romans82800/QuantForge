@@ -233,25 +233,41 @@ function App() {
   }
 
   async function continueToChallenge(fingerprint: string) {
-    if (!workspace) return;
+    await sendFingerprintsToChallenge([fingerprint]);
+  }
+
+  async function sendSelectedToChallenge() {
+    await sendFingerprintsToChallenge([...batchSelection]);
+  }
+
+  async function sendFingerprintsToChallenge(fingerprints: string[]) {
+    if (!workspace || fingerprints.length === 0) return;
+    setBatchBusy(true);
     setError(null);
+    setBatchMessage(null);
     try {
-      const strategyPath = await exportEliteStrategy(fingerprint);
-      if (!strategyPath) return;
+      const exported = await exportEliteStrategies(fingerprints);
+      if (!exported || exported.strategyPaths.length === 0) return;
       setChallengePreset({
         dataPath: workspace.dataPath,
         metadataPath: workspace.metadataPath,
         sourceTimezone: workspace.metadataPath ? null : "Etc/UTC",
-        strategyPath,
+        strategyPath: exported.strategyPaths[0] ?? "",
+        strategyPaths: exported.strategyPaths,
         brokerPath: workspace.brokerPath,
         evaluationsTouched: workspace.selectionBias.evaluationCount,
         commissionPerLotRoundTurn: workspace.commissionPerLotRoundTurn,
         slippagePointsPerSide: workspace.slippagePointsPerSide,
         initialBalance: workspace.initialBalance,
       });
+      setBatchMessage(
+        `Queued ${exported.strategyPaths.length} strategies for parallel Challenge.`,
+      );
       setActiveWorkspace("Challenge");
     } catch (reason) {
       setError(String(reason));
+    } finally {
+      setBatchBusy(false);
     }
   }
 
@@ -455,7 +471,7 @@ function App() {
                 value={formatNumber(
                   workspace.rejections.clone + workspace.rejections.correlated,
                 )}
-                note={`${formatNumber(workspace.rejections.total)} total rejections`}
+                note={`${formatNumber(workspace.rejections.oos1)} OOS1 pick fails · ${formatNumber(workspace.rejections.total)} total`}
               />
             </section>
 
@@ -585,6 +601,15 @@ function App() {
                       >
                         {batchBusy ? "Exporting…" : `Export ${batchSelection.size} selected`}
                       </button>
+                      <button
+                        className="primary"
+                        disabled={batchBusy || batchSelection.size === 0 || !workspace}
+                        onClick={() => void sendSelectedToChallenge()}
+                      >
+                        {batchBusy
+                          ? "Preparing…"
+                          : `Challenge ${batchSelection.size} selected (parallel)`}
+                      </button>
                     </div>
                   </div>
                   {batchMessage && <p className="batch-message">{batchMessage}</p>}
@@ -671,7 +696,7 @@ function HomeWorkspace({
         />
         <WorkflowCard
           action="Run Challenge"
-          description="Freeze chronological development, validation and sealed partitions, then run folds, cost shocks, Monte Carlo and parameter-neighborhood tests."
+          description="Select any number of databank elites. Challenge stress-tests them in parallel on OOS1 (folds, costs, Monte Carlo, neighborhood). OOS2 stays sealed for one-shot final."
           eyebrow="04 / Challenge"
           onClick={() => onNavigate("Challenge")}
           title="Challenge"
@@ -866,7 +891,7 @@ function DiscoverWorkspace({
     generations: 5,
     initialCandidates: 500,
     batchSize: 200,
-    correlationThreshold: 0.88,
+    correlationThreshold: 0.85,
     noveltyWeight: 10,
     seed: 42,
     minimumTrades: 20,
@@ -875,6 +900,7 @@ function DiscoverWorkspace({
     minimumProfitFactor: 1,
     minimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.95,
+    oos1ExpectancyRetention: 0.7,
     flattenAt22: false,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
@@ -929,6 +955,7 @@ function DiscoverWorkspace({
             minimumProfitFactor: null,
             minimumReturnDrawdown: null,
             minimumM1ReturnRetention: null,
+            oos1ExpectancyRetention: null,
             flattenAt22: null,
             commissionPerLotRoundTurn: null,
             slippagePointsPerSide: null,
@@ -985,8 +1012,8 @@ function DiscoverWorkspace({
               <NumberField label="Initial candidates" value={form.initialCandidates} onChange={(value) => update("initialCandidates", value)} min={1} />
               <NumberField label="Batch / generation" value={form.batchSize} onChange={(value) => update("batchSize", value)} min={1} />
               <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value)} min={0} />
-              <NumberField label="Validation reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
-              <NumberField label="Sealed reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
+              <NumberField label="OOS2 sealed reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
             </>}
           </div>
           {form.mode === "new" ? (
@@ -1001,6 +1028,7 @@ function DiscoverWorkspace({
                 <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
                 <NumberField label="Minimum return / DD" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
                 <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
+                <NumberField label="OOS1 expectancy retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
                 <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                 <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
                 <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
@@ -1012,12 +1040,12 @@ function DiscoverWorkspace({
             <p className="immutable-note">Continuation loads the grammar, seed, gates and cost model from the verified databank. Only the generation count can change.</p>
           )}
           {form.mode === "new" && <>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Certification-grade search: evaluate development partition only</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Train on IS only; pick elites when OOS1 expectancy ≥ retention × IS (default 0.7×). OOS2 stays sealed.</span></label>
             <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Close positions and cancel pending orders at 22:00 broker time</span></label>
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Every strategy risks a fixed $1,000 per trade. H1 screens quickly; each survivor is replayed through M1 and discarded unless it retains the configured result.</p>
+          <p>Every strategy risks a fixed $1,000 per trade. Search scores IS; deposit requires OOS1 expectancy retention. H1 screens quickly; survivors must retain edge on M1. Never touch OOS2 during Discover.</p>
           <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
         </div>
       </section>
@@ -1061,6 +1089,7 @@ function ChallengeWorkspace({
     metadataPath: null,
     sourceTimezone: "Etc/UTC",
     strategyPath: "",
+    strategyPaths: [],
     brokerPath: "",
     outputDirectory: "",
     validationFraction: 0.2,
@@ -1084,26 +1113,52 @@ function ChallengeWorkspace({
   function update<K extends keyof ChallengeRequest>(key: K, value: ChallengeRequest[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
+  const queuedCount = form.strategyPaths.length || (form.strategyPath ? 1 : 0);
   async function run() {
     setBusy(true); setResult(null); onError(null);
-    try { setResult(await runChallenge(form)); }
+    try {
+      const strategyPaths =
+        form.strategyPaths.length > 0
+          ? form.strategyPaths
+          : form.strategyPath
+            ? [form.strategyPath]
+            : [];
+      setResult(
+        await runChallenge({
+          ...form,
+          strategyPath: strategyPaths[0] ?? "",
+          strategyPaths,
+        }),
+      );
+    }
     catch (reason) { onError(String(reason)); }
     finally { setBusy(false); }
   }
   return <div className="tool-content promotion-layout">
     <section className="panel setup-panel">
-      <div className="panel-heading"><div><p className="eyebrow">Promotion gate</p><h2>Run the robustness battery</h2></div><span className="read-only-badge">No-clobber</span></div>
+      <div className="panel-heading"><div><p className="eyebrow">Promotion gate · OOS1 battery</p><h2>Challenge any number of databank elites in parallel</h2></div><span className="read-only-badge">No-clobber</span></div>
       <div className="form-stack compact">
         <PathField label="Decision OHLC" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required />
         <PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : current.sourceTimezone ?? "Etc/UTC" }))} />
         {!form.metadataPath && <label className="field-row"><span>Source timezone</span><input value={form.sourceTimezone ?? ""} onChange={(event) => update("sourceTimezone", event.target.value || null)} /></label>}
-        <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+        <PathField label="Primary strategy IR (optional if batch queued)" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} />
         <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
         <PathField label="New Challenge directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create Challenge directory", "quantforge-challenge")} onChange={(value) => update("outputDirectory", value)} required />
       </div>
+      {form.strategyPaths.length > 0 && (
+        <div className="batch-message">
+          Queued <strong>{form.strategyPaths.length}</strong> strategies for parallel OOS1 Challenge.
+          <ul className="blocker-list">
+            {form.strategyPaths.slice(0, 12).map((path) => (
+              <li key={path}><code>{path}</code></li>
+            ))}
+            {form.strategyPaths.length > 12 && <li>…and {form.strategyPaths.length - 12} more</li>}
+          </ul>
+        </div>
+      )}
       <div className="numeric-grid">
-        <NumberField label="Validation fraction" value={form.validationFraction} onChange={(value) => update("validationFraction", value ?? .2)} step={.05} />
-        <NumberField label="Sealed fraction" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value ?? .2)} step={.05} />
+        <NumberField label="OOS1 fraction" value={form.validationFraction} onChange={(value) => update("validationFraction", value ?? .2)} step={.05} />
+        <NumberField label="OOS2 sealed fraction" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value ?? .2)} step={.05} />
         <NumberField label="Evaluations touched" value={form.evaluationsTouched} onChange={(value) => update("evaluationsTouched", value ?? 1)} min={1} />
         <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} />
         <NumberField label="Folds" value={form.folds} onChange={(value) => update("folds", value ?? 5)} min={2} />
@@ -1112,24 +1167,54 @@ function ChallengeWorkspace({
         <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} />
         <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
       </div>
-      <div className="form-footer"><p>The app freezes a 60/20/20 split by default. Failed Challenge runs are still written for audit but remain Illuminated.</p><button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? "Stress testing…" : "Run Challenge"}</button></div>
+      <div className="form-footer"><p>Default freeze is IS 60% / OOS1 20% / OOS2 20%. Challenge stress-tests on <strong>OOS1 only</strong>. OOS2 stays sealed until the one-shot sealed-final step. Deflated Sharpe floor is enforced (≥ 0).</p><button className="primary" disabled={busy || !form.dataPath || queuedCount === 0 || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? `Stress testing ${queuedCount}…` : `Run Challenge on ${queuedCount}`}</button></div>
     </section>
-    {result ? <ChallengeResult result={result} /> : <WorkspacePrimer title="No candidate challenged yet" copy="Choose one exact strategy IR and its broker-bound data. QuantForge will run purged folds, cost shocks, block-bootstrap Monte Carlo and local parameter perturbations." />}
+    {result ? <ChallengeResult result={result} /> : <WorkspacePrimer title="No candidates challenged yet" copy="From Databank, select any number of elites and click Challenge selected. QuantForge runs purged folds, cost shocks, Monte Carlo and neighborhood tests in parallel on OOS1." />}
     <PromotionLedgerPanels onError={onError} />
   </div>;
 }
 
 function ChallengeResult({ result }: { result: ChallengeView }) {
   return <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}>
-    <div className="result-hero"><div><p className="eyebrow">Challenge result</p><h2>{result.passed ? "Robustness gate passed" : "Candidate remains Illuminated"}</h2></div><span className="grade-pill">{result.grade}</span></div>
+    <div className="result-hero"><div><p className="eyebrow">Challenge result</p><h2>{result.passedCount}/{result.totalCount} passed OOS1 battery</h2></div><span className="grade-pill">{result.grade}</span></div>
     <div className="job-kpis">
-      <Kpi label="Validation trades" value={formatNumber(result.validationTrades)} note={`${formatNumber(result.returnPercent, 2)}% return`} />
-      <Kpi label="Max drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} />
-      <Kpi label="Purged folds" value={`${result.passingFolds} / ${result.totalFolds}`} note="Passing folds" />
-      <Kpi label="Cost shocks" value={`${result.passingCostShocks} / ${result.totalCostShocks}`} note="Survived assumptions" />
+      <Kpi label="Passed" value={formatNumber(result.passedCount)} note={`${formatNumber(result.failedCount)} failed`} />
+      <Kpi label="OOS1 trades (first)" value={formatNumber(result.validationTrades)} note={`${formatNumber(result.returnPercent, 2)}% return`} />
+      <Kpi label="Purged folds" value={`${result.passingFolds} / ${result.totalFolds}`} note="First candidate" />
+      <Kpi label="Cost shocks" value={`${result.passingCostShocks} / ${result.totalCostShocks}`} note="First candidate" />
     </div>
-    <div className="partition-strip"><span>Development <strong>{formatNumber(result.developmentBars)}</strong></span><span>Validation <strong>{formatNumber(result.validationBars)}</strong></span><span>Sealed <strong>{formatNumber(result.sealedBars)}</strong></span></div>
-    <ArtifactPath label="Challenge" value={result.challengePath} /><ArtifactPath label="Split plan" value={result.splitPlanPath} />
+    <div className="partition-strip"><span>IS <strong>{formatNumber(result.isBars ?? result.developmentBars)}</strong></span><span>OOS1 <strong>{formatNumber(result.oos1Bars ?? result.validationBars)}</strong></span><span>OOS2 sealed <strong>{formatNumber(result.oos2Bars ?? result.sealedBars)}</strong></span></div>
+    <ArtifactPath label="Split plan" value={result.splitPlanPath} />
+    {result.results?.length > 0 && (
+      <div className="elite-table-wrap">
+        <table className="elite-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Result</th>
+              <th>Return</th>
+              <th>DD</th>
+              <th>Folds</th>
+              <th>Costs</th>
+              <th>Artifact</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.results.map((item) => (
+              <tr key={item.strategyPath}>
+                <td><strong>{item.strategyId}</strong></td>
+                <td>{item.passed ? "pass" : item.error ? "error" : "fail"}</td>
+                <td>{formatNumber(item.returnPercent, 2)}%</td>
+                <td>{formatNumber(item.maximumDrawdownPercent, 2)}%</td>
+                <td>{item.passingFolds}/{item.totalFolds}</td>
+                <td>{item.passingCostShocks}/{item.totalCostShocks}</td>
+                <td><code>{item.challengePath}</code></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
     {result.blockers.length > 0 && <div className="blocker-list">{result.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div>}
   </section>;
 }
@@ -1137,7 +1222,7 @@ function ChallengeResult({ result }: { result: ChallengeView }) {
 function PromotionLedgerPanels({ onError }: { onError: (message: string | null) => void }) {
   const [tab, setTab] = useState<"sealed" | "incubation">("sealed");
   return <section className="promotion-ledger">
-    <div className="workspace-tabs"><button className={tab === "sealed" ? "active" : ""} onClick={() => setTab("sealed")}>2 · One-shot sealed final</button><button className={tab === "incubation" ? "active" : ""} onClick={() => setTab("incubation")}>3 · Paper incubation</button></div>
+    <div className="workspace-tabs"><button className={tab === "sealed" ? "active" : ""} onClick={() => setTab("sealed")}>2 · OOS2 sealed final (one-shot)</button><button className={tab === "incubation" ? "active" : ""} onClick={() => setTab("incubation")}>3 · Paper incubation</button></div>
     {tab === "sealed" ? <SealedPanel onError={onError} /> : <IncubationPanel onError={onError} />}
   </section>;
 }
@@ -1147,7 +1232,7 @@ function SealedPanel({ onError }: { onError: (message: string | null) => void })
   const [result, setResult] = useState<SealedView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof SealedRequest>(key: K, value: SealedRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await runSealedFinal(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content nested-tool"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">One attempt only</p><h2>Open the sealed partition</h2></div><span className="read-only-badge">Irreversible</span></div><div className="form-stack compact"><PathField label="Full OHLC source" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required /><PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : "Etc/UTC" }))} /><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="Split plan" path={form.splitPlanPath} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value)} required /><PathField label="Passing Challenge" path={form.challengePath} choose={() => chooseJsonFile("Choose Challenge artifact")} onChange={(value) => update("challengePath", value)} required /><PathField label="Sealed ledger root" path={form.sealedRoot} choose={() => chooseDirectory("Choose sealed ledger root")} onChange={(value) => update("sealedRoot", value)} required /></div><div className="numeric-grid"><NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value ?? 20)} min={1} /><NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value ?? 1)} step={.1} /><NumberField label="Minimum PF" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value ?? 1.1)} step={.05} /><NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value ?? 20)} step={.1} /></div><div className="form-footer"><p>Access is durably claimed before market bars load. A crash or failed result still consumes this candidate/split attempt.</p><button className="danger" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.splitPlanPath || !form.challengePath || !form.sealedRoot} onClick={run}>{busy ? "Opening once…" : "Run sealed final once"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">Sealed final</p><h2>{result.passed ? "Final holdout passed" : "Candidate demoted"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /></div><ArtifactPath label="Sealed artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="Sealed data remains closed" copy="Only run this after the candidate is shortlisted by a passing Challenge. The attempt is intentionally non-repeatable." />}</div>;
+  return <div className="tool-content nested-tool"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">OOS2 · one attempt only</p><h2>Open the sealed OOS2 partition</h2></div><span className="read-only-badge">Irreversible</span></div><div className="form-stack compact"><PathField label="Full OHLC source" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required /><PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : "Etc/UTC" }))} /><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="Split plan" path={form.splitPlanPath} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value)} required /><PathField label="Passing Challenge" path={form.challengePath} choose={() => chooseJsonFile("Choose Challenge artifact")} onChange={(value) => update("challengePath", value)} required /><PathField label="Sealed ledger root" path={form.sealedRoot} choose={() => chooseDirectory("Choose sealed ledger root")} onChange={(value) => update("sealedRoot", value)} required /></div><div className="numeric-grid"><NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value ?? 20)} min={1} /><NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value ?? 1)} step={.1} /><NumberField label="Minimum PF" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value ?? 1.1)} step={.05} /><NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value ?? 20)} step={.1} /></div><div className="form-footer"><p>Access is durably claimed before OOS2 bars load. A crash or failed result still consumes this candidate/split attempt — never re-peek OOS2.</p><button className="danger" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.splitPlanPath || !form.challengePath || !form.sealedRoot} onClick={run}>{busy ? "Opening once…" : "Run OOS2 sealed final once"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">OOS2 sealed final</p><h2>{result.passed ? "Final holdout passed" : "Candidate demoted"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /></div><ArtifactPath label="Sealed artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="OOS2 remains sealed" copy="Only run this after the candidate passes Challenge on OOS1. The OOS2 attempt is intentionally non-repeatable." />}</div>;
 }
 
 function IncubationPanel({ onError }: { onError: (message: string | null) => void }) {
@@ -1552,7 +1637,7 @@ function EliteTable({
     <div className="elite-table">
       <div className="elite-row elite-header">
         <span>Select</span><span>Strategy</span><span>Family</span><span>Evidence</span><span>Novelty</span>
-        <span>Trades</span><span>Return</span><span>DD</span><span>Ret/DD</span><span>Sharpe</span><span>Parity</span>
+        <span>Trades</span><span>Return</span><span>DD</span><span>Ret/DD</span><span>Sharpe</span><span>OOS1×</span>
       </div>
       <div
         className="elite-viewport"
@@ -1590,7 +1675,9 @@ function EliteTable({
               <span>{row.drawdownPercent.toFixed(2)}%</span>
               <span>{formatReturnDrawdown(row)}</span>
               <span>{row.sharpeRatio === null ? "—" : row.sharpeRatio.toFixed(2)}</span>
-              <span className="parity-unknown">unknown</span>
+              <span title={row.oos1Expectancy === null ? "No OOS1 pick metrics (legacy databank)" : `OOS1 expectancy ${row.oos1Expectancy.toFixed(2)} / IS ${row.isExpectancy.toFixed(2)}`}>
+                {row.oos1ExpectancyRatio === null ? "—" : `${row.oos1ExpectancyRatio.toFixed(2)}×`}
+              </span>
             </div>
           ))}
         </div>

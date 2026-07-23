@@ -29,6 +29,7 @@ quantforge-quality.workspace = true
 quantforge-storage.workspace = true
 quantforge-tick.workspace = true
 chrono.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.11.5", features = [] }

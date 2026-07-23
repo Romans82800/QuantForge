@@ -1114,6 +1114,11 @@ fn calculate_metrics(
 
     let net_profit = ending_balance - initial_balance;
     let sharpe_ratio = equity_sharpe_ratio(initial_balance, equity);
+    let expectancy = if trades.is_empty() {
+        0.0
+    } else {
+        trades.iter().map(|trade| trade.net_profit).sum::<f64>() / trades.len() as f64
+    };
     BacktestMetrics {
         initial_balance,
         ending_balance,
@@ -1131,6 +1136,7 @@ fn calculate_metrics(
         max_drawdown,
         max_drawdown_percent,
         sharpe_ratio,
+        expectancy,
     }
 }
 

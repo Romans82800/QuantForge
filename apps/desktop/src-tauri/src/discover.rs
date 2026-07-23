@@ -45,6 +45,7 @@ pub struct DiscoverRequest {
     minimum_profit_factor: Option<f64>,
     minimum_return_drawdown: Option<f64>,
     minimum_m1_return_retention: Option<f64>,
+    oos1_expectancy_retention: Option<f64>,
     flatten_at_22: Option<bool>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
@@ -338,23 +339,39 @@ fn run_discovery(
             m1_quality.score
         ));
     }
-    let promotion_split = request.promotion_split.unwrap_or(false);
+    let promotion_split = request.promotion_split.unwrap_or(true);
     let validation_fraction = request.validation_fraction.unwrap_or(0.2);
     let sealed_fraction = request.sealed_fraction.unwrap_or(0.2);
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| development_partition(&loaded.dataset, validation_fraction, sealed_fraction))
         .transpose()?;
+    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
+        .then(|| oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction))
+        .transpose()?;
     let new_dataset = development_dataset.as_ref().unwrap_or(&loaded.dataset);
+    let oos1_ref = oos1_dataset.as_ref();
+    // Precision M1 must not see OOS1/OOS2 — clip to the same wall-clock window as IS.
+    let m1_is_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
+        .then(|| clip_dataset_to_window(&m1.dataset, new_dataset))
+        .transpose()?;
+    let m1_eval = m1_is_dataset.as_ref().unwrap_or(&m1.dataset);
 
     let (mut bank, continuation_recipe_hash, starting_generation) = match request.mode {
         DiscoverMode::New => {
             update_phase(
                 job,
                 "Evaluating initial grammar population",
-                "The four seed families are being evaluated in parallel.",
+                "IS search with OOS1 expectancy pick gate (0.7×) and M1 precision.",
             )?;
-            let bank = evolve_new(new_dataset, &m1.dataset, &broker, new_config(&request)?, 0)
-                .map_err(|error| error.to_string())?;
+            let bank = evolve_new(
+                new_dataset,
+                oos1_ref,
+                m1_eval,
+                &broker,
+                new_config(&request)?,
+                0,
+            )
+            .map_err(|error| error.to_string())?;
             update_bank(job, &bank, 0, request.generations)?;
             (bank, None, 0)
         }
@@ -387,17 +404,35 @@ fn run_discovery(
                 completed_now + 1,
                 request.generations
             ),
-            "Candidates are bred, evaluated in parallel, then deposited in deterministic order.",
+            "Candidates are bred on IS, precision-checked on M1, then picked only if OOS1 expectancy ≥ 0.7× IS.",
         )?;
         let evaluation_dataset = if bank.data_hash == loaded.dataset.data_hash {
             &loaded.dataset
         } else {
             development_dataset.as_ref().ok_or_else(|| {
-                "this databank was built from a development partition; enable the identical promotion split to continue it".to_owned()
+                "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
             })?
         };
-        bank = continue_evolution(bank, evaluation_dataset, &m1.dataset, &broker, 1)
-            .map_err(|error| error.to_string())?;
+        let evaluation_oos1 = if bank.data_hash == loaded.dataset.data_hash {
+            None
+        } else {
+            oos1_ref
+        };
+        let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
+            // Legacy databanks trained precision on full M1 history.
+            &m1.dataset
+        } else {
+            m1_eval
+        };
+        bank = continue_evolution(
+            bank,
+            evaluation_dataset,
+            evaluation_oos1,
+            evaluation_m1,
+            &broker,
+            1,
+        )
+        .map_err(|error| error.to_string())?;
         completed_now += 1;
         update_bank(job, &bank, completed_now, request.generations)?;
     }
@@ -527,7 +562,70 @@ fn development_partition(
         sealed_fraction,
     )
     .map_err(|error| error.to_string())?;
-    let bars = dataset.bars[..plan.development.bar_count].to_vec();
+    slice_partition(dataset, 0, plan.development.bar_count)
+}
+
+/// OOS1 = chronological validation window (pick gate). OOS2 remains sealed.
+fn oos1_partition(
+    dataset: &quantforge_data::BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<quantforge_data::BarDataset, String> {
+    let plan = quantforge_quality::DataSplitPlan::chronological(
+        dataset,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let start = plan.development.bar_count;
+    let end = start + plan.validation.bar_count;
+    slice_partition(dataset, start, end)
+}
+
+fn slice_partition(
+    dataset: &quantforge_data::BarDataset,
+    start: usize,
+    end: usize,
+) -> Result<quantforge_data::BarDataset, String> {
+    if end <= start || end > dataset.bars.len() {
+        return Err(format!(
+            "invalid partition slice {start}..{end} for {} bars",
+            dataset.bars.len()
+        ));
+    }
+    let bars = dataset.bars[start..end].to_vec();
+    Ok(quantforge_data::BarDataset {
+        data_hash: quantforge_data::bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
+/// Keep bars whose timestamps fall inside `window`'s inclusive time span.
+fn clip_dataset_to_window(
+    dataset: &quantforge_data::BarDataset,
+    window: &quantforge_data::BarDataset,
+) -> Result<quantforge_data::BarDataset, String> {
+    let (Some(first), Some(last)) = (window.bars.first(), window.bars.last()) else {
+        return Err("cannot clip M1: IS window is empty".into());
+    };
+    let start_ms = first.timestamp_ms;
+    let end_ms = last.timestamp_ms;
+    let bars: Vec<_> = dataset
+        .bars
+        .iter()
+        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms <= end_ms)
+        .cloned()
+        .collect();
+    if bars.len() < 2 {
+        return Err(format!(
+            "M1 has fewer than 2 bars inside the IS window [{start_ms}..{end_ms}]"
+        ));
+    }
     Ok(quantforge_data::BarDataset {
         data_hash: quantforge_data::bar_content_hash(&bars),
         source_rows: bars.len(),
@@ -546,7 +644,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
     Ok(DiscoverConfig {
         initial_candidates: request.initial_candidates.unwrap_or(500),
         batch_size: request.batch_size.unwrap_or(200),
-        correlation_threshold: request.correlation_threshold.unwrap_or(0.88),
+        correlation_threshold: request.correlation_threshold.unwrap_or(0.85),
         novelty_weight: request.novelty_weight.unwrap_or(10.0),
         tournament_size: 4,
         structural_mutation_probability: 0.18,
@@ -561,6 +659,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.95),
         },
+        oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
         flatten_at_22: request.flatten_at_22.unwrap_or(false),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
@@ -623,6 +722,7 @@ fn update_bank(
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
+        + telemetry.rejected_oos1
         + telemetry.rejected_evaluation;
     let mut view = job
         .write()

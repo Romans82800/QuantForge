@@ -149,6 +149,9 @@ pub struct BacktestMetrics {
     pub max_drawdown_percent: f64,
     #[serde(default)]
     pub sharpe_ratio: Option<f64>,
+    /// Mean net profit per closed trade (account currency). Zero when no trades.
+    #[serde(default)]
+    pub expectancy: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

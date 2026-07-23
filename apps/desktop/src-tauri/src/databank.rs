@@ -92,6 +92,7 @@ struct RejectionTelemetry {
     correlated: u64,
     niche_not_improved: u64,
     precision: u64,
+    oos1: u64,
     evaluation: u64,
     total: u64,
 }
@@ -129,6 +130,9 @@ struct EliteRow {
     return_drawdown: Option<f64>,
     profit_factor: Option<f64>,
     sharpe_ratio: Option<f64>,
+    is_expectancy: f64,
+    oos1_expectancy: Option<f64>,
+    oos1_expectancy_ratio: Option<f64>,
     complexity: usize,
     generation: u64,
     grade: &'static str,
@@ -397,6 +401,7 @@ fn workspace_view(
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
+        + telemetry.rejected_oos1
         + telemetry.rejected_evaluation;
     DatabankWorkspace {
         source_path: source_path.display().to_string(),
@@ -428,6 +433,7 @@ fn workspace_view(
             correlated: telemetry.rejected_correlated,
             niche_not_improved: telemetry.rejected_niche_not_improved,
             precision: telemetry.rejected_precision,
+            oos1: telemetry.rejected_oos1,
             evaluation: telemetry.rejected_evaluation,
             total: total_rejections,
         },
@@ -516,6 +522,9 @@ fn elite_row(elite: &Elite) -> EliteRow {
         ),
         profit_factor: elite.metrics.profit_factor,
         sharpe_ratio: effective_sharpe(elite),
+        is_expectancy: elite.is_expectancy,
+        oos1_expectancy: elite.oos1_expectancy,
+        oos1_expectancy_ratio: elite.oos1_expectancy_ratio,
         complexity: elite.complexity,
         generation: elite.discovered_generation,
         grade: "illuminated",

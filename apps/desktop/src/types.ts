@@ -23,6 +23,7 @@ export interface RejectionTelemetry {
   correlated: number;
   nicheNotImproved: number;
   precision: number;
+  oos1: number;
   evaluation: number;
   total: number;
 }
@@ -54,6 +55,9 @@ export interface EliteRow {
   returnDrawdown: number | null;
   profitFactor: number | null;
   sharpeRatio: number | null;
+  isExpectancy: number;
+  oos1Expectancy: number | null;
+  oos1ExpectancyRatio: number | null;
   complexity: number;
   generation: number;
   grade: string;
@@ -194,6 +198,7 @@ export interface DiscoverRequest {
   minimumProfitFactor: number | null;
   minimumReturnDrawdown: number | null;
   minimumM1ReturnRetention: number | null;
+  oos1ExpectancyRetention: number | null;
   flattenAt22: boolean | null;
   commissionPerLotRoundTurn: number | null;
   slippagePointsPerSide: number | null;
@@ -228,6 +233,7 @@ export interface ChallengeRequest {
   metadataPath: string | null;
   sourceTimezone: string | null;
   strategyPath: string;
+  strategyPaths: string[];
   brokerPath: string;
   outputDirectory: string;
   validationFraction: number;
@@ -244,14 +250,12 @@ export interface ChallengeRequest {
   seed: number;
 }
 
-export interface ChallengeView {
+export interface ChallengeItemView {
+  strategyPath: string;
+  strategyId: string;
   passed: boolean;
   grade: string;
-  splitPlanPath: string;
   challengePath: string;
-  developmentBars: number;
-  validationBars: number;
-  sealedBars: number;
   validationTrades: number;
   returnPercent: number;
   profitFactor: number | null;
@@ -261,6 +265,33 @@ export interface ChallengeView {
   passingCostShocks: number;
   totalCostShocks: number;
   blockers: string[];
+  error: string | null;
+}
+
+export interface ChallengeView {
+  passed: boolean;
+  grade: string;
+  splitPlanPath: string;
+  challengePath: string;
+  developmentBars: number;
+  validationBars: number;
+  sealedBars: number;
+  isBars: number;
+  oos1Bars: number;
+  oos2Bars: number;
+  validationTrades: number;
+  returnPercent: number;
+  profitFactor: number | null;
+  maximumDrawdownPercent: number;
+  passingFolds: number;
+  totalFolds: number;
+  passingCostShocks: number;
+  totalCostShocks: number;
+  blockers: string[];
+  results: ChallengeItemView[];
+  passedCount: number;
+  failedCount: number;
+  totalCount: number;
 }
 
 export interface SealedRequest {

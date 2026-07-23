@@ -11,6 +11,9 @@ pub(crate) struct CandidateEvaluation {
     pub strategy: StrategyIr,
     pub result: ScoutResult,
     pub generation: u64,
+    pub is_expectancy: f64,
+    pub oos1_expectancy: Option<f64>,
+    pub oos1_expectancy_ratio: Option<f64>,
 }
 
 pub(crate) fn deposit(
@@ -65,6 +68,9 @@ pub(crate) fn deposit(
         novelty,
         complexity,
         metrics: candidate.result.metrics,
+        is_expectancy: candidate.is_expectancy,
+        oos1_expectancy: candidate.oos1_expectancy,
+        oos1_expectancy_ratio: candidate.oos1_expectancy_ratio,
         equity_signature: signature,
         discovered_generation: candidate.generation,
     };
@@ -209,7 +215,7 @@ fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
     };
     let trade_count_bonus = (result.metrics.trade_count.min(100) as f64) * 0.02;
     let drawdown_penalty = result.metrics.max_drawdown_percent * 0.5;
-    let complexity_penalty = strategy.complexity().score as f64 * 0.02;
+    let complexity_penalty = strategy.complexity().score as f64 * 0.05;
     let total = return_component + profit_factor_component + trade_count_bonus
         - drawdown_penalty
         - complexity_penalty;
@@ -387,6 +393,7 @@ mod tests {
                 max_drawdown: 0.0,
                 max_drawdown_percent: 0.0,
                 sharpe_ratio: None,
+                expectancy: 0.0,
             },
             telemetry: ScoutTelemetry::default(),
         }
@@ -426,6 +433,9 @@ mod tests {
                 strategy: trend.clone(),
                 result: profitable_result(),
                 generation: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
             },
         )
         .unwrap();
@@ -437,6 +447,9 @@ mod tests {
                 strategy: trend,
                 result: profitable_result(),
                 generation: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
             },
         )
         .unwrap();
@@ -448,6 +461,9 @@ mod tests {
                 strategy: generate_seed(42, 1),
                 result: profitable_result(),
                 generation: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
             },
         )
         .unwrap();
