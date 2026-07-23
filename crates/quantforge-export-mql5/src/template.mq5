@@ -440,14 +440,12 @@ bool QFClosePartial(const double volume)
           : g_trade.Buy(volume,_Symbol,0.0,0.0,0.0,"QF-partial");
 }
 
-bool QFNewBrokerDay()
+bool QFInCloseBlackout()
 {
    MqlDateTime current;
-   MqlDateTime previous;
-   if(!TimeToStruct(iTime(_Symbol,_Period,0),current)
-      || !TimeToStruct(iTime(_Symbol,_Period,1),previous))
+   if(!TimeToStruct(iTime(_Symbol,_Period,0),current))
       return false;
-   return current.year!=previous.year || current.day_of_year!=previous.day_of_year;
+   return current.hour>=22;
 }
 
 bool QFTightenStop(const bool buy,const double candidate,const double target)
@@ -663,7 +661,7 @@ void OnTick()
       return;
    g_last_bar=current_bar;
 
-   if(QFFlattenEndOfDay() && QFNewBrokerDay())
+   if(QFFlattenEndOfDay() && QFInCloseBlackout())
    {
       QFCancelOwnOrders();
       if(QFOwnPosition()

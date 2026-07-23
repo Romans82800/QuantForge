@@ -14,6 +14,6 @@ pub use model::{
     NicheKey, PrecisionGateConfig, ThreeLevelBucket,
 };
 
-pub const DATABANK_SCHEMA_VERSION: u16 = 3;
-pub const GRAMMAR_VERSION: &str = "m1-verified-fixed-risk-v3";
+pub const DATABANK_SCHEMA_VERSION: u16 = 4;
+pub const GRAMMAR_VERSION: &str = "m1-verified-fixed-risk-close-v4";
 pub const FIXED_RISK_PER_TRADE: f64 = 1_000.0;

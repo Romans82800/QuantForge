@@ -738,5 +738,8 @@ mod tests {
         assert!(bundle.source.contains("g_trade.BuyStop"));
         assert!(bundle.source.contains("QFManagePosition"));
         assert!(bundle.source.contains("return true;"));
+        assert!(bundle.source.contains("QFInCloseBlackout()"));
+        assert!(bundle.source.contains("current.hour>=22"));
+        assert!(!bundle.source.contains("QFNewBrokerDay"));
     }
 }

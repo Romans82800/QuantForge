@@ -3,6 +3,7 @@
 //! Strategy expressions are evaluated on the decision-timeframe bars. Orders,
 //! protective gaps and stop/target chronology are replayed on M1 bars.
 
+use chrono::Timelike;
 use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
@@ -239,16 +240,12 @@ pub fn evaluate_strategy_m1(
         let previous_decision_bar = &decision_bars[decision_index - 1];
         let previous_spread_price =
             resolve_spread(previous_decision_bar, broker, &config.costs)?.points * broker.point;
-        let new_broker_day = broker_clock
-            .local_datetime(previous_decision_bar.timestamp_ms)?
-            .date()
-            != broker_clock
-                .local_datetime(opening_minute.timestamp_ms)?
-                .date();
+        let current_local = broker_clock.local_datetime(opening_minute.timestamp_ms)?;
+        let in_close_blackout = current_local.hour() >= 22;
 
-        if strategy.manage.flatten_end_of_day && new_broker_day {
-            // Match the generated EA: the boundary decision is exclusively a
-            // flatten/cancel cycle and cannot immediately reopen exposure.
+        if strategy.manage.flatten_end_of_day && in_close_blackout {
+            // Match the generated EA: 22:00 is exclusively a flatten/cancel
+            // cycle and the remaining broker-day bars cannot reopen exposure.
             closed_this_decision = true;
             if pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
@@ -386,7 +383,11 @@ pub fn evaluate_strategy_m1(
             telemetry.pending_orders_expired += 1;
         }
 
-        if position.is_none() && pending.is_none() && !closed_this_decision {
+        if position.is_none()
+            && pending.is_none()
+            && !closed_this_decision
+            && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+        {
             let filters_pass = strategy
                 .filters
                 .iter()
@@ -1693,6 +1694,45 @@ mod tests {
         assert_eq!(result.trades[0].entry_price, 98.0);
         assert_eq!(result.trades[0].gross_profit, 24.0);
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
+    }
+
+    #[test]
+    fn judge_flattens_at_22_and_blocks_the_remaining_broker_day() {
+        let start = chrono::DateTime::parse_from_rfc3339("2024-01-01T20:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut decision_bars = Vec::new();
+        for hour in 0..4 {
+            let mut decision = bar(start + hour * 3_600_000, 100.0, 100.0, 100.0, 100.0, 0);
+            decision.tick_volume = 60;
+            decision_bars.push(decision);
+        }
+        let decisions = dataset(decision_bars, b"close-at-22-decisions");
+        let execution = dataset(
+            (0..240)
+                .map(|minute| bar(start + minute * 60_000, 100.0, 100.0, 100.0, 100.0, 0))
+                .collect(),
+            b"close-at-22-m1",
+        );
+        let mut managed = strategy(false);
+        managed.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
+        managed.manage.flatten_end_of_day = true;
+        let result = evaluate_strategy_m1(
+            &managed,
+            &decisions,
+            &execution,
+            &broker(),
+            &JudgeConfig {
+                initial_balance: 100.0,
+                costs: CostModel::default(),
+                allow_execution_gaps: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].exit_reason, ExitReason::EndOfDay);
+        assert_eq!(result.trades[0].exit_timestamp_ms, start + 2 * 3_600_000);
+        assert_eq!(result.telemetry.end_of_day_flattens, 1);
     }
 
     fn strategy(short: bool) -> StrategyIr {

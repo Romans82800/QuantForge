@@ -43,7 +43,12 @@ pub fn evolve_new(
     };
 
     let initial = (0..bank.config.initial_candidates)
-        .map(|index| crate::grammar::generate_seed(bank.config.seed, index as u64))
+        .map(|index| {
+            apply_production_policy(
+                crate::grammar::generate_seed(bank.config.seed, index as u64),
+                &bank.config,
+            )
+        })
         .collect();
     evaluate_and_deposit(&mut bank, initial, dataset, m1_dataset, broker, 0)?;
     run_generations(&mut bank, dataset, m1_dataset, broker, generations)?;
@@ -98,7 +103,10 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                     2 => crate::model::FamilyStyle::Breakout,
                     _ => crate::model::FamilyStyle::MeanReversion,
                 };
-                return build_seed(family, &mut rng, format!("g{generation}-{index}"));
+                return apply_production_policy(
+                    build_seed(family, &mut rng, format!("g{generation}-{index}")),
+                    &bank.config,
+                );
             }
 
             let first_index = tournament(bank, &mut rng, None);
@@ -117,9 +125,17 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 sequence,
             );
             child.id = format!("g{generation}-{index}");
-            child
+            apply_production_policy(child, &bank.config)
         })
         .collect()
+}
+
+fn apply_production_policy(
+    mut strategy: StrategyIr,
+    config: &crate::model::DiscoverConfig,
+) -> StrategyIr {
+    strategy.manage.flatten_end_of_day = config.flatten_at_22;
+    strategy
 }
 
 fn tournament(
@@ -400,6 +416,7 @@ mod tests {
             precision: crate::model::PrecisionGateConfig {
                 minimum_return_retention: 0.0,
             },
+            flatten_at_22: false,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -460,5 +477,19 @@ mod tests {
         };
         let retention = metrics.return_percent / 21.5217;
         assert!(!precision_passes(&metrics, retention, &gates, 0.95));
+    }
+
+    #[test]
+    fn close_at_22_is_a_job_policy_not_an_evolvable_gene() {
+        let dataset = dataset();
+        let mut config = config();
+        config.flatten_at_22 = true;
+        let bank = evolve_new(&dataset, &dataset, &broker(), config, 1).unwrap();
+        assert!(
+            bank.elites
+                .iter()
+                .all(|elite| elite.strategy.manage.flatten_end_of_day)
+        );
+        bank.validate_integrity().unwrap();
     }
 }

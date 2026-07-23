@@ -174,6 +174,7 @@ export interface DiscoverRequest {
   minimumReturnPercent: number | null;
   minimumProfitFactor: number | null;
   minimumM1ReturnRetention: number | null;
+  flattenAt22: boolean | null;
   commissionPerLotRoundTurn: number | null;
   slippagePointsPerSide: number | null;
   fallbackSpreadPoints: number | null;

@@ -44,6 +44,7 @@ pub struct DiscoverRequest {
     minimum_return_percent: Option<f64>,
     minimum_profit_factor: Option<f64>,
     minimum_m1_return_retention: Option<f64>,
+    flatten_at_22: Option<bool>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -282,6 +283,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.minimum_return_percent.is_some(),
             request.minimum_profit_factor.is_some(),
             request.minimum_m1_return_retention.is_some(),
+            request.flatten_at_22.is_some(),
             request.commission_per_lot_round_turn.is_some(),
             request.slippage_points_per_side.is_some(),
             request.fallback_spread_points.is_some(),
@@ -556,6 +558,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.95),
         },
+        flatten_at_22: request.flatten_at_22.unwrap_or(false),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -668,6 +671,7 @@ mod tests {
             minimum_return_percent: Some(-100.0),
             minimum_profit_factor: Some(0.0),
             minimum_m1_return_retention: Some(0.95),
+            flatten_at_22: Some(false),
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,

@@ -207,6 +207,10 @@ struct EvolveArgs {
     minimum_profit_factor: Option<f64>,
     #[arg(long)]
     minimum_m1_return_retention: Option<f64>,
+    /// Close positions, cancel pending orders and block entries from 22:00
+    /// until the next broker day.
+    #[arg(long)]
+    flatten_at_22: bool,
     /// Required for a new databank; a continuation uses the stored assumption.
     #[arg(long)]
     commission_per_lot_round_turn: Option<f64>,
@@ -3961,6 +3965,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
         },
+        flatten_at_22: args.flatten_at_22,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
@@ -3988,6 +3993,7 @@ fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>
         || args.minimum_return_percent.is_some()
         || args.minimum_profit_factor.is_some()
         || args.minimum_m1_return_retention.is_some()
+        || args.flatten_at_22
         || args.commission_per_lot_round_turn.is_some()
         || args.slippage_points_per_side.is_some()
         || args.fallback_spread_points.is_some()

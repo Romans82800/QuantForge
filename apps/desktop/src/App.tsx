@@ -719,6 +719,7 @@ function DiscoverWorkspace({
     minimumReturnPercent: 0,
     minimumProfitFactor: 1,
     minimumM1ReturnRetention: 0.95,
+    flattenAt22: false,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
     fallbackSpreadPoints: null,
@@ -771,6 +772,7 @@ function DiscoverWorkspace({
             minimumReturnPercent: null,
             minimumProfitFactor: null,
             minimumM1ReturnRetention: null,
+            flattenAt22: null,
             commissionPerLotRoundTurn: null,
             slippagePointsPerSide: null,
             fallbackSpreadPoints: null,
@@ -851,7 +853,10 @@ function DiscoverWorkspace({
           ) : (
             <p className="immutable-note">Continuation loads the grammar, seed, gates and cost model from the verified databank. Only the generation count can change.</p>
           )}
-          {form.mode === "new" && <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Certification-grade search: evaluate development partition only</span></label>}
+          {form.mode === "new" && <>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Certification-grade search: evaluate development partition only</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Close positions and cancel pending orders at 22:00 broker time</span></label>
+          </>}
         </fieldset>
         <div className="form-footer">
           <p>Every strategy risks a fixed $1,000 per trade. H1 screens quickly; each survivor is replayed through M1 and discarded unless it retains the configured result.</p>

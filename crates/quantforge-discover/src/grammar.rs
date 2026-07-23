@@ -446,7 +446,8 @@ fn random_manage(rng: &mut ChaCha8Rng) -> ManagePolicy {
         trailing,
         time_stop_bars: rng.gen_bool(0.45).then(|| rng.gen_range(6..=80)),
         partial_exits,
-        flatten_end_of_day: rng.gen_bool(0.15),
+        // Production applies this as an immutable job policy, never a gene.
+        flatten_end_of_day: false,
     }
 }
 
@@ -741,7 +742,7 @@ mod tests {
         assert!(
             population
                 .iter()
-                .any(|value| value.manage.flatten_end_of_day)
+                .all(|value| !value.manage.flatten_end_of_day)
         );
         for strategy in population {
             assert_eq!(

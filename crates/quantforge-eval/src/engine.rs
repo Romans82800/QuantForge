@@ -4,6 +4,7 @@ use crate::model::{
     ScoutTelemetry, Trade,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
+use chrono::Timelike;
 use quantforge_broker::{BrokerClock, SwapMode, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
@@ -151,16 +152,14 @@ fn evaluate_strategy_inner(
         let previous_bar = &bars[index - 1];
         let previous_spread_price =
             resolve_spread(previous_bar, broker, &config.costs)?.points * broker.point;
-        let new_broker_day = broker_clock
-            .local_datetime(previous_bar.timestamp_ms)?
-            .date()
-            != broker_clock.local_datetime(bar.timestamp_ms)?.date();
+        let current_local = broker_clock.local_datetime(bar.timestamp_ms)?;
+        let in_close_blackout = current_local.hour() >= 22;
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
 
-        if strategy.manage.flatten_end_of_day && new_broker_day {
-            // The boundary bar is reserved for flatten/cancellation so a
-            // strategy cannot immediately reopen on the same broker-day turn.
+        if strategy.manage.flatten_end_of_day && in_close_blackout {
+            // The 22:00 broker-time bar is reserved for flatten/cancellation.
+            // The entry gate below keeps the strategy flat through 23:59.
             closed_this_bar = true;
             if pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
@@ -285,6 +284,7 @@ fn evaluate_strategy_inner(
         if position.is_none()
             && pending.is_none()
             && !closed_this_bar
+            && !(strategy.manage.flatten_end_of_day && in_close_blackout)
             && entry_start_timestamp_ms.is_none_or(|start| bar.timestamp_ms >= start)
         {
             let filters_pass = strategy
@@ -1455,20 +1455,25 @@ mod tests {
     }
 
     #[test]
-    fn end_of_day_flatten_closes_before_the_new_broker_day_entry_cycle() {
+    fn end_of_day_flatten_closes_at_22_and_blocks_later_entries() {
         let mut strategy = strategy();
         strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
         strategy.manage.flatten_end_of_day = true;
         let data = dataset_with_bars(vec![
+            timed_bar("2024-01-01T20:00:00Z"),
+            timed_bar("2024-01-01T21:00:00Z"),
             timed_bar("2024-01-01T22:00:00Z"),
             timed_bar("2024-01-01T23:00:00Z"),
-            timed_bar("2024-01-02T00:00:00Z"),
         ]);
         let result =
             evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
         assert_eq!(result.trades[0].exit_reason, ExitReason::EndOfDay);
         assert_eq!(result.telemetry.end_of_day_flattens, 1);
         assert_eq!(result.trades.len(), 1);
+        assert_eq!(
+            result.trades[0].exit_timestamp_ms,
+            timed_bar("2024-01-01T22:00:00Z").timestamp_ms
+        );
     }
 
     #[test]

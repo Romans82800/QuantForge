@@ -55,6 +55,10 @@ pub struct DiscoverConfig {
     pub seed: u64,
     pub gates: GateConfig,
     pub precision: PrecisionGateConfig,
+    /// Mandatory portfolio protection applied to every generated strategy.
+    /// When enabled, exposure is flattened and entries are blocked from 22:00
+    /// until the next broker day.
+    pub flatten_at_22: bool,
     pub scout: ScoutConfig,
 }
 
@@ -70,6 +74,7 @@ impl Default for DiscoverConfig {
             seed: 42,
             gates: GateConfig::default(),
             precision: PrecisionGateConfig::default(),
+            flatten_at_22: false,
             scout: ScoutConfig::default(),
         }
     }
@@ -327,7 +332,8 @@ impl Databank {
                 quantforge_ir::RiskPolicy::FixedCurrency { amount }
                     if (amount - crate::FIXED_RISK_PER_TRADE).abs() <= 1.0e-9
             );
-            if !fixed_risk
+            if elite.strategy.manage.flatten_end_of_day != self.config.flatten_at_22
+                || !fixed_risk
                 || fingerprint != elite.structural_fingerprint
                 || niche_key(&elite.descriptor) != elite.niche
                 || self.coverage_map.get(&niche_label(&elite.niche))
