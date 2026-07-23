@@ -30,6 +30,22 @@ Challenge, one-shot sealed final, M1 Judge, guarded MQL5 export, external and
 indicator parity, paper incubation, evidence assembly, Certified Vault
 admission, portfolio packing and deployment-pack generation.
 
+The Databank workspace supports checkbox selection, deterministic top-N
+selection and no-clobber batch export. A batch folder contains one exact
+`*.strategy.ir.json` artifact per selected elite plus
+`quantforge-strategy-batch.json`, which records the hashes, metrics and paths
+needed to audit the set. The workspace retains the Evidence × Novelty
+behavioral map for diversity analysis and separately plots cumulative equity
+curves reconstructed from the stored 64-point M1 signatures.
+
+Selecting an elite also exposes direct handoffs to Challenge and M1 / MT5.
+Those handoffs carry the decision and M1 data paths, metadata, broker profile,
+cost assumptions, initial balance and newly exported Strategy IR forward from
+the loaded databank. Output paths remain intentionally blank because
+QuantForge artifacts are immutable and never silently overwritten. An older
+databank without recorded M1 source context can still be opened, but its M1
+path must be selected once at the Judge stage.
+
 New searches enable the certification-grade 60/20/20 split by default. Older
 databanks evaluated on full history remain readable, but evidence assembly will
 correctly reject them as non-development-only research. The desktop never

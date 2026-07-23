@@ -23,6 +23,7 @@ pub fn run() {
             databank::load_databank,
             databank::get_elite,
             databank::export_elite_strategy,
+            databank::export_elite_strategies,
             data_lab::inspect_data,
             discover::start_discover,
             discover::get_discover_job,

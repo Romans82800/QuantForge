@@ -20,6 +20,7 @@ import {
   compareIndicatorParity,
   exportMql5,
   exportEliteStrategy,
+  exportEliteStrategies,
   getDiscoverJob,
   inspectData,
   inspectVault,
@@ -123,6 +124,13 @@ function App() {
   const [sort, setSort] = useState<EliteSort>("evidence");
   const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
+  const [challengePreset, setChallengePreset] = useState<Partial<ChallengeRequest>>({});
+  const [judgePreset, setJudgePreset] = useState<Partial<JudgeRequest>>({});
+  const [exportPreset, setExportPreset] = useState<Partial<ExportRequest>>({});
+  const [batchSelection, setBatchSelection] = useState<Set<string>>(new Set());
+  const [batchSize, setBatchSize] = useState(10);
+  const [batchMessage, setBatchMessage] = useState<string | null>(null);
+  const [batchBusy, setBatchBusy] = useState(false);
   const detailRequest = useRef(0);
 
   async function selectElite(fingerprint: string) {
@@ -150,6 +158,8 @@ function App() {
       setActiveWorkspace("Databank");
       setDetail(null);
       setDetailLoading(false);
+      setBatchSelection(new Set());
+      setBatchMessage(null);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -166,6 +176,8 @@ function App() {
       setWorkspace(loaded);
       setDetail(null);
       setDetailLoading(false);
+      setBatchSelection(new Set());
+      setBatchMessage(null);
       setActiveWorkspace("Databank");
     } catch (reason) {
       setError(String(reason));
@@ -183,6 +195,96 @@ function App() {
     });
     setError(null);
     setActiveWorkspace("Discover");
+  }
+
+  function toggleBatchElite(fingerprint: string) {
+    setBatchMessage(null);
+    setBatchSelection((current) => {
+      const next = new Set(current);
+      if (next.has(fingerprint)) next.delete(fingerprint);
+      else next.add(fingerprint);
+      return next;
+    });
+  }
+
+  function selectTopElites() {
+    setBatchMessage(null);
+    setBatchSelection(
+      new Set(filtered.slice(0, Math.max(1, batchSize)).map((row) => row.fingerprint)),
+    );
+  }
+
+  async function exportSelectedElites() {
+    setBatchBusy(true);
+    setBatchMessage(null);
+    setError(null);
+    try {
+      const result = await exportEliteStrategies([...batchSelection]);
+      if (result) {
+        setBatchMessage(
+          `Exported ${result.strategyPaths.length} strategies and batch index to ${result.directory}`,
+        );
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function continueToChallenge(fingerprint: string) {
+    if (!workspace) return;
+    setError(null);
+    try {
+      const strategyPath = await exportEliteStrategy(fingerprint);
+      if (!strategyPath) return;
+      setChallengePreset({
+        dataPath: workspace.dataPath,
+        metadataPath: workspace.metadataPath,
+        sourceTimezone: workspace.metadataPath ? null : "Etc/UTC",
+        strategyPath,
+        brokerPath: workspace.brokerPath,
+        evaluationsTouched: workspace.selectionBias.evaluationCount,
+        commissionPerLotRoundTurn: workspace.commissionPerLotRoundTurn,
+        slippagePointsPerSide: workspace.slippagePointsPerSide,
+        initialBalance: workspace.initialBalance,
+      });
+      setActiveWorkspace("Challenge");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function continueToParity(fingerprint: string) {
+    if (!workspace) return;
+    setError(null);
+    try {
+      const strategyPath = await exportEliteStrategy(fingerprint);
+      if (!strategyPath) return;
+      setJudgePreset({
+        decisionDataPath: workspace.dataPath,
+        decisionMetadataPath: workspace.metadataPath,
+        decisionSourceTimezone: workspace.metadataPath ? null : "Etc/UTC",
+        m1DataPath: workspace.m1DataPath ?? "",
+        m1MetadataPath: workspace.m1MetadataPath,
+        m1SourceTimezone: workspace.m1MetadataPath ? null : "Etc/UTC",
+        strategyPath,
+        brokerPath: workspace.brokerPath,
+        commissionPerLotRoundTurn: workspace.commissionPerLotRoundTurn,
+        slippagePointsPerSide: workspace.slippagePointsPerSide,
+        initialBalance: workspace.initialBalance,
+      });
+      setExportPreset({
+        strategyPath,
+        brokerPath: workspace.brokerPath,
+        commissionPerLotRoundTurn: workspace.commissionPerLotRoundTurn,
+        slippagePointsPerSide: workspace.slippagePointsPerSide,
+        deposit: workspace.initialBalance,
+      });
+      setActiveWorkspace("Parity Lab");
+    } catch (reason) {
+      setError(String(reason));
+    }
   }
 
   const filtered = useMemo(
@@ -287,9 +389,17 @@ function App() {
             preset={discoverPreset}
           />
         ) : activeWorkspace === "Challenge" ? (
-          <ChallengeWorkspace onError={setError} workspace={workspace} />
+          <ChallengeWorkspace
+            onError={setError}
+            workspace={workspace}
+            preset={challengePreset}
+          />
         ) : activeWorkspace === "Parity Lab" ? (
-          <ParityWorkspace onError={setError} />
+          <ParityWorkspace
+            exportPreset={exportPreset}
+            judgePreset={judgePreset}
+            onError={setError}
+          />
         ) : activeWorkspace === "Portfolio" ? (
           <PortfolioWorkspace onError={setError} workspace={workspace} />
         ) : activeWorkspace === "Vault" ? (
@@ -398,6 +508,15 @@ function App() {
                   onSelect={selectElite}
                 />
 
+                <EquityCurvePanel
+                  rows={workspace.elites.filter((row) =>
+                    batchSelection.size > 0
+                      ? batchSelection.has(row.fingerprint)
+                      : row.fingerprint === detail?.fingerprint,
+                  )}
+                  initialBalance={workspace.initialBalance}
+                />
+
                 <section className="panel elites-panel">
                   <div className="panel-heading table-heading">
                     <div>
@@ -436,11 +555,43 @@ function App() {
                         <option value="grade">Grade A–Z</option>
                       </select>
                     </div>
+                    <div className="batch-controls">
+                      <label>
+                        Top
+                        <input
+                          aria-label="Batch selection count"
+                          min={1}
+                          onChange={(event) => setBatchSize(Number(event.target.value) || 1)}
+                          type="number"
+                          value={batchSize}
+                        />
+                      </label>
+                      <button className="secondary" onClick={selectTopElites}>
+                        Select top
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={batchSelection.size === 0}
+                        onClick={() => setBatchSelection(new Set())}
+                      >
+                        Clear
+                      </button>
+                      <button
+                        className="primary"
+                        disabled={batchBusy || batchSelection.size === 0}
+                        onClick={() => void exportSelectedElites()}
+                      >
+                        {batchBusy ? "Exporting…" : `Export ${batchSelection.size} selected`}
+                      </button>
+                    </div>
                   </div>
+                  {batchMessage && <p className="batch-message">{batchMessage}</p>}
                   <EliteTable
                     rows={filtered}
                     selected={detail?.fingerprint ?? null}
+                    batchSelection={batchSelection}
                     onSelect={selectElite}
+                    onToggle={toggleBatchElite}
                   />
                 </section>
               </div>
@@ -451,6 +602,8 @@ function App() {
                 onError={setError}
                 tab={detailTab}
                 onTab={setDetailTab}
+                onChallenge={continueToChallenge}
+                onParity={continueToParity}
               />
             </div>
           </div>
@@ -891,9 +1044,11 @@ function DiscoverWorkspace({
 
 function ChallengeWorkspace({
   onError,
+  preset,
   workspace,
 }: {
   onError: (message: string | null) => void;
+  preset: Partial<ChallengeRequest>;
   workspace: DatabankWorkspace | null;
 }) {
   const [form, setForm] = useState<ChallengeRequest>({
@@ -918,6 +1073,9 @@ function ChallengeWorkspace({
   });
   const [result, setResult] = useState<ChallengeView | null>(null);
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setForm((current) => ({ ...current, ...preset }));
+  }, [preset]);
   function update<K extends keyof ChallengeRequest>(key: K, value: ChallengeRequest[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
@@ -997,17 +1155,34 @@ function IncubationPanel({ onError }: { onError: (message: string | null) => voi
   return <div className="incubation-grid"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Append-only ledger</p><h2>Open paper incubation</h2></div></div><div className="form-stack compact"><PathField label="Strategy IR" path={start.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => setStart((current) => ({ ...current, strategyPath: value }))} required /><PathField label="Broker profile" path={start.brokerPath} choose={chooseBrokerFile} onChange={(value) => setStart((current) => ({ ...current, brokerPath: value }))} required /><PathField label="Split plan" path={start.splitPlanPath} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => setStart((current) => ({ ...current, splitPlanPath: value }))} required /><PathField label="Incubation root" path={start.rootDirectory} choose={() => chooseDirectory("Choose incubation root")} onChange={(value) => setStart((current) => ({ ...current, rootDirectory: value }))} required /><label className="field-row"><span>Start date</span><input type="date" value={start.startDate} onChange={(event) => setStart((current) => ({ ...current, startDate: event.target.value }))} /></label></div><div className="numeric-grid"><NumberField label="Initial balance" value={Number(start.initialBalance)} onChange={(value) => setStart((current) => ({ ...current, initialBalance: String(value ?? 100000) }))} min={1} /><NumberField label="Daily loss limit %" value={Number(start.maximumDailyLossPercent)} onChange={(value) => setStart((current) => ({ ...current, maximumDailyLossPercent: String(value ?? 2) }))} step={.1} /><NumberField label="Total DD limit %" value={Number(start.maximumTotalDrawdownPercent)} onChange={(value) => setStart((current) => ({ ...current, maximumTotalDrawdownPercent: String(value ?? 10) }))} step={.1} /><NumberField label="Minimum days" value={start.minimumObservationDays} onChange={(value) => setStart((current) => ({ ...current, minimumObservationDays: value ?? 30 }))} min={1} /><NumberField label="Minimum trades" value={start.minimumTotalTrades} onChange={(value) => setStart((current) => ({ ...current, minimumTotalTrades: value ?? 20 }))} min={1} /></div><div className="form-footer"><p>Rules are frozen into the immutable start artifact.</p><button className="primary" disabled={busy || !start.strategyPath || !start.brokerPath || !start.splitPlanPath || !start.rootDirectory} onClick={open}>Open ledger</button></div></section><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Daily observation</p><h2>Record or finalize</h2></div><span className="job-status">{view?.status ?? "not open"}</span></div><div className="form-stack compact"><PathField label="Incubation start" path={startPath} choose={() => chooseJsonFile("Choose incubation-start.json")} onChange={setStartPath} required /><label className="field-row"><span>Observation date</span><input type="date" value={record.date} onChange={(event) => setRecord((current) => ({ ...current, date: event.target.value }))} /></label><label className="field-row"><span>Note</span><input value={record.note} onChange={(event) => setRecord((current) => ({ ...current, note: event.target.value }))} /></label></div><div className="numeric-grid"><NumberField label="Ending balance" value={record.endingBalance} onChange={(value) => setRecord((current) => ({ ...current, endingBalance: value ?? 100000 }))} min={1} /><NumberField label="Maximum DD %" value={record.maximumDrawdownPercent} onChange={(value) => setRecord((current) => ({ ...current, maximumDrawdownPercent: value ?? 0 }))} step={.1} /><NumberField label="Trades" value={record.tradeCount} onChange={(value) => setRecord((current) => ({ ...current, tradeCount: value ?? 0 }))} min={0} /></div><div className="form-footer"><button className="secondary" disabled={busy || !startPath || view?.status === "finalized"} onClick={append}>Append observation</button><button className="primary" disabled={busy || !startPath || view?.status === "finalized"} onClick={finalize}>Finalize ledger</button></div>{view && <div className="job-kpis"><Kpi label="Days" value={formatNumber(view.observationDays)} note="Recorded" /><Kpi label="Trades" value={formatNumber(view.totalTrades)} note="Cumulative" /><Kpi label="Return" value={view.returnPercent === null ? "open" : `${formatNumber(view.returnPercent, 2)}%`} note="Paper result" /><Kpi label="Status" value={view.passed === null ? "open" : view.passed ? "passed" : "failed"} note="Incubation gate" /></div>}{view?.finalPath && <ArtifactPath label="Incubation final" value={view.finalPath} />}</section></div>;
 }
 
-function ParityWorkspace({ onError }: { onError: (message: string | null) => void }) {
+function ParityWorkspace({
+  exportPreset,
+  judgePreset,
+  onError,
+}: {
+  exportPreset: Partial<ExportRequest>;
+  judgePreset: Partial<JudgeRequest>;
+  onError: (message: string | null) => void;
+}) {
   const [tab, setTab] = useState<"judge" | "export" | "compare" | "indicators">("judge");
   return <div className="wide-tool-content">
     <div className="workspace-tabs"><button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button><button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>2 · EA Export</button><button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>3 · MT5 Compare</button><button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>4 · Indicators</button></div>
-    {tab === "judge" ? <JudgePanel onError={onError} /> : tab === "export" ? <ExportPanel onError={onError} /> : tab === "compare" ? <ParityComparePanel onError={onError} /> : <IndicatorParityPanel onError={onError} />}
+    {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} /> : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} /> : tab === "compare" ? <ParityComparePanel onError={onError} /> : <IndicatorParityPanel onError={onError} />}
   </div>;
 }
 
-function JudgePanel({ onError }: { onError: (message: string | null) => void }) {
+function JudgePanel({
+  onError,
+  preset,
+}: {
+  onError: (message: string | null) => void;
+  preset: Partial<JudgeRequest>;
+}) {
   const [form, setForm] = useState<JudgeRequest>({ decisionDataPath: "", decisionMetadataPath: null, decisionSourceTimezone: "Etc/UTC", m1DataPath: "", m1MetadataPath: null, m1SourceTimezone: "Etc/UTC", splitPlanPath: null, strategyPath: "", brokerPath: "", outputPath: "", commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000 });
   const [result, setResult] = useState<JudgeView | null>(null); const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setForm((current) => ({ ...current, ...preset }));
+  }, [preset]);
   function update<K extends keyof JudgeRequest>(key: K, value: JudgeRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await runM1Judge(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
   return <div className="tool-content">
@@ -1029,9 +1204,18 @@ function JudgePanel({ onError }: { onError: (message: string | null) => void }) 
   </div>;
 }
 
-function ExportPanel({ onError }: { onError: (message: string | null) => void }) {
+function ExportPanel({
+  onError,
+  preset,
+}: {
+  onError: (message: string | null) => void;
+  preset: Partial<ExportRequest>;
+}) {
   const [form, setForm] = useState<ExportRequest>({ strategyPath: "", brokerPath: "", outputDirectory: "", expertName: "QuantForgeStrategy", expertDirectory: "QuantForge", timeframe: "H1", magic: 42424242, deviationPoints: 10, maxSpreadPoints: null, slippagePointsPerSide: 0, commissionPerLotRoundTurn: 7, deposit: 100000, currency: "USD", leverage: 100, testerModel: 1 });
   const [result, setResult] = useState<ExportView | null>(null); const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setForm((current) => ({ ...current, ...preset }));
+  }, [preset]);
   function update<K extends keyof ExportRequest>(key: K, value: ExportRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await exportMql5(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
   return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Guarded compiler target</p><h2>Generate MT5 expert + tester pack</h2></div><span className="read-only-badge">Live off</span></div><div className="form-stack compact"><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New export directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create EA export directory", "quantforge-ea-export")} onChange={(value) => update("outputDirectory", value)} required /><label className="field-row"><span>Expert name</span><input value={form.expertName} onChange={(event) => update("expertName", event.target.value)} /></label><label className="field-row"><span>Timeframe</span><input value={form.timeframe} onChange={(event) => update("timeframe", event.target.value.toUpperCase())} /></label></div><div className="numeric-grid"><NumberField label="Magic" value={form.magic} onChange={(value) => update("magic", value ?? 42424242)} min={1} /><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Deposit" value={form.deposit} onChange={(value) => update("deposit", value ?? 100000)} min={1} /><NumberField label="Leverage" value={form.leverage} onChange={(value) => update("leverage", value ?? 100)} min={1} /></div><div className="form-footer"><p>The generated set file keeps AllowLiveTrading=false. Protective stops and all selected management/order genes are emitted into the EA.</p><button className="primary" disabled={busy || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? "Generating…" : "Generate EA pack"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">EA export</p><h2>{result.symbol} · {result.timeframe}</h2></div><span className="grade-pill">guarded</span></div><ArtifactPath label="MQL5 source" value={result.sourcePath} /><ArtifactPath label="Tester config" value={result.testerPath} /><ArtifactPath label="Evidence" value={result.evidencePath} /><div className="safety-card"><strong>Live trading default</strong><span>{String(result.liveTradingDefault)}</span></div></section> : <WorkspacePrimer title="No EA generated yet" copy="Export writes MQL5 source, guarded settings, Strategy Tester configuration and a source-hash evidence card into one new directory." />}</div>;
@@ -1255,14 +1439,102 @@ function CoverageGrid({
   );
 }
 
+function EquityCurvePanel({
+  initialBalance,
+  rows,
+}: {
+  initialBalance: number;
+  rows: EliteRow[];
+}) {
+  const visible = rows.slice(0, 12);
+  const curves = visible.map((row) => ({
+    row,
+    values: equityCurveValues(
+      row.equitySignature,
+      initialBalance,
+      row.returnPercent,
+    ),
+  }));
+  const allValues = curves.flatMap((curve) => curve.values);
+  const minimum = allValues.length > 0 ? Math.min(...allValues) : initialBalance;
+  const maximum = allValues.length > 0 ? Math.max(...allValues) : initialBalance;
+  const range = Math.max(maximum - minimum, 1e-9);
+  const colors = [
+    "#5bd7cc", "#78a7e6", "#e7b65c", "#b896ec", "#70d19a", "#ec756d",
+    "#9ed36a", "#e58ec8", "#6fc9ef", "#d4c66a", "#8f9df0", "#df9b6c",
+  ];
+
+  return (
+    <section className="panel equity-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">M1 performance paths</p>
+          <h2>Backtest cumulative equity curves</h2>
+        </div>
+        <span className="read-only-badge">
+          {visible.length === 0 ? "Select a strategy" : `${visible.length} shown`}
+        </span>
+      </div>
+      {visible.length === 0 ? (
+        <p className="cluster-empty">Select a strategy or tick several rows to compare their equity curves.</p>
+      ) : (
+        <>
+          <div className="equity-chart">
+            <span className="equity-axis equity-high">{formatNumber(maximum, 0)}</span>
+            <span className="equity-axis equity-low">{formatNumber(minimum, 0)}</span>
+            <svg viewBox="0 0 900 230" role="img" aria-label="Selected strategy cumulative equity curves">
+              {curves.map(({ row, values }, curveIndex) => {
+                const points = values
+                  .map((value, index) =>
+                    `${(index / Math.max(values.length - 1, 1)) * 900},${220 - ((value - minimum) / range) * 210}`)
+                  .join(" ");
+                return (
+                  <polyline
+                    fill="none"
+                    key={row.fingerprint}
+                    points={points}
+                    style={{ stroke: colors[curveIndex] }}
+                  />
+                );
+              })}
+            </svg>
+          </div>
+          <div className="equity-legend">
+            {curves.map(({ row }, index) => (
+              <button key={row.fingerprint} title={row.fingerprint}>
+                <i style={{ background: colors[index] }} />
+                <span>{row.strategyId}</span>
+                <strong className={row.returnPercent >= 0 ? "positive" : "negative"}>
+                  {row.returnPercent.toFixed(2)}%
+                </strong>
+              </button>
+            ))}
+          </div>
+          {rows.length > visible.length && (
+            <p className="axis-note">Showing the first 12 selected strategies to keep the chart readable.</p>
+          )}
+          <p className="axis-note">
+            Reconstructed from each strategy's stored 64-point M1 equity signature; start and end
+            balances match its recorded backtest.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
 function EliteTable({
+  batchSelection,
   rows,
   selected,
   onSelect,
+  onToggle,
 }: {
+  batchSelection: Set<string>;
   rows: EliteRow[];
   selected: string | null;
   onSelect: (fingerprint: string) => void;
+  onToggle: (fingerprint: string) => void;
 }) {
   const [scrollTop, setScrollTop] = useState(0);
   const rowHeight = 48;
@@ -1274,7 +1546,7 @@ function EliteTable({
   return (
     <div className="elite-table">
       <div className="elite-row elite-header">
-        <span>Strategy</span><span>Family</span><span>Evidence</span><span>Novelty</span>
+        <span>Select</span><span>Strategy</span><span>Family</span><span>Evidence</span><span>Novelty</span>
         <span>Trades</span><span>Return</span><span>DD</span><span>Parity</span>
       </div>
       <div
@@ -1284,12 +1556,26 @@ function EliteTable({
       >
         <div className="elite-virtual-body" style={{ height: rows.length * rowHeight }}>
           {rows.slice(start, end).map((row, offset) => (
-            <button
-              className={`elite-row ${selected === row.fingerprint ? "selected" : ""}`}
+            <div
+              className={`elite-row interactive ${selected === row.fingerprint ? "selected" : ""}`}
               key={row.fingerprint}
               onClick={() => onSelect(row.fingerprint)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") onSelect(row.fingerprint);
+              }}
+              role="button"
               style={{ height: rowHeight, transform: `translateY(${(start + offset) * rowHeight}px)` }}
+              tabIndex={0}
             >
+              <span className="batch-check">
+                <input
+                  aria-label={`Select ${row.strategyId} for batch export`}
+                  checked={batchSelection.has(row.fingerprint)}
+                  onChange={() => onToggle(row.fingerprint)}
+                  onClick={(event) => event.stopPropagation()}
+                  type="checkbox"
+                />
+              </span>
               <span className="strategy-cell"><strong>{row.strategyId}</strong><small>{row.fingerprint.slice(0, 10)}</small></span>
               <span>{row.family}</span>
               <span>{row.evidence.toFixed(2)}</span>
@@ -1298,7 +1584,7 @@ function EliteTable({
               <span className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</span>
               <span>{row.drawdownPercent.toFixed(2)}%</span>
               <span className="parity-unknown">unknown</span>
-            </button>
+            </div>
           ))}
         </div>
       </div>
@@ -1309,13 +1595,17 @@ function EliteTable({
 function EliteInspector({
   detail,
   loading,
+  onChallenge,
   onError,
+  onParity,
   tab,
   onTab,
 }: {
   detail: EliteDetail | null;
   loading: boolean;
+  onChallenge: (fingerprint: string) => Promise<void>;
   onError: (message: string | null) => void;
+  onParity: (fingerprint: string) => Promise<void>;
   tab: "overview" | "ir";
   onTab: (tab: "overview" | "ir") => void;
 }) {
@@ -1336,6 +1626,8 @@ function EliteInspector({
             <button className={tab === "overview" ? "active" : ""} onClick={() => onTab("overview")}>Overview</button>
             <button className={tab === "ir" ? "active" : ""} onClick={() => onTab("ir")}>IR tree</button>
             <button onClick={() => void exportEliteStrategy(detail.fingerprint).catch((reason) => onError(String(reason)))}>Export IR</button>
+            <button onClick={() => void onChallenge(detail.fingerprint)}>Go to Challenge →</button>
+            <button onClick={() => void onParity(detail.fingerprint)}>Go to M1 / MT5 →</button>
           </div>
           {tab === "overview" ? (
             <div className="inspector-body">
@@ -1343,7 +1635,11 @@ function EliteInspector({
                 <p className="eyebrow">Thesis</p>
                 <p>{detail.thesis}</p>
               </section>
-              <Sparkline values={detail.equitySignature} />
+              <Sparkline
+                initialBalance={Number(detail.metrics.initial_balance)}
+                returnPercent={Number(detail.metrics.return_percent)}
+                values={detail.equitySignature}
+              />
               <section className="metric-list">
                 <Metric label="Evidence" value={Number(detail.evidence.total).toFixed(2)} />
                 <Metric label="Return" value={`${Number(detail.metrics.return_percent).toFixed(2)}%`} />
@@ -1375,18 +1671,48 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function Sparkline({ values }: { values: number[] }) {
+function equityCurveValues(
+  values: number[],
+  initialBalance: number,
+  returnPercent: number,
+) {
+  const targetProfit = initialBalance * returnPercent / 100;
+  const signatureTotal = values.reduce((total, value) => total + value, 0);
+  const scale = Math.abs(signatureTotal) > 1e-9 ? targetProfit / signatureTotal : 0;
+  let balance = initialBalance;
+  return [
+    balance,
+    ...values.map((value, index) => {
+      balance += scale === 0
+        ? targetProfit / Math.max(values.length, 1)
+        : value * scale;
+      if (index === values.length - 1) balance = initialBalance + targetProfit;
+      return balance;
+    }),
+  ];
+}
+
+function Sparkline({
+  initialBalance,
+  returnPercent,
+  values,
+}: {
+  initialBalance: number;
+  returnPercent: number;
+  values: number[];
+}) {
   if (values.length < 2) return null;
-  const minimum = Math.min(...values);
-  const maximum = Math.max(...values);
+  const curve = equityCurveValues(values, initialBalance, returnPercent);
+  const minimum = Math.min(...curve);
+  const maximum = Math.max(...curve);
   const range = Math.max(maximum - minimum, 1e-9);
-  const points = values
-    .map((value, index) => `${(index / (values.length - 1)) * 300},${70 - ((value - minimum) / range) * 60}`)
+  const points = curve
+    .map((value, index) => `${(index / (curve.length - 1)) * 300},${70 - ((value - minimum) / range) * 60}`)
     .join(" ");
   return (
     <section className="sparkline-wrap">
-      <div><p className="eyebrow">Equity signature</p><small>64-point archive preview</small></div>
-      <svg viewBox="0 0 300 80" role="img" aria-label="Downsampled equity signature">
+      <div><p className="eyebrow">Equity curve</p><small>64-point M1 archive downsample</small></div>
+      <svg viewBox="0 0 300 80" role="img" aria-label="Downsampled cumulative equity curve">
         <polyline points={points} fill="none" />
       </svg>
     </section>

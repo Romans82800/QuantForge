@@ -56,10 +56,19 @@ export interface EliteRow {
   generation: number;
   grade: string;
   parity: string;
+  equitySignature: number[];
 }
 
 export interface DatabankWorkspace {
   sourcePath: string;
+  dataPath: string;
+  metadataPath: string | null;
+  m1DataPath: string | null;
+  m1MetadataPath: string | null;
+  brokerPath: string;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  initialBalance: number;
   artifactHash: string;
   runId: string;
   createdAt: string;
@@ -76,6 +85,12 @@ export interface DatabankWorkspace {
   rejections: RejectionTelemetry;
   families: FamilyCoverage[];
   elites: EliteRow[];
+}
+
+export interface BatchExportView {
+  directory: string;
+  indexPath: string;
+  strategyPaths: string[];
 }
 
 export interface EliteDetail {

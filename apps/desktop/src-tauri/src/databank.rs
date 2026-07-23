@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use tauri::State;
 use thiserror::Error;
@@ -42,6 +42,14 @@ pub struct DesktopState {
 #[serde(rename_all = "camelCase")]
 pub struct DatabankWorkspace {
     source_path: String,
+    data_path: String,
+    metadata_path: Option<String>,
+    m1_data_path: Option<String>,
+    m1_metadata_path: Option<String>,
+    broker_path: String,
+    commission_per_lot_round_turn: f64,
+    slippage_points_per_side: f64,
+    initial_balance: f64,
     artifact_hash: String,
     run_id: String,
     created_at: String,
@@ -58,6 +66,14 @@ pub struct DatabankWorkspace {
     rejections: RejectionTelemetry,
     families: Vec<FamilyCoverage>,
     elites: Vec<EliteRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExportView {
+    directory: String,
+    index_path: String,
+    strategy_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -115,6 +131,7 @@ struct EliteRow {
     generation: u64,
     grade: &'static str,
     parity: &'static str,
+    equity_signature: Vec<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -146,6 +163,8 @@ pub(crate) enum DesktopError {
     NoDatabank,
     #[error("elite {0} is not present in the loaded databank")]
     MissingElite(String),
+    #[error("batch export is invalid: {0}")]
+    InvalidExport(String),
     #[error("desktop databank state is unavailable")]
     StateUnavailable,
 }
@@ -212,6 +231,106 @@ pub fn export_elite_strategy(
         .to_string())
 }
 
+#[tauri::command]
+pub fn export_elite_strategies(
+    fingerprints: Vec<String>,
+    directory: String,
+    state: State<'_, DesktopState>,
+) -> Result<BatchExportView, String> {
+    export_elite_strategies_to(&fingerprints, Path::new(&directory), &state)
+        .map_err(|error| error.to_string())
+}
+
+fn export_elite_strategies_to(
+    fingerprints: &[String],
+    directory: &Path,
+    state: &DesktopState,
+) -> Result<BatchExportView, DesktopError> {
+    if fingerprints.is_empty() {
+        return Err(DesktopError::InvalidExport(
+            "select at least one elite".into(),
+        ));
+    }
+    if !directory.is_dir() {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} is not an existing directory",
+            directory.display()
+        )));
+    }
+    let unique: std::collections::BTreeSet<_> = fingerprints.iter().collect();
+    if unique.len() != fingerprints.len() {
+        return Err(DesktopError::InvalidExport(
+            "the selection contains duplicate fingerprints".into(),
+        ));
+    }
+
+    let loaded = state
+        .loaded
+        .read()
+        .map_err(|_| DesktopError::StateUnavailable)?;
+    let bank = &loaded.as_ref().ok_or(DesktopError::NoDatabank)?.bank;
+    let mut exports = Vec::with_capacity(fingerprints.len());
+    for fingerprint in fingerprints {
+        let elite = bank
+            .elites
+            .iter()
+            .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+            .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()))?;
+        let prefix = &fingerprint[..fingerprint.len().min(12)];
+        let file_name = format!(
+            "{}.{}.strategy.ir.json",
+            safe_file_stem(&elite.strategy.id),
+            prefix
+        );
+        exports.push((elite, directory.join(file_name)));
+    }
+    let index_path = directory.join("quantforge-strategy-batch.json");
+    if let Some(existing) = exports
+        .iter()
+        .map(|(_, path)| path)
+        .chain(std::iter::once(&index_path))
+        .find(|path| path.exists())
+    {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} already exists; choose an empty folder",
+            existing.display()
+        )));
+    }
+
+    for (elite, path) in &exports {
+        quantforge_storage::write_json_new(path, &elite.strategy)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    }
+    let index = serde_json::json!({
+        "schema_version": 1,
+        "grammar_version": bank.grammar_version,
+        "data_hash": bank.data_hash,
+        "execution_data_hash": bank.execution_data_hash,
+        "broker_spec_hash": bank.broker_spec_hash,
+        "strategies": exports.iter().map(|(elite, path)| serde_json::json!({
+            "fingerprint": elite.structural_fingerprint,
+            "strategy_id": elite.strategy.id,
+            "family": family_name(elite.niche.family),
+            "return_percent": elite.metrics.return_percent,
+            "profit_factor": elite.metrics.profit_factor,
+            "maximum_drawdown_percent": elite.metrics.max_drawdown_percent,
+            "trades": elite.metrics.trade_count,
+            "path": path.canonicalize().unwrap_or_else(|_| path.clone()),
+        })).collect::<Vec<_>>(),
+    });
+    quantforge_storage::write_json_new(&index_path, &index)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+
+    Ok(BatchExportView {
+        directory: canonical_display(directory),
+        index_path: canonical_display(&index_path),
+        strategy_paths: exports
+            .iter()
+            .map(|(_, path)| canonical_display(path))
+            .collect(),
+    })
+}
+
 fn get_elite_from_state(
     fingerprint: &str,
     state: &DesktopState,
@@ -274,6 +393,15 @@ fn workspace_view(
         + telemetry.rejected_evaluation;
     DatabankWorkspace {
         source_path: source_path.display().to_string(),
+        data_path: artifact.source.clone(),
+        metadata_path: companion_metadata_path(&artifact.source),
+        m1_data_path: manifest_path(artifact, "m1_source"),
+        m1_metadata_path: manifest_path(artifact, "m1_source")
+            .and_then(|path| companion_metadata_path(&path)),
+        broker_path: artifact.broker.clone(),
+        commission_per_lot_round_turn: bank.config.scout.costs.commission_per_lot_round_turn,
+        slippage_points_per_side: bank.config.scout.costs.adverse_slippage_points_per_side,
+        initial_balance: bank.config.scout.initial_balance,
         artifact_hash: artifact_hash.as_str().into(),
         run_id: artifact.manifest.run_id.clone(),
         created_at: artifact.manifest.created_at.to_rfc3339(),
@@ -298,6 +426,46 @@ fn workspace_view(
         },
         families: coverage_families(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
+    }
+}
+
+fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
+    artifact
+        .manifest
+        .recipe
+        .config
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn companion_metadata_path(data_path: &str) -> Option<String> {
+    let candidate = Path::new(data_path).with_extension("metadata.csv");
+    candidate.is_file().then(|| canonical_display(&candidate))
+}
+
+fn canonical_display(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .display()
+        .to_string()
+}
+
+fn safe_file_stem(value: &str) -> String {
+    let safe: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "strategy".into()
+    } else {
+        safe
     }
 }
 
@@ -340,6 +508,7 @@ fn elite_row(elite: &Elite) -> EliteRow {
         generation: elite.discovered_generation,
         grade: "illuminated",
         parity: "unknown",
+        equity_signature: elite.equity_signature.clone(),
     }
 }
 
@@ -506,5 +675,23 @@ mod tests {
             get_elite_from_state("missing", &state),
             Err(DesktopError::NoDatabank)
         ));
+    }
+
+    #[test]
+    fn batch_export_file_stems_are_portable_and_non_empty() {
+        assert_eq!(safe_file_stem("trend/AUDUSD:one"), "trend_AUDUSD_one");
+        assert_eq!(safe_file_stem(""), "strategy");
+    }
+
+    #[test]
+    fn companion_metadata_uses_the_exporter_naming_convention() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let data = directory.path().join("AUDUSD_H1.tsv");
+        let metadata = directory.path().join("AUDUSD_H1.metadata.csv");
+        fs::write(&metadata, "key,value\n").expect("metadata fixture");
+        assert_eq!(
+            companion_metadata_path(data.to_str().expect("UTF-8 path")),
+            Some(canonical_display(&metadata))
+        );
     }
 }

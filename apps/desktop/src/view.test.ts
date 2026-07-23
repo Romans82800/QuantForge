@@ -22,6 +22,7 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
   generation: 2,
   grade: "illuminated",
   parity: "unknown",
+  equitySignature: [0, 1],
   ...overrides,
 });
 

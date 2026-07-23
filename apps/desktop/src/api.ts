@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   DatabankWorkspace,
+  BatchExportView,
   CertifyRequest,
   AssembleEvidenceRequest,
   EvidenceView,
@@ -67,6 +68,15 @@ export async function exportEliteStrategy(fingerprint: string): Promise<string |
     filters: [{ name: "Strategy IR", extensions: ["json"] }],
   });
   return path ? invoke<string>("export_elite_strategy", { fingerprint, path }) : null;
+}
+
+export async function exportEliteStrategies(
+  fingerprints: string[],
+): Promise<BatchExportView | null> {
+  const directory = await chooseDirectory("Choose an empty batch export folder");
+  return directory
+    ? invoke<BatchExportView>("export_elite_strategies", { fingerprints, directory })
+    : null;
 }
 
 export function chooseDataFile(): Promise<string | null> {
