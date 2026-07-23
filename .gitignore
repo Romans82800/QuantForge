@@ -1,0 +1,13 @@
+/target/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/.idea/
+/.vscode/
+.DS_Store
+*.tmp
+*.ex5
+*.log
+/demo-output/
+/runs/
+/ICMarkets_EST7_2020_present
+/data/icmarkets-est7-2020-present

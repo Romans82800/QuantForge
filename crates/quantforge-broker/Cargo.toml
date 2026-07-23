@@ -1,0 +1,12 @@
+[package]
+name = "quantforge-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+quantforge-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true

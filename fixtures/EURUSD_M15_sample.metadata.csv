@@ -1,0 +1,26 @@
+property,value
+schema_version,1
+dataset_name,EURUSD_M15_sample
+broker,Fixture Broker
+server,Fixture-Demo
+terminal_build,0
+export_utc,2024-01-08T02:00:00Z
+symbol,EURUSD
+timeframe,PERIOD_M15
+from_server_time,2024.01.08 00:00:00
+to_server_time,2024.01.08 01:30:00
+last_bar_server_time,2024.01.08 01:15:00
+bar_count,6
+broker_timezone,Etc/UTC
+server_utc_offset_seconds_at_export,0
+account_currency,USD
+currency_base,EUR
+currency_profit,USD
+currency_margin,EUR
+swap_multiplier_sunday,0
+swap_multiplier_monday,1
+swap_multiplier_tuesday,1
+swap_multiplier_wednesday,3
+swap_multiplier_thursday,1
+swap_multiplier_friday,1
+swap_multiplier_saturday,0

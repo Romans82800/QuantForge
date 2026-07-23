@@ -1,0 +1,19 @@
+[package]
+name = "quantforge-discover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantforge-broker.workspace = true
+quantforge-core.workspace = true
+quantforge-data.workspace = true
+quantforge-eval.workspace = true
+quantforge-ir.workspace = true
+quantforge-quality.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "quantforge-tick"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantforge-broker.workspace = true
+quantforge-core.workspace = true
+quantforge-data.workspace = true
+quantforge-eval.workspace = true
+quantforge-ir.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

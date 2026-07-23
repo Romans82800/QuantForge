@@ -1,0 +1,49 @@
+{
+  "id": "fixture-long",
+  "version": 1,
+  "entry": {
+    "long": {
+      "operator": "compare",
+      "comparison": "greater_than",
+      "left": {
+        "kind": "price",
+        "field": "close",
+        "shift": 1
+      },
+      "right": {
+        "kind": "constant",
+        "value": 0.0
+      }
+    },
+    "short": null
+  },
+  "exit": null,
+  "filters": [],
+  "side": "long_only",
+  "risk": {
+    "kind": "fixed_currency",
+    "amount": 10.0
+  },
+  "stops": {
+    "stop_loss": {
+      "kind": "fixed_points",
+      "points": 20.0
+    },
+    "take_profit": {
+      "kind": "risk_multiple",
+      "multiple": 2.0
+    }
+  },
+  "manage": {
+    "break_even_at_r": null,
+    "trailing": null,
+    "time_stop_bars": null,
+    "partial_exits": [],
+    "flatten_end_of_day": false
+  },
+  "meta": {
+    "thesis_hint": "Fixture always-long signal for scout smoke tests",
+    "complexity": 0,
+    "export_safe": true
+  }
+}

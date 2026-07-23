@@ -1,0 +1,80 @@
+{
+  "id": "management-pending-fixture",
+  "version": 1,
+  "entry": {
+    "long": {
+      "operator": "cross_above",
+      "left": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 12,
+          "shift": 1
+        }
+      },
+      "right": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 48,
+          "shift": 1
+        }
+      }
+    },
+    "short": null,
+    "order": {
+      "kind": "limit",
+      "distance": {
+        "kind": "atr_multiple",
+        "period": 14,
+        "multiplier": 0.5
+      },
+      "expiry_bars": 3
+    }
+  },
+  "exit": null,
+  "filters": [],
+  "side": "long_only",
+  "risk": {
+    "kind": "percent_balance",
+    "percent": 0.5
+  },
+  "stops": {
+    "stop_loss": {
+      "kind": "atr_multiple",
+      "period": 14,
+      "multiplier": 2.0
+    },
+    "take_profit": {
+      "kind": "risk_multiple",
+      "multiple": 3.0
+    }
+  },
+  "manage": {
+    "break_even_at_r": 1.0,
+    "trailing": {
+      "kind": "risk_multiple",
+      "activate_at_r": 1.5,
+      "distance_r": 0.75
+    },
+    "time_stop_bars": 48,
+    "partial_exits": [
+      {
+        "at_r": 1.0,
+        "fraction": 0.5
+      },
+      {
+        "at_r": 2.0,
+        "fraction": 0.5
+      }
+    ],
+    "flatten_end_of_day": true
+  },
+  "meta": {
+    "thesis_hint": "Compile and parity fixture for managed pending entries",
+    "complexity": 0,
+    "export_safe": true
+  }
+}

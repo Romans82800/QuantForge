@@ -1,0 +1,1045 @@
+//! Typed strategy intermediate representation shared by generation, execution,
+//! fingerprinting and MQL5 export.
+
+use quantforge_core::{
+    ContentHash, FloatPolicy, HashError, STRATEGY_IR_VERSION, quantize, stable_json_hash,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceField {
+    Open,
+    High,
+    Low,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operator", rename_all = "snake_case")]
+pub enum IndicatorExpr {
+    Sma {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    Ema {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    Wma {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    Rsi {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    Atr {
+        period: u16,
+        shift: u16,
+    },
+    DonchianHigh {
+        period: u16,
+        shift: u16,
+    },
+    DonchianLow {
+        period: u16,
+        shift: u16,
+    },
+    Highest {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    Lowest {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    StandardDeviation {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    ZScore {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    PercentileInRange {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    RateOfChange {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+}
+
+impl IndicatorExpr {
+    fn period_and_shift(&self) -> (u16, u16) {
+        match *self {
+            Self::Sma { period, shift, .. }
+            | Self::Ema { period, shift, .. }
+            | Self::Wma { period, shift, .. }
+            | Self::Rsi { period, shift, .. }
+            | Self::Atr { period, shift }
+            | Self::DonchianHigh { period, shift }
+            | Self::DonchianLow { period, shift }
+            | Self::Highest { period, shift, .. }
+            | Self::Lowest { period, shift, .. }
+            | Self::StandardDeviation { period, shift, .. }
+            | Self::ZScore { period, shift, .. }
+            | Self::PercentileInRange { period, shift, .. }
+            | Self::RateOfChange { period, shift, .. } => (period, shift),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextValue {
+    SessionHour,
+    DayOfWeek,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NumericExpr {
+    Price { field: PriceField, shift: u16 },
+    Indicator { value: IndicatorExpr },
+    Context { value: ContextValue, shift: u16 },
+    Constant { value: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOp {
+    GreaterThan,
+    LessThan,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operator", rename_all = "snake_case")]
+pub enum BoolExpr {
+    Compare {
+        comparison: ComparisonOp,
+        left: NumericExpr,
+        right: NumericExpr,
+    },
+    CrossAbove {
+        left: NumericExpr,
+        right: NumericExpr,
+    },
+    CrossBelow {
+        left: NumericExpr,
+        right: NumericExpr,
+    },
+    Between {
+        value: NumericExpr,
+        lower: NumericExpr,
+        upper: NumericExpr,
+    },
+    And {
+        children: Vec<BoolExpr>,
+    },
+    Or {
+        children: Vec<BoolExpr>,
+    },
+    Not {
+        child: Box<BoolExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntrySignals {
+    pub long: Option<BoolExpr>,
+    pub short: Option<BoolExpr>,
+    /// How a valid signal is converted into an order. Older IR files omit
+    /// this field and retain the original market-entry behaviour.
+    #[serde(default)]
+    pub order: EntryOrderPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntryDistancePolicy {
+    FixedPoints { points: f64 },
+    AtrMultiple { period: u16, multiplier: f64 },
+    RangeMultiple { period: u16, multiplier: f64 },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntryOrderPolicy {
+    #[default]
+    Market,
+    Stop {
+        distance: EntryDistancePolicy,
+        expiry_bars: u16,
+    },
+    Limit {
+        distance: EntryDistancePolicy,
+        expiry_bars: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    LongOnly,
+    ShortOnly,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RiskPolicy {
+    FixedCurrency { amount: f64 },
+    PercentBalance { percent: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StopLossPolicy {
+    FixedPoints { points: f64 },
+    AtrMultiple { period: u16, multiplier: f64 },
+    RangeMultiple { period: u16, multiplier: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TakeProfitPolicy {
+    RiskMultiple { multiple: f64 },
+    FixedPoints { points: f64 },
+    AtrMultiple { period: u16, multiplier: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtectiveStops {
+    pub stop_loss: StopLossPolicy,
+    pub take_profit: TakeProfitPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrailingPolicy {
+    RiskMultiple {
+        activate_at_r: f64,
+        distance_r: f64,
+    },
+    AtrMultiple {
+        activate_at_r: f64,
+        period: u16,
+        multiplier: f64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialExit {
+    pub at_r: f64,
+    /// Fraction of the original position in the interval `(0, 1]`.
+    pub fraction: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManagePolicy {
+    pub break_even_at_r: Option<f64>,
+    pub trailing: Option<TrailingPolicy>,
+    pub time_stop_bars: Option<u16>,
+    pub partial_exits: Vec<PartialExit>,
+    pub flatten_end_of_day: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyMeta {
+    pub thesis_hint: String,
+    pub complexity: u16,
+    pub export_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyIr {
+    pub id: String,
+    pub version: u16,
+    pub entry: EntrySignals,
+    pub exit: Option<BoolExpr>,
+    pub filters: Vec<BoolExpr>,
+    pub side: Side,
+    pub risk: RiskPolicy,
+    pub stops: ProtectiveStops,
+    pub manage: ManagePolicy,
+    pub meta: StrategyMeta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrLimits {
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub max_boolean_children: usize,
+    pub max_filters: usize,
+    pub max_indicator_period: u16,
+}
+
+impl Default for IrLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 8,
+            max_nodes: 64,
+            max_boolean_children: 8,
+            max_filters: 6,
+            max_indicator_period: 2_000,
+        }
+    }
+}
+
+impl StrategyIr {
+    pub fn validate_export_safe(&self, limits: IrLimits) -> Result<(), IrError> {
+        if self.version != STRATEGY_IR_VERSION {
+            return Err(IrError::UnsupportedVersion(self.version));
+        }
+        if !self.meta.export_safe {
+            return Err(IrError::NotExportSafe);
+        }
+        if self.filters.len() > limits.max_filters {
+            return Err(IrError::Invalid {
+                path: "filters".into(),
+                reason: format!("contains more than {} filters", limits.max_filters),
+            });
+        }
+
+        match self.side {
+            Side::LongOnly if self.entry.long.is_none() || self.entry.short.is_some() => {
+                return Err(IrError::Invalid {
+                    path: "entry".into(),
+                    reason: "long-only strategies require only a long entry expression".into(),
+                });
+            }
+            Side::ShortOnly if self.entry.short.is_none() || self.entry.long.is_some() => {
+                return Err(IrError::Invalid {
+                    path: "entry".into(),
+                    reason: "short-only strategies require only a short entry expression".into(),
+                });
+            }
+            Side::Both if self.entry.long.is_none() || self.entry.short.is_none() => {
+                return Err(IrError::Invalid {
+                    path: "entry".into(),
+                    reason: "two-sided strategies require distinct long and short expressions"
+                        .into(),
+                });
+            }
+            _ => {}
+        }
+        if let Some(entry) = &self.entry.long {
+            validate_bool(entry, "entry.long", 1, limits)?;
+        }
+        if let Some(entry) = &self.entry.short {
+            validate_bool(entry, "entry.short", 1, limits)?;
+        }
+        validate_entry_order(&self.entry.order, limits)?;
+        if let Some(exit) = &self.exit {
+            validate_bool(exit, "exit", 1, limits)?;
+        }
+        for (index, filter) in self.filters.iter().enumerate() {
+            validate_bool(filter, &format!("filters[{index}]"), 1, limits)?;
+        }
+        validate_risk(&self.risk)?;
+        validate_stops(&self.stops, limits)?;
+        validate_manage(&self.manage, limits)?;
+
+        let complexity = self.complexity();
+        if complexity.node_count > limits.max_nodes {
+            return Err(IrError::Invalid {
+                path: "strategy".into(),
+                reason: format!(
+                    "contains {} nodes; maximum is {}",
+                    complexity.node_count, limits.max_nodes
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn complexity(&self) -> Complexity {
+        let mut complexity = Complexity::default();
+        if let Some(entry) = &self.entry.long {
+            complexity += bool_complexity(entry);
+        }
+        if let Some(entry) = &self.entry.short {
+            complexity += bool_complexity(entry);
+        }
+        if let Some(exit) = &self.exit {
+            complexity += bool_complexity(exit);
+        }
+        for filter in &self.filters {
+            complexity += bool_complexity(filter);
+        }
+        complexity += policy_complexity(self);
+        complexity.filter_count = self.filters.len();
+        complexity.score =
+            complexity.node_count + complexity.parameter_count + complexity.filter_count;
+        complexity
+    }
+
+    pub fn canonicalized(&self, policy: FloatPolicy) -> Result<Self, IrError> {
+        let mut value = self.clone();
+        if let Some(entry) = &mut value.entry.long {
+            canonicalize_bool(entry, policy)?;
+        }
+        if let Some(entry) = &mut value.entry.short {
+            canonicalize_bool(entry, policy)?;
+        }
+        canonicalize_entry_order(&mut value.entry.order, policy)?;
+        if let Some(exit) = &mut value.exit {
+            canonicalize_bool(exit, policy)?;
+        }
+        for filter in &mut value.filters {
+            canonicalize_bool(filter, policy)?;
+        }
+        value.filters.sort_by_key(serialized_sort_key);
+
+        canonicalize_risk(&mut value.risk, policy)?;
+        canonicalize_stops(&mut value.stops, policy)?;
+        canonicalize_manage(&mut value.manage, policy)?;
+        value.meta.complexity = value.complexity().score.min(u16::MAX as usize) as u16;
+        Ok(value)
+    }
+
+    pub fn structural_fingerprint(&self, policy: FloatPolicy) -> Result<ContentHash, IrError> {
+        let canonical = self.canonicalized(policy)?;
+        let material = FingerprintMaterial {
+            version: canonical.version,
+            entry: &canonical.entry,
+            exit: &canonical.exit,
+            filters: &canonical.filters,
+            side: canonical.side,
+            risk: &canonical.risk,
+            stops: &canonical.stops,
+            manage: &canonical.manage,
+        };
+        Ok(stable_json_hash(&material)?)
+    }
+}
+
+fn policy_complexity(strategy: &StrategyIr) -> Complexity {
+    // Risk, protective exits and management rules are executable structure too;
+    // excluding them would reward elaborate management disguised as "simple".
+    let mut node_count = 4; // risk, protective-stops, stop-loss and take-profit
+    let mut parameter_count = 1; // risk amount or percent
+
+    match &strategy.entry.order {
+        EntryOrderPolicy::Market => {}
+        EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+            node_count += 1;
+            parameter_count += 1; // expiry bars
+            parameter_count += match distance {
+                EntryDistancePolicy::FixedPoints { .. } => 1,
+                EntryDistancePolicy::AtrMultiple { .. }
+                | EntryDistancePolicy::RangeMultiple { .. } => 2,
+            };
+        }
+    }
+
+    parameter_count += match strategy.stops.stop_loss {
+        StopLossPolicy::FixedPoints { .. } => 1,
+        StopLossPolicy::AtrMultiple { .. } | StopLossPolicy::RangeMultiple { .. } => 2,
+    };
+    parameter_count += match strategy.stops.take_profit {
+        TakeProfitPolicy::RiskMultiple { .. } | TakeProfitPolicy::FixedPoints { .. } => 1,
+        TakeProfitPolicy::AtrMultiple { .. } => 2,
+    };
+
+    if strategy.manage.break_even_at_r.is_some() {
+        node_count += 1;
+        parameter_count += 1;
+    }
+    if let Some(trailing) = &strategy.manage.trailing {
+        node_count += 1;
+        parameter_count += match trailing {
+            TrailingPolicy::RiskMultiple { .. } => 2,
+            TrailingPolicy::AtrMultiple { .. } => 3,
+        };
+    }
+    if strategy.manage.time_stop_bars.is_some() {
+        node_count += 1;
+        parameter_count += 1;
+    }
+    node_count += strategy.manage.partial_exits.len();
+    parameter_count += strategy.manage.partial_exits.len() * 2;
+
+    Complexity {
+        node_count,
+        parameter_count,
+        filter_count: 0,
+        score: node_count + parameter_count,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Complexity {
+    pub node_count: usize,
+    pub parameter_count: usize,
+    pub filter_count: usize,
+    pub score: usize,
+}
+
+impl std::ops::AddAssign for Complexity {
+    fn add_assign(&mut self, other: Self) {
+        self.node_count += other.node_count;
+        self.parameter_count += other.parameter_count;
+        self.filter_count += other.filter_count;
+        self.score += other.score;
+    }
+}
+
+#[derive(Serialize)]
+struct FingerprintMaterial<'a> {
+    version: u16,
+    entry: &'a EntrySignals,
+    exit: &'a Option<BoolExpr>,
+    filters: &'a [BoolExpr],
+    side: Side,
+    risk: &'a RiskPolicy,
+    stops: &'a ProtectiveStops,
+    manage: &'a ManagePolicy,
+}
+
+fn validate_bool(
+    expression: &BoolExpr,
+    path: &str,
+    depth: usize,
+    limits: IrLimits,
+) -> Result<(), IrError> {
+    if depth > limits.max_depth {
+        return Err(IrError::Invalid {
+            path: path.into(),
+            reason: format!("exceeds maximum expression depth {}", limits.max_depth),
+        });
+    }
+
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            validate_numeric(left, &format!("{path}.left"), limits)?;
+            validate_numeric(right, &format!("{path}.right"), limits)?;
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            validate_numeric(value, &format!("{path}.value"), limits)?;
+            validate_numeric(lower, &format!("{path}.lower"), limits)?;
+            validate_numeric(upper, &format!("{path}.upper"), limits)?;
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            if !(2..=limits.max_boolean_children).contains(&children.len()) {
+                return Err(IrError::Invalid {
+                    path: path.into(),
+                    reason: format!(
+                        "must contain between 2 and {} children",
+                        limits.max_boolean_children
+                    ),
+                });
+            }
+            for (index, child) in children.iter().enumerate() {
+                validate_bool(
+                    child,
+                    &format!("{path}.children[{index}]"),
+                    depth + 1,
+                    limits,
+                )?;
+            }
+        }
+        BoolExpr::Not { child } => {
+            validate_bool(child, &format!("{path}.child"), depth + 1, limits)?
+        }
+    }
+    Ok(())
+}
+
+fn validate_numeric(expression: &NumericExpr, path: &str, limits: IrLimits) -> Result<(), IrError> {
+    match expression {
+        NumericExpr::Price { shift, .. } | NumericExpr::Context { shift, .. } => {
+            require_completed_bar(*shift, path)?;
+        }
+        NumericExpr::Indicator { value } => {
+            let (period, shift) = value.period_and_shift();
+            if !(2..=limits.max_indicator_period).contains(&period) {
+                return Err(IrError::Invalid {
+                    path: path.into(),
+                    reason: format!(
+                        "indicator period must be between 2 and {}",
+                        limits.max_indicator_period
+                    ),
+                });
+            }
+            require_completed_bar(shift, path)?;
+        }
+        NumericExpr::Constant { value } if !value.is_finite() => {
+            return Err(IrError::Invalid {
+                path: path.into(),
+                reason: "constant must be finite".into(),
+            });
+        }
+        NumericExpr::Constant { .. } => {}
+    }
+    Ok(())
+}
+
+fn require_completed_bar(shift: u16, path: &str) -> Result<(), IrError> {
+    if shift == 0 {
+        Err(IrError::Invalid {
+            path: path.into(),
+            reason: "forming-bar access is forbidden; shift must be at least 1".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
+    match risk {
+        RiskPolicy::FixedCurrency { amount } => require_positive("risk.amount", *amount),
+        RiskPolicy::PercentBalance { percent } => {
+            require_positive("risk.percent", *percent)?;
+            if *percent > 100.0 {
+                return Err(IrError::Invalid {
+                    path: "risk.percent".into(),
+                    reason: "must not exceed 100".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_entry_order(order: &EntryOrderPolicy, limits: IrLimits) -> Result<(), IrError> {
+    let (distance, expiry_bars) = match order {
+        EntryOrderPolicy::Market => return Ok(()),
+        EntryOrderPolicy::Stop {
+            distance,
+            expiry_bars,
+        }
+        | EntryOrderPolicy::Limit {
+            distance,
+            expiry_bars,
+        } => (distance, *expiry_bars),
+    };
+    if expiry_bars == 0 {
+        return Err(IrError::Invalid {
+            path: "entry.order.expiry_bars".into(),
+            reason: "must be greater than zero".into(),
+        });
+    }
+    match distance {
+        EntryDistancePolicy::FixedPoints { points } => {
+            require_positive("entry.order.distance.points", *points)
+        }
+        EntryDistancePolicy::AtrMultiple { period, multiplier }
+        | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
+            validate_period("entry.order.distance.period", *period, limits)?;
+            require_positive("entry.order.distance.multiplier", *multiplier)
+        }
+    }
+}
+
+fn validate_stops(stops: &ProtectiveStops, limits: IrLimits) -> Result<(), IrError> {
+    match stops.stop_loss {
+        StopLossPolicy::FixedPoints { points } => {
+            require_positive("stops.stop_loss.points", points)?
+        }
+        StopLossPolicy::AtrMultiple { period, multiplier }
+        | StopLossPolicy::RangeMultiple { period, multiplier } => {
+            validate_period("stops.stop_loss.period", period, limits)?;
+            require_positive("stops.stop_loss.multiplier", multiplier)?;
+        }
+    }
+    match stops.take_profit {
+        TakeProfitPolicy::RiskMultiple { multiple } => {
+            require_positive("stops.take_profit.multiple", multiple)?
+        }
+        TakeProfitPolicy::FixedPoints { points } => {
+            require_positive("stops.take_profit.points", points)?
+        }
+        TakeProfitPolicy::AtrMultiple { period, multiplier } => {
+            validate_period("stops.take_profit.period", period, limits)?;
+            require_positive("stops.take_profit.multiplier", multiplier)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_manage(manage: &ManagePolicy, limits: IrLimits) -> Result<(), IrError> {
+    if let Some(value) = manage.break_even_at_r {
+        require_positive("manage.break_even_at_r", value)?;
+    }
+    if manage.time_stop_bars == Some(0) {
+        return Err(IrError::Invalid {
+            path: "manage.time_stop_bars".into(),
+            reason: "must be greater than zero".into(),
+        });
+    }
+    if let Some(trailing) = &manage.trailing {
+        match *trailing {
+            TrailingPolicy::RiskMultiple {
+                activate_at_r,
+                distance_r,
+            } => {
+                require_positive("manage.trailing.activate_at_r", activate_at_r)?;
+                require_positive("manage.trailing.distance_r", distance_r)?;
+            }
+            TrailingPolicy::AtrMultiple {
+                activate_at_r,
+                period,
+                multiplier,
+            } => {
+                require_positive("manage.trailing.activate_at_r", activate_at_r)?;
+                validate_period("manage.trailing.period", period, limits)?;
+                require_positive("manage.trailing.multiplier", multiplier)?;
+            }
+        }
+    }
+
+    let mut total_fraction = 0.0;
+    for (index, partial) in manage.partial_exits.iter().enumerate() {
+        require_positive("manage.partial_exits.at_r", partial.at_r)?;
+        if !partial.fraction.is_finite() || partial.fraction <= 0.0 || partial.fraction > 1.0 {
+            return Err(IrError::Invalid {
+                path: format!("manage.partial_exits[{index}].fraction"),
+                reason: "must be in the interval (0, 1]".into(),
+            });
+        }
+        total_fraction += partial.fraction;
+    }
+    if total_fraction > 1.0 + f64::EPSILON {
+        return Err(IrError::Invalid {
+            path: "manage.partial_exits".into(),
+            reason: "fractions must not total more than 1".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_period(path: &str, period: u16, limits: IrLimits) -> Result<(), IrError> {
+    if !(2..=limits.max_indicator_period).contains(&period) {
+        Err(IrError::Invalid {
+            path: path.into(),
+            reason: format!("must be between 2 and {}", limits.max_indicator_period),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn require_positive(path: &str, value: f64) -> Result<(), IrError> {
+    if !value.is_finite() || value <= 0.0 {
+        Err(IrError::Invalid {
+            path: path.into(),
+            reason: "must be finite and greater than zero".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn bool_complexity(expression: &BoolExpr) -> Complexity {
+    let mut result = Complexity {
+        node_count: 1,
+        ..Complexity::default()
+    };
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            result += numeric_complexity(left);
+            result += numeric_complexity(right);
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            result += numeric_complexity(value);
+            result += numeric_complexity(lower);
+            result += numeric_complexity(upper);
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children {
+                result += bool_complexity(child);
+            }
+        }
+        BoolExpr::Not { child } => result += bool_complexity(child),
+    }
+    result
+}
+
+fn numeric_complexity(expression: &NumericExpr) -> Complexity {
+    let parameter_count = match expression {
+        NumericExpr::Price { .. } | NumericExpr::Context { .. } => 1,
+        NumericExpr::Indicator { .. } => 2,
+        NumericExpr::Constant { .. } => 1,
+    };
+    Complexity {
+        node_count: 1,
+        parameter_count,
+        filter_count: 0,
+        score: 1 + parameter_count,
+    }
+}
+
+fn canonicalize_bool(expression: &mut BoolExpr, policy: FloatPolicy) -> Result<(), IrError> {
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            canonicalize_numeric(left, policy)?;
+            canonicalize_numeric(right, policy)?;
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            canonicalize_numeric(value, policy)?;
+            canonicalize_numeric(lower, policy)?;
+            canonicalize_numeric(upper, policy)?;
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children.iter_mut() {
+                canonicalize_bool(child, policy)?;
+            }
+            children.sort_by_key(serialized_sort_key);
+        }
+        BoolExpr::Not { child } => canonicalize_bool(child, policy)?,
+    }
+    Ok(())
+}
+
+fn canonicalize_numeric(expression: &mut NumericExpr, policy: FloatPolicy) -> Result<(), IrError> {
+    if let NumericExpr::Constant { value } = expression {
+        *value = quantize(*value, policy.parameter_quantum)
+            .map_err(|error| IrError::Canonicalization(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn canonicalize_risk(risk: &mut RiskPolicy, policy: FloatPolicy) -> Result<(), IrError> {
+    match risk {
+        RiskPolicy::FixedCurrency { amount } => *amount = q(*amount, policy)?,
+        RiskPolicy::PercentBalance { percent } => *percent = q(*percent, policy)?,
+    }
+    Ok(())
+}
+
+fn canonicalize_entry_order(
+    order: &mut EntryOrderPolicy,
+    policy: FloatPolicy,
+) -> Result<(), IrError> {
+    let distance = match order {
+        EntryOrderPolicy::Market => return Ok(()),
+        EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+            distance
+        }
+    };
+    match distance {
+        EntryDistancePolicy::FixedPoints { points } => *points = q(*points, policy)?,
+        EntryDistancePolicy::AtrMultiple { multiplier, .. }
+        | EntryDistancePolicy::RangeMultiple { multiplier, .. } => {
+            *multiplier = q(*multiplier, policy)?
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_stops(stops: &mut ProtectiveStops, policy: FloatPolicy) -> Result<(), IrError> {
+    match &mut stops.stop_loss {
+        StopLossPolicy::FixedPoints { points } => *points = q(*points, policy)?,
+        StopLossPolicy::AtrMultiple { multiplier, .. }
+        | StopLossPolicy::RangeMultiple { multiplier, .. } => *multiplier = q(*multiplier, policy)?,
+    }
+    match &mut stops.take_profit {
+        TakeProfitPolicy::RiskMultiple { multiple } => *multiple = q(*multiple, policy)?,
+        TakeProfitPolicy::FixedPoints { points } => *points = q(*points, policy)?,
+        TakeProfitPolicy::AtrMultiple { multiplier, .. } => *multiplier = q(*multiplier, policy)?,
+    }
+    Ok(())
+}
+
+fn canonicalize_manage(manage: &mut ManagePolicy, policy: FloatPolicy) -> Result<(), IrError> {
+    if let Some(value) = &mut manage.break_even_at_r {
+        *value = q(*value, policy)?;
+    }
+    if let Some(trailing) = &mut manage.trailing {
+        match trailing {
+            TrailingPolicy::RiskMultiple {
+                activate_at_r,
+                distance_r,
+            } => {
+                *activate_at_r = q(*activate_at_r, policy)?;
+                *distance_r = q(*distance_r, policy)?;
+            }
+            TrailingPolicy::AtrMultiple {
+                activate_at_r,
+                multiplier,
+                ..
+            } => {
+                *activate_at_r = q(*activate_at_r, policy)?;
+                *multiplier = q(*multiplier, policy)?;
+            }
+        }
+    }
+    for partial in &mut manage.partial_exits {
+        partial.at_r = q(partial.at_r, policy)?;
+        partial.fraction = q(partial.fraction, policy)?;
+    }
+    manage.partial_exits.sort_by(|left, right| {
+        left.at_r
+            .total_cmp(&right.at_r)
+            .then_with(|| left.fraction.total_cmp(&right.fraction))
+    });
+    Ok(())
+}
+
+fn q(value: f64, policy: FloatPolicy) -> Result<f64, IrError> {
+    quantize(value, policy.parameter_quantum)
+        .map_err(|error| IrError::Canonicalization(error.to_string()))
+}
+
+fn serialized_sort_key<T: Serialize>(value: &T) -> Vec<u8> {
+    serde_json::to_vec(value).expect("IR variants contain only serializable fields")
+}
+
+#[derive(Debug, Error)]
+pub enum IrError {
+    #[error("unsupported strategy IR version {0}")]
+    UnsupportedVersion(u16),
+    #[error("strategy is marked as not export-safe")]
+    NotExportSafe,
+    #[error("invalid IR at {path}: {reason}")]
+    Invalid { path: String, reason: String },
+    #[error("could not canonicalize IR: {0}")]
+    Canonicalization(String),
+    #[error(transparent)]
+    Hash(#[from] HashError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close() -> NumericExpr {
+        NumericExpr::Price {
+            field: PriceField::Close,
+            shift: 1,
+        }
+    }
+
+    fn ema(period: u16) -> NumericExpr {
+        NumericExpr::Indicator {
+            value: IndicatorExpr::Ema {
+                source: PriceField::Close,
+                period,
+                shift: 1,
+            },
+        }
+    }
+
+    fn fixture() -> StrategyIr {
+        StrategyIr {
+            id: "candidate-a".into(),
+            version: STRATEGY_IR_VERSION,
+            entry: EntrySignals {
+                long: Some(BoolExpr::And {
+                    children: vec![
+                        BoolExpr::CrossAbove {
+                            left: ema(12),
+                            right: ema(48),
+                        },
+                        BoolExpr::Compare {
+                            comparison: ComparisonOp::GreaterThan,
+                            left: close(),
+                            right: NumericExpr::Constant { value: 1.0 },
+                        },
+                    ],
+                }),
+                short: Some(BoolExpr::CrossBelow {
+                    left: ema(12),
+                    right: ema(48),
+                }),
+                order: Default::default(),
+            },
+            exit: None,
+            filters: vec![],
+            side: Side::Both,
+            risk: RiskPolicy::FixedCurrency { amount: 1_000.0 },
+            stops: ProtectiveStops {
+                stop_loss: StopLossPolicy::AtrMultiple {
+                    period: 14,
+                    multiplier: 2.0,
+                },
+                take_profit: TakeProfitPolicy::RiskMultiple { multiple: 2.0 },
+            },
+            manage: ManagePolicy::default(),
+            meta: StrategyMeta {
+                thesis_hint: "EMA trend".into(),
+                complexity: 0,
+                export_safe: true,
+            },
+        }
+    }
+
+    #[test]
+    fn commutative_children_and_identity_metadata_do_not_change_fingerprint() {
+        let first = fixture();
+        let mut second = fixture();
+        second.id = "candidate-b".into();
+        second.meta.thesis_hint = "renamed".into();
+        if let Some(BoolExpr::And { children }) = &mut second.entry.long {
+            children.reverse();
+        }
+
+        assert_eq!(
+            first
+                .structural_fingerprint(FloatPolicy::default())
+                .unwrap(),
+            second
+                .structural_fingerprint(FloatPolicy::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn forming_bar_access_is_rejected() {
+        let mut strategy = fixture();
+        strategy.entry.long = Some(BoolExpr::Compare {
+            comparison: ComparisonOp::GreaterThan,
+            left: NumericExpr::Price {
+                field: PriceField::Close,
+                shift: 0,
+            },
+            right: NumericExpr::Constant { value: 1.0 },
+        });
+
+        assert!(strategy.validate_export_safe(IrLimits::default()).is_err());
+    }
+
+    #[test]
+    fn complexity_is_derived_from_structure() {
+        let complexity = fixture().complexity();
+        assert!(complexity.node_count >= 7);
+        assert_eq!(complexity.filter_count, 0);
+        assert_eq!(
+            complexity.score,
+            complexity.node_count + complexity.parameter_count
+        );
+    }
+}

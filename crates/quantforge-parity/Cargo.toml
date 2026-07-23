@@ -1,0 +1,19 @@
+[package]
+name = "quantforge-parity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+csv.workspace = true
+quantforge-core.workspace = true
+quantforge-data.workspace = true
+quantforge-eval.workspace = true
+quantforge-export-mql5.workspace = true
+quantforge-ir.workspace = true
+quantforge-tick.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

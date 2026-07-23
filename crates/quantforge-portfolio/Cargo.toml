@@ -1,0 +1,12 @@
+[package]
+name = "quantforge-portfolio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantforge-core.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+thiserror.workspace = true

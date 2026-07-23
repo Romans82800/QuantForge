@@ -1,0 +1,16 @@
+[package]
+name = "quantforge-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+quantforge-broker.workspace = true
+quantforge-core.workspace = true
+quantforge-data.workspace = true
+quantforge-ir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

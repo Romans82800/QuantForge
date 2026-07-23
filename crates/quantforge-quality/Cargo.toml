@@ -1,0 +1,17 @@
+[package]
+name = "quantforge-quality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+quantforge-broker.workspace = true
+quantforge-core.workspace = true
+quantforge-data.workspace = true
+quantforge-eval.workspace = true
+quantforge-ir.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+thiserror.workspace = true
