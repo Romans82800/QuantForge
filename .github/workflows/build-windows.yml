@@ -6,6 +6,13 @@ name: Build Windows x64
 
 on:
   workflow_dispatch:
+  # Also run on this branch so the first Windows build works before the
+  # workflow exists on the repo default branch (workflow_dispatch requires that).
+  push:
+    branches:
+      - cursor/is-oos1-oos2-parallel-challenge
+      - main
+      - master
 
 permissions:
   contents: read
