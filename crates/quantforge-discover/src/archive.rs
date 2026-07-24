@@ -7,6 +7,7 @@ use quantforge_core::{FloatPolicy, quantize};
 use quantforge_eval::{PositionSide, ScoutResult};
 use quantforge_ir::StrategyIr;
 
+#[derive(Clone)]
 pub(crate) struct CandidateEvaluation {
     pub strategy: StrategyIr,
     pub result: ScoutResult,
@@ -16,14 +17,48 @@ pub(crate) struct CandidateEvaluation {
     pub oos1_expectancy_ratio: Option<f64>,
 }
 
-pub(crate) fn deposit(
+pub(crate) fn deposit_to_accepted_pool(
     bank: &mut Databank,
     candidate: CandidateEvaluation,
 ) -> Result<DepositDecision, quantforge_ir::IrError> {
-    if !passes_gates(&candidate.result, &bank.config) {
-        return Ok(DepositDecision::RejectedGate);
+    if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
+        return Ok(DepositDecision::RejectedDepositGate);
     }
+    deposit_into(
+        &mut bank.accepted_pool,
+        &mut bank.accepted_coverage_map,
+        bank.config.correlation_threshold,
+        candidate,
+        DepositDecision::AcceptedToPot,
+        DepositDecision::ReplacedInPot,
+    )
+}
 
+pub(crate) fn deposit_to_databank(
+    bank: &mut Databank,
+    candidate: CandidateEvaluation,
+) -> Result<DepositDecision, quantforge_ir::IrError> {
+    if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
+        return Ok(DepositDecision::RejectedDepositGate);
+    }
+    deposit_into(
+        &mut bank.elites,
+        &mut bank.coverage_map,
+        bank.config.correlation_threshold,
+        candidate,
+        DepositDecision::AcceptedToDatabank,
+        DepositDecision::ReplacedInDatabank,
+    )
+}
+
+fn deposit_into(
+    entries: &mut Vec<Elite>,
+    coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
+    correlation_threshold: f64,
+    candidate: CandidateEvaluation,
+    accepted: DepositDecision,
+    replaced: DepositDecision,
+) -> Result<DepositDecision, quantforge_ir::IrError> {
     let fingerprint = candidate
         .strategy
         .structural_fingerprint(FloatPolicy::default())?;
@@ -31,10 +66,7 @@ pub(crate) fn deposit(
     let niche = niche_key(&descriptor);
     let evidence = evidence(&candidate.strategy, &candidate.result);
     let signature = equity_signature(&candidate.result, 64);
-    // A higher-evidence repeat of the same structure is compared against its
-    // current champion below, not against itself for behavioral correlation.
-    let maximum_correlation = bank
-        .elites
+    let maximum_correlation = entries
         .iter()
         .filter(|elite| elite.structural_fingerprint != fingerprint)
         .map(|elite| correlation(&signature, &elite.equity_signature))
@@ -42,12 +74,11 @@ pub(crate) fn deposit(
     let novelty = quantized(1.0 - maximum_correlation.clamp(0.0, 1.0));
     let complexity = candidate.strategy.complexity().score;
 
-    let fingerprint_index = bank
-        .elites
+    let fingerprint_index = entries
         .iter()
         .position(|elite| elite.structural_fingerprint == fingerprint);
     if let Some(index) = fingerprint_index {
-        let existing = &bank.elites[index];
+        let existing = &entries[index];
         if !better_than(
             &evidence,
             novelty,
@@ -75,48 +106,50 @@ pub(crate) fn deposit(
         discovered_generation: candidate.generation,
     };
 
-    if let Some(index) = bank.elites.iter().position(|value| value.niche == niche) {
+    if let Some(index) = entries.iter().position(|value| value.niche == niche) {
         if fingerprint_index == Some(index) {
-            bank.elites[index] = elite;
-            refresh_coverage(bank);
-            return Ok(DepositDecision::ReplacedElite);
+            entries[index] = elite;
+            refresh_coverage_map(entries, coverage_map);
+            return Ok(replaced);
         }
         if better_than(
             &elite.evidence,
             elite.novelty,
             elite.complexity,
             elite.metrics.trade_count,
-            &bank.elites[index],
+            &entries[index],
         ) {
             if let Some(fingerprint_index) = fingerprint_index {
-                bank.elites.remove(fingerprint_index);
+                entries.remove(fingerprint_index);
             }
-            let index = bank
-                .elites
+            let index = entries
                 .iter()
                 .position(|value| value.niche == niche)
                 .expect("destination niche existed before fingerprint removal");
-            bank.elites[index] = elite;
-            refresh_coverage(bank);
-            Ok(DepositDecision::ReplacedElite)
+            entries[index] = elite;
+            refresh_coverage_map(entries, coverage_map);
+            Ok(replaced)
         } else {
             Ok(DepositDecision::RejectedNicheNotImproved)
         }
-    } else if maximum_correlation > bank.config.correlation_threshold {
+    } else if maximum_correlation > correlation_threshold {
         Ok(DepositDecision::RejectedCorrelated)
     } else {
         if let Some(fingerprint_index) = fingerprint_index {
-            bank.elites.remove(fingerprint_index);
+            entries.remove(fingerprint_index);
         }
-        bank.elites.push(elite);
-        bank.elites
-            .sort_by(|left, right| left.niche.cmp(&right.niche));
-        refresh_coverage(bank);
-        Ok(DepositDecision::AcceptedEmpty)
+        entries.push(elite);
+        entries.sort_by(|left, right| left.niche.cmp(&right.niche));
+        refresh_coverage_map(entries, coverage_map);
+        Ok(accepted)
     }
 }
 
 pub(crate) fn passes_gates(result: &ScoutResult, config: &DiscoverConfig) -> bool {
+    passes_gate_config(result, &config.gates)
+}
+
+pub(crate) fn passes_gate_config(result: &ScoutResult, gates: &crate::model::GateConfig) -> bool {
     let metrics = &result.metrics;
     let effective_profit_factor = metrics.profit_factor.unwrap_or({
         if metrics.net_profit > 0.0 && metrics.winning_trades > 0 {
@@ -125,11 +158,11 @@ pub(crate) fn passes_gates(result: &ScoutResult, config: &DiscoverConfig) -> boo
             0.0
         }
     });
-    metrics.trade_count >= config.gates.minimum_trades
-        && metrics.max_drawdown_percent <= config.gates.maximum_drawdown_percent
-        && metrics.return_percent > config.gates.minimum_return_percent
-        && effective_profit_factor >= config.gates.minimum_profit_factor
-        && return_drawdown_ratio(metrics) >= config.gates.minimum_return_drawdown
+    metrics.trade_count >= gates.minimum_trades
+        && metrics.max_drawdown_percent <= gates.maximum_drawdown_percent
+        && metrics.return_percent > gates.minimum_return_percent
+        && effective_profit_factor >= gates.minimum_profit_factor
+        && return_drawdown_ratio(metrics) >= gates.minimum_return_drawdown
 }
 
 fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor {
@@ -294,9 +327,11 @@ fn better_than(
         .is_gt()
 }
 
-fn refresh_coverage(bank: &mut Databank) {
-    bank.coverage_map = bank
-        .elites
+fn refresh_coverage_map(
+    entries: &[Elite],
+    coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
+) {
+    *coverage_map = entries
         .iter()
         .map(|elite| {
             (
@@ -349,11 +384,20 @@ mod tests {
                     minimum_profit_factor: 0.0,
                     minimum_return_drawdown: 0.0,
                 },
+                deposit_gates: GateConfig {
+                    minimum_trades: 0,
+                    maximum_drawdown_percent: 100.0,
+                    minimum_return_percent: -100.0,
+                    minimum_profit_factor: 0.0,
+                    minimum_return_drawdown: 0.0,
+                },
                 scout: ScoutConfig::default(),
                 ..DiscoverConfig::default()
             },
             completed_generations: 0,
             evaluation_count: 0,
+            accepted_pool: Vec::new(),
+            accepted_coverage_map: BTreeMap::new(),
             elites: Vec::new(),
             coverage_map: BTreeMap::new(),
             telemetry: DiscoverTelemetry::default(),
@@ -427,7 +471,7 @@ mod tests {
     fn duplicate_structures_and_correlated_empty_niches_are_rejected() {
         let mut bank = bank(0.88);
         let trend = generate_seed(42, 0);
-        let first = deposit(
+        let first = deposit_to_accepted_pool(
             &mut bank,
             CandidateEvaluation {
                 strategy: trend.clone(),
@@ -439,9 +483,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(first, DepositDecision::AcceptedEmpty);
+        assert_eq!(first, DepositDecision::AcceptedToPot);
 
-        let clone = deposit(
+        let clone = deposit_to_accepted_pool(
             &mut bank,
             CandidateEvaluation {
                 strategy: trend,
@@ -455,7 +499,7 @@ mod tests {
         .unwrap();
         assert_eq!(clone, DepositDecision::RejectedClone);
 
-        let correlated_other_family = deposit(
+        let correlated_other_family = deposit_to_accepted_pool(
             &mut bank,
             CandidateEvaluation {
                 strategy: generate_seed(42, 1),

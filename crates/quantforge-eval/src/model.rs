@@ -154,10 +154,23 @@ pub struct BacktestMetrics {
     pub expectancy: f64,
 }
 
+/// Broker-local hour when new entries/pending may first be placed (inclusive).
+pub const MANDATORY_ENTRY_WINDOW_START_HOUR: u32 = 2;
+/// Broker-local hour when the entry window ends (exclusive). 19 = 7pm: no new
+/// entries or pending from 19:00 onward.
+pub const MANDATORY_ENTRY_WINDOW_END_HOUR: u32 = 19;
+
+/// Hard-coded QuantForge entry session: `[02:00, 19:00)` broker local time.
+pub fn in_mandatory_entry_window(hour: u32) -> bool {
+    hour >= MANDATORY_ENTRY_WINDOW_START_HOUR && hour < MANDATORY_ENTRY_WINDOW_END_HOUR
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoutTelemetry {
     pub conflicting_entry_signals: usize,
     pub skipped_outside_session: usize,
+    #[serde(default)]
+    pub skipped_outside_entry_window: usize,
     pub skipped_for_spread: usize,
     pub skipped_for_broker_stop_level: usize,
     pub skipped_below_minimum_volume: usize,
@@ -168,6 +181,8 @@ pub struct ScoutTelemetry {
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,
     pub end_of_day_flattens: usize,
+    #[serde(default)]
+    pub skipped_max_one_entry_per_day: usize,
     pub synthetic_spread_bars: usize,
     pub fallback_spread_bars: usize,
     pub swap_rollover_events: usize,

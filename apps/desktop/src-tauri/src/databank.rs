@@ -31,6 +31,9 @@ pub(crate) struct EvolveArtifact {
 #[derive(Debug)]
 struct LoadedDatabank {
     bank: Databank,
+    source: String,
+    broker: String,
+    metadata_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -64,6 +67,11 @@ pub struct DatabankWorkspace {
     completed_generations: u64,
     selection_bias: SelectionBiasView,
     rejections: RejectionTelemetry,
+    research_grade: bool,
+    require_m1_precision: bool,
+    m1_fidelity_verified: bool,
+    simple_exits: bool,
+    max_one_entry_per_day: bool,
     families: Vec<FamilyCoverage>,
     elites: Vec<EliteRow>,
 }
@@ -88,6 +96,8 @@ struct SelectionBiasView {
 #[serde(rename_all = "camelCase")]
 struct RejectionTelemetry {
     gate: u64,
+    #[serde(default)]
+    deposit_gate: u64,
     clone: u64,
     correlated: u64,
     niche_not_improved: u64,
@@ -157,6 +167,38 @@ pub struct EliteDetail {
     equity_signature: Vec<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionEquityPoint {
+    timestamp_ms: i64,
+    equity: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionEquityView {
+    fingerprint: String,
+    strategy_id: String,
+    initial_balance: f64,
+    points: Vec<PartitionEquityPoint>,
+    is_end_timestamp_ms: i64,
+    oos1_end_timestamp_ms: i64,
+    oos2_end_timestamp_ms: i64,
+    is_bars: usize,
+    oos1_bars: usize,
+    oos2_bars: usize,
+    is_expectancy: f64,
+    oos1_expectancy: f64,
+    oos1_expectancy_ratio: Option<f64>,
+    oos2_expectancy: f64,
+    is_return_percent: f64,
+    oos1_return_percent: f64,
+    oos2_return_percent: f64,
+    is_trades: usize,
+    oos1_trades: usize,
+    oos2_trades: usize,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum DesktopError {
     #[error("cannot read databank: {0}")]
@@ -193,11 +235,15 @@ fn load_databank_path(
     verify_artifact(&artifact)?;
     let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
+    let metadata_path = companion_metadata_path(&artifact.source);
     *state
         .loaded
         .write()
         .map_err(|_| DesktopError::StateUnavailable)? = Some(LoadedDatabank {
         bank: artifact.databank,
+        source: artifact.source,
+        broker: artifact.broker,
+        metadata_path,
     });
     Ok(workspace)
 }
@@ -208,6 +254,210 @@ pub fn get_elite(
     state: State<'_, DesktopState>,
 ) -> Result<EliteDetail, String> {
     get_elite_from_state(&fingerprint, &state).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_elite_partition_equity(
+    fingerprint: String,
+    state: State<'_, DesktopState>,
+) -> Result<PartitionEquityView, String> {
+    let snapshot = {
+        let loaded = state
+            .loaded
+            .read()
+            .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+        let loaded = loaded
+            .as_ref()
+            .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
+        let elite = loaded
+            .bank
+            .elites
+            .iter()
+            .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+            .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
+            .clone();
+        (
+            elite,
+            loaded.source.clone(),
+            loaded.broker.clone(),
+            loaded.metadata_path.clone(),
+            loaded.bank.config.scout.clone(),
+        )
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let (elite, source, broker_path, metadata_path, scout) = snapshot;
+        partition_equity_for_elite(&elite, &source, metadata_path.as_deref(), &broker_path, &scout)
+    })
+    .await
+    .map_err(|error| format!("partition equity task failed: {error}"))?
+}
+
+fn partition_equity_for_elite(
+    elite: &Elite,
+    source: &str,
+    metadata_path: Option<&str>,
+    broker_path: &str,
+    scout: &quantforge_eval::ScoutConfig,
+) -> Result<PartitionEquityView, String> {
+    let loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
+    // Prefer full decision history. If the databank was built on an IS-only
+    // slice whose path still points at full history, this is the right series.
+    let broker = crate::data_lab::load_bound_broker(broker_path, loaded.metadata.as_ref())?;
+    let plan = quantforge_quality::DataSplitPlan::chronological(&loaded.dataset, 0.2, 0.2)
+        .map_err(|error| error.to_string())?;
+    let result = quantforge_eval::evaluate_strategy(&elite.strategy, &loaded.dataset, &broker, scout)
+        .map_err(|error| error.to_string())?;
+
+    let is_end = plan.development.end_timestamp_ms_exclusive;
+    let oos1_end = plan.validation.end_timestamp_ms_exclusive;
+    let oos2_end = plan.sealed_final.end_timestamp_ms_exclusive;
+
+    let is_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| trade.entry_timestamp_ms < is_end)
+        .collect();
+    let oos1_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| trade.entry_timestamp_ms >= is_end && trade.entry_timestamp_ms < oos1_end)
+        .collect();
+    let oos2_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| {
+            trade.entry_timestamp_ms >= oos1_end && trade.entry_timestamp_ms < oos2_end
+        })
+        .collect();
+
+    let is_expectancy = mean_expectancy(&is_trades);
+    let oos1_expectancy = mean_expectancy(&oos1_trades);
+    let oos2_expectancy = mean_expectancy(&oos2_trades);
+    let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
+        .then_some(oos1_expectancy / is_expectancy);
+
+    let points = downsample_equity(&result.equity, 480, is_end, oos1_end);
+
+    Ok(PartitionEquityView {
+        fingerprint: elite.structural_fingerprint.as_str().into(),
+        strategy_id: elite.strategy.id.clone(),
+        initial_balance: scout.initial_balance,
+        points,
+        is_end_timestamp_ms: is_end,
+        oos1_end_timestamp_ms: oos1_end,
+        oos2_end_timestamp_ms: oos2_end,
+        is_bars: plan.development.bar_count,
+        oos1_bars: plan.validation.bar_count,
+        oos2_bars: plan.sealed_final.bar_count,
+        is_expectancy,
+        oos1_expectancy,
+        oos1_expectancy_ratio: oos1_ratio,
+        oos2_expectancy,
+        is_return_percent: segment_return(&result.equity, scout.initial_balance, None, Some(is_end)),
+        oos1_return_percent: segment_return(
+            &result.equity,
+            scout.initial_balance,
+            Some(is_end),
+            Some(oos1_end),
+        ),
+        oos2_return_percent: segment_return(
+            &result.equity,
+            scout.initial_balance,
+            Some(oos1_end),
+            Some(oos2_end),
+        ),
+        is_trades: is_trades.len(),
+        oos1_trades: oos1_trades.len(),
+        oos2_trades: oos2_trades.len(),
+    })
+}
+
+fn mean_expectancy(trades: &[&quantforge_eval::Trade]) -> f64 {
+    if trades.is_empty() {
+        return 0.0;
+    }
+    trades.iter().map(|trade| trade.net_profit).sum::<f64>() / trades.len() as f64
+}
+
+fn segment_return(
+    equity: &[quantforge_eval::EquityPoint],
+    initial_balance: f64,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> f64 {
+    let start_equity = start_ms
+        .and_then(|boundary| {
+            equity
+                .iter()
+                .rev()
+                .find(|point| point.timestamp_ms < boundary)
+                .map(|point| point.equity)
+        })
+        .unwrap_or(initial_balance);
+    let end_equity = end_ms
+        .and_then(|boundary| {
+            equity
+                .iter()
+                .rev()
+                .find(|point| point.timestamp_ms < boundary)
+                .map(|point| point.equity)
+        })
+        .or_else(|| equity.last().map(|point| point.equity))
+        .unwrap_or(start_equity);
+    if start_equity.abs() < 1e-12 {
+        return 0.0;
+    }
+    ((end_equity - start_equity) / start_equity) * 100.0
+}
+
+fn downsample_equity(
+    equity: &[quantforge_eval::EquityPoint],
+    target: usize,
+    is_end: i64,
+    oos1_end: i64,
+) -> Vec<PartitionEquityPoint> {
+    if equity.is_empty() {
+        return Vec::new();
+    }
+    if equity.len() <= target {
+        return equity
+            .iter()
+            .map(|point| PartitionEquityPoint {
+                timestamp_ms: point.timestamp_ms,
+                equity: point.equity,
+            })
+            .collect();
+    }
+    let mut keep = std::collections::BTreeSet::new();
+    keep.insert(0);
+    keep.insert(equity.len() - 1);
+    if let Some(index) = equity
+        .iter()
+        .position(|point| point.timestamp_ms >= is_end)
+        .map(|index| index.saturating_sub(1))
+    {
+        keep.insert(index);
+    }
+    if let Some(index) = equity
+        .iter()
+        .position(|point| point.timestamp_ms >= oos1_end)
+        .map(|index| index.saturating_sub(1))
+    {
+        keep.insert(index);
+    }
+    let step = ((equity.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
+    let mut cursor = 0.0;
+    while (cursor as usize) < equity.len() {
+        keep.insert(cursor as usize);
+        cursor += step;
+    }
+    keep.into_iter()
+        .filter_map(|index| equity.get(index))
+        .map(|point| PartitionEquityPoint {
+            timestamp_ms: point.timestamp_ms,
+            equity: point.equity,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -397,11 +647,16 @@ fn workspace_view(
     let bank = &artifact.databank;
     let telemetry = &bank.telemetry;
     let total_rejections = telemetry.rejected_gate
+        + telemetry.rejected_deposit_gate
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
         + telemetry.rejected_oos1
+        + telemetry.rejected_m1_fidelity
+        + telemetry.rejected_walk_forward
+        + telemetry.rejected_monte_carlo
+        + telemetry.rejected_param_neighborhood
         + telemetry.rejected_evaluation;
     DatabankWorkspace {
         source_path: source_path.display().to_string(),
@@ -429,6 +684,7 @@ fn workspace_view(
         selection_bias: selection_bias(bank.evaluation_count),
         rejections: RejectionTelemetry {
             gate: telemetry.rejected_gate,
+            deposit_gate: telemetry.rejected_deposit_gate,
             clone: telemetry.rejected_clone,
             correlated: telemetry.rejected_correlated,
             niche_not_improved: telemetry.rejected_niche_not_improved,
@@ -437,9 +693,34 @@ fn workspace_view(
             evaluation: telemetry.rejected_evaluation,
             total: total_rejections,
         },
+        research_grade: artifact_is_research_grade(artifact),
+        require_m1_precision: bank.config.require_m1_precision,
+        m1_fidelity_verified: artifact_m1_fidelity_verified(artifact),
+        simple_exits: bank.config.simple_exits,
+        max_one_entry_per_day: bank.config.max_one_entry_per_day,
         families: coverage_families(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
     }
+}
+
+pub(crate) fn artifact_is_research_grade(artifact: &EvolveArtifact) -> bool {
+    if artifact_m1_fidelity_verified(artifact) {
+        return false;
+    }
+    if matches!(
+        artifact.manifest.recipe.config.get("research_grade"),
+        Some(Value::Bool(false))
+    ) {
+        return false;
+    }
+    !artifact.databank.config.require_m1_precision
+}
+
+pub(crate) fn artifact_m1_fidelity_verified(artifact: &EvolveArtifact) -> bool {
+    matches!(
+        artifact.manifest.recipe.config.get("m1_fidelity_verified"),
+        Some(Value::Bool(true))
+    ) || artifact.databank.config.require_m1_precision
 }
 
 fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
@@ -700,6 +981,8 @@ mod tests {
             evaluation_count: 0,
             elites: Vec::new(),
             coverage_map: BTreeMap::new(),
+            accepted_pool: Vec::new(),
+            accepted_coverage_map: BTreeMap::new(),
             telemetry: Default::default(),
         };
         let families = coverage_families(&bank);
@@ -751,4 +1034,274 @@ mod tests {
         assert!(signature_sharpe(&[1.0, 2.0, 1.5]).is_some_and(|value| value > 0.0));
         assert_eq!(signature_sharpe(&[1.0]), None);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FidelityDemoRequest {
+    databank_path: String,
+    m1_data_path: String,
+    m1_metadata_path: Option<String>,
+    m1_source_timezone: Option<String>,
+    /// Where to write the filtered promotion-grade bank (only passers).
+    output_path: String,
+    /// SQX-style net/return retention vs H1 (default 0.80).
+    return_retention: Option<f64>,
+    /// SQX-style trade-count retention (default 0.80).
+    trade_retention: Option<f64>,
+    /// Max M1 DD as multiple of H1 DD (default 1.30).
+    drawdown_expansion: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FidelityEliteResult {
+    fingerprint: String,
+    strategy_id: String,
+    passed: bool,
+    h1_return_percent: f64,
+    m1_return_percent: f64,
+    return_retention: f64,
+    h1_trades: usize,
+    m1_trades: usize,
+    trade_retention: f64,
+    h1_drawdown_percent: f64,
+    m1_drawdown_percent: f64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FidelityDemoView {
+    evaluated: usize,
+    passed: usize,
+    failed: usize,
+    output_path: Option<String>,
+    results: Vec<FidelityEliteResult>,
+}
+
+/// SQX RetestWithHigherPrecision analogue: retest H1-scout elites on M1 and keep survivors.
+#[tauri::command]
+pub async fn run_fidelity_demo(request: FidelityDemoRequest) -> Result<FidelityDemoView, String> {
+    tauri::async_runtime::spawn_blocking(move || run_fidelity_demo_sync(&request))
+        .await
+        .map_err(|error| format!("fidelity demo task failed: {error}"))?
+}
+
+fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoView, String> {
+    use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
+    use quantforge_eval::evaluate_strategy;
+    use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
+    use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    let return_retention = request.return_retention.unwrap_or(0.80);
+    let trade_retention = request.trade_retention.unwrap_or(0.80);
+    let drawdown_expansion = request.drawdown_expansion.unwrap_or(1.30);
+
+    let bytes = fs::read(&request.databank_path)
+        .map_err(|error| format!("cannot read databank: {error}"))?;
+    let artifact: EvolveArtifact = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("databank JSON is invalid: {error}"))?;
+    verify_artifact(&artifact).map_err(|error| error.to_string())?;
+
+    let h1_metadata = companion_metadata_path(&artifact.source);
+    let h1 = load_data_source(
+        &artifact.source,
+        h1_metadata.as_deref(),
+        if h1_metadata.is_some() {
+            None
+        } else {
+            Some("Etc/UTC")
+        },
+    )?;
+    let m1_metadata = request
+        .m1_metadata_path
+        .clone()
+        .or_else(|| companion_metadata_path(&request.m1_data_path));
+    let m1 = load_data_source(
+        &request.m1_data_path,
+        m1_metadata.as_deref(),
+        if m1_metadata.is_some() {
+            None
+        } else {
+            request.m1_source_timezone.as_deref().or(Some("Etc/UTC"))
+        },
+    )?;
+    let broker = load_bound_broker(&artifact.broker, h1.metadata.as_ref())?;
+    load_bound_broker(&artifact.broker, m1.metadata.as_ref())?;
+
+    // SQX-style: decision OHLC is synthesized from M1 so aggregates always match.
+    let decision = build_decision_from_m1(&m1.dataset, Some(&h1.dataset))?;
+
+    let scout = &artifact.databank.config.scout;
+    let judge = JudgeConfig {
+        initial_balance: scout.initial_balance,
+        costs: scout.costs.clone(),
+        allow_execution_gaps: true,
+    };
+
+    let mut results = Vec::new();
+    let mut keepers = Vec::new();
+    for elite in &artifact.databank.elites {
+        let h1_result = evaluate_strategy(&elite.strategy, &decision, &broker, scout)
+            .map_err(|error| error.to_string());
+        let m1_result = evaluate_strategy_m1(
+            &elite.strategy,
+            &decision,
+            &m1.dataset,
+            &broker,
+            &judge,
+        )
+        .map_err(|error| error.to_string());
+
+        let (passed, reason, row) = match (h1_result, m1_result) {
+            (Ok(h1_eval), Ok(m1_eval)) => {
+                let h1_ret = h1_eval.metrics.return_percent;
+                let m1_ret = m1_eval.metrics.return_percent;
+                let ret_ratio = if h1_ret > 0.0 {
+                    m1_ret / h1_ret
+                } else if m1_ret >= h1_ret {
+                    1.0
+                } else {
+                    0.0
+                };
+                let h1_trades = h1_eval.metrics.trade_count;
+                let m1_trades = m1_eval.metrics.trade_count;
+                let trade_ratio = if h1_trades > 0 {
+                    m1_trades as f64 / h1_trades as f64
+                } else {
+                    1.0
+                };
+                let h1_dd = h1_eval.metrics.max_drawdown_percent;
+                let m1_dd = m1_eval.metrics.max_drawdown_percent;
+                let dd_ok = m1_dd <= h1_dd * drawdown_expansion + 1.0e-9;
+                let passed = ret_ratio >= return_retention && trade_ratio >= trade_retention && dd_ok;
+                let reason = if passed {
+                    "passed SQX-style M1 fidelity band".into()
+                } else if !dd_ok {
+                    format!("M1 DD {m1_dd:.2}% exceeds {drawdown_expansion:.2}× H1 DD")
+                } else if ret_ratio < return_retention {
+                    format!("return retention {ret_ratio:.2} < {return_retention:.2}")
+                } else {
+                    format!("trade retention {trade_ratio:.2} < {trade_retention:.2}")
+                };
+                (
+                    passed,
+                    reason,
+                    FidelityEliteResult {
+                        fingerprint: elite.structural_fingerprint.as_str().into(),
+                        strategy_id: elite.strategy.id.clone(),
+                        passed,
+                        h1_return_percent: h1_ret,
+                        m1_return_percent: m1_ret,
+                        return_retention: ret_ratio,
+                        h1_trades,
+                        m1_trades,
+                        trade_retention: trade_ratio,
+                        h1_drawdown_percent: h1_dd,
+                        m1_drawdown_percent: m1_dd,
+                        reason: String::new(),
+                    },
+                )
+            }
+            (Err(error), _) | (_, Err(error)) => (
+                false,
+                error.clone(),
+                FidelityEliteResult {
+                    fingerprint: elite.structural_fingerprint.as_str().into(),
+                    strategy_id: elite.strategy.id.clone(),
+                    passed: false,
+                    h1_return_percent: 0.0,
+                    m1_return_percent: 0.0,
+                    return_retention: 0.0,
+                    h1_trades: 0,
+                    m1_trades: 0,
+                    trade_retention: 0.0,
+                    h1_drawdown_percent: 0.0,
+                    m1_drawdown_percent: 0.0,
+                    reason: error,
+                },
+            ),
+        };
+        let mut row = row;
+        row.reason = reason;
+        if passed {
+            keepers.push(elite.clone());
+        }
+        results.push(row);
+    }
+
+    let passed = results.iter().filter(|row| row.passed).count();
+    let failed = results.len() - passed;
+    let mut output_path = None;
+
+    if !keepers.is_empty() {
+        let mut bank = artifact.databank.clone();
+        bank.elites = keepers;
+        bank.coverage_map = BTreeMap::new();
+        for elite in &bank.elites {
+            bank.coverage_map.insert(
+                niche_label(&elite.niche),
+                elite.structural_fingerprint.clone(),
+            );
+        }
+        bank.config.require_m1_precision = true;
+        bank.validate_integrity()
+            .map_err(|error| error.to_string())?;
+
+        let mut config = artifact.manifest.recipe.config.clone();
+        config.insert("research_grade".into(), json!(false));
+        config.insert("m1_fidelity_verified".into(), json!(true));
+        config.insert("require_m1_precision".into(), json!(true));
+        config.insert(
+            "fidelity_source_databank".into(),
+            json!(display_path(Path::new(&request.databank_path))),
+        );
+        config.insert(
+            "discover_config".into(),
+            serde_json::to_value(&bank.config).map_err(|error| error.to_string())?,
+        );
+
+        let manifest = RunManifest::new(
+            "evolve",
+            RunRecipe {
+                data_hash: Some(bank.data_hash.clone()),
+                broker_spec_hash: Some(bank.broker_spec_hash.clone()),
+                grammar_version: Some(quantforge_discover::GRAMMAR_VERSION.into()),
+                seed: Some(bank.config.seed),
+                config,
+                override_flags: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+        let filtered = EvolveArtifact {
+            manifest,
+            source: artifact.source.clone(),
+            broker: artifact.broker.clone(),
+            metadata_hash: artifact.metadata_hash.clone(),
+            data_quality: artifact.data_quality.clone(),
+            coverage: bank.coverage(),
+            qd_score: bank.qd_score(),
+            databank: bank,
+        };
+
+        if Path::new(&request.output_path).exists() {
+            write_json_versioned(&request.output_path, &filtered)
+                .map_err(|error| error.to_string())?;
+        } else {
+            write_json_new(&request.output_path, &filtered).map_err(|error| error.to_string())?;
+        }
+        output_path = Some(display_path(Path::new(&request.output_path)));
+    }
+
+    Ok(FidelityDemoView {
+        evaluated: results.len(),
+        passed,
+        failed,
+        output_path,
+        results,
+    })
 }

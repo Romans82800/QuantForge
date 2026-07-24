@@ -103,14 +103,67 @@ pub async fn run_challenge_workflow(request: ChallengeRequest) -> Result<Challen
 }
 
 fn strategy_paths(request: &ChallengeRequest) -> Result<Vec<String>, String> {
-    let mut paths = request.strategy_paths.clone();
-    if paths.is_empty() && !request.strategy_path.trim().is_empty() {
-        paths.push(request.strategy_path.clone());
+    let mut raw = request.strategy_paths.clone();
+    if !request.strategy_path.trim().is_empty()
+        && !raw.iter().any(|path| path == &request.strategy_path)
+    {
+        raw.push(request.strategy_path.clone());
     }
-    if paths.is_empty() {
-        return Err("at least one strategy IR path is required".into());
+    if raw.is_empty() {
+        return Err("at least one strategy IR path (or batch index) is required".into());
     }
-    Ok(paths)
+
+    let mut expanded = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for path in raw {
+        for strategy_path in expand_strategy_input(&path)? {
+            if seen.insert(strategy_path.clone()) {
+                expanded.push(strategy_path);
+            }
+        }
+    }
+    if expanded.is_empty() {
+        return Err("batch index contained no strategy paths".into());
+    }
+    Ok(expanded)
+}
+
+/// Accept either a Strategy IR JSON or a Databank batch index
+/// (`quantforge-strategy-batch.json` with `strategies[].path`).
+fn expand_strategy_input(path: &str) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{path} is not valid JSON: {error}"))?;
+
+    if let Some(strategies) = value.get("strategies").and_then(|entry| entry.as_array()) {
+        let mut paths = Vec::with_capacity(strategies.len());
+        for (index, entry) in strategies.iter().enumerate() {
+            let strategy_path = entry
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!("{path} strategies[{index}] is missing a string \"path\" field")
+                })?;
+            if !Path::new(strategy_path).is_file() {
+                return Err(format!(
+                    "batch entry strategies[{index}] path does not exist: {strategy_path}"
+                ));
+            }
+            paths.push(strategy_path.to_owned());
+        }
+        if paths.is_empty() {
+            return Err(format!("{path} is a batch index with an empty strategies list"));
+        }
+        return Ok(paths);
+    }
+
+    if value.get("id").is_some() {
+        return Ok(vec![path.to_owned()]);
+    }
+
+    Err(format!(
+        "{path} is neither a Strategy IR (missing \"id\") nor a QuantForge batch index (missing \"strategies\")"
+    ))
 }
 
 fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, String> {

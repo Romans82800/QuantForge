@@ -22,14 +22,16 @@ import {
   exportEliteStrategy,
   exportEliteStrategies,
   getDiscoverJob,
+  getElitePartitionEquity,
   inspectData,
   inspectVault,
+  listSymbols,
   loadDatabankPath,
   loadElite,
   pauseDiscover,
   recordIncubation,
   resumeDiscover,
-  runChallenge,
+  runFidelityDemo,
   runM1Judge,
   runSealedFinal,
   startIncubation,
@@ -39,8 +41,6 @@ import {
 } from "./api";
 import type {
   AssembleEvidenceRequest,
-  ChallengeRequest,
-  ChallengeView,
   DatabankWorkspace,
   DataLabView,
   DeployRequest,
@@ -49,6 +49,7 @@ import type {
   DiscoverRequest,
   EliteDetail,
   EliteRow,
+  FidelityDemoView,
   EliteSort,
   ExportRequest,
   ExportView,
@@ -62,16 +63,19 @@ import type {
   IndicatorParityView,
   ParityRequest,
   ParityView,
+  PartitionEquityView,
   PortfolioRequest,
   PortfolioView,
   SealedRequest,
   SealedView,
+  SymbolPack,
   VaultView,
   WorkspaceName,
 } from "./types";
 import {
   bindDiscoverTimezone,
   discoverProgress,
+  discoverProgressLabel,
   filterAndSortElites,
   formatNumber,
   selectionBiasTone,
@@ -82,7 +86,6 @@ const workspaces: { name: WorkspaceName; enabled: boolean }[] = [
   { name: "Home", enabled: true },
   { name: "Databank", enabled: true },
   { name: "Discover", enabled: true },
-  { name: "Challenge", enabled: true },
   { name: "Vault", enabled: true },
   { name: "Data Lab", enabled: true },
   { name: "Parity Lab", enabled: true },
@@ -92,9 +95,8 @@ const workspaces: { name: WorkspaceName; enabled: boolean }[] = [
 
 const workspaceTitles: Record<WorkspaceName, string> = {
   Home: "Research cockpit",
-  Databank: "Quality-diversity archive",
+  Databank: "IS / OOS1 / OOS2 strategy lab",
   Discover: "Deterministic strategy discovery",
-  Challenge: "Robustness challenge",
   Vault: "Certified strategy vault",
   "Data Lab": "MT5 data diagnostics",
   "Parity Lab": "External execution parity",
@@ -124,7 +126,6 @@ function App() {
   const [sort, setSort] = useState<EliteSort>("evidence");
   const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
-  const [challengePreset, setChallengePreset] = useState<Partial<ChallengeRequest>>({});
   const [judgePreset, setJudgePreset] = useState<Partial<JudgeRequest>>({});
   const [exportPreset, setExportPreset] = useState<Partial<ExportRequest>>({});
   const [batchSelection, setBatchSelection] = useState<Set<string>>(new Set());
@@ -225,45 +226,6 @@ function App() {
           `Exported ${result.strategyPaths.length} strategies and batch index to ${result.directory}`,
         );
       }
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatchBusy(false);
-    }
-  }
-
-  async function continueToChallenge(fingerprint: string) {
-    await sendFingerprintsToChallenge([fingerprint]);
-  }
-
-  async function sendSelectedToChallenge() {
-    await sendFingerprintsToChallenge([...batchSelection]);
-  }
-
-  async function sendFingerprintsToChallenge(fingerprints: string[]) {
-    if (!workspace || fingerprints.length === 0) return;
-    setBatchBusy(true);
-    setError(null);
-    setBatchMessage(null);
-    try {
-      const exported = await exportEliteStrategies(fingerprints);
-      if (!exported || exported.strategyPaths.length === 0) return;
-      setChallengePreset({
-        dataPath: workspace.dataPath,
-        metadataPath: workspace.metadataPath,
-        sourceTimezone: workspace.metadataPath ? null : "Etc/UTC",
-        strategyPath: exported.strategyPaths[0] ?? "",
-        strategyPaths: exported.strategyPaths,
-        brokerPath: workspace.brokerPath,
-        evaluationsTouched: workspace.selectionBias.evaluationCount,
-        commissionPerLotRoundTurn: workspace.commissionPerLotRoundTurn,
-        slippagePointsPerSide: workspace.slippagePointsPerSide,
-        initialBalance: workspace.initialBalance,
-      });
-      setBatchMessage(
-        `Queued ${exported.strategyPaths.length} strategies for parallel Challenge.`,
-      );
-      setActiveWorkspace("Challenge");
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -404,12 +366,6 @@ function App() {
             onOpenDatabank={openDatabankPath}
             preset={discoverPreset}
           />
-        ) : activeWorkspace === "Challenge" ? (
-          <ChallengeWorkspace
-            onError={setError}
-            workspace={workspace}
-            preset={challengePreset}
-          />
         ) : activeWorkspace === "Parity Lab" ? (
           <ParityWorkspace
             exportPreset={exportPreset}
@@ -446,6 +402,10 @@ function App() {
                   <dd className={`quality-${workspace.qualityGrade}`}>
                     {workspace.qualityGrade} · {workspace.qualityScore}
                   </dd>
+                </div>
+                <div>
+                  <dt>Grade</dt>
+                  <dd>{workspace.researchGrade ? "research (H1 scout)" : workspace.m1FidelityVerified ? "M1 verified" : "promotion"}</dd>
                 </div>
               </dl>
             </section>
@@ -486,6 +446,14 @@ function App() {
               </div>
               <p>{workspace.selectionBias.message}</p>
             </section>
+
+            {workspace.researchGrade && (
+              <FidelityDemoPanel
+                onError={setError}
+                onLoaded={openDatabankPath}
+                workspace={workspace}
+              />
+            )}
 
             <div className="main-grid">
               <div className="primary-column">
@@ -601,15 +569,6 @@ function App() {
                       >
                         {batchBusy ? "Exporting…" : `Export ${batchSelection.size} selected`}
                       </button>
-                      <button
-                        className="primary"
-                        disabled={batchBusy || batchSelection.size === 0 || !workspace}
-                        onClick={() => void sendSelectedToChallenge()}
-                      >
-                        {batchBusy
-                          ? "Preparing…"
-                          : `Challenge ${batchSelection.size} selected (parallel)`}
-                      </button>
                     </div>
                   </div>
                   {batchMessage && <p className="batch-message">{batchMessage}</p>}
@@ -629,7 +588,6 @@ function App() {
                 onError={setError}
                 tab={detailTab}
                 onTab={setDetailTab}
-                onChallenge={continueToChallenge}
                 onParity={continueToParity}
               />
             </div>
@@ -689,29 +647,22 @@ function HomeWorkspace({
         />
         <WorkflowCard
           action={hasDatabank ? "View loaded archive" : "Choose archive"}
-          description="Explore behavioral coverage, selection-bias counts, evidence, novelty and the exact strategy IR."
-          eyebrow="03 / Interrogate"
+          description="Inspect elites with IS / OOS1 / OOS2 equity on one chart. Pipeline: IS robustness → OOS1 expectancy ≥ 0.7× IS → databank. OOS2 display-only."
+          eyebrow="03 / Databank lab"
           onClick={hasDatabank ? () => onNavigate("Databank") : onOpen}
           title="Databank"
         />
         <WorkflowCard
-          action="Run Challenge"
-          description="Select any number of databank elites. Challenge stress-tests them in parallel on OOS1 (folds, costs, Monte Carlo, neighborhood). OOS2 stays sealed for one-shot final."
-          eyebrow="04 / Challenge"
-          onClick={() => onNavigate("Challenge")}
-          title="Challenge"
-        />
-        <WorkflowCard
           action="Open Parity Lab"
           description="Replay decisions on M1, generate the guarded MT5 expert, and compare trade-level and equity-path output with Strategy Tester."
-          eyebrow="05 / Reconcile"
+          eyebrow="04 / Reconcile"
           onClick={() => onNavigate("Parity Lab")}
           title="Parity Lab"
         />
         <WorkflowCard
           action="Open Vault"
           description="Admit only complete evidence chains, inspect immutable Certified entries, and hand a verified candidate to deployment packaging."
-          eyebrow="06 / Certify"
+          eyebrow="05 / Certify"
           onClick={() => onNavigate("Vault")}
           title="Vault + Deploy"
         />
@@ -789,15 +740,24 @@ function DataLabWorkspace({
           <span className="read-only-badge">Read-only</span>
         </div>
         <div className="form-stack">
-          <PathField label="OHLC data" path={dataPath} choose={chooseDataFile} onChange={setDataPath} required />
-          <PathField label="Exporter metadata" path={metadataPath} choose={chooseMetadataFile} onChange={setMetadataPath} />
-          {!metadataPath && (
-            <label className="field-row">
-              <span>Source timezone <small>required without metadata</small></span>
-              <input value={sourceTimezone} onChange={(event) => setSourceTimezone(event.target.value)} placeholder="Etc/UTC" />
-            </label>
-          )}
-          <PathField label="Broker profile" path={brokerPath} choose={chooseBrokerFile} onChange={setBrokerPath} />
+          <SymbolSelect
+            onError={onError}
+            onSelect={(symbol) => {
+              setDataPath(symbol.dataPath);
+              setMetadataPath(symbol.metadataPath);
+              setSourceTimezone("Etc/UTC");
+              setBrokerPath(symbol.brokerPath);
+            }}
+            selectedDataPath={dataPath}
+          />
+          <details className="advanced-settings">
+            <summary>Bound paths (auto-filled)</summary>
+            <div className="form-stack compact">
+              <label className="field-row"><span>H1</span><code>{dataPath || "—"}</code></label>
+              <label className="field-row"><span>Metadata</span><code>{metadataPath || "—"}</code></label>
+              <label className="field-row"><span>Broker</span><code>{brokerPath || "—"}</code></label>
+            </div>
+          </details>
         </div>
         <div className="form-footer">
           <p>Metadata and a manual timezone are mutually exclusive. Adding a broker profile also verifies symbol, timezone and currency bindings.</p>
@@ -888,20 +848,36 @@ function DiscoverWorkspace({
     m1SourceTimezone: "Etc/UTC",
     brokerPath: "",
     databankPath: "",
-    generations: 5,
+    generations: 0,
+    runUntilStopped: true,
     initialCandidates: 500,
     batchSize: 200,
     correlationThreshold: 0.85,
     noveltyWeight: 10,
     seed: 42,
-    minimumTrades: 20,
-    maximumDrawdownPercent: 30,
+    minimumTrades: 10,
+    maximumDrawdownPercent: 40,
     minimumReturnPercent: 0,
     minimumProfitFactor: 1,
     minimumReturnDrawdown: 0,
+    depositMinimumTrades: 20,
+    depositMaximumDrawdownPercent: 30,
+    depositMinimumReturnPercent: 0,
+    depositMinimumProfitFactor: 1,
+    depositMinimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.95,
     oos1ExpectancyRetention: 0.7,
+    requireM1Precision: false,
+    simpleExits: true,
     flattenAt22: false,
+    maxOneEntryPerDay: true,
+    mutateAfterElites: 300,
+    randomFillFraction: 0.4,
+    workerThreads: 11,
+    requireM1Robustness: true,
+    robustnessFolds: 3,
+    robustnessMonteCarloTrials: 250,
+    robustnessNeighborhoodSamples: 8,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
     fallbackSpreadPoints: null,
@@ -940,7 +916,10 @@ function DiscoverWorkspace({
     setBusy(true);
     onError(null);
     try {
-      const sourceBoundForm = bindDiscoverTimezone(form);
+      const sourceBoundForm = bindDiscoverTimezone({
+        ...form,
+        promotionSplit: true,
+      });
       const request = form.mode === "continue"
         ? {
             ...sourceBoundForm,
@@ -954,9 +933,24 @@ function DiscoverWorkspace({
             minimumReturnPercent: null,
             minimumProfitFactor: null,
             minimumReturnDrawdown: null,
+            depositMinimumTrades: null,
+            depositMaximumDrawdownPercent: null,
+            depositMinimumReturnPercent: null,
+            depositMinimumProfitFactor: null,
+            depositMinimumReturnDrawdown: null,
             minimumM1ReturnRetention: null,
             oos1ExpectancyRetention: null,
+            requireM1Precision: null,
+            simpleExits: null,
             flattenAt22: null,
+            maxOneEntryPerDay: null,
+            mutateAfterElites: null,
+            randomFillFraction: null,
+            workerThreads: null,
+            requireM1Robustness: null,
+            robustnessFolds: null,
+            robustnessMonteCarloTrials: null,
+            robustnessNeighborhoodSamples: null,
             commissionPerLotRoundTurn: null,
             slippagePointsPerSide: null,
             fallbackSpreadPoints: null,
@@ -984,7 +978,19 @@ function DiscoverWorkspace({
     }
   }
 
-  const progress = discoverProgress(job?.completedGenerations ?? 0, job?.requestedGenerations ?? 0);
+  const progress = discoverProgress(
+    job?.completedGenerations ?? 0,
+    job?.requestedGenerations ?? 0,
+    job?.runUntilStopped ?? form.runUntilStopped ?? true,
+  );
+  const progressLabel = discoverProgressLabel(
+    job?.completedGenerations ?? 0,
+    job?.requestedGenerations ?? 0,
+    job?.runUntilStopped ?? form.runUntilStopped ?? true,
+  );
+  const lookedAt = job?.evaluationCount ?? 0;
+  const accepted = job?.acceptedTotal ?? 0;
+  const rejected = job?.rejectedTotal ?? 0;
   return (
     <div className="discover-layout">
       <section className="panel discover-form">
@@ -997,56 +1003,134 @@ function DiscoverWorkspace({
         </div>
         <fieldset disabled={active || busy}>
           <div className="form-stack compact">
-            <PathField label="OHLC data" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required />
-            <PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : current.sourceTimezone ?? "Etc/UTC" }))} />
-            {!form.metadataPath && <label className="field-row"><span>Source timezone</span><input value={form.sourceTimezone ?? ""} onChange={(event) => update("sourceTimezone", event.target.value || null)} /></label>}
-            <PathField label="M1 execution data" path={form.m1DataPath} choose={chooseDataFile} onChange={(value) => update("m1DataPath", value)} required />
-            <PathField label="M1 exporter metadata" path={form.m1MetadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, m1MetadataPath: value || null, m1SourceTimezone: value ? null : current.m1SourceTimezone ?? "Etc/UTC" }))} />
-            {!form.m1MetadataPath && <label className="field-row"><span>M1 source timezone</span><input value={form.m1SourceTimezone ?? ""} onChange={(event) => update("m1SourceTimezone", event.target.value || null)} /></label>}
-            <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
-            <PathField label={form.mode === "new" ? "New databank" : "Existing databank"} path={form.databankPath} choose={chooseOutput} onChange={(value) => update("databankPath", value)} required />
+            <SymbolSelect
+              disabled={active || busy}
+              onError={onError}
+              onSelect={(symbol) => {
+                setForm((current) => ({
+                  ...current,
+                  dataPath: symbol.dataPath,
+                  metadataPath: symbol.metadataPath,
+                  sourceTimezone: null,
+                  m1DataPath: symbol.m1DataPath,
+                  m1MetadataPath: symbol.m1MetadataPath,
+                  m1SourceTimezone: null,
+                  brokerPath: symbol.brokerPath,
+                  databankPath:
+                    current.mode === "new" && !current.databankPath
+                      ? symbol.defaultDatabankPath
+                      : current.databankPath || symbol.defaultDatabankPath,
+                }));
+              }}
+              selectedDataPath={form.dataPath}
+            />
+            <PathField
+              label={form.mode === "new" ? "New databank" : "Existing databank"}
+              path={form.databankPath}
+              choose={chooseOutput}
+              onChange={(value) => update("databankPath", value)}
+              required
+            />
+            <details className="advanced-settings">
+              <summary>Bound paths (auto-filled from symbol)</summary>
+              <div className="form-stack compact">
+                <label className="field-row"><span>H1</span><code>{form.dataPath || "—"}</code></label>
+                <label className="field-row"><span>H1 metadata</span><code>{form.metadataPath || "—"}</code></label>
+                <label className="field-row"><span>M1</span><code>{form.m1DataPath || "—"}</code></label>
+                <label className="field-row"><span>M1 metadata</span><code>{form.m1MetadataPath || "—"}</code></label>
+                <label className="field-row"><span>Broker</span><code>{form.brokerPath || "—"}</code></label>
+              </div>
+            </details>
           </div>
           <div className="numeric-grid core-numbers">
-            <NumberField label="Generations" value={form.generations} onChange={(value) => update("generations", value ?? 1)} min={1} />
+            <label className="check-field discover-split" style={{ gridColumn: "1 / -1" }}>
+              <input
+                type="checkbox"
+                checked={form.runUntilStopped ?? true}
+                onChange={(event) => update("runUntilStopped", event.target.checked)}
+              />
+              <span>Run until stopped (SQX-style continuous bank growth)</span>
+            </label>
+            <NumberField
+              label={form.runUntilStopped ? "Soft generation budget (0 = none)" : "Generations"}
+              value={form.generations}
+              onChange={(value) => update("generations", value ?? 0)}
+              min={0}
+            />
             {form.mode === "new" && <>
               <NumberField label="Initial candidates" value={form.initialCandidates} onChange={(value) => update("initialCandidates", value)} min={1} />
               <NumberField label="Batch / generation" value={form.batchSize} onChange={(value) => update("batchSize", value)} min={1} />
               <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value)} min={0} />
+              <NumberField label="Worker threads (0 = all)" value={form.workerThreads} onChange={(value) => update("workerThreads", value)} min={0} />
+              <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
+              <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
               <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
-              <NumberField label="OOS2 sealed reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              <NumberField label="OOS2 display reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
             </>}
           </div>
           {form.mode === "new" ? (
-            <details className="advanced-settings">
-              <summary>Gates, diversity and cost model</summary>
-              <div className="numeric-grid">
-                <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
-                <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
-                <NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value)} min={0} />
-                <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
-                <NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value)} step={0.1} />
-                <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
-                <NumberField label="Minimum return / DD" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
-                <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
-                <NumberField label="OOS1 expectancy retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
-                <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
-                <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
-                <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
-                <NumberField label="Maximum spread points" value={form.maxSpreadPoints} onChange={(value) => update("maxSpreadPoints", value)} step={0.1} optional />
-                <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value)} min={1} />
-              </div>
-            </details>
+            <>
+              <details className="advanced-settings" open>
+                <summary>Scout gates — random search screen</summary>
+                <p className="immutable-note">Cheap H1 filter. Keep these loose so the databank pot can fill before breeding.</p>
+                <div className="numeric-grid">
+                  <NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value)} min={0} />
+                  <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
+                  <NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value)} step={0.1} />
+                  <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
+                  <NumberField label="Minimum return / DD" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
+                </div>
+              </details>
+              <details className="advanced-settings" open>
+                <summary>Deposit gates — enter the initial pot</summary>
+                <p className="immutable-note">H1 metrics to join the breeding pot. Databank needs M1 IS robustness then OOS1 ≥0.7×.</p>
+                <div className="numeric-grid">
+                  <NumberField label="Minimum trades" value={form.depositMinimumTrades} onChange={(value) => update("depositMinimumTrades", value)} min={0} />
+                  <NumberField label="Maximum drawdown %" value={form.depositMaximumDrawdownPercent} onChange={(value) => update("depositMaximumDrawdownPercent", value)} step={0.1} />
+                  <NumberField label="Minimum return %" value={form.depositMinimumReturnPercent} onChange={(value) => update("depositMinimumReturnPercent", value)} step={0.1} />
+                  <NumberField label="Minimum profit factor" value={form.depositMinimumProfitFactor} onChange={(value) => update("depositMinimumProfitFactor", value)} step={0.01} />
+                  <NumberField label="Minimum return / DD" value={form.depositMinimumReturnDrawdown} onChange={(value) => update("depositMinimumReturnDrawdown", value)} min={0} step={0.05} />
+                </div>
+              </details>
+              <details className="advanced-settings" open>
+                <summary>M1 robustness — on IS, before OOS1</summary>
+                <p className="immutable-note">SQX-style: M1 WFO/MC/±10% on IS only. OOS1 0.7× expectancy retention runs after. Pot fills on deposit; databank needs robustness + OOS1.</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood before deposit</span></label>
+                <div className="numeric-grid">
+                  <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
+                  <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
+                  <NumberField label="Param samples (±10%)" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
+                </div>
+              </details>
+              <details className="advanced-settings">
+                <summary>Diversity and cost model</summary>
+                <div className="numeric-grid">
+                  <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
+                  <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
+                  <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
+                  <NumberField label="OOS1 expectancy retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
+                  <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
+                  <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
+                  <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
+                  <NumberField label="Maximum spread points" value={form.maxSpreadPoints} onChange={(value) => update("maxSpreadPoints", value)} step={0.1} optional />
+                  <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value)} min={1} />
+                </div>
+              </details>
+            </>
           ) : (
             <p className="immutable-note">Continuation loads the grammar, seed, gates and cost model from the verified databank. Only the generation count can change.</p>
           )}
           {form.mode === "new" && <>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.promotionSplit ?? false} onChange={(event) => update("promotionSplit", event.target.checked)} /><span>Train on IS only; pick elites when OOS1 expectancy ≥ retention × IS (default 0.7×). OOS2 stays sealed.</span></label>
+            <p className="immutable-note">SQX-style default: H1 Selected-TF scout (fast). Turn on M1 precision only if you want in-loop fidelity. OOS1 pick still applies. OOS2 never used in Discover.</p>
+            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>H1 scout only (SQX Selected TF — defer M1 to Fidelity demo)</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.simpleExits ?? true} onChange={(event) => update("simpleExits", event.target.checked)} /><span>Simple exits (market + SL/TP + max 16 bars; no trail/BE/stop-limit)</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one signal/day (first market or pending locks the day; entries only 02:00–19:00 broker)</span></label>
             <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Close positions and cancel pending orders at 22:00 broker time</span></label>
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Every strategy risks a fixed $1,000 per trade. Search scores IS; deposit requires OOS1 expectancy retention. H1 screens quickly; survivors must retain edge on M1. Never touch OOS2 during Discover.</p>
-          <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
+          <p>Pipeline: H1 scout → deposit → initial pot → M1 robustness on IS → OOS1 (≥0.7× IS expectancy) → databank. Expectancy shown in R ($1,000 risk).</p>
+          <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath || (!(form.runUntilStopped ?? true) && form.generations < 1)} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
         </div>
       </section>
 
@@ -1055,19 +1139,70 @@ function DiscoverWorkspace({
         <div className="job-body">
           <p className="job-message">{job?.message ?? "Configure a search to start the Rust discovery worker."}</p>
           <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
-          <div className="progress-label"><span>{job?.completedGenerations ?? 0} / {job?.requestedGenerations ?? 0} generations this run</span><strong>{progress.toFixed(0)}%</strong></div>
+          <div className="progress-label"><span>{progressLabel}</span><strong>{(job?.runUntilStopped && (job?.requestedGenerations ?? 0) <= 0) ? "∞" : `${progress.toFixed(0)}%`}</strong></div>
           <div className="job-kpis">
-            <Kpi label="Evaluations" value={formatNumber(job?.evaluationCount ?? 0)} note="Persistent selection-bias count" />
-            <Kpi label="Coverage" value={formatNumber(job?.coverage ?? 0)} note="Occupied behavioral niches" />
-            <Kpi label="QD score" value={formatNumber(job?.qdScore ?? 0, 2)} note="Positive evidence mass" />
-            <Kpi label="Rejected" value={formatNumber(job?.rejectedTotal ?? 0)} note={`${formatNumber((job?.rejectedClone ?? 0) + (job?.rejectedCorrelated ?? 0))} clone + correlation`} />
+            <Kpi label="Looked at" value={formatNumber(lookedAt)} note="Candidates evaluated" />
+            <Kpi
+              label="Initial pot"
+              value={formatNumber(job?.potElites ?? 0)}
+              note={`${formatNumber(job?.potNewNiches ?? 0)} new · ${job?.breedingActive ? "breeding" : `fill → ${job?.mutateAfterElites ?? 300}`}`}
+            />
+            <Kpi
+              label="Databank"
+              value={formatNumber(job?.databankElites ?? job?.coverage ?? 0)}
+              note="Passed M1 + WFO + MC + params"
+            />
+            <Kpi label="Accepted" value={formatNumber(accepted)} note="Pot + databank events" />
+            <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
+            <Kpi label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0, 0)} note={`${formatNumber(job?.acceptsPerHour ?? 0, 1)} accepts/hr · ${job?.workerThreads ?? "—"} threads`} />
+            <Kpi label="QD score" value={formatNumber(job?.qdScore ?? 0, 2)} note="Databank evidence mass" />
+          </div>
+          <div className="reject-funnel">
+            <p className="eyebrow">Reject reasons</p>
+            <ul>
+              <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
+              <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
+              <li><span>OOS1 pick</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
+              <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
+              <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
+              <li><span>Param ±10%</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
+              <li><span>M1 precision</span><strong>{formatNumber(job?.rejectedPrecision ?? 0)}</strong></li>
+              <li><span>Clone</span><strong>{formatNumber(job?.rejectedClone ?? 0)}</strong></li>
+              <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
+              <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
+              <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
+            </ul>
+            {(job?.bestIsExpectancy != null || job?.bestOos1Expectancy != null) && (
+              <p className="funnel-best">
+                Best banked expectancy (R) — IS {job?.bestIsExpectancy != null ? formatNumber(job.bestIsExpectancy, 2) : "—"}
+                {" · "}
+                OOS1 {job?.bestOos1Expectancy != null ? formatNumber(job.bestOos1Expectancy, 2) : "—"}
+                {" · "}
+                $1,000 risk → 0.35R = $350/trade
+              </p>
+            )}
+            {(job?.m1BarsRepaired ?? 0) > 0 && (
+              <p className="funnel-best">Aligned {formatNumber(job!.m1BarsRepaired)} H1 bars to M1 OHLC before search.</p>
+            )}
+            {(job?.topEvaluationErrors?.length ?? 0) > 0 && (
+              <div className="eval-errors">
+                <p className="eyebrow">Top evaluation errors</p>
+                <ul>
+                  {job!.topEvaluationErrors.map((entry) => (
+                    <li key={entry.message}><code>{entry.message}</code><strong>{formatNumber(entry.count)}</strong></li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
           {active && <div className="job-controls">
             {job?.status === "running" ? <button className="secondary" onClick={() => void control(pauseDiscover)}>Pause</button> : <button className="secondary" onClick={() => void control(resumeDiscover)}>Resume</button>}
             <button className="danger" onClick={() => void control(stopDiscover)}>Stop & checkpoint</button>
-            <small>Pause and stop take effect at a generation boundary.</small>
+            <small>Pause and stop take effect at a generation boundary. Elites are written to the databank as soon as they pass.</small>
           </div>}
           {job?.status === "completed" && job.outputPath && <div className="completion-card"><div><span>Checkpoint</span><code>{job.outputPath}</code></div><button className="primary" onClick={() => onOpenDatabank(job.outputPath!)}>Open in Databank</button></div>}
+          {job?.status === "completed" && !job.outputPath && <div className="job-empty-note">{job.message}</div>}
           {job?.status === "failed" && <div className="job-error">{job.message}</div>}
         </div>
       </section>
@@ -1075,174 +1210,53 @@ function DiscoverWorkspace({
   );
 }
 
-function ChallengeWorkspace({
+function SymbolSelect({
+  disabled = false,
   onError,
-  preset,
-  workspace,
+  onSelect,
+  selectedDataPath,
 }: {
+  disabled?: boolean;
   onError: (message: string | null) => void;
-  preset: Partial<ChallengeRequest>;
-  workspace: DatabankWorkspace | null;
+  onSelect: (symbol: SymbolPack) => void;
+  selectedDataPath: string;
 }) {
-  const [form, setForm] = useState<ChallengeRequest>({
-    dataPath: "",
-    metadataPath: null,
-    sourceTimezone: "Etc/UTC",
-    strategyPath: "",
-    strategyPaths: [],
-    brokerPath: "",
-    outputDirectory: "",
-    validationFraction: 0.2,
-    sealedFraction: 0.2,
-    evaluationsTouched: workspace?.selectionBias.evaluationCount ?? 1,
-    commissionPerLotRoundTurn: 7,
-    slippagePointsPerSide: 0,
-    fallbackSpreadPoints: null,
-    maxSpreadPoints: null,
-    initialBalance: 100000,
-    folds: 5,
-    monteCarloTrials: 1000,
-    neighborhoodSamples: 20,
-    seed: 42,
-  });
-  const [result, setResult] = useState<ChallengeView | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [symbols, setSymbols] = useState<SymbolPack[]>([]);
+  const [selected, setSelected] = useState("");
   useEffect(() => {
-    setForm((current) => ({ ...current, ...preset }));
-  }, [preset]);
-  function update<K extends keyof ChallengeRequest>(key: K, value: ChallengeRequest[K]) {
-    setForm((current) => ({ ...current, [key]: value }));
-  }
-  const queuedCount = form.strategyPaths.length || (form.strategyPath ? 1 : 0);
-  async function run() {
-    setBusy(true); setResult(null); onError(null);
-    try {
-      const strategyPaths =
-        form.strategyPaths.length > 0
-          ? form.strategyPaths
-          : form.strategyPath
-            ? [form.strategyPath]
-            : [];
-      setResult(
-        await runChallenge({
-          ...form,
-          strategyPath: strategyPaths[0] ?? "",
-          strategyPaths,
-        }),
-      );
-    }
-    catch (reason) { onError(String(reason)); }
-    finally { setBusy(false); }
-  }
-  return <div className="tool-content promotion-layout">
-    <section className="panel setup-panel">
-      <div className="panel-heading"><div><p className="eyebrow">Promotion gate · OOS1 battery</p><h2>Challenge any number of databank elites in parallel</h2></div><span className="read-only-badge">No-clobber</span></div>
-      <div className="form-stack compact">
-        <PathField label="Decision OHLC" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required />
-        <PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : current.sourceTimezone ?? "Etc/UTC" }))} />
-        {!form.metadataPath && <label className="field-row"><span>Source timezone</span><input value={form.sourceTimezone ?? ""} onChange={(event) => update("sourceTimezone", event.target.value || null)} /></label>}
-        <PathField label="Primary strategy IR (optional if batch queued)" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} />
-        <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
-        <PathField label="New Challenge directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create Challenge directory", "quantforge-challenge")} onChange={(value) => update("outputDirectory", value)} required />
-      </div>
-      {form.strategyPaths.length > 0 && (
-        <div className="batch-message">
-          Queued <strong>{form.strategyPaths.length}</strong> strategies for parallel OOS1 Challenge.
-          <ul className="blocker-list">
-            {form.strategyPaths.slice(0, 12).map((path) => (
-              <li key={path}><code>{path}</code></li>
-            ))}
-            {form.strategyPaths.length > 12 && <li>…and {form.strategyPaths.length - 12} more</li>}
-          </ul>
-        </div>
-      )}
-      <div className="numeric-grid">
-        <NumberField label="OOS1 fraction" value={form.validationFraction} onChange={(value) => update("validationFraction", value ?? .2)} step={.05} />
-        <NumberField label="OOS2 sealed fraction" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value ?? .2)} step={.05} />
-        <NumberField label="Evaluations touched" value={form.evaluationsTouched} onChange={(value) => update("evaluationsTouched", value ?? 1)} min={1} />
-        <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} />
-        <NumberField label="Folds" value={form.folds} onChange={(value) => update("folds", value ?? 5)} min={2} />
-        <NumberField label="Monte Carlo trials" value={form.monteCarloTrials} onChange={(value) => update("monteCarloTrials", value ?? 1000)} min={1} />
-        <NumberField label="Neighborhood samples" value={form.neighborhoodSamples} onChange={(value) => update("neighborhoodSamples", value ?? 20)} min={1} />
-        <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} />
-        <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
-      </div>
-      <div className="form-footer"><p>Default freeze is IS 60% / OOS1 20% / OOS2 20%. Challenge stress-tests on <strong>OOS1 only</strong>. OOS2 stays sealed until the one-shot sealed-final step. Deflated Sharpe floor is enforced (≥ 0).</p><button className="primary" disabled={busy || !form.dataPath || queuedCount === 0 || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? `Stress testing ${queuedCount}…` : `Run Challenge on ${queuedCount}`}</button></div>
-    </section>
-    {result ? <ChallengeResult result={result} /> : <WorkspacePrimer title="No candidates challenged yet" copy="From Databank, select any number of elites and click Challenge selected. QuantForge runs purged folds, cost shocks, Monte Carlo and neighborhood tests in parallel on OOS1." />}
-    <PromotionLedgerPanels onError={onError} />
-  </div>;
-}
-
-function ChallengeResult({ result }: { result: ChallengeView }) {
-  return <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}>
-    <div className="result-hero"><div><p className="eyebrow">Challenge result</p><h2>{result.passedCount}/{result.totalCount} passed OOS1 battery</h2></div><span className="grade-pill">{result.grade}</span></div>
-    <div className="job-kpis">
-      <Kpi label="Passed" value={formatNumber(result.passedCount)} note={`${formatNumber(result.failedCount)} failed`} />
-      <Kpi label="OOS1 trades (first)" value={formatNumber(result.validationTrades)} note={`${formatNumber(result.returnPercent, 2)}% return`} />
-      <Kpi label="Purged folds" value={`${result.passingFolds} / ${result.totalFolds}`} note="First candidate" />
-      <Kpi label="Cost shocks" value={`${result.passingCostShocks} / ${result.totalCostShocks}`} note="First candidate" />
-    </div>
-    <div className="partition-strip"><span>IS <strong>{formatNumber(result.isBars ?? result.developmentBars)}</strong></span><span>OOS1 <strong>{formatNumber(result.oos1Bars ?? result.validationBars)}</strong></span><span>OOS2 sealed <strong>{formatNumber(result.oos2Bars ?? result.sealedBars)}</strong></span></div>
-    <ArtifactPath label="Split plan" value={result.splitPlanPath} />
-    {result.results?.length > 0 && (
-      <div className="elite-table-wrap">
-        <table className="elite-table">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Result</th>
-              <th>Return</th>
-              <th>DD</th>
-              <th>Folds</th>
-              <th>Costs</th>
-              <th>Artifact</th>
-            </tr>
-          </thead>
-          <tbody>
-            {result.results.map((item) => (
-              <tr key={item.strategyPath}>
-                <td><strong>{item.strategyId}</strong></td>
-                <td>{item.passed ? "pass" : item.error ? "error" : "fail"}</td>
-                <td>{formatNumber(item.returnPercent, 2)}%</td>
-                <td>{formatNumber(item.maximumDrawdownPercent, 2)}%</td>
-                <td>{item.passingFolds}/{item.totalFolds}</td>
-                <td>{item.passingCostShocks}/{item.totalCostShocks}</td>
-                <td><code>{item.challengePath}</code></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    )}
-    {result.blockers.length > 0 && <div className="blocker-list">{result.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div>}
-  </section>;
-}
-
-function PromotionLedgerPanels({ onError }: { onError: (message: string | null) => void }) {
-  const [tab, setTab] = useState<"sealed" | "incubation">("sealed");
-  return <section className="promotion-ledger">
-    <div className="workspace-tabs"><button className={tab === "sealed" ? "active" : ""} onClick={() => setTab("sealed")}>2 · OOS2 sealed final (one-shot)</button><button className={tab === "incubation" ? "active" : ""} onClick={() => setTab("incubation")}>3 · Paper incubation</button></div>
-    {tab === "sealed" ? <SealedPanel onError={onError} /> : <IncubationPanel onError={onError} />}
-  </section>;
-}
-
-function SealedPanel({ onError }: { onError: (message: string | null) => void }) {
-  const [form, setForm] = useState<SealedRequest>({ dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", brokerPath: "", splitPlanPath: "", challengePath: "", sealedRoot: "", minimumTrades: 20, minimumReturnPercent: 1, minimumProfitFactor: 1.1, maximumDrawdownPercent: 20 });
-  const [result, setResult] = useState<SealedView | null>(null); const [busy, setBusy] = useState(false);
-  function update<K extends keyof SealedRequest>(key: K, value: SealedRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
-  async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await runSealedFinal(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content nested-tool"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">OOS2 · one attempt only</p><h2>Open the sealed OOS2 partition</h2></div><span className="read-only-badge">Irreversible</span></div><div className="form-stack compact"><PathField label="Full OHLC source" path={form.dataPath} choose={chooseDataFile} onChange={(value) => update("dataPath", value)} required /><PathField label="Exporter metadata" path={form.metadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, metadataPath: value || null, sourceTimezone: value ? null : "Etc/UTC" }))} /><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="Split plan" path={form.splitPlanPath} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value)} required /><PathField label="Passing Challenge" path={form.challengePath} choose={() => chooseJsonFile("Choose Challenge artifact")} onChange={(value) => update("challengePath", value)} required /><PathField label="Sealed ledger root" path={form.sealedRoot} choose={() => chooseDirectory("Choose sealed ledger root")} onChange={(value) => update("sealedRoot", value)} required /></div><div className="numeric-grid"><NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value ?? 20)} min={1} /><NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value ?? 1)} step={.1} /><NumberField label="Minimum PF" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value ?? 1.1)} step={.05} /><NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value ?? 20)} step={.1} /></div><div className="form-footer"><p>Access is durably claimed before OOS2 bars load. A crash or failed result still consumes this candidate/split attempt — never re-peek OOS2.</p><button className="danger" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.splitPlanPath || !form.challengePath || !form.sealedRoot} onClick={run}>{busy ? "Opening once…" : "Run OOS2 sealed final once"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">OOS2 sealed final</p><h2>{result.passed ? "Final holdout passed" : "Candidate demoted"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /></div><ArtifactPath label="Sealed artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="OOS2 remains sealed" copy="Only run this after the candidate passes Challenge on OOS1. The OOS2 attempt is intentionally non-repeatable." />}</div>;
-}
-
-function IncubationPanel({ onError }: { onError: (message: string | null) => void }) {
-  const today = new Date().toISOString().slice(0, 10);
-  const [start, setStart] = useState<IncubationStartRequest>({ strategyPath: "", brokerPath: "", splitPlanPath: "", rootDirectory: "", startDate: today, initialBalance: "100000", maximumDailyLossPercent: "2", maximumTotalDrawdownPercent: "10", minimumObservationDays: 30, minimumTotalTrades: 20, maximumConsecutiveZeroTradeDays: 5 });
-  const [startPath, setStartPath] = useState(""); const [record, setRecord] = useState({ date: today, endingBalance: 100000, maximumDrawdownPercent: 0, tradeCount: 0, note: "" }); const [view, setView] = useState<IncubationView | null>(null); const [busy, setBusy] = useState(false);
-  async function open() { setBusy(true); onError(null); try { const next = await startIncubation(start); setView(next); setStartPath(next.startPath); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  async function append() { setBusy(true); onError(null); try { setView(await recordIncubation({ startPath, date: record.date, endingBalance: record.endingBalance, maximumDrawdownPercent: record.maximumDrawdownPercent, tradeCount: record.tradeCount, note: record.note || null })); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  async function finalize() { setBusy(true); onError(null); try { setView(await finalizeIncubation(startPath)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="incubation-grid"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Append-only ledger</p><h2>Open paper incubation</h2></div></div><div className="form-stack compact"><PathField label="Strategy IR" path={start.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => setStart((current) => ({ ...current, strategyPath: value }))} required /><PathField label="Broker profile" path={start.brokerPath} choose={chooseBrokerFile} onChange={(value) => setStart((current) => ({ ...current, brokerPath: value }))} required /><PathField label="Split plan" path={start.splitPlanPath} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => setStart((current) => ({ ...current, splitPlanPath: value }))} required /><PathField label="Incubation root" path={start.rootDirectory} choose={() => chooseDirectory("Choose incubation root")} onChange={(value) => setStart((current) => ({ ...current, rootDirectory: value }))} required /><label className="field-row"><span>Start date</span><input type="date" value={start.startDate} onChange={(event) => setStart((current) => ({ ...current, startDate: event.target.value }))} /></label></div><div className="numeric-grid"><NumberField label="Initial balance" value={Number(start.initialBalance)} onChange={(value) => setStart((current) => ({ ...current, initialBalance: String(value ?? 100000) }))} min={1} /><NumberField label="Daily loss limit %" value={Number(start.maximumDailyLossPercent)} onChange={(value) => setStart((current) => ({ ...current, maximumDailyLossPercent: String(value ?? 2) }))} step={.1} /><NumberField label="Total DD limit %" value={Number(start.maximumTotalDrawdownPercent)} onChange={(value) => setStart((current) => ({ ...current, maximumTotalDrawdownPercent: String(value ?? 10) }))} step={.1} /><NumberField label="Minimum days" value={start.minimumObservationDays} onChange={(value) => setStart((current) => ({ ...current, minimumObservationDays: value ?? 30 }))} min={1} /><NumberField label="Minimum trades" value={start.minimumTotalTrades} onChange={(value) => setStart((current) => ({ ...current, minimumTotalTrades: value ?? 20 }))} min={1} /></div><div className="form-footer"><p>Rules are frozen into the immutable start artifact.</p><button className="primary" disabled={busy || !start.strategyPath || !start.brokerPath || !start.splitPlanPath || !start.rootDirectory} onClick={open}>Open ledger</button></div></section><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Daily observation</p><h2>Record or finalize</h2></div><span className="job-status">{view?.status ?? "not open"}</span></div><div className="form-stack compact"><PathField label="Incubation start" path={startPath} choose={() => chooseJsonFile("Choose incubation-start.json")} onChange={setStartPath} required /><label className="field-row"><span>Observation date</span><input type="date" value={record.date} onChange={(event) => setRecord((current) => ({ ...current, date: event.target.value }))} /></label><label className="field-row"><span>Note</span><input value={record.note} onChange={(event) => setRecord((current) => ({ ...current, note: event.target.value }))} /></label></div><div className="numeric-grid"><NumberField label="Ending balance" value={record.endingBalance} onChange={(value) => setRecord((current) => ({ ...current, endingBalance: value ?? 100000 }))} min={1} /><NumberField label="Maximum DD %" value={record.maximumDrawdownPercent} onChange={(value) => setRecord((current) => ({ ...current, maximumDrawdownPercent: value ?? 0 }))} step={.1} /><NumberField label="Trades" value={record.tradeCount} onChange={(value) => setRecord((current) => ({ ...current, tradeCount: value ?? 0 }))} min={0} /></div><div className="form-footer"><button className="secondary" disabled={busy || !startPath || view?.status === "finalized"} onClick={append}>Append observation</button><button className="primary" disabled={busy || !startPath || view?.status === "finalized"} onClick={finalize}>Finalize ledger</button></div>{view && <div className="job-kpis"><Kpi label="Days" value={formatNumber(view.observationDays)} note="Recorded" /><Kpi label="Trades" value={formatNumber(view.totalTrades)} note="Cumulative" /><Kpi label="Return" value={view.returnPercent === null ? "open" : `${formatNumber(view.returnPercent, 2)}%`} note="Paper result" /><Kpi label="Status" value={view.passed === null ? "open" : view.passed ? "passed" : "failed"} note="Incubation gate" /></div>}{view?.finalPath && <ArtifactPath label="Incubation final" value={view.finalPath} />}</section></div>;
+    void listSymbols()
+      .then((items) => {
+        setSymbols(items);
+        if (!selectedDataPath && items[0]) {
+          setSelected(items[0].symbol);
+          onSelect(items[0]);
+        } else {
+          const match = items.find((item) => item.dataPath === selectedDataPath);
+          if (match) setSelected(match.symbol);
+        }
+      })
+      .catch((reason) => onError(String(reason)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <label className="field-row">
+      <span>Symbol <small>required</small></span>
+      <select
+        disabled={disabled || symbols.length === 0}
+        value={selected}
+        onChange={(event) => {
+          const next = symbols.find((item) => item.symbol === event.target.value);
+          setSelected(event.target.value);
+          if (next) onSelect(next);
+        }}
+      >
+        <option value="" disabled>{symbols.length ? "Choose symbol…" : "Scanning data pack…"}</option>
+        {symbols.map((item) => (
+          <option key={item.symbol} value={item.symbol}>{item.symbol}</option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 function ParityWorkspace({
@@ -1278,10 +1292,22 @@ function JudgePanel({
   return <div className="tool-content">
     <section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Internal acceptance</p><h2>Replay decision signals through M1 chronology</h2></div></div>
       <div className="form-stack compact">
-        <PathField label="Decision-timeframe OHLC" path={form.decisionDataPath} choose={chooseDataFile} onChange={(value) => update("decisionDataPath", value)} required />
-        <PathField label="Decision metadata" path={form.decisionMetadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, decisionMetadataPath: value || null, decisionSourceTimezone: value ? null : "Etc/UTC" }))} />
-        <PathField label="M1 OHLC" path={form.m1DataPath} choose={chooseDataFile} onChange={(value) => update("m1DataPath", value)} required />
-        <PathField label="M1 metadata" path={form.m1MetadataPath ?? ""} choose={chooseMetadataFile} onChange={(value) => setForm((current) => ({ ...current, m1MetadataPath: value || null, m1SourceTimezone: value ? null : "Etc/UTC" }))} />
+        <SymbolSelect
+          onError={onError}
+          onSelect={(symbol) => {
+            setForm((current) => ({
+              ...current,
+              decisionDataPath: symbol.dataPath,
+              decisionMetadataPath: symbol.metadataPath,
+              decisionSourceTimezone: null,
+              m1DataPath: symbol.m1DataPath,
+              m1MetadataPath: symbol.m1MetadataPath,
+              m1SourceTimezone: null,
+              brokerPath: symbol.brokerPath,
+            }));
+          }}
+          selectedDataPath={form.decisionDataPath}
+        />
         <PathField label="Split plan (uses validation only)" path={form.splitPlanPath ?? ""} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value || null)} />
         <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
         <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
@@ -1463,6 +1489,85 @@ function ClusterView({
               />
             );
           })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FidelityDemoPanel({
+  onError,
+  onLoaded,
+  workspace,
+}: {
+  onError: (message: string | null) => void;
+  onLoaded: (path: string) => Promise<void>;
+  workspace: DatabankWorkspace;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<FidelityDemoView | null>(null);
+
+  async function run() {
+    onError(null);
+    setBusy(true);
+    try {
+      const outputPath = await chooseNewDatabank();
+      if (!outputPath) return;
+      const m1DataPath = workspace.m1DataPath;
+      if (!m1DataPath) {
+        onError("This databank has no M1 source in its manifest. Re-run Discover with a symbol pack that includes M1.");
+        return;
+      }
+      const view = await runFidelityDemo({
+        databankPath: workspace.sourcePath,
+        m1DataPath,
+        m1MetadataPath: workspace.m1MetadataPath,
+        m1SourceTimezone: workspace.m1MetadataPath ? null : "Etc/UTC",
+        outputPath,
+        returnRetention: 0.8,
+        tradeRetention: 0.8,
+        drawdownExpansion: 1.3,
+      });
+      setResult(view);
+      if (view.outputPath) {
+        await onLoaded(view.outputPath);
+      }
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel fidelity-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">SQX RetestWithHigherPrecision</p>
+          <h2>Fidelity demo (M1)</h2>
+        </div>
+        <button className="primary" disabled={busy} onClick={() => void run()}>
+          {busy ? "Retesting…" : "Run M1 fidelity demo"}
+        </button>
+      </div>
+      <p className="immutable-note">
+        Research bank from H1 scout. Retest elites on M1 with SQX-style bands (≥80% return &amp; trades, DD ≤130% of H1).
+        Passers are written to a new promotion-grade databank.
+      </p>
+      {result && (
+        <div className="fidelity-results">
+          <p>
+            {formatNumber(result.passed)} passed · {formatNumber(result.failed)} failed · {formatNumber(result.evaluated)} evaluated
+            {result.outputPath ? ` · wrote ${result.outputPath}` : " · no passers written"}
+          </p>
+          <ul>
+            {result.results.slice(0, 12).map((row) => (
+              <li key={row.fingerprint}>
+                <strong className={row.passed ? "pass" : "fail"}>{row.strategyId}</strong>
+                <span>{row.reason}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </section>
@@ -1675,7 +1780,7 @@ function EliteTable({
               <span>{row.drawdownPercent.toFixed(2)}%</span>
               <span>{formatReturnDrawdown(row)}</span>
               <span>{row.sharpeRatio === null ? "—" : row.sharpeRatio.toFixed(2)}</span>
-              <span title={row.oos1Expectancy === null ? "No OOS1 pick metrics (legacy databank)" : `OOS1 expectancy ${row.oos1Expectancy.toFixed(2)} / IS ${row.isExpectancy.toFixed(2)}`}>
+              <span title={row.oos1Expectancy === null ? "No OOS1 pick metrics (legacy databank)" : `OOS1 ${(row.oos1Expectancy / 1000).toFixed(2)}R / IS ${(row.isExpectancy / 1000).toFixed(2)}R`}>
                 {row.oos1ExpectancyRatio === null ? "—" : `${row.oos1ExpectancyRatio.toFixed(2)}×`}
               </span>
             </div>
@@ -1689,7 +1794,6 @@ function EliteTable({
 function EliteInspector({
   detail,
   loading,
-  onChallenge,
   onError,
   onParity,
   tab,
@@ -1697,14 +1801,13 @@ function EliteInspector({
 }: {
   detail: EliteDetail | null;
   loading: boolean;
-  onChallenge: (fingerprint: string) => Promise<void>;
   onError: (message: string | null) => void;
   onParity: (fingerprint: string) => Promise<void>;
   tab: "overview" | "ir";
   onTab: (tab: "overview" | "ir") => void;
 }) {
   return (
-    <aside className="panel inspector">
+    <aside className="panel inspector inspector-wide">
       {loading && <div className="inspector-loading">Loading elite…</div>}
       {!detail ? (
         <div className="inspector-empty">Select an occupied niche or table row.</div>
@@ -1720,7 +1823,6 @@ function EliteInspector({
             <button className={tab === "overview" ? "active" : ""} onClick={() => onTab("overview")}>Overview</button>
             <button className={tab === "ir" ? "active" : ""} onClick={() => onTab("ir")}>IR tree</button>
             <button onClick={() => void exportEliteStrategy(detail.fingerprint).catch((reason) => onError(String(reason)))}>Export IR</button>
-            <button onClick={() => void onChallenge(detail.fingerprint)}>Go to Challenge →</button>
             <button onClick={() => void onParity(detail.fingerprint)}>Go to M1 / MT5 →</button>
           </div>
           {tab === "overview" ? (
@@ -1729,11 +1831,7 @@ function EliteInspector({
                 <p className="eyebrow">Thesis</p>
                 <p>{detail.thesis}</p>
               </section>
-              <Sparkline
-                initialBalance={Number(detail.metrics.initial_balance)}
-                returnPercent={Number(detail.metrics.return_percent)}
-                values={detail.equitySignature}
-              />
+              <PartitionEquityChart fingerprint={detail.fingerprint} onError={onError} />
               <section className="metric-list">
                 <Metric label="Evidence" value={Number(detail.evidence.total).toFixed(2)} />
                 <Metric label="Return" value={`${Number(detail.metrics.return_percent).toFixed(2)}%`} />
@@ -1762,8 +1860,8 @@ function EliteInspector({
                 <code className="niche-code">{detail.niche}</code>
               </section>
               <div className="gate-stack">
-                <span className="gate-pass">Discovery gates passed</span>
-                <span className="gate-pending">Challenge not attached</span>
+                <span className="gate-pass">IS train · OOS1 pick gate</span>
+                <span className="gate-pass">OOS2 display only</span>
                 <span className="gate-pending">External parity unknown</span>
               </div>
             </div>
@@ -1773,6 +1871,88 @@ function EliteInspector({
         </>
       )}
     </aside>
+  );
+}
+
+function PartitionEquityChart({
+  fingerprint,
+  onError,
+}: {
+  fingerprint: string;
+  onError: (message: string | null) => void;
+}) {
+  const [view, setView] = useState<PartitionEquityView | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setBusy(true);
+    setView(null);
+    void getElitePartitionEquity(fingerprint)
+      .then((next) => {
+        if (!cancelled) setView(next);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fingerprint, onError]);
+
+  if (busy && !view) {
+    return <div className="partition-equity loading">Replaying full IS / OOS1 / OOS2 equity…</div>;
+  }
+  if (!view || view.points.length < 2) {
+    return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
+  }
+
+  const width = 520;
+  const height = 300;
+  const pad = 18;
+  const equities = view.points.map((point) => point.equity);
+  const min = Math.min(...equities);
+  const max = Math.max(...equities);
+  const span = Math.max(max - min, 1e-9);
+  const t0 = view.points[0].timestampMs;
+  const t1 = view.points[view.points.length - 1].timestampMs;
+  const tSpan = Math.max(t1 - t0, 1);
+  const xAt = (timestamp: number) => pad + ((timestamp - t0) / tSpan) * (width - pad * 2);
+  const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
+  const path = view.points
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
+    .join(" ");
+  const isX = xAt(view.isEndTimestampMs);
+  const oos1X = xAt(view.oos1EndTimestampMs);
+
+  return (
+    <section className="partition-equity">
+      <div className="partition-equity-head">
+        <div>
+          <p className="eyebrow">Full-run equity</p>
+          <small>IS 60% · OOS1 20% · OOS2 20% (display only)</small>
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve">
+        <rect x={pad} y={pad} width={isX - pad} height={height - pad * 2} className="region-is" />
+        <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1" />
+        <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2" />
+        <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
+        <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
+        <path d={path} className="equity-path" />
+        <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
+        <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>
+        <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
+      </svg>
+      <div className="partition-kpis">
+        <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}%`} />
+        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS`} />
+        <Kpi label="OOS2 expectancy (R)" value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
+        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="IS / OOS1 / OOS2" />
+      </div>
+    </section>
   );
 }
 

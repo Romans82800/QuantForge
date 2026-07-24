@@ -9,7 +9,8 @@ use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
 use quantforge_eval::{
     BacktestMetrics, CostModel, EquityPoint, EvalError, ExitReason, FeatureCache, PositionSide,
-    ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio, resolve_spread,
+    ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio, in_mandatory_entry_window,
+    resolve_spread,
 };
 use quantforge_ir::{
     EntryDistancePolicy, EntryOrderPolicy, IndicatorExpr, IrError, IrLimits, RiskPolicy,
@@ -24,8 +25,8 @@ pub const ENGINE_TIER: &str = "m1-judge";
 pub struct JudgeConfig {
     pub initial_balance: f64,
     pub costs: CostModel,
-    /// Minute gaps whose H1 and M1 volumes do not reconcile are a hard error by
-    /// default. This explicit research-only override is surfaced in telemetry.
+    /// When true, continue M1 replay across in-bar minute gaps (research default).
+    /// Gap events remain in telemetry for audit.
     pub allow_execution_gaps: bool,
 }
 
@@ -34,7 +35,7 @@ impl Default for JudgeConfig {
         Self {
             initial_balance: 100_000.0,
             costs: CostModel::default(),
-            allow_execution_gaps: false,
+            allow_execution_gaps: true,
         }
     }
 }
@@ -61,6 +62,8 @@ pub struct JudgeTelemetry {
     pub same_minute_stop_target_collisions: usize,
     pub conflicting_entry_signals: usize,
     pub skipped_outside_session: usize,
+    #[serde(default)]
+    pub skipped_outside_entry_window: usize,
     pub skipped_for_spread: usize,
     pub skipped_for_broker_stop_level: usize,
     pub skipped_below_minimum_volume: usize,
@@ -71,6 +74,8 @@ pub struct JudgeTelemetry {
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,
     pub end_of_day_flattens: usize,
+    #[serde(default)]
+    pub skipped_max_one_entry_per_day: usize,
     pub synthetic_spread_bars: usize,
     pub fallback_spread_bars: usize,
     pub swap_rollover_events: usize,
@@ -189,6 +194,8 @@ pub fn evaluate_strategy_m1(
     let mut m1_cursor = 0usize;
     let mut last_execution_timestamp_ms: Option<i64> = None;
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
+    let mut active_entry_day: Option<chrono::NaiveDate> = None;
+    let mut signal_taken_today = false;
 
     for (decision_index, decision_bar) in decision_bars.iter().enumerate().skip(1) {
         let start = decision_bar.timestamp_ms;
@@ -242,6 +249,12 @@ pub fn evaluate_strategy_m1(
             resolve_spread(previous_decision_bar, broker, &config.costs)?.points * broker.point;
         let current_local = broker_clock.local_datetime(opening_minute.timestamp_ms)?;
         let in_close_blackout = current_local.hour() >= 22;
+        let in_entry_window = in_mandatory_entry_window(current_local.hour());
+        let day_key = current_local.date();
+        if active_entry_day != Some(day_key) {
+            active_entry_day = Some(day_key);
+            signal_taken_today = false;
+        }
 
         if strategy.manage.flatten_end_of_day && in_close_blackout {
             // Match the generated EA: 22:00 is exclusively a flatten/cancel
@@ -270,6 +283,10 @@ pub fn evaluate_strategy_m1(
                     &mut trades,
                 );
                 telemetry.end_of_day_flattens += 1;
+            }
+        } else if !in_entry_window {
+            if pending.take().is_some() {
+                telemetry.pending_orders_expired += 1;
             }
         }
 
@@ -422,12 +439,16 @@ pub fn evaluate_strategy_m1(
                 if let Some(side) = side {
                     if !broker.is_trading_at(opening_minute.timestamp_ms)? {
                         telemetry.skipped_outside_session += 1;
+                    } else if !in_entry_window {
+                        telemetry.skipped_outside_entry_window += 1;
                     } else if config
                         .costs
                         .max_spread_points
                         .is_some_and(|maximum| opening_spread.points > maximum)
                     {
                         telemetry.skipped_for_spread += 1;
+                    } else if strategy.manage.max_one_entry_per_day && signal_taken_today {
+                        telemetry.skipped_max_one_entry_per_day += 1;
                     } else {
                         match &strategy.entry.order {
                             EntryOrderPolicy::Market => {
@@ -445,6 +466,7 @@ pub fn evaluate_strategy_m1(
                                 )? {
                                     balance -= open.entry_commission;
                                     position = Some(open);
+                                    signal_taken_today = true;
                                 }
                             }
                             EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. } => {
@@ -462,6 +484,7 @@ pub fn evaluate_strategy_m1(
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
+                                    signal_taken_today = true;
                                 }
                             }
                         }
@@ -493,9 +516,17 @@ pub fn evaluate_strategy_m1(
                 )?;
             }
             let spread_price = spread.points * broker.point;
+            let minute_local = broker_clock.local_datetime(minute.timestamp_ms)?;
+            let minute_in_entry_window = in_mandatory_entry_window(minute_local.hour());
+            if !minute_in_entry_window {
+                if pending.take().is_some() {
+                    telemetry.pending_orders_expired += 1;
+                }
+            }
             let mut filled_this_minute = false;
             if position.is_none()
                 && !closed_this_decision
+                && minute_in_entry_window
                 && let Some(fill_price) = pending
                     .as_ref()
                     .and_then(|order| pending_fill_price(order, minute, spread_price))
@@ -1556,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn an_in_bar_m1_gap_is_rejected_by_default() {
+    fn an_in_bar_m1_gap_is_rejected_when_gaps_disallowed() {
         let mut execution = m1_dataset(false, false);
         execution.bars.remove(7);
         assert!(matches!(

@@ -189,6 +189,16 @@ fn verify_databank(
     {
         return Err("portfolio requires an intact, promotion-grade databank".into());
     }
+    let fidelity_verified = matches!(
+        artifact.manifest.recipe.config.get("m1_fidelity_verified"),
+        Some(serde_json::Value::Bool(true))
+    ) || bank.config.require_m1_precision;
+    if !fidelity_verified {
+        return Err(
+            "databank is research-grade (H1 scout only). Run Fidelity demo (M1 retest) before Portfolio."
+                .into(),
+        );
+    }
     Ok(())
 }
 

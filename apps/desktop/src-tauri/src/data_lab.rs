@@ -1,6 +1,7 @@
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
     BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
+    build_timeframe_from_m1, infer_median_interval_ms,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -155,6 +156,25 @@ pub(crate) fn load_data_source(
             .map_err(|error| error.to_string())?;
     }
     Ok(LoadedDataSource { dataset, metadata })
+}
+
+/// SQX-style: build decision bars from M1. Optional exported H1 supplies the open grid
+/// and interval; otherwise H1 (3_600_000ms) is assumed from M1 timestamps.
+pub(crate) fn build_decision_from_m1(
+    m1: &BarDataset,
+    exported_decision: Option<&BarDataset>,
+) -> Result<BarDataset, String> {
+    let interval_ms = exported_decision
+        .and_then(|dataset| infer_median_interval_ms(&dataset.bars))
+        .unwrap_or(3_600_000);
+    let grid = exported_decision.map(|dataset| {
+        dataset
+            .bars
+            .iter()
+            .map(|bar| bar.timestamp_ms)
+            .collect::<Vec<_>>()
+    });
+    build_timeframe_from_m1(m1, interval_ms, grid.as_deref()).map_err(|error| error.to_string())
 }
 
 pub(crate) fn load_bound_broker(

@@ -98,6 +98,14 @@ pub fn generate_bundle(
             },
         ),
         (
+            "@@MAX_ONE_ENTRY_PER_DAY@@",
+            if strategy.manage.max_one_entry_per_day {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        (
             "@@PARTIAL_COUNT@@",
             strategy.manage.partial_exits.len().to_string(),
         ),
@@ -717,6 +725,7 @@ mod tests {
         let mut strategy = strategy();
         strategy.manage.break_even_at_r = Some(1.0);
         strategy.manage.flatten_end_of_day = true;
+        strategy.manage.max_one_entry_per_day = true;
         strategy.manage.trailing = Some(TrailingPolicy::RiskMultiple {
             activate_at_r: 1.5,
             distance_r: 0.75,
@@ -740,6 +749,10 @@ mod tests {
         assert!(bundle.source.contains("return true;"));
         assert!(bundle.source.contains("QFInCloseBlackout()"));
         assert!(bundle.source.contains("current.hour>=22"));
-        assert!(!bundle.source.contains("QFNewBrokerDay"));
+        assert!(bundle.source.contains("QFMaxOneEntryPerDay"));
+        assert!(bundle.source.contains("QFEntryDayExhausted"));
+        assert!(bundle.source.contains("QFInMandatoryEntryWindow"));
+        assert!(bundle.source.contains("current.hour>=2 && current.hour<19"));
+        assert!(bundle.source.contains("QFMarkEntrySignalTaken"));
     }
 }

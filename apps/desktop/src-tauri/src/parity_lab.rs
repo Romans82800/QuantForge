@@ -1,4 +1,4 @@
-use crate::data_lab::{display_path, load_bound_broker, load_data_source};
+use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
 use crate::workflow::{
     ChallengeArtifact, IndicatorParityArtifact, JudgeArtifact, ParityArtifact, ScoutArtifactInput,
     ensure_new, manifest, read_json, recipe_path, write_json_new, write_text_new,
@@ -172,12 +172,13 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
         request.m1_metadata_path.as_deref(),
         request.m1_source_timezone.as_deref(),
     )?;
+    let built_decision = build_decision_from_m1(&m1.dataset, Some(&decision.dataset))?;
     let decision_dataset = request
         .split_plan_path
         .as_deref()
-        .map(|path| validation_partition(&decision.dataset, path))
+        .map(|path| validation_partition(&built_decision, path))
         .transpose()?
-        .unwrap_or_else(|| decision.dataset.clone());
+        .unwrap_or(built_decision);
     let decision_quality = DataQualityReport::analyze(&decision_dataset);
     let m1_quality = DataQualityReport::analyze(&m1.dataset);
     if decision_quality.grade == QualityGrade::Fail || m1_quality.grade == QualityGrade::Fail {

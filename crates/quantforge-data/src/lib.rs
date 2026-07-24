@@ -573,6 +573,110 @@ pub fn bar_content_hash(bars: &[Bar]) -> ContentHash {
     ContentHash::sha256(bytes)
 }
 
+/// Infer the median positive bar interval in milliseconds from an ordered series.
+pub fn infer_median_interval_ms(bars: &[Bar]) -> Option<i64> {
+    let mut intervals: Vec<i64> = bars
+        .windows(2)
+        .map(|pair| pair[1].timestamp_ms - pair[0].timestamp_ms)
+        .filter(|delta| *delta > 0)
+        .collect();
+    if intervals.is_empty() {
+        return None;
+    }
+    intervals.sort_unstable();
+    Some(intervals[intervals.len() / 2])
+}
+
+/// SQX-style: synthesize decision-timeframe bars from M1 so OHLC always matches
+/// the execution stream (import M1 → compute higher TF).
+///
+/// - `interval_ms` is the decision bar length (e.g. 3_600_000 for H1).
+/// - `bar_open_timestamps`, when provided, is the open grid (typically from an
+///   exported H1 file). Otherwise opens are derived by flooring M1 timestamps.
+/// - Hours with at least one M1 minute are emitted (partial coverage included).
+pub fn build_timeframe_from_m1(
+    m1: &BarDataset,
+    interval_ms: i64,
+    bar_open_timestamps: Option<&[i64]>,
+) -> Result<BarDataset, DataError> {
+    if interval_ms < 60_000 || interval_ms % 60_000 != 0 {
+        return Err(DataError::InvalidAggregationInterval { interval_ms });
+    }
+    if m1.bars.is_empty() {
+        return Err(DataError::NoRows);
+    }
+
+    let opens: Vec<i64> = if let Some(grid) = bar_open_timestamps {
+        let mut opens = grid.to_vec();
+        opens.sort_unstable();
+        opens.dedup();
+        opens
+    } else {
+        let mut opens: Vec<i64> = m1
+            .bars
+            .iter()
+            .map(|bar| bar.timestamp_ms - bar.timestamp_ms.rem_euclid(interval_ms))
+            .collect();
+        opens.sort_unstable();
+        opens.dedup();
+        opens
+    };
+
+    let mut built = Vec::with_capacity(opens.len());
+    for open_ms in opens {
+        let end_ms = open_ms
+            .checked_add(interval_ms)
+            .ok_or(DataError::InvalidAggregationInterval { interval_ms })?;
+        let start_idx = m1
+            .bars
+            .partition_point(|candidate| candidate.timestamp_ms < open_ms);
+        let mut end_idx = start_idx;
+        while end_idx < m1.bars.len() && m1.bars[end_idx].timestamp_ms < end_ms {
+            end_idx += 1;
+        }
+        if end_idx <= start_idx {
+            continue;
+        }
+        let slice = &m1.bars[start_idx..end_idx];
+        let first = &slice[0];
+        let last = &slice[slice.len() - 1];
+        let high = slice
+            .iter()
+            .map(|bar| bar.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let low = slice
+            .iter()
+            .map(|bar| bar.low)
+            .fold(f64::INFINITY, f64::min);
+        let tick_volume = slice.iter().map(|bar| bar.tick_volume).sum();
+        let real_volume = slice.iter().map(|bar| bar.real_volume).sum();
+        built.push(Bar {
+            timestamp_ms: open_ms,
+            open: first.open,
+            high,
+            low,
+            close: last.close,
+            tick_volume,
+            real_volume,
+            spread_points: first.spread_points,
+        });
+    }
+
+    if built.is_empty() {
+        return Err(DataError::EmptyAggregation);
+    }
+
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&built),
+        source_rows: built.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: m1.delimiter,
+        source_timezone: m1.source_timezone.clone(),
+        bars: built,
+    })
+}
+
 fn median_u64(values: &[u64]) -> Option<u64> {
     if values.is_empty() {
         return None;
@@ -664,6 +768,10 @@ pub enum DataError {
     },
     #[error("metadata does not match dataset: {0}")]
     MetadataDatasetMismatch(String),
+    #[error("decision interval must be a positive multiple of 60s; got {interval_ms}ms")]
+    InvalidAggregationInterval { interval_ms: i64 },
+    #[error("no decision bars could be built from the M1 stream")]
+    EmptyAggregation,
     #[error(transparent)]
     Hash(#[from] HashError),
 }
@@ -878,5 +986,69 @@ mod tests {
 
         let metadata = Mt5ExportMetadata::load(metadata_path).unwrap();
         metadata.validate_dataset(&dataset).unwrap();
+    }
+
+    #[test]
+    fn build_h1_from_m1_matches_partial_hour_high() {
+        // Gappy hour: missing the minute that would have printed the exported H1 high.
+        let mut m1_bars = Vec::new();
+        for minute in 0..60 {
+            if minute == 30 {
+                continue; // gap
+            }
+            m1_bars.push(Bar {
+                timestamp_ms: 1_701_806_400_000 + minute * 60_000,
+                open: 0.6550,
+                high: if minute == 15 { 0.65513 } else { 0.65505 },
+                low: 0.6549,
+                close: 0.6550,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(8),
+            });
+        }
+        let m1 = BarDataset {
+            data_hash: bar_content_hash(&m1_bars),
+            bars: m1_bars,
+            source_rows: 59,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+        };
+        let built = build_timeframe_from_m1(&m1, 3_600_000, Some(&[1_701_806_400_000])).unwrap();
+        assert_eq!(built.bars.len(), 1);
+        assert!((built.bars[0].high - 0.65513).abs() < 1e-12);
+        assert_eq!(built.bars[0].tick_volume, 59);
+    }
+
+    #[test]
+    fn build_h1_from_m1_derives_open_grid_when_none_supplied() {
+        let m1_bars = (0..120)
+            .map(|minute| Bar {
+                timestamp_ms: minute * 60_000,
+                open: 1.0,
+                high: 1.1,
+                low: 0.9,
+                close: 1.05,
+                tick_volume: 2,
+                real_volume: 0,
+                spread_points: None,
+            })
+            .collect::<Vec<_>>();
+        let m1 = BarDataset {
+            data_hash: bar_content_hash(&m1_bars),
+            bars: m1_bars,
+            source_rows: 120,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+        };
+        let built = build_timeframe_from_m1(&m1, 3_600_000, None).unwrap();
+        assert_eq!(built.bars.len(), 2);
+        assert_eq!(built.bars[0].timestamp_ms, 0);
+        assert_eq!(built.bars[1].timestamp_ms, 3_600_000);
+        assert_eq!(built.bars[0].tick_volume, 120);
     }
 }

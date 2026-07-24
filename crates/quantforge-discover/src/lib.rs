@@ -4,6 +4,7 @@ mod archive;
 mod engine;
 mod grammar;
 mod model;
+mod robustness;
 
 pub use archive::niche_label;
 pub use engine::{continue_evolution, evolve_new};
@@ -15,5 +16,5 @@ pub use model::{
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 4;
-pub const GRAMMAR_VERSION: &str = "m1-verified-fixed-risk-close-v4";
+pub const GRAMMAR_VERSION: &str = "m1-verified-fixed-risk-close-v5";
 pub const FIXED_RISK_PER_TRADE: f64 = 1_000.0;

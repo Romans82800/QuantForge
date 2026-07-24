@@ -178,11 +178,28 @@ fn write_databank(
             minimum_profit_factor: 0.0,
             minimum_return_drawdown: 0.0,
         },
+        deposit_gates: GateConfig {
+            minimum_trades: challenge.baseline.metrics.trade_count,
+            maximum_drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
+            minimum_return_percent: challenge.baseline.metrics.return_percent - 1.0,
+            minimum_profit_factor: 0.0,
+            minimum_return_drawdown: 0.0,
+        },
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: 0.0,
         },
         oos1_expectancy_retention: 0.0,
+        require_m1_precision: false,
+        simple_exits: false,
         flatten_at_22: false,
+        max_one_entry_per_day: false,
+        mutate_after_elites: 0,
+        random_fill_fraction: 0.0,
+        worker_threads: 1,
+        require_m1_robustness: false,
+        robustness_folds: 3,
+        robustness_monte_carlo_trials: 50,
+        robustness_neighborhood_samples: 2,
         scout,
     };
     let bucket = |value: f64, first: f64, second: f64| {
@@ -239,6 +256,8 @@ fn write_databank(
         evaluation_count: challenge.config.evaluations_touched,
         elites: vec![elite],
         coverage_map: BTreeMap::from([(niche_label(&niche), fingerprint)]),
+        accepted_pool: Vec::new(),
+        accepted_coverage_map: BTreeMap::new(),
         telemetry: DiscoverTelemetry::default(),
     };
     let run_manifest = manifest(

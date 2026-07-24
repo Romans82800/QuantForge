@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
     BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
+    bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
 use quantforge_discover::{Databank, DiscoverConfig, GateConfig, continue_evolution, evolve_new};
 use quantforge_eval::{CostModel, ScoutConfig, ScoutResult, evaluate_strategy};
@@ -228,6 +229,13 @@ struct EvolveArgs {
     /// Allow a data-quality Fail and record the override in the manifest.
     #[arg(long)]
     allow_failed_data: bool,
+    /// Train on IS only and pick elites when OOS1 expectancy retains enough of IS.
+    #[arg(long, default_value_t = true)]
+    promotion_split: bool,
+    #[arg(long, default_value_t = 0.2)]
+    validation_fraction: f64,
+    #[arg(long, default_value_t = 0.2)]
+    sealed_fraction: f64,
 }
 
 #[derive(Debug, Args)]
@@ -2860,6 +2868,13 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
         metadata: args.m1_metadata.clone(),
     };
     let (m1_dataset, m1_metadata) = load_source(&m1_source)?;
+    let interval_ms = infer_median_interval_ms(&decision_dataset.bars).unwrap_or(3_600_000);
+    let grid: Vec<i64> = decision_dataset
+        .bars
+        .iter()
+        .map(|bar| bar.timestamp_ms)
+        .collect();
+    let decision_dataset = build_timeframe_from_m1(&m1_dataset, interval_ms, Some(&grid))?;
     let decision_quality = DataQualityReport::analyze(&decision_dataset);
     let m1_quality = DataQualityReport::analyze(&m1_dataset);
     if (decision_quality.grade == QualityGrade::Fail || m1_quality.grade == QualityGrade::Fail)
@@ -3345,17 +3360,60 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    // SQX-style: synthesize decision bars from M1 (exported H1 is only the open grid).
+    let interval_ms = infer_median_interval_ms(&dataset.bars).unwrap_or(3_600_000);
+    let grid: Vec<i64> = dataset.bars.iter().map(|bar| bar.timestamp_ms).collect();
+    let dataset = build_timeframe_from_m1(&m1_dataset, interval_ms, Some(&grid))?;
+    eprintln!(
+        "built {} decision bars from M1 (SQX-style, interval {}ms)",
+        dataset.bars.len(),
+        interval_ms
+    );
+
+    let development = args
+        .promotion_split
+        .then(|| development_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .transpose()?;
+    let oos1 = args
+        .promotion_split
+        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .transpose()?;
+    let search_dataset = development.as_ref().unwrap_or(&dataset);
+    let oos1_ref = oos1.as_ref();
+    let m1_is = args
+        .promotion_split
+        .then(|| clip_dataset_to_window(&m1_dataset, search_dataset))
+        .transpose()?;
+    let m1_eval = m1_is.as_ref().unwrap_or(&m1_dataset);
+
     let (bank, continuation_recipe_hash, starting_generation) = if args.continue_existing {
         reject_continuation_overrides(&args)?;
         let previous: EvolveArtifact = read_json(&args.databank)?;
         let recipe_hash = previous.manifest.recipe_hash.clone();
         let starting_generation = previous.databank.completed_generations;
+        let evaluation_dataset = if previous.databank.data_hash == dataset.data_hash {
+            &dataset
+        } else {
+            development.as_ref().ok_or(
+                "this databank was built from an IS partition; enable --promotion-split to continue it",
+            )?
+        };
+        let evaluation_oos1 = if previous.databank.data_hash == dataset.data_hash {
+            None
+        } else {
+            oos1_ref
+        };
+        let evaluation_m1 = if previous.databank.execution_data_hash == m1_dataset.data_hash {
+            &m1_dataset
+        } else {
+            m1_eval
+        };
         (
             continue_evolution(
                 previous.databank,
-                &dataset,
-                None,
-                &m1_dataset,
+                evaluation_dataset,
+                evaluation_oos1,
+                evaluation_m1,
                 &broker_spec,
                 args.generations,
             )?,
@@ -3373,9 +3431,9 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         let config = new_discover_config(&args)?;
         (
             evolve_new(
-                &dataset,
-                None,
-                &m1_dataset,
+                search_dataset,
+                oos1_ref,
+                m1_eval,
                 &broker_spec,
                 config,
                 args.generations,
@@ -3403,6 +3461,15 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         ("continued".into(), json!(args.continue_existing)),
         ("data_quality_grade".into(), json!(quality.grade)),
         ("data_quality_score".into(), json!(quality.score)),
+        ("promotion_split".into(), json!(args.promotion_split)),
+        (
+            "validation_fraction".into(),
+            json!(args.validation_fraction),
+        ),
+        ("sealed_fraction".into(), json!(args.sealed_fraction)),
+        ("is_label".into(), json!("in_sample")),
+        ("oos1_label".into(), json!("out_of_sample_1_pick")),
+        ("oos2_label".into(), json!("out_of_sample_2_display")),
     ]);
     if let Some(metadata) = &metadata {
         manifest_config.insert("metadata_hash".into(), json!(&metadata.metadata_hash));
@@ -3955,12 +4022,19 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
     Ok(DiscoverConfig {
         initial_candidates: args.initial.unwrap_or(500),
         batch_size: args.batch.unwrap_or(200),
-        correlation_threshold: args.correlation.unwrap_or(0.88),
+        correlation_threshold: args.correlation.unwrap_or(0.85),
         novelty_weight: args.novelty_weight.unwrap_or(10.0),
         tournament_size: args.tournament_size.unwrap_or(4),
         structural_mutation_probability: args.structural_mutation_probability.unwrap_or(0.18),
         seed: args.seed.unwrap_or(42),
         gates: GateConfig {
+            minimum_trades: args.minimum_trades.unwrap_or(10),
+            maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(40.0),
+            minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
+            minimum_profit_factor: args.minimum_profit_factor.unwrap_or(1.0),
+            minimum_return_drawdown: args.minimum_return_drawdown.unwrap_or(0.0),
+        },
+        deposit_gates: GateConfig {
             minimum_trades: args.minimum_trades.unwrap_or(20),
             maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(30.0),
             minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
@@ -3971,7 +4045,17 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
         },
         oos1_expectancy_retention: 0.7,
+        require_m1_precision: false,
+        simple_exits: true,
         flatten_at_22: args.flatten_at_22,
+        max_one_entry_per_day: true,
+        mutate_after_elites: 300,
+        random_fill_fraction: 0.4,
+        worker_threads: 0,
+        require_m1_robustness: true,
+        robustness_folds: 3,
+        robustness_monte_carlo_trials: 250,
+        robustness_neighborhood_samples: 8,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
@@ -3983,6 +4067,82 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
                 include_costs_in_risk: true,
             },
         },
+    })
+}
+
+fn development_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
+    Ok(slice_partition(dataset, 0, plan.development.bar_count)?)
+}
+
+fn oos1_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
+    let start = plan.development.bar_count;
+    let end = start + plan.validation.bar_count;
+    Ok(slice_partition(dataset, start, end)?)
+}
+
+fn slice_partition(
+    dataset: &BarDataset,
+    start: usize,
+    end: usize,
+) -> Result<BarDataset, Box<dyn Error>> {
+    if end <= start || end > dataset.bars.len() {
+        return Err(format!(
+            "invalid partition slice {start}..{end} for {} bars",
+            dataset.bars.len()
+        )
+        .into());
+    }
+    let bars = dataset.bars[start..end].to_vec();
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
+fn clip_dataset_to_window(
+    dataset: &BarDataset,
+    window: &BarDataset,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let (Some(first), Some(last)) = (window.bars.first(), window.bars.last()) else {
+        return Err("cannot clip M1: IS window is empty".into());
+    };
+    let start_ms = first.timestamp_ms;
+    let end_ms = last.timestamp_ms;
+    let bars: Vec<_> = dataset
+        .bars
+        .iter()
+        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms <= end_ms)
+        .cloned()
+        .collect();
+    if bars.len() < 2 {
+        return Err(format!(
+            "M1 has fewer than 2 bars inside the IS window [{start_ms}..{end_ms}]"
+        )
+        .into());
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
     })
 }
 

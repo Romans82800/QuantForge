@@ -90,6 +90,8 @@ describe("databank view rules", () => {
     expect(discoverProgress(2, 4)).toBe(50);
     expect(discoverProgress(5, 4)).toBe(100);
     expect(discoverProgress(1, 0)).toBe(0);
+    expect(discoverProgress(3, 0, true)).toBe(100);
+    expect(discoverProgress(0, 0, true)).toBe(0);
   });
 
   it("never sends two competing timezone authorities", () => {

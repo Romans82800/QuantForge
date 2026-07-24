@@ -4,7 +4,6 @@ export type WorkspaceName =
   | "Home"
   | "Databank"
   | "Discover"
-  | "Challenge"
   | "Vault"
   | "Data Lab"
   | "Parity Lab"
@@ -26,6 +25,60 @@ export interface RejectionTelemetry {
   oos1: number;
   evaluation: number;
   total: number;
+}
+
+/** Saved H1 / M1 / metadata / broker binding for one symbol. */
+export interface AssetProfile {
+  id: string;
+  name: string;
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string | null;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+  updatedAt: string;
+}
+
+/** Auto-scanned complete symbol from the ICMarkets data pack. */
+export interface SymbolPack {
+  symbol: string;
+  dataPath: string;
+  metadataPath: string;
+  m1DataPath: string;
+  m1MetadataPath: string;
+  brokerPath: string;
+  defaultDatabankPath: string;
+  packRoot: string;
+}
+
+export interface PartitionEquityPoint {
+  timestampMs: number;
+  equity: number;
+}
+
+export interface PartitionEquityView {
+  fingerprint: string;
+  strategyId: string;
+  initialBalance: number;
+  points: PartitionEquityPoint[];
+  isEndTimestampMs: number;
+  oos1EndTimestampMs: number;
+  oos2EndTimestampMs: number;
+  isBars: number;
+  oos1Bars: number;
+  oos2Bars: number;
+  isExpectancy: number;
+  oos1Expectancy: number;
+  oos1ExpectancyRatio: number | null;
+  oos2Expectancy: number;
+  isReturnPercent: number;
+  oos1ReturnPercent: number;
+  oos2ReturnPercent: number;
+  isTrades: number;
+  oos1Trades: number;
+  oos2Trades: number;
 }
 
 export interface CoverageCell {
@@ -89,6 +142,11 @@ export interface DatabankWorkspace {
   completedGenerations: number;
   selectionBias: SelectionBiasView;
   rejections: RejectionTelemetry;
+  researchGrade: boolean;
+  requireM1Precision: boolean;
+  m1FidelityVerified: boolean;
+  simpleExits: boolean;
+  maxOneEntryPerDay: boolean;
   families: FamilyCoverage[];
   elites: EliteRow[];
 }
@@ -187,6 +245,7 @@ export interface DiscoverRequest {
   brokerPath: string;
   databankPath: string;
   generations: number;
+  runUntilStopped: boolean | null;
   initialCandidates: number | null;
   batchSize: number | null;
   correlationThreshold: number | null;
@@ -197,9 +256,24 @@ export interface DiscoverRequest {
   minimumReturnPercent: number | null;
   minimumProfitFactor: number | null;
   minimumReturnDrawdown: number | null;
+  depositMinimumTrades: number | null;
+  depositMaximumDrawdownPercent: number | null;
+  depositMinimumReturnPercent: number | null;
+  depositMinimumProfitFactor: number | null;
+  depositMinimumReturnDrawdown: number | null;
   minimumM1ReturnRetention: number | null;
   oos1ExpectancyRetention: number | null;
+  requireM1Precision: boolean | null;
+  simpleExits: boolean | null;
   flattenAt22: boolean | null;
+  maxOneEntryPerDay: boolean | null;
+  mutateAfterElites: number | null;
+  randomFillFraction: number | null;
+  workerThreads: number | null;
+  requireM1Robustness: boolean | null;
+  robustnessFolds: number | null;
+  robustnessMonteCarloTrials: number | null;
+  robustnessNeighborhoodSamples: number | null;
   commissionPerLotRoundTurn: number | null;
   slippagePointsPerSide: number | null;
   fallbackSpreadPoints: number | null;
@@ -210,6 +284,45 @@ export interface DiscoverRequest {
   sealedFraction: number | null;
 }
 
+export interface EvaluationErrorCount {
+  message: string;
+  count: number;
+}
+
+export interface FidelityDemoRequest {
+  databankPath: string;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  outputPath: string;
+  returnRetention: number | null;
+  tradeRetention: number | null;
+  drawdownExpansion: number | null;
+}
+
+export interface FidelityEliteResult {
+  fingerprint: string;
+  strategyId: string;
+  passed: boolean;
+  h1ReturnPercent: number;
+  m1ReturnPercent: number;
+  returnRetention: number;
+  h1Trades: number;
+  m1Trades: number;
+  tradeRetention: number;
+  h1DrawdownPercent: number;
+  m1DrawdownPercent: number;
+  reason: string;
+}
+
+export interface FidelityDemoView {
+  evaluated: number;
+  passed: number;
+  failed: number;
+  outputPath: string | null;
+  results: FidelityEliteResult[];
+}
+
 export interface DiscoverJobView {
   jobId: string | null;
   status: DiscoverJobStatus;
@@ -218,12 +331,37 @@ export interface DiscoverJobView {
   outputPath: string | null;
   completedGenerations: number;
   requestedGenerations: number;
+  runUntilStopped: boolean;
   evaluationCount: number;
+  acceptedTotal: number;
+  potElites: number;
+  potNewNiches: number;
+  databankElites: number;
+  mutateAfterElites: number;
+  breedingActive: boolean;
+  workerThreads: number;
   coverage: number;
   qdScore: number;
+  rejectedGate: number;
+  rejectedDepositGate: number;
+  rejectedPrecision: number;
+  rejectedOos1: number;
+  rejectedM1Fidelity: number;
+  rejectedWalkForward: number;
+  rejectedMonteCarlo: number;
+  rejectedParamNeighborhood: number;
   rejectedClone: number;
   rejectedCorrelated: number;
+  rejectedNicheNotImproved: number;
+  rejectedEvaluation: number;
   rejectedTotal: number;
+  evaluationsPerHour: number;
+  acceptsPerHour: number;
+  bestIsExpectancy: number | null;
+  bestOos1Expectancy: number | null;
+  topEvaluationErrors: EvaluationErrorCount[];
+  m1BarsRepaired: number;
+  startedAtMs: number | null;
   stopRequested: boolean;
   message: string;
 }

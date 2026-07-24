@@ -1,4 +1,4 @@
-use crate::archive::{CandidateEvaluation, deposit};
+use crate::archive::{CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank};
 use crate::grammar::{build_seed, classify_family, crossover, mutate_with_rng, rng_for};
 use crate::model::{
     Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, return_drawdown_ratio,
@@ -18,12 +18,16 @@ use std::collections::BTreeMap;
 enum CandidateOutcome {
     CoarseRejected,
     PrecisionRejected,
-    Oos1Rejected,
+    DepositGateRejected,
     Accepted {
         result: Box<ScoutResult>,
         is_expectancy: f64,
         oos1_expectancy: Option<f64>,
         oos1_expectancy_ratio: Option<f64>,
+        /// M1 WFO/MC/param on IS. `Ok` continues to OOS1; `Err` is pot-only.
+        databank_gate: Result<(), crate::robustness::RobustnessReject>,
+        /// OOS1 retention after IS robustness (ignored when robustness failed).
+        oos1_ok: bool,
     },
 }
 
@@ -35,111 +39,206 @@ fn evaluate_and_deposit(
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     generation: u64,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<(), DiscoverError> {
     let scout = &bank.config.scout;
     let gates = &bank.config.gates;
     let discover_config = &bank.config;
     let minimum_return_retention = bank.config.precision.minimum_return_retention;
     let oos1_retention = bank.config.oos1_expectancy_retention;
-    let evaluated: Vec<_> = candidates
-        .into_par_iter()
-        .map(|strategy| {
-            let result = (|| {
-                let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
-                    .map_err(|error| error.to_string())?;
-                if !crate::archive::passes_gates(&coarse, discover_config) {
-                    return Ok::<_, String>(CandidateOutcome::CoarseRejected);
-                }
-                let precise = evaluate_strategy_m1(
-                    &strategy,
-                    dataset,
-                    m1_dataset,
-                    broker,
-                    &JudgeConfig {
-                        initial_balance: scout.initial_balance,
-                        costs: scout.costs.clone(),
-                        allow_execution_gaps: false,
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-                let precise_result = ScoutResult {
-                    trades: precise.trades,
-                    equity: precise.equity,
-                    metrics: precise.metrics,
-                    telemetry: ScoutTelemetry::default(),
-                };
-                let retention = if coarse.metrics.return_percent > 0.0 {
-                    precise_result.metrics.return_percent / coarse.metrics.return_percent
-                } else if precise_result.metrics.return_percent >= coarse.metrics.return_percent {
-                    1.0
-                } else {
-                    0.0
-                };
-                let precision_passed = precision_passes(
-                    &precise_result.metrics,
-                    retention,
-                    gates,
-                    minimum_return_retention,
-                );
-                if !precision_passed {
-                    return Ok(CandidateOutcome::PrecisionRejected);
-                }
-
-                let is_expectancy = precise_result.metrics.expectancy;
-                let (oos1_expectancy, oos1_expectancy_ratio) = if let Some(oos1) = oos1_dataset {
-                    let oos1_result = evaluate_strategy(&strategy, oos1, broker, scout)
+    let require_m1 = bank.config.require_m1_precision;
+    let require_robustness = bank.config.require_m1_robustness;
+    let robustness = crate::robustness::RobustnessConfig {
+        folds: bank.config.robustness_folds,
+        monte_carlo_trials: bank.config.robustness_monte_carlo_trials,
+        neighborhood_samples: bank.config.robustness_neighborhood_samples,
+        seed: bank.config.seed,
+        initial_balance: scout.initial_balance,
+        costs: scout.costs.clone(),
+        minimum_fold_trades: 2,
+        minimum_return_percent: bank.config.deposit_gates.minimum_return_percent,
+        minimum_profit_factor: bank.config.deposit_gates.minimum_profit_factor.min(1.0),
+        maximum_drawdown_percent: bank.config.deposit_gates.maximum_drawdown_percent.max(30.0),
+        minimum_passing_fold_fraction: 0.6,
+        minimum_neighborhood_survival_fraction: 0.7,
+        parameter_perturbation_fraction: 0.1,
+    };
+    let evaluate_batch = || {
+        candidates
+            .into_par_iter()
+            .map(|strategy| {
+                let result = (|| {
+                    let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
                         .map_err(|error| error.to_string())?;
-                    let oos1_expectancy = oos1_result.metrics.expectancy;
-                    if !passes_oos1_pick(is_expectancy, oos1_expectancy, oos1_retention) {
-                        return Ok(CandidateOutcome::Oos1Rejected);
+                    if !crate::archive::passes_gates(&coarse, discover_config) {
+                        return Ok::<_, String>(CandidateOutcome::CoarseRejected);
                     }
-                    let ratio = (is_expectancy > 0.0)
-                        .then_some(oos1_expectancy / is_expectancy)
-                        .filter(|value| value.is_finite());
-                    (Some(oos1_expectancy), ratio)
-                } else {
-                    (None, None)
-                };
 
-                Ok(CandidateOutcome::Accepted {
-                    result: Box::new(precise_result),
-                    is_expectancy,
-                    oos1_expectancy,
-                    oos1_expectancy_ratio,
-                })
-            })();
-            (strategy, result)
-        })
-        .collect();
+                    // SQX Selected-TF path: deposit from H1/IS metrics; M1 fidelity is deferred
+                    // unless require_m1_precision is on (legacy in-loop) or robustness is on.
+                    let deposit_result = if require_m1 {
+                        let precise = evaluate_strategy_m1(
+                            &strategy,
+                            dataset,
+                            m1_dataset,
+                            broker,
+                            &JudgeConfig {
+                                initial_balance: scout.initial_balance,
+                                costs: scout.costs.clone(),
+                                allow_execution_gaps: true,
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let precise_result = ScoutResult {
+                            trades: precise.trades,
+                            equity: precise.equity,
+                            metrics: precise.metrics,
+                            telemetry: ScoutTelemetry::default(),
+                        };
+                        let retention = if coarse.metrics.return_percent > 0.0 {
+                            precise_result.metrics.return_percent / coarse.metrics.return_percent
+                        } else if precise_result.metrics.return_percent
+                            >= coarse.metrics.return_percent
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        if !precision_passes(
+                            &precise_result.metrics,
+                            retention,
+                            gates,
+                            minimum_return_retention,
+                        ) {
+                            return Ok(CandidateOutcome::PrecisionRejected);
+                        }
+                        precise_result
+                    } else {
+                        coarse
+                    };
+
+                    if !crate::archive::passes_gate_config(
+                        &deposit_result,
+                        &discover_config.deposit_gates,
+                    ) {
+                        return Ok(CandidateOutcome::DepositGateRejected);
+                    }
+
+                    // SQX-style: M1 robustness on IS only, then OOS1 pick (never feed OOS1 into WFO/MC).
+                    let databank_gate = if require_robustness {
+                        crate::robustness::run_m1_predeposit_robustness(
+                            &strategy,
+                            dataset,
+                            m1_dataset,
+                            broker,
+                            &robustness,
+                        )
+                    } else {
+                        Ok(())
+                    };
+
+                    let is_expectancy = deposit_result.metrics.expectancy;
+                    let (oos1_expectancy, oos1_expectancy_ratio, oos1_ok) =
+                        if matches!(databank_gate, Ok(())) {
+                            if let Some(oos1) = oos1_dataset {
+                                let oos1_result = evaluate_strategy(&strategy, oos1, broker, scout)
+                                    .map_err(|error| error.to_string())?;
+                                let oos1_expectancy = oos1_result.metrics.expectancy;
+                                let ok =
+                                    passes_oos1_pick(is_expectancy, oos1_expectancy, oos1_retention);
+                                let ratio = (is_expectancy > 0.0)
+                                    .then_some(oos1_expectancy / is_expectancy)
+                                    .filter(|value| value.is_finite());
+                                (Some(oos1_expectancy), ratio, ok)
+                            } else {
+                                (None, None, true)
+                            }
+                        } else {
+                            (None, None, false)
+                        };
+
+                    Ok(CandidateOutcome::Accepted {
+                        result: Box::new(deposit_result),
+                        is_expectancy,
+                        oos1_expectancy,
+                        oos1_expectancy_ratio,
+                        databank_gate,
+                        oos1_ok,
+                    })
+                })();
+                (strategy, result)
+            })
+            .collect::<Vec<_>>()
+    };
+    let evaluated = match pool {
+        Some(pool) => pool.install(evaluate_batch),
+        None => evaluate_batch(),
+    };
 
     for (strategy, result) in evaluated {
         bank.evaluation_count += 1;
-        let decision = match result {
+        match result {
             Ok(CandidateOutcome::Accepted {
                 result,
                 is_expectancy,
                 oos1_expectancy,
                 oos1_expectancy_ratio,
-            }) => deposit(
-                bank,
-                CandidateEvaluation {
-                    strategy,
+                databank_gate,
+                oos1_ok,
+            }) => {
+                let evaluation = CandidateEvaluation {
+                    strategy: strategy.clone(),
                     result: *result,
                     generation,
                     is_expectancy,
                     oos1_expectancy,
                     oos1_expectancy_ratio,
-                },
-            )?,
-            Ok(CandidateOutcome::CoarseRejected) => DepositDecision::RejectedGate,
-            Ok(CandidateOutcome::PrecisionRejected) => DepositDecision::RejectedPrecision,
-            Ok(CandidateOutcome::Oos1Rejected) => DepositDecision::RejectedOos1,
+                };
+                let pot_decision = deposit_to_accepted_pool(bank, evaluation.clone())?;
+                bank.telemetry.record(pot_decision);
+                let pot_ok = matches!(
+                    pot_decision,
+                    DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot
+                );
+                if !pot_ok {
+                    // Niche/clone/correlation reject — skip expensive post-pot accounting.
+                } else if let Err(reject) = databank_gate {
+                    match reject {
+                        crate::robustness::RobustnessReject::M1Fidelity => {
+                            bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
+                        }
+                        crate::robustness::RobustnessReject::WalkForward => {
+                            bank.telemetry.record(DepositDecision::RejectedWalkForward);
+                        }
+                        crate::robustness::RobustnessReject::MonteCarlo => {
+                            bank.telemetry.record(DepositDecision::RejectedMonteCarlo);
+                        }
+                        crate::robustness::RobustnessReject::ParamNeighborhood => {
+                            bank.telemetry
+                                .record(DepositDecision::RejectedParamNeighborhood);
+                        }
+                    }
+                } else if !oos1_ok {
+                    bank.telemetry.record(DepositDecision::RejectedOos1);
+                } else {
+                    let bank_decision = deposit_to_databank(bank, evaluation)?;
+                    bank.telemetry.record(bank_decision);
+                }
+            }
+            Ok(CandidateOutcome::CoarseRejected) => {
+                bank.telemetry.record(DepositDecision::RejectedGate);
+            }
+            Ok(CandidateOutcome::PrecisionRejected) => {
+                bank.telemetry.record(DepositDecision::RejectedPrecision);
+            }
+            Ok(CandidateOutcome::DepositGateRejected) => {
+                bank.telemetry.record(DepositDecision::RejectedDepositGate);
+            }
             Err(error) => {
                 *bank.telemetry.evaluation_errors.entry(error).or_default() += 1;
-                DepositDecision::RejectedEvaluation
+                bank.telemetry.record(DepositDecision::RejectedEvaluation);
             }
-        };
-        bank.telemetry.record(decision);
+        }
     }
     Ok(())
 }
@@ -175,6 +274,8 @@ pub fn evolve_new(
         evaluation_count: 0,
         elites: Vec::new(),
         coverage_map: BTreeMap::new(),
+        accepted_pool: Vec::new(),
+        accepted_coverage_map: BTreeMap::new(),
         telemetry: Default::default(),
     };
 
@@ -186,6 +287,7 @@ pub fn evolve_new(
             )
         })
         .collect();
+    let pool = build_worker_pool(bank.config.worker_threads)?;
     evaluate_and_deposit(
         &mut bank,
         initial,
@@ -194,6 +296,7 @@ pub fn evolve_new(
         m1_dataset,
         broker,
         0,
+        pool.as_ref(),
     )?;
     run_generations(
         &mut bank,
@@ -202,6 +305,7 @@ pub fn evolve_new(
         m1_dataset,
         broker,
         generations,
+        pool.as_ref(),
     )?;
     Ok(bank)
 }
@@ -215,6 +319,7 @@ pub fn continue_evolution(
     additional_generations: u64,
 ) -> Result<Databank, DiscoverError> {
     validate_resume(&bank, dataset, m1_dataset, broker)?;
+    let pool = build_worker_pool(bank.config.worker_threads)?;
     run_generations(
         &mut bank,
         dataset,
@@ -222,8 +327,20 @@ pub fn continue_evolution(
         m1_dataset,
         broker,
         additional_generations,
+        pool.as_ref(),
     )?;
     Ok(bank)
+}
+
+fn build_worker_pool(worker_threads: usize) -> Result<Option<rayon::ThreadPool>, DiscoverError> {
+    if worker_threads == 0 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()
+        .map(Some)
+        .map_err(|error| DiscoverError::InvalidConfig(format!("worker thread pool: {error}")))
 }
 
 fn run_generations(
@@ -233,6 +350,7 @@ fn run_generations(
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     count: u64,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<(), DiscoverError> {
     for _ in 0..count {
         let generation = bank.completed_generations + 1;
@@ -245,6 +363,7 @@ fn run_generations(
             m1_dataset,
             broker,
             generation,
+            pool,
         )?;
         bank.completed_generations = generation;
     }
@@ -252,13 +371,18 @@ fn run_generations(
 }
 
 fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
+    let pot_size = bank.accepted_pool.len();
+    let breeding_unlocked = pot_size >= bank.config.mutate_after_elites;
     (0..bank.config.batch_size)
         .map(|index| {
             let sequence = generation
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
             let mut rng = rng_for(bank.config.seed, generation + 10, index as u64);
-            if bank.elites.is_empty() {
+            let keep_filling = !breeding_unlocked
+                || bank.accepted_pool.is_empty()
+                || rng.gen_bool(bank.config.random_fill_fraction);
+            if keep_filling {
                 let family = match index % 4 {
                     0 => crate::model::FamilyStyle::Trend,
                     1 => crate::model::FamilyStyle::Momentum,
@@ -272,12 +396,12 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             }
 
             let first_index = tournament(bank, &mut rng, None);
-            let first = &bank.elites[first_index];
+            let first = &bank.accepted_pool[first_index];
             let preferred_family = rng.gen_bool(0.75).then(|| classify_family(&first.strategy));
             let second_index = tournament(bank, &mut rng, preferred_family);
             let crossed = crossover(
                 &first.strategy,
-                &bank.elites[second_index].strategy,
+                &bank.accepted_pool[second_index].strategy,
                 &mut rng,
             );
             let mut child = mutate_with_rng(
@@ -297,7 +421,62 @@ fn apply_production_policy(
     config: &crate::model::DiscoverConfig,
 ) -> StrategyIr {
     strategy.manage.flatten_end_of_day = config.flatten_at_22;
+    strategy.manage.max_one_entry_per_day = config.max_one_entry_per_day;
+    if config.simple_exits {
+        enforce_simple_exits(&mut strategy);
+    }
     strategy
+}
+
+/// Market-only entries, no trailing/BE/partials, fixed or ATR SL/TP, time stop ≤ 16.
+fn enforce_simple_exits(strategy: &mut StrategyIr) {
+    strategy.entry.order = quantforge_ir::EntryOrderPolicy::Market;
+    strategy.manage.trailing = None;
+    strategy.manage.break_even_at_r = None;
+    strategy.manage.partial_exits.clear();
+    let bars = strategy
+        .manage
+        .time_stop_bars
+        .unwrap_or(8)
+        .clamp(1, 16);
+    strategy.manage.time_stop_bars = Some(bars);
+    strategy.stops.stop_loss = match &strategy.stops.stop_loss {
+        quantforge_ir::StopLossPolicy::FixedPoints { points } => {
+            quantforge_ir::StopLossPolicy::FixedPoints {
+                points: (*points).clamp(10.0, 1_000.0),
+            }
+        }
+        quantforge_ir::StopLossPolicy::AtrMultiple { period, multiplier } => {
+            quantforge_ir::StopLossPolicy::AtrMultiple {
+                period: (*period).clamp(5, 30),
+                multiplier: (*multiplier).clamp(0.5, 4.0),
+            }
+        }
+        quantforge_ir::StopLossPolicy::RangeMultiple { period, multiplier } => {
+            quantforge_ir::StopLossPolicy::AtrMultiple {
+                period: (*period).clamp(5, 30),
+                multiplier: (*multiplier).clamp(0.5, 4.0),
+            }
+        }
+    };
+    strategy.stops.take_profit = match &strategy.stops.take_profit {
+        quantforge_ir::TakeProfitPolicy::FixedPoints { points } => {
+            quantforge_ir::TakeProfitPolicy::FixedPoints {
+                points: (*points).clamp(10.0, 2_000.0),
+            }
+        }
+        quantforge_ir::TakeProfitPolicy::RiskMultiple { multiple } => {
+            quantforge_ir::TakeProfitPolicy::RiskMultiple {
+                multiple: (*multiple).clamp(0.5, 5.0),
+            }
+        }
+        quantforge_ir::TakeProfitPolicy::AtrMultiple { period, multiplier } => {
+            quantforge_ir::TakeProfitPolicy::AtrMultiple {
+                period: (*period).clamp(5, 30),
+                multiplier: (*multiplier).clamp(0.5, 5.0),
+            }
+        }
+    };
 }
 
 fn tournament(
@@ -306,7 +485,7 @@ fn tournament(
     preferred_family: Option<crate::model::FamilyStyle>,
 ) -> usize {
     let pool: Vec<usize> = bank
-        .elites
+        .accepted_pool
         .iter()
         .enumerate()
         .filter_map(|(index, elite)| {
@@ -316,7 +495,7 @@ fn tournament(
         })
         .collect();
     let pool = if pool.is_empty() {
-        (0..bank.elites.len()).collect()
+        (0..bank.accepted_pool.len()).collect()
     } else {
         pool
     };
@@ -325,8 +504,8 @@ fn tournament(
     for _ in 1..bank.config.tournament_size {
         let contender = pool[rng.gen_range(0..pool.len())];
         if selection_is_better(
-            &bank.elites[contender],
-            &bank.elites[winner],
+            &bank.accepted_pool[contender],
+            &bank.accepted_pool[winner],
             bank.config.novelty_weight,
         ) {
             winner = contender;
@@ -492,11 +671,28 @@ mod tests {
                 minimum_profit_factor: 0.0,
                 minimum_return_drawdown: 0.0,
             },
+            deposit_gates: GateConfig {
+                minimum_trades: 0,
+                maximum_drawdown_percent: 100.0,
+                minimum_return_percent: -100.0,
+                minimum_profit_factor: 0.0,
+                minimum_return_drawdown: 0.0,
+            },
             precision: crate::model::PrecisionGateConfig {
                 minimum_return_retention: 0.0,
             },
             oos1_expectancy_retention: 0.0,
+            require_m1_precision: false,
+            simple_exits: true,
             flatten_at_22: false,
+            max_one_entry_per_day: true,
+            mutate_after_elites: 0,
+            random_fill_fraction: 0.0,
+            worker_threads: 1,
+            require_m1_robustness: false,
+            robustness_folds: 3,
+            robustness_monte_carlo_trials: 50,
+            robustness_neighborhood_samples: 2,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -581,6 +777,20 @@ mod tests {
             bank.elites
                 .iter()
                 .all(|elite| elite.strategy.manage.flatten_end_of_day)
+        );
+        bank.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn max_one_entry_per_day_is_a_job_policy_not_an_evolvable_gene() {
+        let dataset = dataset();
+        let mut config = config();
+        config.max_one_entry_per_day = true;
+        let bank = evolve_new(&dataset, None, &dataset, &broker(), config, 1).unwrap();
+        assert!(
+            bank.elites
+                .iter()
+                .all(|elite| elite.strategy.manage.max_one_entry_per_day)
         );
         bank.validate_integrity().unwrap();
     }

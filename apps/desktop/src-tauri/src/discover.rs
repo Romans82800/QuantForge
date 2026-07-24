@@ -1,5 +1,6 @@
-use crate::data_lab::{display_path, load_bound_broker, load_data_source};
+use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
 use crate::databank::{EvolveArtifact, verify_artifact};
+use quantforge_data::{BarDataset, bar_content_hash};
 use quantforge_discover::{Databank, DiscoverConfig, GateConfig, continue_evolution, evolve_new};
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
@@ -11,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -33,20 +34,44 @@ pub struct DiscoverRequest {
     m1_source_timezone: Option<String>,
     broker_path: String,
     databank_path: String,
+    /// Soft generation budget. Ignored as a hard stop when `run_until_stopped` is true
+    /// and this is 0; otherwise the worker stops after this many generations.
     generations: u64,
+    /// When true (default), keep evolving until Stop (or optional soft `generations` budget).
+    run_until_stopped: Option<bool>,
     initial_candidates: Option<usize>,
     batch_size: Option<usize>,
     correlation_threshold: Option<f64>,
     novelty_weight: Option<f64>,
     seed: Option<u64>,
+    /// Scout (early H1) gate thresholds.
     minimum_trades: Option<usize>,
     maximum_drawdown_percent: Option<f64>,
     minimum_return_percent: Option<f64>,
     minimum_profit_factor: Option<f64>,
     minimum_return_drawdown: Option<f64>,
+    /// Deposit (final pot) gate thresholds.
+    deposit_minimum_trades: Option<usize>,
+    deposit_maximum_drawdown_percent: Option<f64>,
+    deposit_minimum_return_percent: Option<f64>,
+    deposit_minimum_profit_factor: Option<f64>,
+    deposit_minimum_return_drawdown: Option<f64>,
     minimum_m1_return_retention: Option<f64>,
     oos1_expectancy_retention: Option<f64>,
+    /// SQX Selected-TF style when false (default): skip M1 during Discover.
+    require_m1_precision: Option<bool>,
+    /// Market + SL/TP + time stop ≤ 16; no trailing/BE/partials/stop-limit entries.
+    simple_exits: Option<bool>,
     flatten_at_22: Option<bool>,
+    /// Cap to one filled entry per broker-local day (default true).
+    max_one_entry_per_day: Option<bool>,
+    mutate_after_elites: Option<usize>,
+    random_fill_fraction: Option<f64>,
+    worker_threads: Option<usize>,
+    require_m1_robustness: Option<bool>,
+    robustness_folds: Option<usize>,
+    robustness_monte_carlo_trials: Option<usize>,
+    robustness_neighborhood_samples: Option<usize>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -59,6 +84,13 @@ pub struct DiscoverRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EvaluationErrorCount {
+    message: String,
+    count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoverJobView {
     job_id: Option<String>,
     status: &'static str,
@@ -67,12 +99,38 @@ pub struct DiscoverJobView {
     output_path: Option<String>,
     completed_generations: u64,
     requested_generations: u64,
+    run_until_stopped: bool,
     evaluation_count: u64,
+    accepted_total: u64,
+    /// Distinct niches currently occupied (= elites in the pot).
+    pot_elites: usize,
+    pot_new_niches: u64,
+    databank_elites: usize,
+    mutate_after_elites: usize,
+    breeding_active: bool,
+    worker_threads: usize,
     coverage: usize,
     qd_score: f64,
+    rejected_gate: u64,
+    rejected_deposit_gate: u64,
+    rejected_precision: u64,
+    rejected_oos1: u64,
+    rejected_m1_fidelity: u64,
+    rejected_walk_forward: u64,
+    rejected_monte_carlo: u64,
+    rejected_param_neighborhood: u64,
     rejected_clone: u64,
     rejected_correlated: u64,
+    rejected_niche_not_improved: u64,
+    rejected_evaluation: u64,
     rejected_total: u64,
+    evaluations_per_hour: f64,
+    accepts_per_hour: f64,
+    best_is_expectancy: Option<f64>,
+    best_oos1_expectancy: Option<f64>,
+    top_evaluation_errors: Vec<EvaluationErrorCount>,
+    m1_bars_repaired: u64,
+    started_at_ms: Option<u64>,
     stop_requested: bool,
     message: String,
 }
@@ -119,12 +177,37 @@ impl DiscoverJobView {
             output_path: None,
             completed_generations: 0,
             requested_generations: 0,
+            run_until_stopped: true,
             evaluation_count: 0,
+            accepted_total: 0,
+            pot_elites: 0,
+            pot_new_niches: 0,
+            databank_elites: 0,
+            mutate_after_elites: 300,
+            breeding_active: false,
+            worker_threads: 0,
             coverage: 0,
             qd_score: 0.0,
+            rejected_gate: 0,
+            rejected_deposit_gate: 0,
+            rejected_precision: 0,
+            rejected_oos1: 0,
+            rejected_m1_fidelity: 0,
+            rejected_walk_forward: 0,
+            rejected_monte_carlo: 0,
+            rejected_param_neighborhood: 0,
             rejected_clone: 0,
             rejected_correlated: 0,
+            rejected_niche_not_improved: 0,
+            rejected_evaluation: 0,
             rejected_total: 0,
+            evaluations_per_hour: 0.0,
+            accepts_per_hour: 0.0,
+            best_is_expectancy: None,
+            best_oos1_expectancy: None,
+            top_evaluation_errors: Vec::new(),
+            m1_bars_repaired: 0,
+            started_at_ms: None,
             stop_requested: false,
             message: "Configure a new search or continue an existing databank.".into(),
         }
@@ -149,13 +232,12 @@ pub fn start_discover(
 
     state.paused.store(false, Ordering::SeqCst);
     state.stop.store(false, Ordering::SeqCst);
-    let job_id = format!(
-        "desktop-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis()
-    );
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as u64;
+    let job_id = format!("desktop-{now_ms}");
+    let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let started = DiscoverJobView {
         job_id: Some(job_id),
         status: "running",
@@ -164,12 +246,37 @@ pub fn start_discover(
         output_path: Some(display_path(Path::new(&request.databank_path))),
         completed_generations: 0,
         requested_generations: request.generations,
+        run_until_stopped,
         evaluation_count: 0,
+        accepted_total: 0,
+        pot_elites: 0,
+        pot_new_niches: 0,
+        databank_elites: 0,
+        mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
+        breeding_active: false,
+        worker_threads: request.worker_threads.unwrap_or(0),
         coverage: 0,
         qd_score: 0.0,
+        rejected_gate: 0,
+        rejected_deposit_gate: 0,
+        rejected_precision: 0,
+        rejected_oos1: 0,
+        rejected_m1_fidelity: 0,
+        rejected_walk_forward: 0,
+        rejected_monte_carlo: 0,
+        rejected_param_neighborhood: 0,
         rejected_clone: 0,
         rejected_correlated: 0,
+        rejected_niche_not_improved: 0,
+        rejected_evaluation: 0,
         rejected_total: 0,
+        evaluations_per_hour: 0.0,
+        accepts_per_hour: 0.0,
+        best_is_expectancy: None,
+        best_oos1_expectancy: None,
+        top_evaluation_errors: Vec::new(),
+        m1_bars_repaired: 0,
+        started_at_ms: Some(now_ms),
         stop_requested: false,
         message: "The Rust discovery worker is starting.".into(),
     };
@@ -260,8 +367,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     {
         return Err("data, broker and databank paths are required".into());
     }
-    if request.generations == 0 {
-        return Err("at least one generation is required".into());
+    let run_until_stopped = request.run_until_stopped.unwrap_or(true);
+    if !run_until_stopped && request.generations == 0 {
+        return Err("at least one generation is required when not running until stopped".into());
     }
     let databank_exists = Path::new(&request.databank_path).exists();
     match request.mode {
@@ -285,8 +393,23 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.minimum_return_percent.is_some(),
             request.minimum_profit_factor.is_some(),
             request.minimum_return_drawdown.is_some(),
+            request.deposit_minimum_trades.is_some(),
+            request.deposit_maximum_drawdown_percent.is_some(),
+            request.deposit_minimum_return_percent.is_some(),
+            request.deposit_minimum_profit_factor.is_some(),
+            request.deposit_minimum_return_drawdown.is_some(),
             request.minimum_m1_return_retention.is_some(),
+            request.require_m1_precision.is_some(),
+            request.simple_exits.is_some(),
             request.flatten_at_22.is_some(),
+            request.max_one_entry_per_day.is_some(),
+            request.mutate_after_elites.is_some(),
+            request.random_fill_fraction.is_some(),
+            request.worker_threads.is_some(),
+            request.require_m1_robustness.is_some(),
+            request.robustness_folds.is_some(),
+            request.robustness_monte_carlo_trials.is_some(),
+            request.robustness_neighborhood_samples.is_some(),
             request.commission_per_lot_round_turn.is_some(),
             request.slippage_points_per_side.is_some(),
             request.fallback_spread_points.is_some(),
@@ -313,6 +436,10 @@ fn run_discovery(
     paused: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let run_until_stopped = request.run_until_stopped.unwrap_or(true);
+    let soft_budget = request.generations;
+
     let loaded = load_data_source(
         &request.data_path,
         request.metadata_path.as_deref(),
@@ -339,18 +466,33 @@ fn run_discovery(
             m1_quality.score
         ));
     }
+
+    let (search_h1, h1_bars_built) = {
+        let built = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
+        let count = built.bars.len() as u64;
+        (built, count)
+    };
+    {
+        let mut view = job
+            .write()
+            .map_err(|_| "discover job state is unavailable".to_owned())?;
+        view.m1_bars_repaired = h1_bars_built;
+        view.message = format!(
+            "Built {h1_bars_built} decision bars from M1 (SQX-style) before search."
+        );
+    }
+
     let promotion_split = request.promotion_split.unwrap_or(true);
     let validation_fraction = request.validation_fraction.unwrap_or(0.2);
     let sealed_fraction = request.sealed_fraction.unwrap_or(0.2);
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| development_partition(&loaded.dataset, validation_fraction, sealed_fraction))
+        .then(|| development_partition(&search_h1, validation_fraction, sealed_fraction))
         .transpose()?;
     let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction))
+        .then(|| oos1_partition(&search_h1, validation_fraction, sealed_fraction))
         .transpose()?;
-    let new_dataset = development_dataset.as_ref().unwrap_or(&loaded.dataset);
+    let new_dataset = development_dataset.as_ref().unwrap_or(&search_h1);
     let oos1_ref = oos1_dataset.as_ref();
-    // Precision M1 must not see OOS1/OOS2 — clip to the same wall-clock window as IS.
     let m1_is_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| clip_dataset_to_window(&m1.dataset, new_dataset))
         .transpose()?;
@@ -372,8 +514,8 @@ fn run_discovery(
                 0,
             )
             .map_err(|error| error.to_string())?;
-            update_bank(job, &bank, 0, request.generations)?;
-            (bank, None, 0)
+            update_bank(job, &bank, 0, soft_budget, run_until_stopped, started)?;
+            (bank, None, 0u64)
         }
         DiscoverMode::Continue => {
             let bytes = fs::read(&request.databank_path)
@@ -382,7 +524,14 @@ fn run_discovery(
                 .map_err(|error| format!("databank JSON is invalid: {error}"))?;
             verify_artifact(&artifact).map_err(|error| error.to_string())?;
             let starting_generation = artifact.databank.completed_generations;
-            update_bank(job, &artifact.databank, 0, request.generations)?;
+            update_bank(
+                job,
+                &artifact.databank,
+                0,
+                soft_budget,
+                run_until_stopped,
+                started,
+            )?;
             (
                 artifact.databank,
                 Some(artifact.manifest.recipe_hash),
@@ -391,35 +540,72 @@ fn run_discovery(
         }
     };
 
-    let mut completed_now = 0;
-    while completed_now < request.generations {
+    let mut completed_now = 0u64;
+    let mut wrote_checkpoint = Path::new(&request.databank_path).exists();
+
+    if bank.coverage() > 0 {
+        write_discover_checkpoint(
+            &request,
+            &bank,
+            display_path(Path::new(&request.data_path)),
+            display_path(Path::new(&request.broker_path)),
+            loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+            &quality,
+            &m1_quality,
+            &m1.dataset.data_hash,
+            validation_fraction,
+            sealed_fraction,
+            starting_generation,
+            continuation_recipe_hash.clone(),
+            completed_now,
+            soft_budget,
+            run_until_stopped,
+            true,
+            wrote_checkpoint,
+        )?;
+        wrote_checkpoint = true;
+    }
+
+    loop {
         wait_if_paused(job, paused, stop)?;
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        update_phase(
-            job,
-            &format!(
+        if !run_until_stopped && completed_now >= soft_budget {
+            break;
+        }
+        if run_until_stopped && soft_budget > 0 && completed_now >= soft_budget {
+            break;
+        }
+
+        let phase_label = if run_until_stopped && soft_budget == 0 {
+            format!("Evolving generation {}", completed_now + 1)
+        } else {
+            format!(
                 "Evolving generation {} of {}",
                 completed_now + 1,
-                request.generations
-            ),
+                soft_budget.max(1)
+            )
+        };
+        update_phase(
+            job,
+            &phase_label,
             "Candidates are bred on IS, precision-checked on M1, then picked only if OOS1 expectancy ≥ 0.7× IS.",
         )?;
-        let evaluation_dataset = if bank.data_hash == loaded.dataset.data_hash {
-            &loaded.dataset
+
+        let evaluation_dataset = if bank.data_hash == search_h1.data_hash {
+            &search_h1
         } else {
             development_dataset.as_ref().ok_or_else(|| {
                 "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
             })?
         };
-        let evaluation_oos1 = if bank.data_hash == loaded.dataset.data_hash {
+        let evaluation_oos1 = if bank.data_hash == search_h1.data_hash {
             None
         } else {
             oos1_ref
         };
         let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
-            // Legacy databanks trained precision on full M1 history.
             &m1.dataset
         } else {
             m1_eval
@@ -434,7 +620,107 @@ fn run_discovery(
         )
         .map_err(|error| error.to_string())?;
         completed_now += 1;
-        update_bank(job, &bank, completed_now, request.generations)?;
+        update_bank(
+            job,
+            &bank,
+            completed_now,
+            soft_budget,
+            run_until_stopped,
+            started,
+        )?;
+
+        if bank.coverage() > 0 {
+            write_discover_checkpoint(
+                &request,
+                &bank,
+                display_path(Path::new(&request.data_path)),
+                display_path(Path::new(&request.broker_path)),
+                loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+                &quality,
+                &m1_quality,
+                &m1.dataset.data_hash,
+                validation_fraction,
+                sealed_fraction,
+                starting_generation,
+                continuation_recipe_hash.clone(),
+                completed_now,
+                soft_budget,
+                run_until_stopped,
+                true,
+                wrote_checkpoint,
+            )?;
+            wrote_checkpoint = true;
+            if let Ok(mut view) = job.write() {
+                view.output_path = Some(display_path(Path::new(&request.databank_path)));
+                view.message = format!(
+                    "Bank growing: {} niches after {} evaluations.",
+                    bank.coverage(),
+                    bank.evaluation_count
+                );
+            }
+        }
+    }
+
+    finish_discovery(
+        request,
+        job,
+        bank,
+        &loaded,
+        &m1,
+        &quality,
+        &m1_quality,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash,
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        wrote_checkpoint,
+        started,
+    )
+}
+
+fn finish_discovery(
+    request: DiscoverRequest,
+    job: &Arc<RwLock<DiscoverJobView>>,
+    bank: Databank,
+    loaded: &crate::data_lab::LoadedDataSource,
+    m1: &crate::data_lab::LoadedDataSource,
+    quality: &quantforge_data::DataQualityReport,
+    m1_quality: &quantforge_data::DataQualityReport,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    starting_generation: u64,
+    continuation_recipe_hash: Option<quantforge_core::ContentHash>,
+    completed_now: u64,
+    soft_budget: u64,
+    run_until_stopped: bool,
+    wrote_checkpoint: bool,
+    started: Instant,
+) -> Result<(), String> {
+    update_bank(
+        job,
+        &bank,
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        started,
+    )?;
+
+    if bank.elites.is_empty() {
+        let funnel = funnel_summary(&bank);
+        let mut view = job
+            .write()
+            .map_err(|_| "discover job state is unavailable".to_owned())?;
+        view.status = "completed";
+        view.phase = "Completed with an empty bank".into();
+        view.message = format!(
+            "No elites passed H1 → M1 → OOS1 after {} evaluations across {} generations. {funnel} Keep searching, loosen gates, or check data.",
+            bank.evaluation_count, completed_now
+        );
+        view.output_path = None;
+        return Ok(());
     }
 
     bank.validate_integrity().map_err(|error| {
@@ -448,6 +734,88 @@ fn run_discovery(
         "Writing immutable checkpoint",
         "The manifest and archive are being written atomically.",
     )?;
+    write_discover_checkpoint(
+        &request,
+        &bank,
+        display_path(Path::new(&request.data_path)),
+        display_path(Path::new(&request.broker_path)),
+        loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+        quality,
+        m1_quality,
+        &m1.dataset.data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash,
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        false,
+        wrote_checkpoint,
+    )?;
+
+    let mut view = job
+        .write()
+        .map_err(|_| "discover job state is unavailable".to_owned())?;
+    view.status = "completed";
+    view.phase = if stop_was_early(completed_now, soft_budget, run_until_stopped) {
+        "Stopped and checkpointed".into()
+    } else {
+        "Discovery checkpoint complete".into()
+    };
+    view.output_path = Some(display_path(Path::new(&request.databank_path)));
+    view.message = format!(
+        "Saved {} niches after {} evaluations.",
+        view.coverage, view.evaluation_count
+    );
+    Ok(())
+}
+
+fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool) -> bool {
+    if run_until_stopped && soft_budget == 0 {
+        true
+    } else {
+        soft_budget > 0 && completed_now < soft_budget
+    }
+}
+
+fn funnel_summary(bank: &Databank) -> String {
+    let telemetry = &bank.telemetry;
+    format!(
+        "Rejects — scout {}, deposit {}, M1 {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
+        telemetry.rejected_gate,
+        telemetry.rejected_deposit_gate,
+        telemetry.rejected_m1_fidelity,
+        telemetry.rejected_walk_forward,
+        telemetry.rejected_monte_carlo,
+        telemetry.rejected_param_neighborhood,
+        telemetry.rejected_oos1,
+        telemetry.rejected_clone,
+        telemetry.rejected_correlated,
+        telemetry.rejected_niche_not_improved,
+        telemetry.rejected_evaluation
+    )
+}
+
+fn write_discover_checkpoint(
+    request: &DiscoverRequest,
+    bank: &Databank,
+    source: String,
+    broker: String,
+    metadata_hash: Option<quantforge_core::ContentHash>,
+    quality: &quantforge_data::DataQualityReport,
+    m1_quality: &quantforge_data::DataQualityReport,
+    m1_data_hash: &quantforge_core::ContentHash,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    starting_generation: u64,
+    continuation_recipe_hash: Option<quantforge_core::ContentHash>,
+    completed_now: u64,
+    soft_budget: u64,
+    run_until_stopped: bool,
+    partial: bool,
+    already_exists: bool,
+) -> Result<(), String> {
     let mut manifest_config = BTreeMap::<String, Value>::from([
         (
             "source".into(),
@@ -470,7 +838,7 @@ fn run_discovery(
             "discover_config".into(),
             serde_json::to_value(&bank.config).map_err(|error| error.to_string())?,
         ),
-        ("generations_requested".into(), json!(request.generations)),
+        ("generations_requested".into(), json!(soft_budget)),
         ("starting_generation".into(), json!(starting_generation)),
         (
             "continued".into(),
@@ -478,27 +846,34 @@ fn run_discovery(
         ),
         ("data_quality_grade".into(), json!(quality.grade)),
         ("data_quality_score".into(), json!(quality.score)),
-        ("m1_data_hash".into(), json!(&m1.dataset.data_hash)),
+        ("m1_data_hash".into(), json!(m1_data_hash)),
         ("m1_quality_grade".into(), json!(m1_quality.grade)),
         ("m1_quality_score".into(), json!(m1_quality.score)),
         ("desktop_job".into(), json!(true)),
-        (
-            "promotion_split".into(),
-            json!(bank.data_hash != loaded.dataset.data_hash),
-        ),
+        ("promotion_split".into(), json!(true)),
         ("validation_fraction".into(), json!(validation_fraction)),
         ("sealed_fraction".into(), json!(sealed_fraction)),
         (
             "stopped_early".into(),
-            json!(completed_now < request.generations),
+            json!(stop_was_early(completed_now, soft_budget, run_until_stopped)),
         ),
+        ("run_until_stopped".into(), json!(run_until_stopped)),
+        ("partial_checkpoint".into(), json!(partial)),
+        (
+            "require_m1_precision".into(),
+            json!(bank.config.require_m1_precision),
+        ),
+        (
+            "research_grade".into(),
+            json!(!bank.config.require_m1_precision),
+        ),
+        ("simple_exits".into(), json!(bank.config.simple_exits)),
+        (
+            "max_one_entry_per_day".into(),
+            json!(bank.config.max_one_entry_per_day),
+        ),
+        ("m1_fidelity_verified".into(), json!(false)),
     ]);
-    if let Some(metadata) = &loaded.metadata {
-        manifest_config.insert("metadata_hash".into(), json!(metadata.metadata_hash));
-    }
-    if let Some(metadata) = &m1.metadata {
-        manifest_config.insert("m1_metadata_hash".into(), json!(metadata.metadata_hash));
-    }
     if let Some(recipe_hash) = continuation_recipe_hash {
         manifest_config.insert("continued_recipe_hash".into(), json!(recipe_hash));
     }
@@ -516,46 +891,28 @@ fn run_discovery(
     .map_err(|error| error.to_string())?;
     let artifact = EvolveArtifact {
         manifest,
-        source: display_path(Path::new(&request.data_path)),
-        broker: display_path(Path::new(&request.broker_path)),
-        metadata_hash: loaded.metadata.map(|value| value.metadata_hash),
-        data_quality: quality,
+        source,
+        broker,
+        metadata_hash,
+        data_quality: quality.clone(),
         coverage: bank.coverage(),
         qd_score: bank.qd_score(),
-        databank: bank,
+        databank: bank.clone(),
     };
-    match request.mode {
-        DiscoverMode::New => {
-            write_json_new(&request.databank_path, &artifact).map_err(|error| error.to_string())?;
-        }
-        DiscoverMode::Continue => {
-            write_json_versioned(&request.databank_path, &artifact)
-                .map_err(|error| error.to_string())?;
-        }
-    }
-
-    let mut view = job
-        .write()
-        .map_err(|_| "discover job state is unavailable".to_owned())?;
-    view.status = "completed";
-    view.phase = if completed_now < request.generations {
-        "Stopped and checkpointed".into()
+    if already_exists || request.mode == DiscoverMode::Continue {
+        write_json_versioned(&request.databank_path, &artifact)
+            .map_err(|error| error.to_string())?;
     } else {
-        "Discovery checkpoint complete".into()
-    };
-    view.output_path = Some(display_path(Path::new(&request.databank_path)));
-    view.message = format!(
-        "Saved {} niches after {} evaluations.",
-        view.coverage, view.evaluation_count
-    );
+        write_json_new(&request.databank_path, &artifact).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
 fn development_partition(
-    dataset: &quantforge_data::BarDataset,
+    dataset: &BarDataset,
     validation_fraction: f64,
     sealed_fraction: f64,
-) -> Result<quantforge_data::BarDataset, String> {
+) -> Result<BarDataset, String> {
     let plan = quantforge_quality::DataSplitPlan::chronological(
         dataset,
         validation_fraction,
@@ -565,12 +922,11 @@ fn development_partition(
     slice_partition(dataset, 0, plan.development.bar_count)
 }
 
-/// OOS1 = chronological validation window (pick gate). OOS2 remains sealed.
 fn oos1_partition(
-    dataset: &quantforge_data::BarDataset,
+    dataset: &BarDataset,
     validation_fraction: f64,
     sealed_fraction: f64,
-) -> Result<quantforge_data::BarDataset, String> {
+) -> Result<BarDataset, String> {
     let plan = quantforge_quality::DataSplitPlan::chronological(
         dataset,
         validation_fraction,
@@ -582,11 +938,7 @@ fn oos1_partition(
     slice_partition(dataset, start, end)
 }
 
-fn slice_partition(
-    dataset: &quantforge_data::BarDataset,
-    start: usize,
-    end: usize,
-) -> Result<quantforge_data::BarDataset, String> {
+fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<BarDataset, String> {
     if end <= start || end > dataset.bars.len() {
         return Err(format!(
             "invalid partition slice {start}..{end} for {} bars",
@@ -594,8 +946,8 @@ fn slice_partition(
         ));
     }
     let bars = dataset.bars[start..end].to_vec();
-    Ok(quantforge_data::BarDataset {
-        data_hash: quantforge_data::bar_content_hash(&bars),
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
         source_rows: bars.len(),
         duplicate_rows_removed: 0,
         input_was_sorted: true,
@@ -605,11 +957,7 @@ fn slice_partition(
     })
 }
 
-/// Keep bars whose timestamps fall inside `window`'s inclusive time span.
-fn clip_dataset_to_window(
-    dataset: &quantforge_data::BarDataset,
-    window: &quantforge_data::BarDataset,
-) -> Result<quantforge_data::BarDataset, String> {
+fn clip_dataset_to_window(dataset: &BarDataset, window: &BarDataset) -> Result<BarDataset, String> {
     let (Some(first), Some(last)) = (window.bars.first(), window.bars.last()) else {
         return Err("cannot clip M1: IS window is empty".into());
     };
@@ -626,8 +974,8 @@ fn clip_dataset_to_window(
             "M1 has fewer than 2 bars inside the IS window [{start_ms}..{end_ms}]"
         ));
     }
-    Ok(quantforge_data::BarDataset {
-        data_hash: quantforge_data::bar_content_hash(&bars),
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
         source_rows: bars.len(),
         duplicate_rows_removed: 0,
         input_was_sorted: true,
@@ -650,17 +998,42 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
         gates: GateConfig {
-            minimum_trades: request.minimum_trades.unwrap_or(20),
-            maximum_drawdown_percent: request.maximum_drawdown_percent.unwrap_or(30.0),
+            minimum_trades: request.minimum_trades.unwrap_or(10),
+            maximum_drawdown_percent: request.maximum_drawdown_percent.unwrap_or(40.0),
             minimum_return_percent: request.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: request.minimum_profit_factor.unwrap_or(1.0),
             minimum_return_drawdown: request.minimum_return_drawdown.unwrap_or(0.0),
+        },
+        deposit_gates: GateConfig {
+            minimum_trades: request.deposit_minimum_trades.unwrap_or(20),
+            maximum_drawdown_percent: request
+                .deposit_maximum_drawdown_percent
+                .unwrap_or(30.0),
+            minimum_return_percent: request.deposit_minimum_return_percent.unwrap_or(0.0),
+            minimum_profit_factor: request.deposit_minimum_profit_factor.unwrap_or(1.0),
+            minimum_return_drawdown: request.deposit_minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.95),
         },
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
+        require_m1_precision: request.require_m1_precision.unwrap_or(false),
+        simple_exits: request.simple_exits.unwrap_or(true),
         flatten_at_22: request.flatten_at_22.unwrap_or(false),
+        max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
+        mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
+        random_fill_fraction: request.random_fill_fraction.unwrap_or(0.4),
+        worker_threads: request.worker_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|cores| cores.get().saturating_sub(1).max(1))
+                .unwrap_or(1)
+        }),
+        require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
+        robustness_folds: request.robustness_folds.unwrap_or(3),
+        robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
+        robustness_neighborhood_samples: request
+            .robustness_neighborhood_samples
+            .unwrap_or(8),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -715,26 +1088,120 @@ fn update_bank(
     bank: &Databank,
     completed_now: u64,
     requested: u64,
+    run_until_stopped: bool,
+    started: Instant,
 ) -> Result<(), String> {
     let telemetry = &bank.telemetry;
+    let accepted_total = telemetry.pot_accepted
+        + telemetry.pot_replaced
+        + telemetry.databank_accepted
+        + telemetry.databank_replaced;
     let rejected_total = telemetry.rejected_gate
+        + telemetry.rejected_deposit_gate
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
         + telemetry.rejected_oos1
+        + telemetry.rejected_m1_fidelity
+        + telemetry.rejected_walk_forward
+        + telemetry.rejected_monte_carlo
+        + telemetry.rejected_param_neighborhood
         + telemetry.rejected_evaluation;
+    let hours = started.elapsed().as_secs_f64().max(1.0) / 3600.0;
+    let risk = quantforge_discover::FIXED_RISK_PER_TRADE;
+    let best_is = bank
+        .elites
+        .iter()
+        .chain(bank.accepted_pool.iter())
+        .map(|elite| elite.is_expectancy / risk)
+        .fold(None, |best: Option<f64>, value| {
+            Some(best.map_or(value, |current| current.max(value)))
+        });
+    let best_oos1 = bank
+        .elites
+        .iter()
+        .chain(bank.accepted_pool.iter())
+        .filter_map(|elite| elite.oos1_expectancy.map(|value| value / risk))
+        .fold(None, |best: Option<f64>, value| {
+            Some(best.map_or(value, |current| current.max(value)))
+        });
+    let mut errors: Vec<EvaluationErrorCount> = telemetry
+        .evaluation_errors
+        .iter()
+        .map(|(message, count)| EvaluationErrorCount {
+            message: message.clone(),
+            count: *count,
+        })
+        .collect();
+    errors.sort_by(|left, right| right.count.cmp(&left.count));
+    errors.truncate(5);
+
+    let mutate_after = bank.config.mutate_after_elites;
+    let pot_elites = bank.pot_size();
+    let databank_elites = bank.coverage();
+    let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
+    let phase = if breeding_active {
+        format!(
+            "Breeding from pot · pot {pot_elites} · databank {databank_elites} · gen {completed_now}"
+        )
+    } else {
+        format!(
+            "Filling initial pot · {pot_elites}/{mutate_after} · databank {databank_elites} · gen {completed_now}"
+        )
+    };
+    let pot_message = format!(
+        "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} (M1+WFO+MC only). {} · {}",
+        if breeding_active {
+            "Breeding unlocked; random fill continues".to_owned()
+        } else {
+            format!(
+                "{} more pot elites until breeding",
+                mutate_after.saturating_sub(pot_elites)
+            )
+        },
+        funnel_summary(bank)
+    );
+
     let mut view = job
         .write()
         .map_err(|_| "discover job state is unavailable".to_owned())?;
+    if view.status != "paused" {
+        view.status = "running";
+        view.phase = phase;
+        view.message = pot_message;
+    }
     view.completed_generations = completed_now;
     view.requested_generations = requested;
+    view.run_until_stopped = run_until_stopped;
     view.evaluation_count = bank.evaluation_count;
-    view.coverage = bank.coverage();
+    view.accepted_total = accepted_total;
+    view.pot_elites = pot_elites;
+    view.pot_new_niches = telemetry.pot_accepted;
+    view.databank_elites = databank_elites;
+    view.mutate_after_elites = mutate_after;
+    view.breeding_active = breeding_active;
+    view.worker_threads = bank.config.worker_threads;
+    view.coverage = databank_elites;
     view.qd_score = bank.qd_score();
+    view.rejected_gate = telemetry.rejected_gate;
+    view.rejected_deposit_gate = telemetry.rejected_deposit_gate;
+    view.rejected_precision = telemetry.rejected_precision;
+    view.rejected_oos1 = telemetry.rejected_oos1;
+    view.rejected_m1_fidelity = telemetry.rejected_m1_fidelity;
+    view.rejected_walk_forward = telemetry.rejected_walk_forward;
+    view.rejected_monte_carlo = telemetry.rejected_monte_carlo;
+    view.rejected_param_neighborhood = telemetry.rejected_param_neighborhood;
     view.rejected_clone = telemetry.rejected_clone;
     view.rejected_correlated = telemetry.rejected_correlated;
+    view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
+    view.rejected_evaluation = telemetry.rejected_evaluation;
     view.rejected_total = rejected_total;
+    view.evaluations_per_hour = bank.evaluation_count as f64 / hours;
+    view.accepts_per_hour = accepted_total as f64 / hours;
+    view.best_is_expectancy = best_is;
+    view.best_oos1_expectancy = best_oos1;
+    view.top_evaluation_errors = errors;
     Ok(())
 }
 
@@ -764,6 +1231,7 @@ mod tests {
             broker_path: fixture("EURUSD_fixture_broker.json"),
             databank_path,
             generations: 1,
+            run_until_stopped: Some(false),
             initial_candidates: Some(16),
             batch_size: Some(8),
             correlation_threshold: Some(0.88),
@@ -774,14 +1242,30 @@ mod tests {
             minimum_return_percent: Some(-100.0),
             minimum_profit_factor: Some(0.0),
             minimum_return_drawdown: Some(0.0),
+            deposit_minimum_trades: Some(0),
+            deposit_maximum_drawdown_percent: Some(100.0),
+            deposit_minimum_return_percent: Some(-100.0),
+            deposit_minimum_profit_factor: Some(0.0),
+            deposit_minimum_return_drawdown: Some(0.0),
             minimum_m1_return_retention: Some(0.95),
+            oos1_expectancy_retention: Some(0.7),
+            require_m1_precision: Some(false),
+            simple_exits: Some(true),
             flatten_at_22: Some(false),
+            max_one_entry_per_day: Some(true),
+            mutate_after_elites: Some(0),
+            random_fill_fraction: Some(0.0),
+            worker_threads: Some(1),
+            require_m1_robustness: Some(false),
+            robustness_folds: Some(3),
+            robustness_monte_carlo_trials: Some(50),
+            robustness_neighborhood_samples: Some(2),
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,
             max_spread_points: None,
             initial_balance: Some(100_000.0),
-            promotion_split: None,
+            promotion_split: Some(false),
             validation_fraction: None,
             sealed_fraction: None,
         }
@@ -838,21 +1322,76 @@ mod tests {
     }
 
     #[test]
-    fn worker_never_persists_an_unloadable_empty_archive() {
+    fn worker_soft_completes_an_empty_archive_without_persisting() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("empty-bank.json");
         let mut request = request(path.display().to_string());
         request.minimum_trades = Some(usize::MAX);
         let job = Arc::new(RwLock::new(DiscoverJobView::idle()));
-        let error = run_discovery(
+        run_discovery(
             request,
             &job,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
         )
-        .expect_err("an empty archive must fail before persistence");
+        .expect("empty archive should soft-complete");
 
-        assert!(error.contains("no loadable checkpoint"));
+        let view = job.read().expect("job state");
+        assert_eq!(view.status, "completed");
+        assert!(view.phase.contains("empty"));
         assert!(!path.exists());
+        assert!(view.rejected_total > 0 || view.evaluation_count > 0);
+    }
+
+    #[test]
+    fn decision_bars_are_built_from_m1_including_gappy_hours() {
+        use quantforge_data::Bar;
+        let decision = BarDataset {
+            data_hash: bar_content_hash(&[]),
+            source_rows: 1,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars: vec![Bar {
+                timestamp_ms: 0,
+                open: 1.0,
+                high: 1.5, // exported H1 high that M1 never printed
+                low: 0.9,
+                close: 1.1,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: None,
+            }],
+        };
+        let mut m1_bars = Vec::new();
+        for minute in 0..60 {
+            if minute == 30 {
+                continue;
+            }
+            m1_bars.push(Bar {
+                timestamp_ms: minute * 60_000,
+                open: if minute == 0 { 1.0 } else { 1.05 },
+                high: 1.2,
+                low: 0.95,
+                close: 1.1,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: None,
+            });
+        }
+        let m1 = BarDataset {
+            data_hash: bar_content_hash(&m1_bars),
+            source_rows: m1_bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars: m1_bars,
+        };
+        let built = crate::data_lab::build_decision_from_m1(&m1, Some(&decision)).expect("build");
+        assert_eq!(built.bars.len(), 1);
+        assert!((built.bars[0].high - 1.2).abs() < 1e-9);
+        assert_eq!(built.bars[0].tick_volume, 59);
     }
 }

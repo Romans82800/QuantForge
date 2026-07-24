@@ -719,23 +719,26 @@ fn shocked_inputs(
     ))
 }
 
-fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCarloReport {
-    let profits: Vec<_> = baseline
-        .trades
-        .iter()
-        .map(|trade| trade.net_profit)
-        .collect();
-    let mut rng = ChaCha8Rng::seed_from_u64(config.seed ^ 0xa5a5_01b0_07c5_7a11);
-    let mut net_profits = Vec::with_capacity(config.monte_carlo_trials);
-    let mut drawdowns = Vec::with_capacity(config.monte_carlo_trials);
+/// Moving-block bootstrap of an ordered trade-profit sequence (SQX-style MC retest).
+pub fn monte_carlo_from_trade_profits(
+    profits: &[f64],
+    initial_balance: f64,
+    trials: usize,
+    block_length: usize,
+    seed: u64,
+    minimum_p05_net_profit: f64,
+    maximum_p95_drawdown_percent: f64,
+) -> MonteCarloReport {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xa5a5_01b0_07c5_7a11);
+    let mut net_profits = Vec::with_capacity(trials);
+    let mut drawdowns = Vec::with_capacity(trials);
     if profits.is_empty() {
-        net_profits.resize(config.monte_carlo_trials, 0.0);
-        drawdowns.resize(config.monte_carlo_trials, 0.0);
+        net_profits.resize(trials, 0.0);
+        drawdowns.resize(trials, 0.0);
     } else {
-        for _ in 0..config.monte_carlo_trials {
-            let sampled = moving_block_sample(&profits, config.monte_carlo_block_length, &mut rng);
-            let (net_profit, drawdown) =
-                profit_path_metrics(config.scout.initial_balance, &sampled);
+        for _ in 0..trials {
+            let sampled = moving_block_sample(profits, block_length, &mut rng);
+            let (net_profit, drawdown) = profit_path_metrics(initial_balance, &sampled);
             net_profits.push(net_profit);
             drawdowns.push(drawdown);
         }
@@ -748,17 +751,34 @@ fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCar
     let worst_drawdown_percent = *drawdowns.last().unwrap_or(&0.0);
     MonteCarloReport {
         method: "moving_block_trade_bootstrap_v1".into(),
-        seed: config.seed,
-        trials: config.monte_carlo_trials,
-        block_length: config.monte_carlo_block_length,
+        seed,
+        trials,
+        block_length,
         p05_net_profit,
         median_net_profit,
         p95_drawdown_percent,
         worst_drawdown_percent,
         passed: !profits.is_empty()
-            && p05_net_profit >= config.monte_carlo_minimum_p05_net_profit
-            && p95_drawdown_percent <= config.monte_carlo_maximum_p95_drawdown_percent,
+            && p05_net_profit >= minimum_p05_net_profit
+            && p95_drawdown_percent <= maximum_p95_drawdown_percent,
     }
+}
+
+fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCarloReport {
+    let profits: Vec<_> = baseline
+        .trades
+        .iter()
+        .map(|trade| trade.net_profit)
+        .collect();
+    monte_carlo_from_trade_profits(
+        &profits,
+        config.scout.initial_balance,
+        config.monte_carlo_trials,
+        config.monte_carlo_block_length,
+        config.seed,
+        config.monte_carlo_minimum_p05_net_profit,
+        config.monte_carlo_maximum_p95_drawdown_percent,
+    )
 }
 
 fn moving_block_sample(values: &[f64], block_length: usize, rng: &mut ChaCha8Rng) -> Vec<f64> {
@@ -847,6 +867,16 @@ fn run_parameter_neighborhood(
         survival_fraction,
         passed: survival_fraction >= config.minimum_neighborhood_survival_fraction,
     })
+}
+
+pub fn perturb_strategy_parameters(
+    strategy: &StrategyIr,
+    fraction: f64,
+    sample: usize,
+    seed: u64,
+) -> Result<StrategyIr, ChallengeError> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15 ^ sample as u64);
+    perturb_strategy(strategy, fraction, sample, &mut rng)
 }
 
 fn perturb_strategy(

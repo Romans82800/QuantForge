@@ -88,9 +88,31 @@ export function visibleEliteFingerprint(
   return elites[0]?.fingerprint ?? null;
 }
 
-export function discoverProgress(completed: number, requested: number): number {
+export function discoverProgress(
+  completed: number,
+  requested: number,
+  runUntilStopped = false,
+): number {
+  if (runUntilStopped && requested <= 0) {
+    // Indeterminate continuous run — keep the bar visually full while active generations tick.
+    return completed > 0 ? 100 : 0;
+  }
   if (requested <= 0) return 0;
   return Math.max(0, Math.min(100, (completed / requested) * 100));
+}
+
+export function discoverProgressLabel(
+  completed: number,
+  requested: number,
+  runUntilStopped: boolean,
+): string {
+  if (runUntilStopped && requested <= 0) {
+    return `Generation ${completed} · running until stopped`;
+  }
+  if (runUntilStopped) {
+    return `${completed} / ${requested} soft budget · until stopped`;
+  }
+  return `${completed} / ${requested} generations this run`;
 }
 
 export function bindDiscoverTimezone(request: DiscoverRequest): DiscoverRequest {

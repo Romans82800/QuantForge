@@ -15,6 +15,8 @@ input string InpParityPrefix="@@PARITY_PREFIX@@";
 CTrade g_trade;
 datetime g_last_bar=0;
 datetime g_last_exit_bar=0;
+int g_entry_day_key=0;
+int g_entries_today=0;
 int g_deals_file=INVALID_HANDLE;
 int g_equity_file=INVALID_HANDLE;
 int g_metadata_file=INVALID_HANDLE;
@@ -241,6 +243,50 @@ double QFTrailingDistance()
 bool QFFlattenEndOfDay()
 {
    return @@FLATTEN_EOD@@;
+}
+
+bool QFMaxOneEntryPerDay()
+{
+   return @@MAX_ONE_ENTRY_PER_DAY@@;
+}
+
+int QFBrokerDayKey(const datetime bar_time)
+{
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.year*10000+current.mon*100+current.day;
+}
+
+bool QFInMandatoryEntryWindow(const datetime bar_time)
+{
+   // Hard-coded QuantForge session: [02:00, 19:00) broker/chart local time.
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.hour>=2 && current.hour<19;
+}
+
+void QFSyncEntryDay(const datetime bar_time)
+{
+   const int day_key=QFBrokerDayKey(bar_time);
+   if(day_key!=g_entry_day_key)
+   {
+      g_entry_day_key=day_key;
+      g_entries_today=0;
+   }
+}
+
+bool QFEntryDayExhausted(const datetime bar_time)
+{
+   if(!QFMaxOneEntryPerDay())
+      return false;
+   QFSyncEntryDay(bar_time);
+   return g_entries_today>=1;
+}
+
+void QFMarkEntrySignalTaken(const datetime bar_time)
+{
+   QFSyncEntryDay(bar_time);
+   g_entries_today=1;
 }
 
 int QFPartialCount()
@@ -672,6 +718,10 @@ void OnTick()
       return;
    }
 
+   // Hard session: cancel unfilled pending outside [02:00, 19:00).
+   if(!QFInMandatoryEntryWindow(current_bar))
+      QFCancelOwnOrders();
+
    QFManagePosition();
 
    if(QFOwnPosition() && (QFExitSignal(0) || QFTimeStopReached()))
@@ -691,6 +741,16 @@ void OnTick()
       QFRecordEquity(current_bar);
       return;
    }
+   if(!QFInMandatoryEntryWindow(current_bar))
+   {
+      QFRecordEquity(current_bar);
+      return;
+   }
+   if(QFEntryDayExhausted(current_bar))
+   {
+      QFRecordEquity(current_bar);
+      return;
+   }
 
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol,tick))
@@ -706,8 +766,12 @@ void OnTick()
    const bool short_signal=QFShortSignal(0);
    if(long_signal!=short_signal)
    {
+      // First successful market/pending place locks the broker day.
       if(QFOpenOrder(long_signal))
+      {
+         QFMarkEntrySignalTaken(current_bar);
          QFCapturePositionState();
+      }
    }
    QFRecordEquity(current_bar);
 }

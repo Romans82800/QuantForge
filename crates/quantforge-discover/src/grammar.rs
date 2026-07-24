@@ -224,76 +224,296 @@ pub(crate) fn classify_family(strategy: &StrategyIr) -> FamilyStyle {
 }
 
 fn family_entries(family: FamilyStyle, rng: &mut ChaCha8Rng) -> (BoolExpr, BoolExpr) {
+    // Each family has 4 atom pairs (original + 3 extras). Pick 1..=3 and AND them.
+    let atoms = family_entry_atoms(family, rng);
+    let count = rng.gen_range(1..=atoms.len().min(3));
+    let mut order: Vec<usize> = (0..atoms.len()).collect();
+    // Fisher–Yates shuffle prefix for selection without replacement.
+    for index in 0..count {
+        let swap_with = rng.gen_range(index..order.len());
+        order.swap(index, swap_with);
+    }
+    let mut longs = Vec::with_capacity(count);
+    let mut shorts = Vec::with_capacity(count);
+    for &atom_index in order.iter().take(count) {
+        longs.push(atoms[atom_index].0.clone());
+        shorts.push(atoms[atom_index].1.clone());
+    }
+    (and_all(longs), and_all(shorts))
+}
+
+/// (long_condition, short_condition) atoms available inside a family.
+fn family_entry_atoms(
+    family: FamilyStyle,
+    rng: &mut ChaCha8Rng,
+) -> Vec<(BoolExpr, BoolExpr)> {
     match family {
         FamilyStyle::Trend => {
             let fast_index = rng.gen_range(0..6);
             let slow_index = rng.gen_range((fast_index + 2)..PERIODS.len());
-            let fast = ema(PERIODS[fast_index], 1);
-            let slow = ema(PERIODS[slow_index], 1);
-            (
-                BoolExpr::CrossAbove {
-                    left: fast.clone(),
-                    right: slow.clone(),
-                },
-                BoolExpr::CrossBelow {
-                    left: fast,
-                    right: slow,
-                },
-            )
+            let fast_p = PERIODS[fast_index];
+            let slow_p = PERIODS[slow_index];
+            let ema_fast = ema(fast_p, 1);
+            let ema_slow = ema(slow_p, 1);
+            let sma_fast = sma(fast_p, 1);
+            let sma_slow = sma(slow_p, 1);
+            let trend_ema = ema(choose_period(rng), 1);
+            let roc_period = choose_period(rng);
+            vec![
+                // Original: EMA cross
+                (
+                    BoolExpr::CrossAbove {
+                        left: ema_fast.clone(),
+                        right: ema_slow.clone(),
+                    },
+                    BoolExpr::CrossBelow {
+                        left: ema_fast,
+                        right: ema_slow,
+                    },
+                ),
+                // +1 SMA cross
+                (
+                    BoolExpr::CrossAbove {
+                        left: sma_fast.clone(),
+                        right: sma_slow.clone(),
+                    },
+                    BoolExpr::CrossBelow {
+                        left: sma_fast,
+                        right: sma_slow,
+                    },
+                ),
+                // +2 Close vs EMA
+                (
+                    compare(ComparisonOp::GreaterThan, close(1), trend_ema.clone()),
+                    compare(ComparisonOp::LessThan, close(1), trend_ema),
+                ),
+                // +3 Rate of change sign
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant { value: 0.0 },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant { value: 0.0 },
+                    ),
+                ),
+            ]
         }
         FamilyStyle::Momentum => {
             let period = choose_period(rng);
             let upper = rng.gen_range(52.0..=65.0);
             let lower = 100.0 - upper;
-            (
-                compare(
-                    ComparisonOp::GreaterThan,
-                    rsi(period, 1),
-                    NumericExpr::Constant { value: upper },
+            let roc_period = choose_period(rng);
+            let roc_level = rng.gen_range(0.1..=2.5);
+            let mid_period = choose_period(rng);
+            let sma_period = choose_period(rng);
+            vec![
+                // Original: RSI extremes
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        rsi(period, 1),
+                        NumericExpr::Constant { value: upper },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        rsi(period, 1),
+                        NumericExpr::Constant { value: lower },
+                    ),
                 ),
-                compare(
-                    ComparisonOp::LessThan,
-                    rsi(period, 1),
-                    NumericExpr::Constant { value: lower },
+                // +1 ROC magnitude
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant { value: roc_level },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant {
+                            value: -roc_level,
+                        },
+                    ),
                 ),
-            )
+                // +2 RSI side of 50
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        rsi(mid_period, 1),
+                        NumericExpr::Constant { value: 50.0 },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        rsi(mid_period, 1),
+                        NumericExpr::Constant { value: 50.0 },
+                    ),
+                ),
+                // +3 Close vs SMA momentum
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        close(1),
+                        sma(sma_period, 1),
+                    ),
+                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                ),
+            ]
         }
         FamilyStyle::Breakout => {
             let period = choose_period(rng).max(10);
-            (
-                compare(
-                    ComparisonOp::GreaterThan,
-                    close(1),
-                    NumericExpr::Indicator {
-                        value: IndicatorExpr::DonchianHigh { period, shift: 2 },
-                    },
+            let high_period = choose_period(rng).max(10);
+            let sma_period = choose_period(rng);
+            let roc_period = choose_period(rng);
+            vec![
+                // Original: Donchian
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        close(1),
+                        NumericExpr::Indicator {
+                            value: IndicatorExpr::DonchianHigh {
+                                period,
+                                shift: 2,
+                            },
+                        },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        close(1),
+                        NumericExpr::Indicator {
+                            value: IndicatorExpr::DonchianLow {
+                                period,
+                                shift: 2,
+                            },
+                        },
+                    ),
                 ),
-                compare(
-                    ComparisonOp::LessThan,
-                    close(1),
-                    NumericExpr::Indicator {
-                        value: IndicatorExpr::DonchianLow { period, shift: 2 },
-                    },
+                // +1 Highest / Lowest channel
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        close(1),
+                        NumericExpr::Indicator {
+                            value: IndicatorExpr::Highest {
+                                source: PriceField::High,
+                                period: high_period,
+                                shift: 2,
+                            },
+                        },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        close(1),
+                        NumericExpr::Indicator {
+                            value: IndicatorExpr::Lowest {
+                                source: PriceField::Low,
+                                period: high_period,
+                                shift: 2,
+                            },
+                        },
+                    ),
                 ),
-            )
+                // +2 Close vs SMA confirmation
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        close(1),
+                        sma(sma_period, 1),
+                    ),
+                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                ),
+                // +3 Positive / negative ROC expansion
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant { value: 0.05 },
+                    ),
+                    compare(
+                        ComparisonOp::LessThan,
+                        roc(roc_period, 1),
+                        NumericExpr::Constant { value: -0.05 },
+                    ),
+                ),
+            ]
         }
         FamilyStyle::MeanReversion => {
             let period = choose_period(rng);
             let lower = rng.gen_range(20.0..=40.0);
             let upper = 100.0 - lower;
-            (
-                compare(
-                    ComparisonOp::LessThan,
-                    rsi(period, 1),
-                    NumericExpr::Constant { value: lower },
+            let z_period = choose_period(rng);
+            let z_level = rng.gen_range(1.0..=2.5);
+            let pct_period = choose_period(rng).max(10);
+            let pct_low = rng.gen_range(5.0..=25.0);
+            let pct_high = 100.0 - pct_low;
+            let sma_period = choose_period(rng);
+            vec![
+                // Original: RSI extremes
+                (
+                    compare(
+                        ComparisonOp::LessThan,
+                        rsi(period, 1),
+                        NumericExpr::Constant { value: lower },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        rsi(period, 1),
+                        NumericExpr::Constant { value: upper },
+                    ),
                 ),
-                compare(
-                    ComparisonOp::GreaterThan,
-                    rsi(period, 1),
-                    NumericExpr::Constant { value: upper },
+                // +1 Z-score
+                (
+                    compare(
+                        ComparisonOp::LessThan,
+                        zscore(z_period, 1),
+                        NumericExpr::Constant { value: -z_level },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        zscore(z_period, 1),
+                        NumericExpr::Constant { value: z_level },
+                    ),
                 ),
-            )
+                // +2 Percentile in range
+                (
+                    compare(
+                        ComparisonOp::LessThan,
+                        percentile(pct_period, 1),
+                        NumericExpr::Constant { value: pct_low },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        percentile(pct_period, 1),
+                        NumericExpr::Constant { value: pct_high },
+                    ),
+                ),
+                // +3 Close below / above SMA
+                (
+                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        close(1),
+                        sma(sma_period, 1),
+                    ),
+                ),
+            ]
         }
+    }
+}
+
+fn and_all(parts: Vec<BoolExpr>) -> BoolExpr {
+    match parts.len() {
+        0 => BoolExpr::Compare {
+            comparison: ComparisonOp::GreaterThan,
+            left: NumericExpr::Constant { value: 1.0 },
+            right: NumericExpr::Constant { value: 0.0 },
+        },
+        1 => parts.into_iter().next().expect("len checked"),
+        _ => BoolExpr::And { children: parts },
     }
 }
 
@@ -322,9 +542,49 @@ fn ema(period: u16, shift: u16) -> NumericExpr {
     }
 }
 
+fn sma(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::Sma {
+            source: PriceField::Close,
+            period,
+            shift,
+        },
+    }
+}
+
 fn rsi(period: u16, shift: u16) -> NumericExpr {
     NumericExpr::Indicator {
         value: IndicatorExpr::Rsi {
+            source: PriceField::Close,
+            period,
+            shift,
+        },
+    }
+}
+
+fn roc(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::RateOfChange {
+            source: PriceField::Close,
+            period,
+            shift,
+        },
+    }
+}
+
+fn zscore(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::ZScore {
+            source: PriceField::Close,
+            period,
+            shift,
+        },
+    }
+}
+
+fn percentile(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::PercentileInRange {
             source: PriceField::Close,
             period,
             shift,
@@ -446,8 +706,9 @@ fn random_manage(rng: &mut ChaCha8Rng) -> ManagePolicy {
         trailing,
         time_stop_bars: rng.gen_bool(0.45).then(|| rng.gen_range(6..=80)),
         partial_exits,
-        // Production applies this as an immutable job policy, never a gene.
+        // Production applies these as immutable job policies, never genes.
         flatten_end_of_day: false,
+        max_one_entry_per_day: false,
     }
 }
 
@@ -744,6 +1005,11 @@ mod tests {
                 .iter()
                 .all(|value| !value.manage.flatten_end_of_day)
         );
+        assert!(
+            population
+                .iter()
+                .all(|value| !value.manage.max_one_entry_per_day)
+        );
         for strategy in population {
             assert_eq!(
                 strategy.risk,
@@ -753,5 +1019,37 @@ mod tests {
             );
             strategy.validate_export_safe(IrLimits::default()).unwrap();
         }
+    }
+
+    #[test]
+    fn entry_signals_use_one_to_three_family_atoms() {
+        let population: Vec<_> = (0..400).map(|index| generate_seed(17, index)).collect();
+        let mut saw_single = false;
+        let mut saw_and = false;
+        let mut max_children = 0usize;
+        for strategy in &population {
+            let Some(entry) = strategy.entry.long.as_ref().or(strategy.entry.short.as_ref()) else {
+                continue;
+            };
+            match entry {
+                BoolExpr::And { children } => {
+                    saw_and = true;
+                    max_children = max_children.max(children.len());
+                    assert!((2..=3).contains(&children.len()));
+                }
+                BoolExpr::Compare { .. }
+                | BoolExpr::CrossAbove { .. }
+                | BoolExpr::CrossBelow { .. } => {
+                    saw_single = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_single, "expected some single-atom entries");
+        assert!(saw_and, "expected some And-combined entries");
+        assert!(
+            max_children >= 2,
+            "expected multi-atom And entries, max={max_children}"
+        );
     }
 }

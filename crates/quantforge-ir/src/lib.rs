@@ -256,6 +256,12 @@ pub struct ManagePolicy {
     pub time_stop_bars: Option<u16>,
     pub partial_exits: Vec<PartialExit>,
     pub flatten_end_of_day: bool,
+    /// When true, the first successful entry action (market fill or pending place)
+    /// locks the broker-local calendar day — no further market entries or pending
+    /// orders may be placed that day, even if the first trade closed early.
+    /// Production Discover stamps this from job config; it is not an evolvable gene.
+    #[serde(default)]
+    pub max_one_entry_per_day: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

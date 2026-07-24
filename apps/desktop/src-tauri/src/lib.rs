@@ -1,3 +1,4 @@
+mod assets;
 mod challenge;
 mod data_lab;
 mod databank;
@@ -20,10 +21,16 @@ pub fn run() {
         .manage(DesktopState::default())
         .manage(DiscoverState::default())
         .invoke_handler(tauri::generate_handler![
+            assets::list_assets,
+            assets::list_symbols,
+            assets::upsert_asset,
+            assets::delete_asset,
             databank::load_databank,
             databank::get_elite,
+            databank::get_elite_partition_equity,
             databank::export_elite_strategy,
             databank::export_elite_strategies,
+            databank::run_fidelity_demo,
             data_lab::inspect_data,
             discover::start_discover,
             discover::get_discover_job,

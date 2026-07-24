@@ -17,6 +17,8 @@ import type {
   EliteDetail,
   ExportRequest,
   ExportView,
+  FidelityDemoRequest,
+  FidelityDemoView,
   JudgeRequest,
   JudgeView,
   IncubationRecordRequest,
@@ -32,6 +34,9 @@ import type {
   SealedView,
   VaultRequest,
   VaultView,
+  AssetProfile,
+  SymbolPack,
+  PartitionEquityView,
 } from "./types";
 
 async function chooseFile(
@@ -55,6 +60,10 @@ export async function chooseAndLoadDatabank(): Promise<DatabankWorkspace | null>
 
 export function loadDatabankPath(path: string): Promise<DatabankWorkspace> {
   return invoke<DatabankWorkspace>("load_databank", { path });
+}
+
+export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityDemoView> {
+  return invoke<FidelityDemoView>("run_fidelity_demo", { request });
 }
 
 export async function loadElite(fingerprint: string): Promise<EliteDetail> {
@@ -210,4 +219,24 @@ export function certifyToVault(request: CertifyRequest): Promise<VaultView> {
 
 export function buildDeploymentPack(request: DeployRequest): Promise<DeployView> {
   return invoke<DeployView>("build_deployment_pack", { request });
+}
+
+export function listAssets(): Promise<AssetProfile[]> {
+  return invoke<AssetProfile[]>("list_assets");
+}
+
+export function listSymbols(): Promise<SymbolPack[]> {
+  return invoke<SymbolPack[]>("list_symbols");
+}
+
+export function getElitePartitionEquity(fingerprint: string): Promise<PartitionEquityView> {
+  return invoke<PartitionEquityView>("get_elite_partition_equity", { fingerprint });
+}
+
+export function upsertAsset(asset: AssetProfile): Promise<AssetProfile[]> {
+  return invoke<AssetProfile[]>("upsert_asset", { asset });
+}
+
+export function deleteAsset(id: string): Promise<AssetProfile[]> {
+  return invoke<AssetProfile[]>("delete_asset", { id });
 }

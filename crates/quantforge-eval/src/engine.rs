@@ -1,7 +1,7 @@
 use crate::features::FeatureCache;
 use crate::model::{
     BacktestMetrics, EquityPoint, EvalError, ExitReason, PositionSide, ScoutConfig, ScoutResult,
-    ScoutTelemetry, Trade,
+    ScoutTelemetry, Trade, in_mandatory_entry_window,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
 use chrono::Timelike;
@@ -140,6 +140,9 @@ fn evaluate_strategy_inner(
     let mut equity = Vec::with_capacity(bars.len() - 1);
     let mut telemetry = ScoutTelemetry::default();
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
+    let mut active_entry_day: Option<chrono::NaiveDate> = None;
+    // First successful market open or pending place locks the broker day.
+    let mut signal_taken_today = false;
 
     for (index, bar) in bars.iter().enumerate().skip(1) {
         let spread = resolve_spread(bar, broker, &config.costs)?;
@@ -154,6 +157,12 @@ fn evaluate_strategy_inner(
             resolve_spread(previous_bar, broker, &config.costs)?.points * broker.point;
         let current_local = broker_clock.local_datetime(bar.timestamp_ms)?;
         let in_close_blackout = current_local.hour() >= 22;
+        let in_entry_window = in_mandatory_entry_window(current_local.hour());
+        let day_key = current_local.date();
+        if active_entry_day != Some(day_key) {
+            active_entry_day = Some(day_key);
+            signal_taken_today = false;
+        }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
 
@@ -180,6 +189,11 @@ fn evaluate_strategy_inner(
                     &mut trades,
                 );
                 telemetry.end_of_day_flattens += 1;
+            }
+        } else if !in_entry_window {
+            // Hard session: cancel unfilled pending outside [02:00, 19:00).
+            if pending.take().is_some() {
+                telemetry.pending_orders_expired += 1;
             }
         }
 
@@ -323,12 +337,16 @@ fn evaluate_strategy_inner(
                 if let Some(side) = side {
                     if !broker.is_trading_at(bar.timestamp_ms)? {
                         telemetry.skipped_outside_session += 1;
+                    } else if !in_entry_window {
+                        telemetry.skipped_outside_entry_window += 1;
                     } else if config
                         .costs
                         .max_spread_points
                         .is_some_and(|maximum| spread.points > maximum)
                     {
                         telemetry.skipped_for_spread += 1;
+                    } else if strategy.manage.max_one_entry_per_day && signal_taken_today {
+                        telemetry.skipped_max_one_entry_per_day += 1;
                     } else {
                         match &strategy.entry.order {
                             EntryOrderPolicy::Market => {
@@ -347,6 +365,7 @@ fn evaluate_strategy_inner(
                                     balance -= open.entry_commission;
                                     position = Some(open);
                                     opened_this_bar = true;
+                                    signal_taken_today = true;
                                 }
                             }
                             EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. } => {
@@ -364,6 +383,8 @@ fn evaluate_strategy_inner(
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
+                                    // Pending place consumes the day's signal slot.
+                                    signal_taken_today = true;
                                 }
                             }
                         }
@@ -374,6 +395,7 @@ fn evaluate_strategy_inner(
 
         if position.is_none()
             && !closed_this_bar
+            && in_entry_window
             && let Some(fill_price) = pending
                 .as_ref()
                 .and_then(|order| pending_fill_price(order, bar, spread_price))
@@ -392,6 +414,7 @@ fn evaluate_strategy_inner(
             position = Some(open);
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
+            // Day was already locked when the pending was placed.
         }
 
         if opened_this_bar {
@@ -1530,6 +1553,55 @@ mod tests {
         assert_eq!(
             result.trades[0].exit_timestamp_ms,
             timed_bar("2024-01-01T22:00:00Z").timestamp_ms
+        );
+    }
+
+    #[test]
+    fn max_one_entry_per_day_blocks_reentry_after_early_exit() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = true;
+        strategy.manage.time_stop_bars = Some(1);
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-01T10:00:00Z"),
+            timed_bar("2024-01-01T11:00:00Z"),
+            timed_bar("2024-01-01T12:00:00Z"),
+            timed_bar("2024-01-01T13:00:00Z"),
+            timed_bar("2024-01-02T10:00:00Z"),
+            timed_bar("2024-01-02T11:00:00Z"),
+        ]);
+        let limited =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert_eq!(limited.trades.len(), 2);
+        assert!(limited.telemetry.skipped_max_one_entry_per_day > 0);
+
+        strategy.manage.max_one_entry_per_day = false;
+        let unlimited =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert!(unlimited.trades.len() > limited.trades.len());
+    }
+
+    #[test]
+    fn mandatory_entry_window_blocks_outside_2am_to_7pm() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.manage.time_stop_bars = Some(1);
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-01T01:00:00Z"), // before window
+            timed_bar("2024-01-01T01:30:00Z"),
+            timed_bar("2024-01-01T10:00:00Z"), // inside
+            timed_bar("2024-01-01T11:00:00Z"),
+            timed_bar("2024-01-01T19:00:00Z"), // at/after 7pm
+            timed_bar("2024-01-01T20:00:00Z"),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert_eq!(result.trades.len(), 1);
+        assert!(result.telemetry.skipped_outside_entry_window > 0);
+        assert_eq!(
+            result.trades[0].entry_timestamp_ms,
+            timed_bar("2024-01-01T10:00:00Z").timestamp_ms
         );
     }
 
