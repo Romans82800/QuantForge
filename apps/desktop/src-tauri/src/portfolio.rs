@@ -204,10 +204,16 @@ fn verify_databank(
 
 fn family_name(family: FamilyStyle) -> &'static str {
     match family {
-        FamilyStyle::Trend => "trend",
-        FamilyStyle::Momentum => "momentum",
-        FamilyStyle::Breakout => "breakout",
-        FamilyStyle::MeanReversion => "mean_reversion",
+        FamilyStyle::TrendPullback => "trend_pullback",
+        FamilyStyle::MomentumBurst => "momentum_burst",
+        FamilyStyle::DonchianBreakout => "donchian_breakout",
+        FamilyStyle::MeanReversionBand => "mean_reversion_band",
+        FamilyStyle::ZScoreReversion => "zscore_reversion",
+        FamilyStyle::SessionOrb => "session_orb",
+        FamilyStyle::ImpulseCandle => "impulse_candle",
+        FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
+        FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
+        FamilyStyle::SweepReclaim => "sweep_reclaim",
     }
 }
 

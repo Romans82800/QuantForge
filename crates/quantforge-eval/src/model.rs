@@ -162,7 +162,7 @@ pub const MANDATORY_ENTRY_WINDOW_END_HOUR: u32 = 19;
 
 /// Hard-coded QuantForge entry session: `[02:00, 19:00)` broker local time.
 pub fn in_mandatory_entry_window(hour: u32) -> bool {
-    hour >= MANDATORY_ENTRY_WINDOW_START_HOUR && hour < MANDATORY_ENTRY_WINDOW_END_HOUR
+    (MANDATORY_ENTRY_WINDOW_START_HOUR..MANDATORY_ENTRY_WINDOW_END_HOUR).contains(&hour)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -13,7 +13,7 @@ use std::sync::RwLock;
 use tauri::State;
 use thiserror::Error;
 
-const TOTAL_NICHES: usize = 4 * 3usize.pow(5);
+const TOTAL_NICHES: usize = 10 * 3usize.pow(5);
 const SELECTION_BIAS_WARNING_THRESHOLD: u64 = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +102,8 @@ struct RejectionTelemetry {
     correlated: u64,
     niche_not_improved: u64,
     precision: u64,
+    #[serde(default)]
+    ambiguous: u64,
     oos1: u64,
     evaluation: u64,
     total: u64,
@@ -652,6 +654,7 @@ fn workspace_view(
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
+        + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
         + telemetry.rejected_m1_fidelity
         + telemetry.rejected_walk_forward
@@ -689,6 +692,7 @@ fn workspace_view(
             correlated: telemetry.rejected_correlated,
             niche_not_improved: telemetry.rejected_niche_not_improved,
             precision: telemetry.rejected_precision,
+            ambiguous: telemetry.rejected_ambiguous,
             oos1: telemetry.rejected_oos1,
             evaluation: telemetry.rejected_evaluation,
             total: total_rejections,
@@ -877,14 +881,9 @@ fn coverage_families(bank: &Databank) -> Vec<FamilyCoverage> {
         .iter()
         .map(|elite| elite.evidence.total)
         .fold(f64::NEG_INFINITY, f64::max);
-    [
-        FamilyStyle::Trend,
-        FamilyStyle::Momentum,
-        FamilyStyle::Breakout,
-        FamilyStyle::MeanReversion,
-    ]
-    .into_iter()
-    .map(|family| {
+    FamilyStyle::ALL
+        .into_iter()
+        .map(|family| {
         let mut cells = Vec::with_capacity(3usize.pow(5));
         for win_rate in three_levels() {
             for skew in skew_levels() {
@@ -941,10 +940,16 @@ fn evidence_intensity(value: f64, minimum: f64, maximum: f64) -> f64 {
 
 fn family_name(family: FamilyStyle) -> &'static str {
     match family {
-        FamilyStyle::Trend => "trend",
-        FamilyStyle::Momentum => "momentum",
-        FamilyStyle::Breakout => "breakout",
-        FamilyStyle::MeanReversion => "mean reversion",
+        FamilyStyle::TrendPullback => "trend_pullback",
+        FamilyStyle::MomentumBurst => "momentum_burst",
+        FamilyStyle::DonchianBreakout => "donchian_breakout",
+        FamilyStyle::MeanReversionBand => "mean_reversion_band",
+        FamilyStyle::ZScoreReversion => "zscore_reversion",
+        FamilyStyle::SessionOrb => "session_orb",
+        FamilyStyle::ImpulseCandle => "impulse_candle",
+        FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
+        FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
+        FamilyStyle::SweepReclaim => "sweep_reclaim",
     }
 }
 
@@ -986,7 +991,7 @@ mod tests {
             telemetry: Default::default(),
         };
         let families = coverage_families(&bank);
-        assert_eq!(families.len(), 4);
+        assert_eq!(families.len(), 10);
         assert_eq!(
             families.iter().map(|family| family.total).sum::<usize>(),
             TOTAL_NICHES
@@ -1096,7 +1101,7 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     use serde_json::json;
     use std::collections::BTreeMap;
 
-    let return_retention = request.return_retention.unwrap_or(0.80);
+    let return_retention = request.return_retention.unwrap_or(0.90);
     let trade_retention = request.trade_retention.unwrap_or(0.80);
     let drawdown_expansion = request.drawdown_expansion.unwrap_or(1.30);
 

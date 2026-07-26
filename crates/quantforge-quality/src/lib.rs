@@ -8,7 +8,8 @@ pub use challenge::{
     CHALLENGE_REPORT_SCHEMA_VERSION, ChallengeBlocker, ChallengeConfig, ChallengeError,
     ChallengeReport, CostShockPoint, CostShockReport, MonteCarloReport, MultipleTestingReport,
     ParameterNeighbor, ParameterNeighborhoodReport, PurgedFoldReport, SelectionBiasLevel,
-    monte_carlo_from_trade_profits, perturb_strategy_parameters, run_challenge,
+    deflated_trade_sharpe, expected_max_lucky_sharpe, monte_carlo_from_trade_profits,
+    perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
 };
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,

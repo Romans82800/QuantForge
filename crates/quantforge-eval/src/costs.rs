@@ -30,11 +30,15 @@ pub fn resolve_spread(
     broker: &SymbolSpecification,
     costs: &CostModel,
 ) -> Result<ResolvedSpread, EvalError> {
+    // MT5 exports often stamp quiet minutes as spread=0. That understates ask-side
+    // stops vs the tester; when a fallback is configured, treat 0 as missing.
     if let Some(points) = bar.spread_points {
-        return Ok(ResolvedSpread {
-            points: f64::from(points),
-            source: SpreadSource::Recorded,
-        });
+        if points > 0 || costs.fallback_spread_points.is_none() {
+            return Ok(ResolvedSpread {
+                points: f64::from(points),
+                source: SpreadSource::Recorded,
+            });
+        }
     }
     if let Some(points) = broker.synthetic_spread_points_at(bar.timestamp_ms)? {
         return Ok(ResolvedSpread {
@@ -46,6 +50,12 @@ pub fn resolve_spread(
         return Ok(ResolvedSpread {
             points,
             source: SpreadSource::ExplicitFallback,
+        });
+    }
+    if let Some(points) = bar.spread_points {
+        return Ok(ResolvedSpread {
+            points: f64::from(points),
+            source: SpreadSource::Recorded,
         });
     }
     Err(EvalError::MissingSpread {
@@ -156,6 +166,23 @@ fn quote_to_account(broker: &SymbolSpecification) -> f64 {
 mod tests {
     use super::*;
     use quantforge_broker::{DailySwapMultiplier, FillingMode, SyntheticSpreadWindow, TradeMode};
+
+    #[test]
+    fn recorded_zero_defers_to_fallback_when_configured() {
+        let broker = broker();
+        let costs = CostModel {
+            fallback_spread_points: Some(8.0),
+            ..CostModel::default()
+        };
+        let bar = bar("2024-01-03T12:00:00Z", Some(0));
+        assert_eq!(
+            resolve_spread(&bar, &broker, &costs).unwrap(),
+            ResolvedSpread {
+                points: 8.0,
+                source: SpreadSource::ExplicitFallback,
+            }
+        );
+    }
 
     #[test]
     fn recorded_spread_precedes_window_and_fallback() {

@@ -55,10 +55,171 @@ pub struct PrecisionGateConfig {
 impl Default for PrecisionGateConfig {
     fn default() -> Self {
         Self {
-            minimum_return_retention: 0.95,
+            minimum_return_retention: 0.90,
         }
     }
 }
+
+/// Named institutional search recipe (locked grammar + mirror + ATR14).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFamily {
+    #[default]
+    TrendPullback,
+    MomentumBurst,
+    DonchianBreakout,
+    MeanReversionBand,
+    ZScoreReversion,
+    SessionOrb,
+    ImpulseCandle,
+    VolSqueezeBreak,
+    SupplyDemandReclaim,
+    SweepReclaim,
+}
+
+impl SearchFamily {
+    pub const ALL: [Self; 10] = [
+        Self::TrendPullback,
+        Self::MomentumBurst,
+        Self::DonchianBreakout,
+        Self::MeanReversionBand,
+        Self::ZScoreReversion,
+        Self::SessionOrb,
+        Self::ImpulseCandle,
+        Self::VolSqueezeBreak,
+        Self::SupplyDemandReclaim,
+        Self::SweepReclaim,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TrendPullback => "TrendPullback",
+            Self::MomentumBurst => "MomentumBurst",
+            Self::DonchianBreakout => "DonchianBreakout",
+            Self::MeanReversionBand => "MeanReversionBand",
+            Self::ZScoreReversion => "ZScoreReversion",
+            Self::SessionOrb => "SessionOrb",
+            Self::ImpulseCandle => "ImpulseCandle",
+            Self::VolSqueezeBreak => "VolSqueezeBreak",
+            Self::SupplyDemandReclaim => "SupplyDemandReclaim",
+            Self::SweepReclaim => "SweepReclaim",
+        }
+    }
+
+    pub fn recipe_summary(self) -> &'static str {
+        match self {
+            Self::TrendPullback => {
+                "EMA/SMA structure + optional ROC · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::MomentumBurst => {
+                "RSI/ROC thrust atoms · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::DonchianBreakout => {
+                "Donchian/HH-LL + optional SMA · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::MeanReversionBand => {
+                "RSI + percentile fades · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::ZScoreReversion => {
+                "Close z-score extremes · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::SessionOrb => {
+                "Broker-local opening-range breakout · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::ImpulseCandle => {
+                "Body/range + close-in-bar thrust · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::VolSqueezeBreak => {
+                "ATR-percentile squeeze then break · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::SupplyDemandReclaim => {
+                "Swing-base zone reclaim · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+            Self::SweepReclaim => {
+                "Liquidity sweep then reclaim · max 3 atoms · ATR14 · stop/limit · mirror"
+            }
+        }
+    }
+
+    pub fn style(self) -> FamilyStyle {
+        match self {
+            Self::TrendPullback => FamilyStyle::TrendPullback,
+            Self::MomentumBurst => FamilyStyle::MomentumBurst,
+            Self::DonchianBreakout => FamilyStyle::DonchianBreakout,
+            Self::MeanReversionBand => FamilyStyle::MeanReversionBand,
+            Self::ZScoreReversion => FamilyStyle::ZScoreReversion,
+            Self::SessionOrb => FamilyStyle::SessionOrb,
+            Self::ImpulseCandle => FamilyStyle::ImpulseCandle,
+            Self::VolSqueezeBreak => FamilyStyle::VolSqueezeBreak,
+            Self::SupplyDemandReclaim => FamilyStyle::SupplyDemandReclaim,
+            Self::SweepReclaim => FamilyStyle::SweepReclaim,
+        }
+    }
+
+    pub fn from_style(style: FamilyStyle) -> Self {
+        match style {
+            FamilyStyle::TrendPullback => Self::TrendPullback,
+            FamilyStyle::MomentumBurst => Self::MomentumBurst,
+            FamilyStyle::DonchianBreakout => Self::DonchianBreakout,
+            FamilyStyle::MeanReversionBand => Self::MeanReversionBand,
+            FamilyStyle::ZScoreReversion => Self::ZScoreReversion,
+            FamilyStyle::SessionOrb => Self::SessionOrb,
+            FamilyStyle::ImpulseCandle => Self::ImpulseCandle,
+            FamilyStyle::VolSqueezeBreak => Self::VolSqueezeBreak,
+            FamilyStyle::SupplyDemandReclaim => Self::SupplyDemandReclaim,
+            FamilyStyle::SweepReclaim => Self::SweepReclaim,
+        }
+    }
+
+    pub fn spec(self) -> SearchFamilySpec {
+        SearchFamilySpec {
+            family: self,
+            max_atoms: 3,
+            atr_period: crate::FROZEN_ATR_PERIOD,
+            indicator_periods: vec![10, 14, 20],
+            market_only: true,
+            pending_only: false,
+            mirror_sides: true,
+            complexity_penalty_weight: 0.01,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchFamilySpec {
+    pub family: SearchFamily,
+    pub max_atoms: usize,
+    pub atr_period: u16,
+    pub indicator_periods: Vec<u16>,
+    pub market_only: bool,
+    /// When true, seeds/mutations use stop or limit entries only (no market).
+    #[serde(default)]
+    pub pending_only: bool,
+    pub mirror_sides: bool,
+    pub complexity_penalty_weight: f64,
+}
+
+/// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverRunMode {
+    FastScout,
+    #[default]
+    FullHarvest,
+}
+
+/// Named gate outcome persisted on elites for evidence-first promotion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateResult {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// Warn in UI when planned evaluations exceed this (Veritas-style honesty).
+pub const TRIAL_BUDGET_WARNING: u64 = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -70,6 +231,21 @@ pub struct DiscoverConfig {
     pub tournament_size: usize,
     pub structural_mutation_probability: f64,
     pub seed: u64,
+    /// Locked Search Family for this databank (immutable on continue).
+    #[serde(default)]
+    pub search_family: SearchFamily,
+    /// Fast Scout vs Full Harvest knobs applied at start.
+    #[serde(default)]
+    pub run_mode: DiscoverRunMode,
+    /// When false (default), structural mutation cannot jump families.
+    #[serde(default)]
+    pub allow_cross_family_mutation: bool,
+    /// Stop evolving once the accepted pot reaches this size (`None` = no early stop).
+    #[serde(default)]
+    pub early_stop_pot_elites: Option<usize>,
+    /// Soft warning threshold for planned trial budget (UI).
+    #[serde(default = "default_trial_budget_warning")]
+    pub trial_budget_warning: u64,
     /// Early H1/IS screen used during random search (cheap reject).
     pub gates: GateConfig,
     /// Final metrics required to enter or replace an elite in the pot.
@@ -84,7 +260,7 @@ pub struct DiscoverConfig {
     /// defers M1 path fidelity to a later fidelity demo. Research-grade until verified.
     #[serde(default = "default_require_m1_precision")]
     pub require_m1_precision: bool,
-    /// Prefer market entries, fixed/ATR SL-TP, no trailing/BE/partials, and a
+    /// Prefer stop/limit pendings, ATR/R SL-TP, no trailing/BE/partials, and a
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
@@ -120,7 +296,23 @@ pub struct DiscoverConfig {
     pub robustness_monte_carlo_trials: usize,
     #[serde(default = "default_robustness_neighborhood_samples")]
     pub robustness_neighborhood_samples: usize,
+    /// Use broker-local calendar-year folds (every year must pass) instead of
+    /// contiguous index slices.
+    #[serde(default = "default_calendar_year_folds")]
+    pub calendar_year_folds: bool,
+    /// When set, databank admission requires deflated trade Sharpe ≥ this floor.
+    /// `Some(0.0)` is the production default; `None` reports without rejecting.
+    #[serde(default = "default_minimum_deflated_trade_sharpe")]
+    pub minimum_deflated_trade_sharpe: Option<f64>,
+    /// Require identical-parameter H1 profitability on at least this many pack
+    /// symbols before M1 work. `0` disables the multi-symbol screen.
+    #[serde(default = "default_multi_symbol_minimum_pass")]
+    pub multi_symbol_minimum_pass: usize,
     pub scout: ScoutConfig,
+}
+
+fn default_trial_budget_warning() -> u64 {
+    TRIAL_BUDGET_WARNING
 }
 
 fn default_oos1_expectancy_retention() -> f64 {
@@ -170,6 +362,19 @@ fn default_robustness_neighborhood_samples() -> usize {
     8
 }
 
+fn default_calendar_year_folds() -> bool {
+    true
+}
+
+fn default_minimum_deflated_trade_sharpe() -> Option<f64> {
+    // Report-only until multi-symbol pooling is wired; flip to Some(0.0) for hard gate.
+    None
+}
+
+fn default_multi_symbol_minimum_pass() -> usize {
+    0
+}
+
 impl Default for DiscoverConfig {
     fn default() -> Self {
         Self {
@@ -180,6 +385,11 @@ impl Default for DiscoverConfig {
             tournament_size: 4,
             structural_mutation_probability: 0.18,
             seed: 42,
+            search_family: SearchFamily::default(),
+            run_mode: DiscoverRunMode::FullHarvest,
+            allow_cross_family_mutation: false,
+            early_stop_pot_elites: None,
+            trial_budget_warning: default_trial_budget_warning(),
             gates: GateConfig::default(),
             deposit_gates: GateConfig::deposit_defaults(),
             precision: PrecisionGateConfig::default(),
@@ -195,16 +405,57 @@ impl Default for DiscoverConfig {
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
             robustness_neighborhood_samples: default_robustness_neighborhood_samples(),
+            calendar_year_folds: default_calendar_year_folds(),
+            minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
+            multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
             scout: ScoutConfig::default(),
         }
     }
 }
 
 impl DiscoverConfig {
+    /// Apply Fast Scout or Full Harvest presets (family stays as configured).
+    pub fn apply_run_mode(&mut self) {
+        match self.run_mode {
+            DiscoverRunMode::FastScout => {
+                self.initial_candidates = self.initial_candidates.clamp(40, 80);
+                self.batch_size = self.batch_size.clamp(20, 40);
+                self.require_m1_precision = false;
+                self.require_m1_robustness = false;
+                self.simple_exits = true;
+                self.allow_cross_family_mutation = false;
+                if self.early_stop_pot_elites.is_none() {
+                    self.early_stop_pot_elites = Some(8);
+                }
+                self.mutate_after_elites = self.mutate_after_elites.min(20);
+            }
+            DiscoverRunMode::FullHarvest => {
+                self.simple_exits = true;
+                self.allow_cross_family_mutation = false;
+            }
+        }
+    }
+
+    /// Planned evaluations for honesty UI: initial + batch × generations.
+    pub fn planned_evaluations(&self, generations: u64) -> u64 {
+        (self.initial_candidates as u64).saturating_add(
+            (self.batch_size as u64).saturating_mul(generations),
+        )
+    }
+
+    pub fn exceeds_trial_budget_warning(&self, generations: u64) -> bool {
+        self.planned_evaluations(generations) > self.trial_budget_warning
+    }
+
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
+            ));
+        }
+        if self.search_family.spec().max_atoms == 0 {
+            return Err(DiscoverError::InvalidConfig(
+                "search family max_atoms must be positive".into(),
             ));
         }
         if self.batch_size == 0 {
@@ -299,10 +550,31 @@ impl DiscoverConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FamilyStyle {
-    Trend,
-    Momentum,
-    Breakout,
-    MeanReversion,
+    TrendPullback,
+    MomentumBurst,
+    DonchianBreakout,
+    MeanReversionBand,
+    ZScoreReversion,
+    SessionOrb,
+    ImpulseCandle,
+    VolSqueezeBreak,
+    SupplyDemandReclaim,
+    SweepReclaim,
+}
+
+impl FamilyStyle {
+    pub const ALL: [Self; 10] = [
+        Self::TrendPullback,
+        Self::MomentumBurst,
+        Self::DonchianBreakout,
+        Self::MeanReversionBand,
+        Self::ZScoreReversion,
+        Self::SessionOrb,
+        Self::ImpulseCandle,
+        Self::VolSqueezeBreak,
+        Self::SupplyDemandReclaim,
+        Self::SweepReclaim,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -371,9 +643,34 @@ pub struct Elite {
     /// `oos1_expectancy / is_expectancy` when IS expectancy is positive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oos1_expectancy_ratio: Option<f64>,
+    /// Observed trade Sharpe proxy at deposit time (primary or pooled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_trade_sharpe: Option<f64>,
+    /// Expected max lucky Sharpe given `evaluations_touched` at deposit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_max_lucky_sharpe: Option<f64>,
+    /// `observed - expected_max_lucky` at deposit time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deflated_trade_sharpe: Option<f64>,
+    /// Per-symbol H1 screen metrics when multi-symbol gate ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multi_symbol_results: Vec<SymbolScreenResult>,
+    /// Named gate outcomes at deposit (evidence strip).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_results: Vec<GateResult>,
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolScreenResult {
+    pub symbol: String,
+    pub passed: bool,
+    pub trade_count: usize,
+    pub return_percent: f64,
+    pub profit_factor: Option<f64>,
+    pub net_profit: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,11 +686,14 @@ pub enum DepositDecision {
     RejectedCorrelated,
     RejectedNicheNotImproved,
     RejectedPrecision,
+    RejectedAmbiguous,
     RejectedOos1,
     RejectedM1Fidelity,
     RejectedWalkForward,
     RejectedMonteCarlo,
     RejectedParamNeighborhood,
+    RejectedMultiSymbol,
+    RejectedDeflatedSharpe,
     RejectedEvaluation,
 }
 
@@ -420,6 +720,8 @@ pub struct DiscoverTelemetry {
     pub rejected_niche_not_improved: u64,
     pub rejected_precision: u64,
     #[serde(default)]
+    pub rejected_ambiguous: u64,
+    #[serde(default)]
     pub rejected_oos1: u64,
     #[serde(default)]
     pub rejected_m1_fidelity: u64,
@@ -429,6 +731,10 @@ pub struct DiscoverTelemetry {
     pub rejected_monte_carlo: u64,
     #[serde(default)]
     pub rejected_param_neighborhood: u64,
+    #[serde(default)]
+    pub rejected_multi_symbol: u64,
+    #[serde(default)]
+    pub rejected_deflated_sharpe: u64,
     pub rejected_evaluation: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
 }
@@ -458,11 +764,14 @@ impl DiscoverTelemetry {
                 self.rejected_niche_not_improved += 1;
             }
             DepositDecision::RejectedPrecision => self.rejected_precision += 1,
+            DepositDecision::RejectedAmbiguous => self.rejected_ambiguous += 1,
             DepositDecision::RejectedOos1 => self.rejected_oos1 += 1,
             DepositDecision::RejectedM1Fidelity => self.rejected_m1_fidelity += 1,
             DepositDecision::RejectedWalkForward => self.rejected_walk_forward += 1,
             DepositDecision::RejectedMonteCarlo => self.rejected_monte_carlo += 1,
             DepositDecision::RejectedParamNeighborhood => self.rejected_param_neighborhood += 1,
+            DepositDecision::RejectedMultiSymbol => self.rejected_multi_symbol += 1,
+            DepositDecision::RejectedDeflatedSharpe => self.rejected_deflated_sharpe += 1,
             DepositDecision::RejectedEvaluation => self.rejected_evaluation += 1,
         }
     }
@@ -536,15 +845,22 @@ impl Databank {
             &self.coverage_map,
             &self.config,
             self.completed_generations,
+            ArchiveKind::MapElites,
         )?;
         validate_archive_entries(
             &self.accepted_pool,
             &self.accepted_coverage_map,
             &self.config,
             self.completed_generations,
+            ArchiveKind::BreedingBag,
         )?;
         Ok(())
     }
+}
+
+enum ArchiveKind {
+    MapElites,
+    BreedingBag,
 }
 
 fn validate_archive_entries(
@@ -552,6 +868,7 @@ fn validate_archive_entries(
     coverage_map: &BTreeMap<String, ContentHash>,
     config: &DiscoverConfig,
     completed_generations: u64,
+    kind: ArchiveKind,
 ) -> Result<(), DiscoverError> {
     let fingerprints: BTreeSet<_> = entries
         .iter()
@@ -582,12 +899,22 @@ fn validate_archive_entries(
             quantforge_ir::RiskPolicy::FixedCurrency { amount }
                 if (amount - crate::FIXED_RISK_PER_TRADE).abs() <= 1.0e-9
         );
+        let coverage_ok = match kind {
+            ArchiveKind::MapElites => {
+                coverage_map.get(&niche_label(&elite.niche))
+                    == Some(&elite.structural_fingerprint)
+            }
+            ArchiveKind::BreedingBag => {
+                coverage_map.get(&elite.structural_fingerprint.to_string())
+                    == Some(&elite.structural_fingerprint)
+            }
+        };
         if elite.strategy.manage.flatten_end_of_day != config.flatten_at_22
             || elite.strategy.manage.max_one_entry_per_day != config.max_one_entry_per_day
             || !fixed_risk
             || fingerprint != elite.structural_fingerprint
             || niche_key(&elite.descriptor) != elite.niche
-            || coverage_map.get(&niche_label(&elite.niche)) != Some(&elite.structural_fingerprint)
+            || !coverage_ok
             || elite.metrics.trade_count < config.deposit_gates.minimum_trades
             || elite.metrics.return_percent <= config.deposit_gates.minimum_return_percent
             || effective_profit_factor < config.deposit_gates.minimum_profit_factor

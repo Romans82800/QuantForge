@@ -171,6 +171,11 @@ fn write_databank(
         tournament_size: 1,
         structural_mutation_probability: 0.1,
         seed: 42,
+        search_family: quantforge_discover::SearchFamily::TrendPullback,
+        run_mode: quantforge_discover::DiscoverRunMode::FullHarvest,
+        allow_cross_family_mutation: false,
+        early_stop_pot_elites: None,
+        trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: challenge.baseline.metrics.trade_count,
             maximum_drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
@@ -200,6 +205,9 @@ fn write_databank(
         robustness_folds: 3,
         robustness_monte_carlo_trials: 50,
         robustness_neighborhood_samples: 2,
+        calendar_year_folds: false,
+        minimum_deflated_trade_sharpe: None,
+        multi_symbol_minimum_pass: 0,
         scout,
     };
     let bucket = |value: f64, first: f64, second: f64| {
@@ -212,7 +220,7 @@ fn write_databank(
         }
     };
     let niche = NicheKey {
-        family: FamilyStyle::Trend,
+        family: FamilyStyle::TrendPullback,
         trade_frequency: ThreeLevelBucket::High,
         hold_time: ThreeLevelBucket::Low,
         drawdown: bucket(challenge.baseline.metrics.max_drawdown_percent, 5.0, 15.0),
@@ -223,7 +231,7 @@ fn write_databank(
         strategy: strategy.clone(),
         structural_fingerprint: fingerprint.clone(),
         descriptor: BehaviorDescriptor {
-            family: FamilyStyle::Trend,
+            family: FamilyStyle::TrendPullback,
             trades_per_1000_bars: 100.0,
             average_bars_held: 1.0,
             drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
@@ -242,6 +250,14 @@ fn write_databank(
         novelty: 1.0,
         complexity: 1,
         metrics: challenge.baseline.metrics.clone(),
+        is_expectancy: challenge.baseline.metrics.expectancy,
+        oos1_expectancy: None,
+        oos1_expectancy_ratio: None,
+        observed_trade_sharpe: None,
+        expected_max_lucky_sharpe: None,
+        deflated_trade_sharpe: None,
+        multi_symbol_results: Vec::new(),
+        gate_results: Vec::new(),
         equity_signature: Vec::new(),
         discovered_generation: 0,
     };
@@ -742,8 +758,8 @@ fn assembler_rejects_semantic_tampering_and_bundle_detects_later_byte_changes() 
 
     let sealed_path: PathBuf = fs::read_dir(&sealed_root)
         .unwrap()
-        .next()
-        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.file_type().unwrap().is_dir())
         .unwrap()
         .path()
         .read_dir()

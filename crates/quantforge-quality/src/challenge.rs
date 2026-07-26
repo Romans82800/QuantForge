@@ -619,10 +619,18 @@ fn run_purged_folds(
     config: &ChallengeConfig,
 ) -> Result<Vec<PurgedFoldReport>, ChallengeError> {
     let mut reports = Vec::with_capacity(config.folds);
+    let total = validation.bars.len();
     for fold in 0..config.folds {
-        let start = validation.bars.len() * fold / config.folds;
-        let end = validation.bars.len() * (fold + 1) / config.folds;
-        let context = derived_dataset(validation, validation.bars[..end].to_vec());
+        let start = total * fold / config.folds;
+        let end = total * (fold + 1) / config.folds;
+        if end <= start {
+            continue;
+        }
+        let purge_start = start.saturating_sub(config.purge_bars);
+        let embargo_end = end.saturating_add(config.embargo_bars).min(total);
+        let context_bars =
+            purged_fold_context_bars(&validation.bars, purge_start, start, end);
+        let context = derived_dataset(validation, context_bars);
         let result = evaluate_strategy_from(
             strategy,
             &context,
@@ -630,10 +638,6 @@ fn run_purged_folds(
             &config.scout,
             validation.bars[start].timestamp_ms,
         )?;
-        let purge_start = start.saturating_sub(config.purge_bars);
-        let embargo_end = end
-            .saturating_add(config.embargo_bars)
-            .min(validation.bars.len());
         let end_timestamp = validation.bars.get(end).map_or_else(
             || {
                 validation.bars[end - 1]
@@ -643,6 +647,12 @@ fn run_purged_folds(
             },
             |bar| Ok(bar.timestamp_ms),
         )?;
+        let remaining_training = purge_start + total.saturating_sub(embargo_end);
+        debug_assert_eq!(
+            context.bars.len(),
+            purge_start + (end - start),
+            "purged fold context must exclude the purge gap and post-test embargo"
+        );
         reports.push(PurgedFoldReport {
             fold,
             test_start_timestamp_ms: validation.bars[start].timestamp_ms,
@@ -650,7 +660,7 @@ fn run_purged_folds(
             test_bar_count: end - start,
             purged_before_bar_count: start - purge_start,
             embargo_after_bar_count: embargo_end - end,
-            remaining_training_bar_count: purge_start + validation.bars.len() - embargo_end,
+            remaining_training_bar_count: remaining_training,
             passed: metrics_pass(&result.metrics, config.minimum_fold_trades, config),
             metrics: result.metrics,
         });
@@ -1034,7 +1044,7 @@ fn perturb_numeric(expression: &mut NumericExpr, fraction: f64, rng: &mut ChaCha
 }
 
 fn perturb_indicator(indicator: &mut IndicatorExpr, fraction: f64, rng: &mut ChaCha8Rng) {
-    let period = match indicator {
+    match indicator {
         IndicatorExpr::Sma { period, .. }
         | IndicatorExpr::Ema { period, .. }
         | IndicatorExpr::Wma { period, .. }
@@ -1047,9 +1057,40 @@ fn perturb_indicator(indicator: &mut IndicatorExpr, fraction: f64, rng: &mut Cha
         | IndicatorExpr::StandardDeviation { period, .. }
         | IndicatorExpr::ZScore { period, .. }
         | IndicatorExpr::PercentileInRange { period, .. }
-        | IndicatorExpr::RateOfChange { period, .. } => period,
-    };
-    perturb_period(period, fraction, rng);
+        | IndicatorExpr::RateOfChange { period, .. }
+        | IndicatorExpr::LiquiditySweepScore { period, .. } => {
+            perturb_period(period, fraction, rng);
+        }
+        IndicatorExpr::SessionRangeHigh { range_bars, .. }
+        | IndicatorExpr::SessionRangeLow { range_bars, .. } => {
+            perturb_period(range_bars, fraction, rng);
+        }
+        IndicatorExpr::AtrPercentile {
+            atr_period,
+            lookback,
+            ..
+        } => {
+            perturb_period(atr_period, fraction, rng);
+            perturb_period(lookback, fraction, rng);
+        }
+        IndicatorExpr::SwingBaseZoneHigh {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        }
+        | IndicatorExpr::SwingBaseZoneLow {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        } => {
+            perturb_period(swing_left, fraction, rng);
+            perturb_period(swing_right, fraction, rng);
+            perturb_period(base_bars, fraction, rng);
+        }
+        IndicatorExpr::BodyRangeRatio { .. } | IndicatorExpr::CloseLocationInBar { .. } => {}
+    }
 }
 
 fn perturb_period(period: &mut u16, fraction: f64, rng: &mut ChaCha8Rng) {
@@ -1097,7 +1138,22 @@ fn multiple_testing_report(
     }
 }
 
-fn trade_sharpe_proxy(values: &[f64]) -> Option<f64> {
+/// Warm-up bars `[0, purge_start)` plus test bars `[start, end)`.
+/// The purge gap `[purge_start, start)` is intentionally omitted.
+fn purged_fold_context_bars(
+    bars: &[Bar],
+    purge_start: usize,
+    start: usize,
+    end: usize,
+) -> Vec<Bar> {
+    let mut context = Vec::with_capacity(purge_start + end.saturating_sub(start));
+    context.extend_from_slice(&bars[..purge_start]);
+    context.extend_from_slice(&bars[start..end]);
+    context
+}
+
+/// Trade-level Sharpe proxy: mean/std × √n on per-trade net profits.
+pub fn trade_sharpe_proxy(values: &[f64]) -> Option<f64> {
     if values.len() < 2 {
         return None;
     }
@@ -1111,13 +1167,20 @@ fn trade_sharpe_proxy(values: &[f64]) -> Option<f64> {
     (deviation > 1.0e-12).then_some(mean / deviation * (values.len() as f64).sqrt())
 }
 
-fn expected_max_lucky_sharpe(evaluations: u64) -> f64 {
+/// Bailey / López de Prado expected maximum Sharpe under N independent null trials.
+pub fn expected_max_lucky_sharpe(evaluations: u64) -> f64 {
     if evaluations <= 1 {
         return 0.0;
     }
     let logarithm = (evaluations as f64).ln();
     let leading = (2.0 * logarithm).sqrt();
     leading - (logarithm.ln() + (4.0 * PI).ln()) / (2.0 * leading)
+}
+
+/// Deflated trade Sharpe: observed proxy minus the multiple-testing luck bar.
+pub fn deflated_trade_sharpe(profits: &[f64], evaluations_touched: u64) -> Option<f64> {
+    let observed = trade_sharpe_proxy(profits)?;
+    Some(observed - expected_max_lucky_sharpe(evaluations_touched))
 }
 
 fn quantile(sorted: &[f64], probability: f64) -> f64 {
@@ -1380,5 +1443,39 @@ mod tests {
             report.validate_integrity(),
             Err(ChallengeError::InvalidReport(_))
         ));
+    }
+
+    #[test]
+    fn purged_fold_context_excludes_purge_gap_and_post_test_bars() {
+        let bars = dataset(100).bars;
+        let start = 40;
+        let end = 60;
+        let purge_bars = 5;
+        let purge_start = start - purge_bars;
+        let context = purged_fold_context_bars(&bars, purge_start, start, end);
+        assert_eq!(context.len(), purge_start + (end - start));
+        assert_eq!(context[purge_start - 1].timestamp_ms, bars[purge_start - 1].timestamp_ms);
+        assert_eq!(context[purge_start].timestamp_ms, bars[start].timestamp_ms);
+        // Purged timestamps must not appear.
+        let purged: std::collections::BTreeSet<_> = bars[purge_start..start]
+            .iter()
+            .map(|bar| bar.timestamp_ms)
+            .collect();
+        assert!(
+            context
+                .iter()
+                .all(|bar| !purged.contains(&bar.timestamp_ms))
+        );
+        // Post-test (embargo region) must not appear.
+        assert!(context.iter().all(|bar| bar.timestamp_ms < bars[end].timestamp_ms));
+    }
+
+    #[test]
+    fn expected_max_lucky_sharpe_at_64k_trials_is_about_four() {
+        let value = expected_max_lucky_sharpe(64_000);
+        assert!(
+            (4.0..4.4).contains(&value),
+            "expected ~4.18 at N=64000, got {value}"
+        );
     }
 }

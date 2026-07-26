@@ -117,6 +117,7 @@ pub fn generate_bundle(
         ),
         ("@@FINGERPRINT_SHORT@@", fingerprint_short.into()),
         ("@@SYMBOL@@", mql_string(&broker.symbol)),
+        ("@@BROKER_TIMEZONE@@", broker.timezone.clone()),
     ] {
         source = source.replace(placeholder, &value);
     }
@@ -349,6 +350,58 @@ fn indicator_expr(indicator: &IndicatorExpr, extra_shift: &str) -> String {
             period,
             shift,
             extra_shift
+        ),
+        IndicatorExpr::SessionRangeHigh {
+            start_hour,
+            range_bars,
+            shift,
+        } => format!(
+            "QFSessionRangeHigh({},{},({}+{}))",
+            start_hour, range_bars, shift, extra_shift
+        ),
+        IndicatorExpr::SessionRangeLow {
+            start_hour,
+            range_bars,
+            shift,
+        } => format!(
+            "QFSessionRangeLow({},{},({}+{}))",
+            start_hour, range_bars, shift, extra_shift
+        ),
+        IndicatorExpr::BodyRangeRatio { shift } => {
+            format!("QFBodyRangeRatio(({}+{}))", shift, extra_shift)
+        }
+        IndicatorExpr::CloseLocationInBar { shift } => {
+            format!("QFCloseLocationInBar(({}+{}))", shift, extra_shift)
+        }
+        IndicatorExpr::AtrPercentile {
+            atr_period,
+            lookback,
+            shift,
+        } => format!(
+            "QFAtrPercentile({},{},({}+{}))",
+            atr_period, lookback, shift, extra_shift
+        ),
+        IndicatorExpr::SwingBaseZoneHigh {
+            swing_left,
+            swing_right,
+            base_bars,
+            shift,
+        } => format!(
+            "QFSwingBaseZoneHigh({},{},{},({}+{}))",
+            swing_left, swing_right, base_bars, shift, extra_shift
+        ),
+        IndicatorExpr::SwingBaseZoneLow {
+            swing_left,
+            swing_right,
+            base_bars,
+            shift,
+        } => format!(
+            "QFSwingBaseZoneLow({},{},{},({}+{}))",
+            swing_left, swing_right, base_bars, shift, extra_shift
+        ),
+        IndicatorExpr::LiquiditySweepScore { period, shift } => format!(
+            "QFLiquiditySweepScore({},({}+{}))",
+            period, shift, extra_shift
         ),
     }
 }
@@ -718,6 +771,51 @@ mod tests {
         assert!(!first.source.contains("@@"));
         assert!(first.evidence.mandatory_stop_loss);
         assert!(first.evidence.mandatory_take_profit);
+    }
+
+    #[test]
+    fn new_family_indicators_emit_qf_helpers() {
+        let mut strategy = strategy();
+        strategy.entry.long = Some(BoolExpr::And {
+            children: vec![
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Indicator {
+                        value: IndicatorExpr::BodyRangeRatio { shift: 1 },
+                    },
+                    right: NumericExpr::Constant { value: 0.6 },
+                },
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Indicator {
+                        value: IndicatorExpr::LiquiditySweepScore {
+                            period: 14,
+                            shift: 1,
+                        },
+                    },
+                    right: NumericExpr::Constant { value: 0.0 },
+                },
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Price {
+                        field: PriceField::Close,
+                        shift: 1,
+                    },
+                    right: NumericExpr::Indicator {
+                        value: IndicatorExpr::SessionRangeHigh {
+                            start_hour: 9,
+                            range_bars: 2,
+                            shift: 1,
+                        },
+                    },
+                },
+            ],
+        });
+        let bundle = generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
+        assert!(bundle.source.contains("QFBodyRangeRatio"));
+        assert!(bundle.source.contains("QFLiquiditySweepScore"));
+        assert!(bundle.source.contains("QFSessionRangeHigh"));
+        assert!(!bundle.source.contains("@@"));
     }
 
     #[test]

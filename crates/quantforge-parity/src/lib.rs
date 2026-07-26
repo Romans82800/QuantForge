@@ -2,12 +2,14 @@
 
 mod indicator;
 
+use quantforge_data::SourceTimezone;
 use quantforge_eval::{PositionSide, ScoutResult};
 use quantforge_export_mql5::ExportEvidenceCard;
 use quantforge_tick::JudgeResult;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str::FromStr;
 use thiserror::Error;
 
 pub use indicator::{
@@ -306,14 +308,54 @@ pub fn load_mt5_tester_run(
     equity_path: impl AsRef<Path>,
     initial_balance: f64,
 ) -> Result<ParityRun, ParityError> {
+    load_mt5_tester_run_in_timezone(deals_path, equity_path, initial_balance, None)
+}
+
+/// Load MT5 tester CSVs, optionally converting server-epoch timestamps to UTC
+/// with the same [`SourceTimezone`] used for QuantForge bar ingestion.
+pub fn load_mt5_tester_run_in_timezone(
+    deals_path: impl AsRef<Path>,
+    equity_path: impl AsRef<Path>,
+    initial_balance: f64,
+    broker_timezone: Option<&str>,
+) -> Result<ParityRun, ParityError> {
     if !initial_balance.is_finite() || initial_balance <= 0.0 {
         return Err(ParityError::InvalidInput(
             "initial balance must be finite and greater than zero".into(),
         ));
     }
-    let deals = load_deals(deals_path.as_ref())?;
+    let timezone = broker_timezone
+        .map(SourceTimezone::from_str)
+        .transpose()
+        .map_err(|error| ParityError::InvalidInput(error.to_string()))?;
+    let mut deals = load_deals(deals_path.as_ref())?;
+    let mut equity = load_equity(equity_path.as_ref())?;
+    if let Some(timezone) = timezone {
+        for deal in &mut deals {
+            deal.timestamp_ms = timezone.server_epoch_ms_to_utc_ms(deal.timestamp_ms).ok_or_else(
+                || {
+                    ParityError::InvalidInput(format!(
+                        "cannot localize MT5 deal timestamp {} with {}",
+                        deal.timestamp_ms,
+                        timezone
+                    ))
+                },
+            )?;
+        }
+        for point in &mut equity {
+            point.timestamp_ms = timezone
+                .server_epoch_ms_to_utc_ms(point.timestamp_ms)
+                .ok_or_else(|| {
+                    ParityError::InvalidInput(format!(
+                        "cannot localize MT5 equity timestamp {} with {}",
+                        point.timestamp_ms, timezone
+                    ))
+                })?;
+        }
+        deals.sort_by_key(|row| (row.timestamp_ms, row.deal_ticket));
+        equity.sort_by_key(|row| row.timestamp_ms);
+    }
     let trades = pair_deals(deals)?;
-    let equity = load_equity(equity_path.as_ref())?;
     let metrics = calculate_metrics(initial_balance, &trades, &equity);
     Ok(ParityRun {
         engine: "mt5-strategy-tester".into(),
@@ -508,40 +550,88 @@ fn calculate_metrics(
     }
 }
 
+/// Pair reference↔external trades by side and closest entry time (not list index).
+///
+/// Index pairing fails as soon as one side inserts/skips a fill; after broker-clock
+/// localization the true matches are usually within a minute but sit at different
+/// offsets in the two lists.
 fn align_trades(reference: &ParityRun, external: &ParityRun) -> Vec<TradeDiff> {
-    let count = reference.trades.len().max(external.trades.len());
-    (0..count)
-        .map(|index| {
-            let reference = reference.trades.get(index);
-            let external = external.trades.get(index);
-            TradeDiff {
-                index,
-                reference_present: reference.is_some(),
-                external_present: external.is_some(),
-                side_match: reference
-                    .zip(external)
-                    .is_some_and(|(left, right)| left.side == right.side),
-                entry_timestamp_delta_ms: reference
-                    .zip(external)
-                    .map(|(left, right)| right.entry_timestamp_ms - left.entry_timestamp_ms),
-                exit_timestamp_delta_ms: reference
-                    .zip(external)
-                    .map(|(left, right)| right.exit_timestamp_ms - left.exit_timestamp_ms),
-                entry_price_delta: reference
-                    .zip(external)
-                    .map(|(left, right)| right.entry_price - left.entry_price),
-                exit_price_delta: reference
-                    .zip(external)
-                    .map(|(left, right)| right.exit_price - left.exit_price),
-                volume_delta: reference
-                    .zip(external)
-                    .map(|(left, right)| right.volume - left.volume),
-                net_profit_delta: reference
-                    .zip(external)
-                    .map(|(left, right)| right.net_profit - left.net_profit),
+    const MAX_SEARCH_MS: i64 = 24 * 60 * 60 * 1000;
+    let mut used = vec![false; external.trades.len()];
+    let mut diffs = Vec::with_capacity(reference.trades.len() + external.trades.len());
+
+    for (index, left) in reference.trades.iter().enumerate() {
+        let mut best: Option<(i64, f64, usize)> = None;
+        for (external_index, right) in external.trades.iter().enumerate() {
+            if used[external_index] || left.side != right.side {
+                continue;
             }
-        })
-        .collect()
+            let time_delta = (right.entry_timestamp_ms - left.entry_timestamp_ms).abs();
+            if time_delta > MAX_SEARCH_MS {
+                continue;
+            }
+            let price_delta = (right.entry_price - left.entry_price).abs();
+            let better = match best {
+                None => true,
+                Some((best_time, best_price, _)) => {
+                    time_delta < best_time
+                        || (time_delta == best_time && price_delta < best_price)
+                }
+            };
+            if better {
+                best = Some((time_delta, price_delta, external_index));
+            }
+        }
+
+        if let Some((_, _, external_index)) = best {
+            used[external_index] = true;
+            let right = &external.trades[external_index];
+            diffs.push(TradeDiff {
+                index,
+                reference_present: true,
+                external_present: true,
+                side_match: true,
+                entry_timestamp_delta_ms: Some(right.entry_timestamp_ms - left.entry_timestamp_ms),
+                exit_timestamp_delta_ms: Some(right.exit_timestamp_ms - left.exit_timestamp_ms),
+                entry_price_delta: Some(right.entry_price - left.entry_price),
+                exit_price_delta: Some(right.exit_price - left.exit_price),
+                volume_delta: Some(right.volume - left.volume),
+                net_profit_delta: Some(right.net_profit - left.net_profit),
+            });
+        } else {
+            diffs.push(TradeDiff {
+                index,
+                reference_present: true,
+                external_present: false,
+                side_match: false,
+                entry_timestamp_delta_ms: None,
+                exit_timestamp_delta_ms: None,
+                entry_price_delta: None,
+                exit_price_delta: None,
+                volume_delta: None,
+                net_profit_delta: None,
+            });
+        }
+    }
+
+    for (external_index, _) in external.trades.iter().enumerate() {
+        if used[external_index] {
+            continue;
+        }
+        diffs.push(TradeDiff {
+            index: diffs.len(),
+            reference_present: false,
+            external_present: true,
+            side_match: false,
+            entry_timestamp_delta_ms: None,
+            exit_timestamp_delta_ms: None,
+            entry_price_delta: None,
+            exit_price_delta: None,
+            volume_delta: None,
+            net_profit_delta: None,
+        });
+    }
+    diffs
 }
 
 fn equity_divergence(reference: &ParityRun, external: &ParityRun, points: usize) -> f64 {

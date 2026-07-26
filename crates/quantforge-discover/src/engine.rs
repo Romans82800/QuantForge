@@ -1,14 +1,18 @@
 use crate::archive::{CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank};
 use crate::grammar::{build_seed, classify_family, crossover, mutate_with_rng, rng_for};
 use crate::model::{
-    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, return_drawdown_ratio,
+    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateResult, SearchFamily,
+    SymbolScreenResult, return_drawdown_ratio,
 };
+use crate::FROZEN_ATR_PERIOD;
+use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
 use quantforge_eval::evaluate_strategy;
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::StrategyIr;
+use quantforge_quality::{deflated_trade_sharpe, expected_max_lucky_sharpe, trade_sharpe_proxy};
 use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -17,20 +21,34 @@ use std::collections::BTreeMap;
 
 enum CandidateOutcome {
     CoarseRejected,
+    AmbiguousRejected,
     PrecisionRejected,
     DepositGateRejected,
+    MultiSymbolRejected {
+        #[allow(dead_code)]
+        results: Vec<SymbolScreenResult>,
+    },
+    DeflatedSharpeRejected {
+        #[allow(dead_code)]
+        observed: Option<f64>,
+        #[allow(dead_code)]
+        expected: f64,
+        #[allow(dead_code)]
+        deflated: Option<f64>,
+        #[allow(dead_code)]
+        multi_symbol_results: Vec<SymbolScreenResult>,
+    },
     Accepted {
         result: Box<ScoutResult>,
         is_expectancy: f64,
-        oos1_expectancy: Option<f64>,
-        oos1_expectancy_ratio: Option<f64>,
-        /// M1 WFO/MC/param on IS. `Ok` continues to OOS1; `Err` is pot-only.
-        databank_gate: Result<(), crate::robustness::RobustnessReject>,
-        /// OOS1 retention after IS robustness (ignored when robustness failed).
-        oos1_ok: bool,
+        observed_trade_sharpe: Option<f64>,
+        expected_max_lucky_sharpe: f64,
+        deflated_trade_sharpe: Option<f64>,
+        multi_symbol_results: Vec<SymbolScreenResult>,
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_and_deposit(
     bank: &mut Databank,
     candidates: Vec<StrategyIr>,
@@ -38,16 +56,21 @@ fn evaluate_and_deposit(
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
     generation: u64,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<(), DiscoverError> {
-    let scout = &bank.config.scout;
+    let scout = bank.config.scout.clone();
     let gates = &bank.config.gates;
     let discover_config = &bank.config;
     let minimum_return_retention = bank.config.precision.minimum_return_retention;
     let oos1_retention = bank.config.oos1_expectancy_retention;
     let require_m1 = bank.config.require_m1_precision;
     let require_robustness = bank.config.require_m1_robustness;
+    let multi_symbol_minimum = bank.config.multi_symbol_minimum_pass;
+    let minimum_deflated = bank.config.minimum_deflated_trade_sharpe;
+    let evaluations_touched = bank.evaluation_count.max(1);
     let robustness = crate::robustness::RobustnessConfig {
         folds: bank.config.robustness_folds,
         monte_carlo_trials: bank.config.robustness_monte_carlo_trials,
@@ -55,23 +78,70 @@ fn evaluate_and_deposit(
         seed: bank.config.seed,
         initial_balance: scout.initial_balance,
         costs: scout.costs.clone(),
-        minimum_fold_trades: 2,
+        minimum_return_retention,
+        minimum_fold_trades: bank.config.deposit_gates.minimum_trades.clamp(1, 2),
         minimum_return_percent: bank.config.deposit_gates.minimum_return_percent,
         minimum_profit_factor: bank.config.deposit_gates.minimum_profit_factor.min(1.0),
         maximum_drawdown_percent: bank.config.deposit_gates.maximum_drawdown_percent.max(30.0),
         minimum_passing_fold_fraction: 0.6,
         minimum_neighborhood_survival_fraction: 0.7,
         parameter_perturbation_fraction: 0.1,
+        calendar_year_folds: bank.config.calendar_year_folds,
     };
     let evaluate_batch = || {
         candidates
             .into_par_iter()
             .map(|strategy| {
                 let result = (|| {
-                    let coarse = evaluate_strategy(&strategy, dataset, broker, scout)
+                    let coarse = evaluate_strategy(&strategy, dataset, broker, &scout)
                         .map_err(|error| error.to_string())?;
                     if !crate::archive::passes_gates(&coarse, discover_config) {
                         return Ok::<_, String>(CandidateOutcome::CoarseRejected);
+                    }
+                    // SQX automatic dismissal: ≥25% same-bar open+close trades.
+                    if ambiguous_trade_fraction(&coarse) >= 0.25 {
+                        return Ok(CandidateOutcome::AmbiguousRejected);
+                    }
+
+                    // Cheap cross-symbol H1 screen before any M1 work.
+                    let multi = if multi_symbol_minimum > 0 && !pack.is_empty() {
+                        screen_multi_symbol(
+                            &strategy,
+                            primary_symbol,
+                            &coarse,
+                            pack,
+                            &scout,
+                            gates,
+                        )
+                    } else {
+                        crate::multi_symbol::MultiSymbolScreen {
+                            results: Vec::new(),
+                            passing: 1,
+                            pooled_profits: coarse
+                                .trades
+                                .iter()
+                                .map(|trade| trade.net_profit)
+                                .collect(),
+                        }
+                    };
+                    if multi_symbol_minimum > 0 && multi.passing < multi_symbol_minimum {
+                        return Ok(CandidateOutcome::MultiSymbolRejected {
+                            results: multi.results,
+                        });
+                    }
+
+                    let observed = trade_sharpe_proxy(&multi.pooled_profits);
+                    let expected = expected_max_lucky_sharpe(evaluations_touched);
+                    let deflated = deflated_trade_sharpe(&multi.pooled_profits, evaluations_touched);
+                    if let Some(floor) = minimum_deflated {
+                        if deflated.is_none_or(|value| value < floor) {
+                            return Ok(CandidateOutcome::DeflatedSharpeRejected {
+                                observed,
+                                expected,
+                                deflated,
+                                multi_symbol_results: multi.results,
+                            });
+                        }
                     }
 
                     // SQX Selected-TF path: deposit from H1/IS metrics; M1 fidelity is deferred
@@ -124,46 +194,16 @@ fn evaluate_and_deposit(
                         return Ok(CandidateOutcome::DepositGateRejected);
                     }
 
-                    // SQX-style: M1 robustness on IS only, then OOS1 pick (never feed OOS1 into WFO/MC).
-                    let databank_gate = if require_robustness {
-                        crate::robustness::run_m1_predeposit_robustness(
-                            &strategy,
-                            dataset,
-                            m1_dataset,
-                            broker,
-                            &robustness,
-                        )
-                    } else {
-                        Ok(())
-                    };
-
+                    // Pot path stops here. M1 robustness + OOS1 run only after a
+                    // candidate actually enters the pot (see sequential loop below).
                     let is_expectancy = deposit_result.metrics.expectancy;
-                    let (oos1_expectancy, oos1_expectancy_ratio, oos1_ok) =
-                        if matches!(databank_gate, Ok(())) {
-                            if let Some(oos1) = oos1_dataset {
-                                let oos1_result = evaluate_strategy(&strategy, oos1, broker, scout)
-                                    .map_err(|error| error.to_string())?;
-                                let oos1_expectancy = oos1_result.metrics.expectancy;
-                                let ok =
-                                    passes_oos1_pick(is_expectancy, oos1_expectancy, oos1_retention);
-                                let ratio = (is_expectancy > 0.0)
-                                    .then_some(oos1_expectancy / is_expectancy)
-                                    .filter(|value| value.is_finite());
-                                (Some(oos1_expectancy), ratio, ok)
-                            } else {
-                                (None, None, true)
-                            }
-                        } else {
-                            (None, None, false)
-                        };
-
                     Ok(CandidateOutcome::Accepted {
                         result: Box::new(deposit_result),
                         is_expectancy,
-                        oos1_expectancy,
-                        oos1_expectancy_ratio,
-                        databank_gate,
-                        oos1_ok,
+                        observed_trade_sharpe: observed,
+                        expected_max_lucky_sharpe: expected,
+                        deflated_trade_sharpe: deflated,
+                        multi_symbol_results: multi.results,
                     })
                 })();
                 (strategy, result)
@@ -181,28 +221,94 @@ fn evaluate_and_deposit(
             Ok(CandidateOutcome::Accepted {
                 result,
                 is_expectancy,
-                oos1_expectancy,
-                oos1_expectancy_ratio,
-                databank_gate,
-                oos1_ok,
+                observed_trade_sharpe,
+                expected_max_lucky_sharpe,
+                deflated_trade_sharpe,
+                multi_symbol_results,
             }) => {
-                let evaluation = CandidateEvaluation {
+                // Deposit to pot first with H1 metrics only — do not wait on M1.
+                let pot_evaluation = CandidateEvaluation {
                     strategy: strategy.clone(),
                     result: *result,
                     generation,
                     is_expectancy,
-                    oos1_expectancy,
-                    oos1_expectancy_ratio,
+                    oos1_expectancy: None,
+                    oos1_expectancy_ratio: None,
+                    observed_trade_sharpe,
+                    expected_max_lucky_sharpe: Some(expected_max_lucky_sharpe),
+                    deflated_trade_sharpe,
+                    multi_symbol_results: multi_symbol_results.clone(),
+                    gate_results: build_gate_results(
+                        is_expectancy,
+                        None,
+                        None,
+                        false,
+                        None,
+                        &multi_symbol_results,
+                        bank.config.multi_symbol_minimum_pass,
+                        deflated_trade_sharpe,
+                        bank.config.minimum_deflated_trade_sharpe,
+                    ),
                 };
-                let pot_decision = deposit_to_accepted_pool(bank, evaluation.clone())?;
+                let pot_decision = deposit_to_accepted_pool(bank, pot_evaluation.clone())?;
                 bank.telemetry.record(pot_decision);
                 let pot_ok = matches!(
                     pot_decision,
                     DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot
                 );
                 if !pot_ok {
-                    // Niche/clone/correlation reject — skip expensive post-pot accounting.
-                } else if let Err(reject) = databank_gate {
+                    // Niche/clone/correlation reject — skip expensive M1 battery.
+                    continue;
+                }
+
+                // Databank path only: M1 robustness on IS, then OOS1 pick.
+                let databank_gate = if require_robustness {
+                    crate::robustness::run_m1_predeposit_robustness(
+                        &strategy,
+                        dataset,
+                        m1_dataset,
+                        broker,
+                        &robustness,
+                        &pot_evaluation.result.metrics,
+                    )
+                } else {
+                    Ok(())
+                };
+
+                let (oos1_expectancy, oos1_expectancy_ratio, oos1_ok) =
+                    if matches!(databank_gate, Ok(())) {
+                        if let Some(oos1) = oos1_dataset {
+                            match evaluate_strategy(&strategy, oos1, broker, &scout) {
+                                Ok(oos1_result) => {
+                                    let oos1_expectancy = oos1_result.metrics.expectancy;
+                                    let ok = passes_oos1_pick(
+                                        is_expectancy,
+                                        oos1_expectancy,
+                                        oos1_retention,
+                                    );
+                                    let ratio = (is_expectancy > 0.0)
+                                        .then_some(oos1_expectancy / is_expectancy)
+                                        .filter(|value| value.is_finite());
+                                    (Some(oos1_expectancy), ratio, ok)
+                                }
+                                Err(error) => {
+                                    *bank
+                                        .telemetry
+                                        .evaluation_errors
+                                        .entry(error.to_string())
+                                        .or_default() += 1;
+                                    bank.telemetry.record(DepositDecision::RejectedEvaluation);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            (None, None, true)
+                        }
+                    } else {
+                        (None, None, false)
+                    };
+
+                if let Err(reject) = databank_gate {
                     match reject {
                         crate::robustness::RobustnessReject::M1Fidelity => {
                             bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
@@ -221,18 +327,43 @@ fn evaluate_and_deposit(
                 } else if !oos1_ok {
                     bank.telemetry.record(DepositDecision::RejectedOos1);
                 } else {
-                    let bank_decision = deposit_to_databank(bank, evaluation)?;
+                    let bank_evaluation = CandidateEvaluation {
+                        oos1_expectancy,
+                        oos1_expectancy_ratio,
+                        gate_results: build_gate_results(
+                            is_expectancy,
+                            oos1_expectancy,
+                            oos1_expectancy_ratio,
+                            oos1_ok,
+                            None,
+                            &multi_symbol_results,
+                            bank.config.multi_symbol_minimum_pass,
+                            deflated_trade_sharpe,
+                            bank.config.minimum_deflated_trade_sharpe,
+                        ),
+                        ..pot_evaluation
+                    };
+                    let bank_decision = deposit_to_databank(bank, bank_evaluation)?;
                     bank.telemetry.record(bank_decision);
                 }
             }
             Ok(CandidateOutcome::CoarseRejected) => {
                 bank.telemetry.record(DepositDecision::RejectedGate);
             }
+            Ok(CandidateOutcome::AmbiguousRejected) => {
+                bank.telemetry.record(DepositDecision::RejectedAmbiguous);
+            }
             Ok(CandidateOutcome::PrecisionRejected) => {
                 bank.telemetry.record(DepositDecision::RejectedPrecision);
             }
             Ok(CandidateOutcome::DepositGateRejected) => {
                 bank.telemetry.record(DepositDecision::RejectedDepositGate);
+            }
+            Ok(CandidateOutcome::MultiSymbolRejected { .. }) => {
+                bank.telemetry.record(DepositDecision::RejectedMultiSymbol);
+            }
+            Ok(CandidateOutcome::DeflatedSharpeRejected { .. }) => {
+                bank.telemetry.record(DepositDecision::RejectedDeflatedSharpe);
             }
             Err(error) => {
                 *bank.telemetry.evaluation_errors.entry(error).or_default() += 1;
@@ -253,6 +384,20 @@ pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retenti
         && oos1_expectancy >= retention * is_expectancy
 }
 
+/// Fraction of trades that open and close on the same decision bar (SQX ambiguous).
+pub(crate) fn ambiguous_trade_fraction(result: &ScoutResult) -> f64 {
+    let total = result.trades.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let ambiguous = result
+        .trades
+        .iter()
+        .filter(|trade| trade.bars_held == 0)
+        .count();
+    ambiguous as f64 / total as f64
+}
+
 pub fn evolve_new(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
@@ -261,8 +406,36 @@ pub fn evolve_new(
     config: DiscoverConfig,
     generations: u64,
 ) -> Result<Databank, DiscoverError> {
+    evolve_new_with_pack(
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        broker,
+        &[],
+        &broker.symbol,
+        config,
+        generations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_new_with_pack(
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
+    mut config: DiscoverConfig,
+    generations: u64,
+) -> Result<Databank, DiscoverError> {
+    config.apply_run_mode();
     config.validate()?;
     broker.validate()?;
+    for market in pack {
+        market.broker.validate()?;
+    }
+    let search_family = config.search_family;
     let mut bank = Databank {
         schema_version: DATABANK_SCHEMA_VERSION,
         grammar_version: GRAMMAR_VERSION.into(),
@@ -282,7 +455,11 @@ pub fn evolve_new(
     let initial = (0..bank.config.initial_candidates)
         .map(|index| {
             apply_production_policy(
-                crate::grammar::generate_seed(bank.config.seed, index as u64),
+                crate::grammar::generate_seed_for_family(
+                    bank.config.seed,
+                    index as u64,
+                    search_family,
+                ),
                 &bank.config,
             )
         })
@@ -295,6 +472,8 @@ pub fn evolve_new(
         oos1_dataset,
         m1_dataset,
         broker,
+        pack,
+        primary_symbol,
         0,
         pool.as_ref(),
     )?;
@@ -304,6 +483,8 @@ pub fn evolve_new(
         oos1_dataset,
         m1_dataset,
         broker,
+        pack,
+        primary_symbol,
         generations,
         pool.as_ref(),
     )?;
@@ -311,11 +492,34 @@ pub fn evolve_new(
 }
 
 pub fn continue_evolution(
+    bank: Databank,
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    additional_generations: u64,
+) -> Result<Databank, DiscoverError> {
+    continue_evolution_with_pack(
+        bank,
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        broker,
+        &[],
+        &broker.symbol,
+        additional_generations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continue_evolution_with_pack(
     mut bank: Databank,
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
     additional_generations: u64,
 ) -> Result<Databank, DiscoverError> {
     validate_resume(&bank, dataset, m1_dataset, broker)?;
@@ -326,6 +530,8 @@ pub fn continue_evolution(
         oos1_dataset,
         m1_dataset,
         broker,
+        pack,
+        primary_symbol,
         additional_generations,
         pool.as_ref(),
     )?;
@@ -343,16 +549,24 @@ fn build_worker_pool(worker_threads: usize) -> Result<Option<rayon::ThreadPool>,
         .map_err(|error| DiscoverError::InvalidConfig(format!("worker thread pool: {error}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_generations(
     bank: &mut Databank,
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
     count: u64,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<(), DiscoverError> {
     for _ in 0..count {
+        if let Some(limit) = bank.config.early_stop_pot_elites {
+            if bank.accepted_pool.len() >= limit {
+                break;
+            }
+        }
         let generation = bank.completed_generations + 1;
         let batch = breed_generation(bank, generation);
         evaluate_and_deposit(
@@ -362,6 +576,8 @@ fn run_generations(
             oos1_dataset,
             m1_dataset,
             broker,
+            pack,
+            primary_symbol,
             generation,
             pool,
         )?;
@@ -373,6 +589,8 @@ fn run_generations(
 fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
     let pot_size = bank.accepted_pool.len();
     let breeding_unlocked = pot_size >= bank.config.mutate_after_elites;
+    let search_family = bank.config.search_family;
+    let max_atoms = search_family.spec().max_atoms.max(1);
     (0..bank.config.batch_size)
         .map(|index| {
             let sequence = generation
@@ -383,21 +601,21 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 || bank.accepted_pool.is_empty()
                 || rng.gen_bool(bank.config.random_fill_fraction);
             if keep_filling {
-                let family = match index % 4 {
-                    0 => crate::model::FamilyStyle::Trend,
-                    1 => crate::model::FamilyStyle::Momentum,
-                    2 => crate::model::FamilyStyle::Breakout,
-                    _ => crate::model::FamilyStyle::MeanReversion,
-                };
                 return apply_production_policy(
-                    build_seed(family, &mut rng, format!("g{generation}-{index}")),
+                    build_seed(
+                        search_family,
+                        &mut rng,
+                        format!("g{generation}-{index}"),
+                        max_atoms,
+                        true,
+                    ),
                     &bank.config,
                 );
             }
 
-            let first_index = tournament(bank, &mut rng, None);
+            let first_index = tournament(bank, &mut rng, Some(search_family.style()));
             let first = &bank.accepted_pool[first_index];
-            let preferred_family = rng.gen_bool(0.75).then(|| classify_family(&first.strategy));
+            let preferred_family = Some(search_family.style());
             let second_index = tournament(bank, &mut rng, preferred_family);
             let crossed = crossover(
                 &first.strategy,
@@ -409,11 +627,77 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 &mut rng,
                 bank.config.structural_mutation_probability,
                 sequence,
+                bank.config.allow_cross_family_mutation,
+                search_family,
             );
             child.id = format!("g{generation}-{index}");
             apply_production_policy(child, &bank.config)
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_gate_results(
+    is_expectancy: f64,
+    oos1_expectancy: Option<f64>,
+    oos1_ratio: Option<f64>,
+    oos1_ok: bool,
+    robustness_reject: Option<&crate::robustness::RobustnessReject>,
+    multi_symbol: &[SymbolScreenResult],
+    multi_symbol_minimum: usize,
+    deflated: Option<f64>,
+    deflated_floor: Option<f64>,
+) -> Vec<GateResult> {
+    let mut gates = vec![GateResult {
+        name: "is_deposit".into(),
+        passed: true,
+        detail: format!("IS expectancy {is_expectancy:.4} R"),
+    }];
+    if let Some(oos1) = oos1_expectancy {
+        gates.push(GateResult {
+            name: "oos1_retention".into(),
+            passed: oos1_ok,
+            detail: format!(
+                "OOS1 {oos1:.4} R · ratio {}",
+                oos1_ratio
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "n/a".into())
+            ),
+        });
+    }
+    if multi_symbol_minimum > 0 {
+        let passing = multi_symbol.iter().filter(|row| row.passed).count();
+        gates.push(GateResult {
+            name: "multi_symbol".into(),
+            passed: passing >= multi_symbol_minimum,
+            detail: format!("{passing}/{multi_symbol_minimum} pack symbols"),
+        });
+    }
+    match robustness_reject {
+        None => gates.push(GateResult {
+            name: "m1_robustness".into(),
+            passed: true,
+            detail: "passed or not required".into(),
+        }),
+        Some(reject) => gates.push(GateResult {
+            name: "m1_robustness".into(),
+            passed: false,
+            detail: format!("{reject:?}"),
+        }),
+    }
+    if let Some(floor) = deflated_floor {
+        gates.push(GateResult {
+            name: "deflated_sharpe".into(),
+            passed: deflated.is_some_and(|value| value >= floor),
+            detail: format!(
+                "deflated {} · floor {floor:.3}",
+                deflated
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "n/a".into())
+            ),
+        });
+    }
+    gates
 }
 
 fn apply_production_policy(
@@ -422,13 +706,31 @@ fn apply_production_policy(
 ) -> StrategyIr {
     strategy.manage.flatten_end_of_day = config.flatten_at_22;
     strategy.manage.max_one_entry_per_day = config.max_one_entry_per_day;
+    strategy.meta.thesis_hint = match config.search_family {
+        SearchFamily::TrendPullback => "trend_pullback".into(),
+        SearchFamily::MomentumBurst => "momentum_burst".into(),
+        SearchFamily::DonchianBreakout => "donchian_breakout".into(),
+        SearchFamily::MeanReversionBand => "mean_reversion_band".into(),
+        SearchFamily::ZScoreReversion => "zscore_reversion".into(),
+        SearchFamily::SessionOrb => "session_orb".into(),
+        SearchFamily::ImpulseCandle => "impulse_candle".into(),
+        SearchFamily::VolSqueezeBreak => "vol_squeeze_break".into(),
+        SearchFamily::SupplyDemandReclaim => "supply_demand_reclaim".into(),
+        SearchFamily::SweepReclaim => "sweep_reclaim".into(),
+    };
     if config.simple_exits {
         enforce_simple_exits(&mut strategy);
     }
     strategy
 }
 
-/// Market-only entries, no trailing/BE/partials, fixed or ATR SL/TP, time stop ≤ 16.
+/// Selected-timeframe compatibility profile.
+///
+/// Signals use completed bars and entries occur at the next bar open. Market
+/// entries avoid inventing an unknowable intrabar path for stop/limit fills,
+/// which is the largest source of Selected-TF versus M1 divergence. Pending
+/// orders remain supported by IR, evaluators and exporters, but are reserved
+/// for workflows that discover and validate directly on M1/ticks.
 fn enforce_simple_exits(strategy: &mut StrategyIr) {
     strategy.entry.order = quantforge_ir::EntryOrderPolicy::Market;
     strategy.manage.trailing = None;
@@ -440,41 +742,36 @@ fn enforce_simple_exits(strategy: &mut StrategyIr) {
         .unwrap_or(8)
         .clamp(1, 16);
     strategy.manage.time_stop_bars = Some(bars);
+    // Point stops are not cross-symbol portable; force ATR multiples at frozen period.
     strategy.stops.stop_loss = match &strategy.stops.stop_loss {
-        quantforge_ir::StopLossPolicy::FixedPoints { points } => {
-            quantforge_ir::StopLossPolicy::FixedPoints {
-                points: (*points).clamp(10.0, 1_000.0),
+        quantforge_ir::StopLossPolicy::AtrMultiple { multiplier, .. } => {
+            quantforge_ir::StopLossPolicy::AtrMultiple {
+                period: FROZEN_ATR_PERIOD,
+                multiplier: ((*multiplier * 4.0).round() / 4.0).clamp(1.0, 4.0),
             }
         }
-        quantforge_ir::StopLossPolicy::AtrMultiple { period, multiplier } => {
+        quantforge_ir::StopLossPolicy::FixedPoints { .. }
+        | quantforge_ir::StopLossPolicy::RangeMultiple { .. } => {
             quantforge_ir::StopLossPolicy::AtrMultiple {
-                period: (*period).clamp(5, 30),
-                multiplier: (*multiplier).clamp(0.5, 4.0),
-            }
-        }
-        quantforge_ir::StopLossPolicy::RangeMultiple { period, multiplier } => {
-            quantforge_ir::StopLossPolicy::AtrMultiple {
-                period: (*period).clamp(5, 30),
-                multiplier: (*multiplier).clamp(0.5, 4.0),
+                period: FROZEN_ATR_PERIOD,
+                multiplier: 2.0,
             }
         }
     };
     strategy.stops.take_profit = match &strategy.stops.take_profit {
-        quantforge_ir::TakeProfitPolicy::FixedPoints { points } => {
-            quantforge_ir::TakeProfitPolicy::FixedPoints {
-                points: (*points).clamp(10.0, 2_000.0),
-            }
-        }
         quantforge_ir::TakeProfitPolicy::RiskMultiple { multiple } => {
             quantforge_ir::TakeProfitPolicy::RiskMultiple {
-                multiple: (*multiple).clamp(0.5, 5.0),
+                multiple: ((*multiple * 4.0).round() / 4.0).clamp(1.0, 4.0),
             }
         }
-        quantforge_ir::TakeProfitPolicy::AtrMultiple { period, multiplier } => {
+        quantforge_ir::TakeProfitPolicy::AtrMultiple { multiplier, .. } => {
             quantforge_ir::TakeProfitPolicy::AtrMultiple {
-                period: (*period).clamp(5, 30),
-                multiplier: (*multiplier).clamp(0.5, 5.0),
+                period: FROZEN_ATR_PERIOD,
+                multiplier: ((*multiplier * 4.0).round() / 4.0).clamp(1.0, 6.0),
             }
+        }
+        quantforge_ir::TakeProfitPolicy::FixedPoints { .. } => {
+            quantforge_ir::TakeProfitPolicy::RiskMultiple { multiple: 2.0 }
         }
     };
 }
@@ -664,6 +961,11 @@ mod tests {
             tournament_size: 3,
             structural_mutation_probability: 0.3,
             seed: 1234,
+            search_family: crate::SearchFamily::TrendPullback,
+            run_mode: crate::DiscoverRunMode::FullHarvest,
+            allow_cross_family_mutation: false,
+            early_stop_pot_elites: None,
+            trial_budget_warning: crate::TRIAL_BUDGET_WARNING,
             gates: GateConfig {
                 minimum_trades: 0,
                 maximum_drawdown_percent: 100.0,
@@ -685,7 +987,8 @@ mod tests {
             require_m1_precision: false,
             simple_exits: true,
             flatten_at_22: false,
-            max_one_entry_per_day: true,
+            // Fixture series is short; pendings need multiple fills/day to illuminate niches.
+            max_one_entry_per_day: false,
             mutate_after_elites: 0,
             random_fill_fraction: 0.0,
             worker_threads: 1,
@@ -693,6 +996,9 @@ mod tests {
             robustness_folds: 3,
             robustness_monte_carlo_trials: 50,
             robustness_neighborhood_samples: 2,
+            calendar_year_folds: false,
+            minimum_deflated_trade_sharpe: None,
+            multi_symbol_minimum_pass: 0,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -709,6 +1015,19 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.coverage() >= 4);
         assert_eq!(first.evaluation_count, 64);
+        let non_market: Vec<_> = first
+            .elites
+            .iter()
+            .chain(first.accepted_pool.iter())
+            .filter(|elite| {
+                !matches!(
+                    elite.strategy.entry.order,
+                    quantforge_ir::EntryOrderPolicy::Market
+                )
+            })
+            .map(|elite| &elite.strategy.entry.order)
+            .collect();
+        assert!(non_market.is_empty(), "non-market production entries: {non_market:?}");
         assert_eq!(first.completed_generations, 2);
     }
 

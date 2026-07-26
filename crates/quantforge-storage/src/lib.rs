@@ -19,6 +19,9 @@ use thiserror::Error;
 
 pub const VAULT_SCHEMA_VERSION: u16 = 1;
 pub const SEALED_ACCESS_SCHEMA_VERSION: u16 = 1;
+pub const SEALED_BUDGET_SCHEMA_VERSION: u16 = 1;
+/// Lifetime cap on sealed (OOS2) opens per split plan.
+pub const DEFAULT_SEALED_ACCESS_BUDGET: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRecipe {
@@ -191,14 +194,92 @@ pub fn sealed_access_path(
         .join(format!("{}.sealed-open.json", split_plan_hash.as_str()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedBudgetEntry {
+    pub strategy_fingerprint: ContentHash,
+    pub challenge_artifact_hash: ContentHash,
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// Lifetime sealed-access budget for one split plan (default 20 opens).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedAccessBudgetLedger {
+    pub schema_version: u16,
+    pub split_plan_hash: ContentHash,
+    pub lifetime_limit: u64,
+    pub claims: Vec<SealedBudgetEntry>,
+}
+
+pub fn sealed_budget_path(root: impl AsRef<Path>, split_plan_hash: &ContentHash) -> PathBuf {
+    root.as_ref()
+        .join(".quantforge-budget")
+        .join(format!("{}.sealed-budget.json", split_plan_hash.as_str()))
+}
+
+pub fn read_sealed_budget(
+    root: impl AsRef<Path>,
+    split_plan_hash: &ContentHash,
+) -> Result<SealedAccessBudgetLedger, StorageError> {
+    let path = sealed_budget_path(&root, split_plan_hash);
+    if !path.is_file() {
+        // Read the pre-v1 location so existing sealed roots remain usable, but
+        // always write new ledgers into the private metadata directory. The
+        // sealed root itself must contain candidate directories only.
+        let legacy_path = root
+            .as_ref()
+            .join(format!("{}.sealed-budget.json", split_plan_hash.as_str()));
+        if legacy_path.is_file() {
+            let bytes = fs::read(legacy_path)?;
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
+        return Ok(SealedAccessBudgetLedger {
+            schema_version: SEALED_BUDGET_SCHEMA_VERSION,
+            split_plan_hash: split_plan_hash.clone(),
+            lifetime_limit: DEFAULT_SEALED_ACCESS_BUDGET,
+            claims: Vec::new(),
+        });
+    }
+    let bytes = fs::read(&path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 /// Claims the one allowed access before any sealed market bars are loaded. If
 /// evaluation crashes afterward, the durable claim still prevents a retry.
+///
+/// Also enforces the lifetime sealed-access budget for the split plan
+/// ([`DEFAULT_SEALED_ACCESS_BUDGET`] opens).
 pub fn claim_sealed_access_once(
     root: impl AsRef<Path>,
     strategy_fingerprint: &ContentHash,
     split_plan_hash: &ContentHash,
     challenge_artifact_hash: &ContentHash,
 ) -> Result<PathBuf, StorageError> {
+    claim_sealed_access_once_with_budget(
+        root,
+        strategy_fingerprint,
+        split_plan_hash,
+        challenge_artifact_hash,
+        DEFAULT_SEALED_ACCESS_BUDGET,
+    )
+}
+
+pub fn claim_sealed_access_once_with_budget(
+    root: impl AsRef<Path>,
+    strategy_fingerprint: &ContentHash,
+    split_plan_hash: &ContentHash,
+    challenge_artifact_hash: &ContentHash,
+    lifetime_limit: u64,
+) -> Result<PathBuf, StorageError> {
+    let root = root.as_ref();
+    let mut ledger = read_sealed_budget(root, split_plan_hash)?;
+    ledger.lifetime_limit = lifetime_limit;
+    if ledger.claims.len() as u64 >= lifetime_limit {
+        return Err(StorageError::SealedBudgetExhausted {
+            used: ledger.claims.len() as u64,
+            limit: lifetime_limit,
+        });
+    }
+
     let path = sealed_access_path(root, strategy_fingerprint, split_plan_hash);
     let claim = SealedAccessClaim {
         schema_version: SEALED_ACCESS_SCHEMA_VERSION,
@@ -208,6 +289,19 @@ pub fn claim_sealed_access_once(
         challenge_artifact_hash: challenge_artifact_hash.clone(),
     };
     write_json_new(&path, &claim)?;
+
+    ledger.claims.push(SealedBudgetEntry {
+        strategy_fingerprint: strategy_fingerprint.clone(),
+        challenge_artifact_hash: challenge_artifact_hash.clone(),
+        claimed_at: claim.claimed_at,
+    });
+    // Budget ledger is versioned in place after the durable per-strategy claim.
+    let budget_path = sealed_budget_path(root, split_plan_hash);
+    if budget_path.is_file() {
+        write_json_versioned(&budget_path, &ledger)?;
+    } else {
+        write_json_new(&budget_path, &ledger)?;
+    }
     Ok(path)
 }
 
@@ -386,6 +480,8 @@ pub enum StorageError {
     InvalidSealedAttempt,
     #[error("sealed-final report has no durable pre-open access claim")]
     MissingSealedAccessClaim,
+    #[error("sealed-access budget exhausted ({used}/{limit} lifetime opens)")]
+    SealedBudgetExhausted { used: u64, limit: u64 },
     #[error("invalid directory artifact: {0}")]
     InvalidDirectoryArtifact(String),
 }
@@ -607,5 +703,29 @@ mod tests {
             claim_sealed_access_once(directory.path(), &strategy, &split, &challenge).unwrap();
         assert!(path.is_file());
         assert!(claim_sealed_access_once(directory.path(), &strategy, &split, &challenge).is_err());
+    }
+
+    #[test]
+    fn sealed_access_budget_refuses_the_21st_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let split = ContentHash::sha256("budget split");
+        for index in 0..DEFAULT_SEALED_ACCESS_BUDGET {
+            let strategy = ContentHash::sha256(format!("strategy-{index}"));
+            let challenge = ContentHash::sha256(format!("challenge-{index}"));
+            claim_sealed_access_once(directory.path(), &strategy, &split, &challenge).unwrap();
+        }
+        let over = claim_sealed_access_once(
+            directory.path(),
+            &ContentHash::sha256("strategy-over"),
+            &split,
+            &ContentHash::sha256("challenge-over"),
+        );
+        assert!(matches!(
+            over,
+            Err(StorageError::SealedBudgetExhausted {
+                used: DEFAULT_SEALED_ACCESS_BUDGET,
+                limit: DEFAULT_SEALED_ACCESS_BUDGET
+            })
+        ));
     }
 }

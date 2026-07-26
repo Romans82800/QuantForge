@@ -22,6 +22,7 @@ int g_equity_file=INVALID_HANDLE;
 int g_metadata_file=INVALID_HANDLE;
 double g_initial_volume=0.0;
 double g_initial_risk=0.0;
+double g_peak_favorable=EMPTY_VALUE;
 bool g_partial_done[];
 
 // Strategy fingerprint: @@STRATEGY_FINGERPRINT@@
@@ -115,6 +116,227 @@ double QFROC(const int field,const int period,const int shift)
    if(!QFValid(current) || !QFValid(previous) || previous==0.0)
       return EMPTY_VALUE;
    return (current/previous-1.0)*100.0;
+}
+
+double QFBodyRangeRatio(const int shift)
+{
+   const double open=QFPrice(0,shift);
+   const double high=QFPrice(1,shift);
+   const double low=QFPrice(2,shift);
+   const double close=QFPrice(3,shift);
+   if(!QFValid(open) || !QFValid(high) || !QFValid(low) || !QFValid(close))
+      return EMPTY_VALUE;
+   const double range=high-low;
+   if(range<=0.0)
+      return EMPTY_VALUE;
+   return MathAbs(close-open)/range;
+}
+
+double QFCloseLocationInBar(const int shift)
+{
+   const double high=QFPrice(1,shift);
+   const double low=QFPrice(2,shift);
+   const double close=QFPrice(3,shift);
+   if(!QFValid(high) || !QFValid(low) || !QFValid(close))
+      return EMPTY_VALUE;
+   const double range=high-low;
+   if(range<=0.0)
+      return EMPTY_VALUE;
+   return (close-low)/range;
+}
+
+double QFAtrPercentile(const int atr_period,const int lookback,const int shift)
+{
+   if(atr_period<1 || lookback<1 || Bars(_Symbol,_Period)<shift+lookback)
+      return EMPTY_VALUE;
+   double values[];
+   ArrayResize(values,lookback);
+   int finite=0;
+   double current=EMPTY_VALUE;
+   for(int offset=0;offset<lookback;offset++)
+   {
+      const double value=QFATR(atr_period,shift+offset);
+      if(!QFValid(value))
+         continue;
+      values[finite++]=value;
+      if(offset==0)
+         current=value;
+   }
+   if(finite==0 || !QFValid(current))
+      return EMPTY_VALUE;
+   int rank=0;
+   for(int index=0;index<finite;index++)
+      if(values[index]<=current)
+         rank++;
+   return (double)rank/(double)finite*100.0;
+}
+
+bool QFSameBrokerDay(const datetime left,const datetime right)
+{
+   MqlDateTime a,b;
+   if(!TimeToStruct(left,a) || !TimeToStruct(right,b))
+      return false;
+   return a.year==b.year && a.mon==b.mon && a.day==b.day;
+}
+
+double QFSessionRangeExtreme(const int start_hour,const int range_bars,const int shift,
+                             const bool want_high)
+{
+   if(range_bars<1 || Bars(_Symbol,_Period)<=shift)
+      return EMPTY_VALUE;
+   const datetime anchor=iTime(_Symbol,_Period,shift);
+   if(anchor<=0)
+      return EMPTY_VALUE;
+   MqlDateTime parts;
+   if(!TimeToStruct(anchor,parts))
+      return EMPTY_VALUE;
+   int start_shift=-1;
+   for(int index=Bars(_Symbol,_Period)-1;index>=shift;index--)
+   {
+      const datetime bar_time=iTime(_Symbol,_Period,index);
+      if(bar_time<=0 || !QFSameBrokerDay(bar_time,anchor))
+         continue;
+      MqlDateTime bar_parts;
+      if(!TimeToStruct(bar_time,bar_parts))
+         continue;
+      if(bar_parts.hour>=start_hour)
+      {
+         start_shift=index;
+         break;
+      }
+   }
+   if(start_shift<0 || start_shift+1<range_bars)
+      return EMPTY_VALUE;
+   // Window is the earliest `range_bars` bars from session start (lower shift = newer).
+   // Walk forward in time: start_shift is oldest candidate; find contiguous range.
+   int oldest=start_shift;
+   for(int index=start_shift;index>=shift;index--)
+   {
+      const datetime bar_time=iTime(_Symbol,_Period,index);
+      if(bar_time<=0 || !QFSameBrokerDay(bar_time,anchor))
+         break;
+      MqlDateTime bar_parts;
+      if(!TimeToStruct(bar_time,bar_parts) || bar_parts.hour<start_hour)
+         continue;
+      oldest=index;
+   }
+   // Collect `range_bars` bars starting at oldest toward present.
+   int collected=0;
+   double extreme=want_high ? -DBL_MAX : DBL_MAX;
+   for(int index=oldest;index>=shift && collected<range_bars;index--)
+   {
+      const datetime bar_time=iTime(_Symbol,_Period,index);
+      if(bar_time<=0 || !QFSameBrokerDay(bar_time,anchor))
+         break;
+      const double high=iHigh(_Symbol,_Period,index);
+      const double low=iLow(_Symbol,_Period,index);
+      if(want_high)
+         extreme=MathMax(extreme,high);
+      else
+         extreme=MathMin(extreme,low);
+      collected++;
+   }
+   if(collected<range_bars)
+      return EMPTY_VALUE;
+   return extreme;
+}
+
+double QFSessionRangeHigh(const int start_hour,const int range_bars,const int shift)
+{
+   return QFSessionRangeExtreme(start_hour,range_bars,shift,true);
+}
+
+double QFSessionRangeLow(const int start_hour,const int range_bars,const int shift)
+{
+   return QFSessionRangeExtreme(start_hour,range_bars,shift,false);
+}
+
+double QFSwingBaseZoneExtreme(const int swing_left,const int swing_right,const int base_bars,
+                              const int shift,const bool zone_high)
+{
+   // MT5 shift: larger = older. Pivot confirmed at shift `confirm` where
+   // pivot = confirm + swing_right (older by swing_right bars).
+   if(swing_left<1 || swing_right<1 || base_bars<1)
+      return EMPTY_VALUE;
+   const int total=Bars(_Symbol,_Period);
+   if(total<=shift+swing_right+base_bars+swing_left)
+      return EMPTY_VALUE;
+   double last_zone=EMPTY_VALUE;
+   for(int confirm=total-1-swing_right;confirm>=shift;confirm--)
+   {
+      const int pivot=confirm+swing_right;
+      if(pivot+swing_left>=total || pivot-swing_right<0)
+         continue;
+      bool is_swing_low=true;
+      bool is_swing_high=true;
+      for(int offset=1;offset<=swing_left;offset++)
+      {
+         // Older bars: pivot+offset
+         if(iLow(_Symbol,_Period,pivot)>iLow(_Symbol,_Period,pivot+offset))
+            is_swing_low=false;
+         if(iHigh(_Symbol,_Period,pivot)<iHigh(_Symbol,_Period,pivot+offset))
+            is_swing_high=false;
+      }
+      for(int offset=1;offset<=swing_right;offset++)
+      {
+         // Newer bars: pivot-offset
+         if(iLow(_Symbol,_Period,pivot)>=iLow(_Symbol,_Period,pivot-offset))
+            is_swing_low=false;
+         if(iHigh(_Symbol,_Period,pivot)<=iHigh(_Symbol,_Period,pivot-offset))
+            is_swing_high=false;
+      }
+      const bool use_pivot=zone_high ? is_swing_low : is_swing_high;
+      if(!use_pivot)
+         continue;
+      // Base is `base_bars` bars after the pivot (newer).
+      const int base_oldest=pivot-1;
+      if(base_oldest-(base_bars-1)<0)
+         continue;
+      double extreme=zone_high ? -DBL_MAX : DBL_MAX;
+      for(int offset=0;offset<base_bars;offset++)
+      {
+         const int index=base_oldest-offset;
+         if(zone_high)
+            extreme=MathMax(extreme,iHigh(_Symbol,_Period,index));
+         else
+            extreme=MathMin(extreme,iLow(_Symbol,_Period,index));
+      }
+      last_zone=extreme;
+   }
+   return last_zone;
+}
+
+double QFSwingBaseZoneHigh(const int swing_left,const int swing_right,const int base_bars,
+                           const int shift)
+{
+   return QFSwingBaseZoneExtreme(swing_left,swing_right,base_bars,shift,true);
+}
+
+double QFSwingBaseZoneLow(const int swing_left,const int swing_right,const int base_bars,
+                          const int shift)
+{
+   return QFSwingBaseZoneExtreme(swing_left,swing_right,base_bars,shift,false);
+}
+
+double QFLiquiditySweepScore(const int period,const int shift)
+{
+   if(period<1 || Bars(_Symbol,_Period)<shift+period+1)
+      return 0.0;
+   double prior_high=-DBL_MAX;
+   double prior_low=DBL_MAX;
+   for(int offset=1;offset<=period;offset++)
+   {
+      prior_high=MathMax(prior_high,iHigh(_Symbol,_Period,shift+offset));
+      prior_low=MathMin(prior_low,iLow(_Symbol,_Period,shift+offset));
+   }
+   const double high=iHigh(_Symbol,_Period,shift);
+   const double low=iLow(_Symbol,_Period,shift);
+   const double close=iClose(_Symbol,_Period,shift);
+   if(low<prior_low && close>prior_low)
+      return 1.0;
+   if(high>prior_high && close<prior_high)
+      return -1.0;
+   return 0.0;
 }
 
 double QFAverageRange(const int period,const int shift)
@@ -445,7 +667,59 @@ void QFResetPositionState()
 {
    g_initial_volume=0.0;
    g_initial_risk=0.0;
+   g_peak_favorable=EMPTY_VALUE;
    ArrayInitialize(g_partial_done,false);
+}
+
+// Fill-aware favorable extreme from completed decision bar's M1 path.
+// Entry minute: close only. Later minutes: high/low. Ignores pre-entry minutes.
+double QFFavorableSampleSinceEntry(const bool buy)
+{
+   if(!QFOwnPosition())
+      return EMPTY_VALUE;
+   const datetime entry=(datetime)PositionGetInteger(POSITION_TIME);
+   const int entry_shift=iBarShift(_Symbol,PERIOD_M1,entry,false);
+   if(entry_shift<0)
+      return EMPTY_VALUE;
+   const datetime entry_minute=iTime(_Symbol,PERIOD_M1,entry_shift);
+   const datetime completed_start=iTime(_Symbol,_Period,1);
+   const datetime completed_end=iTime(_Symbol,_Period,0);
+   if(completed_start<=0 || completed_end<=completed_start)
+      return EMPTY_VALUE;
+   MqlRates rates[];
+   const int copied=CopyRates(_Symbol,PERIOD_M1,completed_start,completed_end-1,rates);
+   if(copied<=0)
+      return EMPTY_VALUE;
+   const double completed_spread=(double)iSpread(_Symbol,_Period,1)*_Point;
+   double best=EMPTY_VALUE;
+   for(int index=0;index<copied;index++)
+   {
+      if(rates[index].time<entry_minute)
+         continue;
+      double sample;
+      if(rates[index].time==entry_minute)
+         sample=rates[index].close;
+      else
+         sample=buy ? rates[index].high : rates[index].low;
+      if(!buy)
+         sample+=completed_spread;
+      if(best==EMPTY_VALUE)
+         best=sample;
+      else
+         best=buy ? MathMax(best,sample) : MathMin(best,sample);
+   }
+   return best;
+}
+
+void QFRatchetPeakFavorable(const bool buy,const double sample)
+{
+   if(!QFValid(sample))
+      return;
+   if(g_peak_favorable==EMPTY_VALUE)
+      g_peak_favorable=sample;
+   else
+      g_peak_favorable=buy ? MathMax(g_peak_favorable,sample)
+                           : MathMin(g_peak_favorable,sample);
 }
 
 void QFCapturePositionState()
@@ -494,6 +768,29 @@ bool QFInCloseBlackout()
    return current.hour>=22;
 }
 
+bool QFStopWouldTriggerAtOpen(const bool buy,const double candidate,
+                              const double bar_open,const double bar_spread)
+{
+   if(!QFValid(candidate))
+      return true;
+   return buy ? (bar_open<=candidate+1.0e-12)
+              : (bar_open+bar_spread>=candidate-1.0e-12);
+}
+
+// Clamp to stops-level, or EMPTY_VALUE if the stop would already trigger at open
+// (matches Rust placeable_stop_candidate / MT5 PositionModify reject).
+double QFPlaceableStop(const bool buy,const double raw,const double bar_open,
+                       const double bar_spread,const double minimum_distance)
+{
+   if(!QFValid(raw))
+      return EMPTY_VALUE;
+   const double candidate=buy ? MathMin(raw,bar_open-minimum_distance)
+                              : MathMax(raw,bar_open+bar_spread+minimum_distance);
+   if(QFStopWouldTriggerAtOpen(buy,candidate,bar_open,bar_spread))
+      return EMPTY_VALUE;
+   return candidate;
+}
+
 bool QFTightenStop(const bool buy,const double candidate,const double target)
 {
    const double current=PositionGetDouble(POSITION_SL);
@@ -519,36 +816,39 @@ void QFManagePosition()
    QFCapturePositionState();
    if(g_initial_volume<=0.0 || g_initial_risk<=0.0)
       return;
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol,tick))
-      return;
    const ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    const bool buy=type==POSITION_TYPE_BUY;
    const double entry=PositionGetDouble(POSITION_PRICE_OPEN);
    const double target=PositionGetDouble(POSITION_TP);
-   const double completed_spread=(double)iSpread(_Symbol,_Period,1)*_Point;
-   const double favorable=buy ? iHigh(_Symbol,_Period,1)
-                              : iLow(_Symbol,_Period,1)+completed_spread;
+   const double sample=QFFavorableSampleSinceEntry(buy);
+   QFRatchetPeakFavorable(buy,sample);
+   if(!QFValid(g_peak_favorable))
+      return;
+   const double favorable=g_peak_favorable;
    const double favorable_r=buy ? (favorable-entry)/g_initial_risk
                                 : (entry-favorable)/g_initial_risk;
    const double minimum_distance=
       (double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
+   // Match Rust: placeable stops only — never clamp a through-market trail onto
+   // the open (that invents an immediate runner exit MT5 would reject).
+   const double bar_open=iOpen(_Symbol,_Period,0);
+   const double bar_spread=(double)iSpread(_Symbol,_Period,0)*_Point;
 
    if(QFBreakEvenAtR()>0.0 && favorable_r>=QFBreakEvenAtR())
    {
-      const double candidate=buy ? MathMin(entry,tick.bid-minimum_distance)
-                                 : MathMax(entry,tick.ask+minimum_distance);
-      QFTightenStop(buy,candidate,target);
+      const double candidate=QFPlaceableStop(buy,entry,bar_open,bar_spread,minimum_distance);
+      if(QFValid(candidate))
+         QFTightenStop(buy,candidate,target);
    }
    if(QFTrailingKind()>0 && favorable_r>=QFTrailingActivateR())
    {
       const double distance=QFTrailingDistance();
       if(QFValid(distance) && distance>0.0)
       {
-         double candidate=buy ? favorable-distance : favorable+distance;
-         candidate=buy ? MathMin(candidate,tick.bid-minimum_distance)
-                       : MathMax(candidate,tick.ask+minimum_distance);
-         QFTightenStop(buy,candidate,target);
+         const double raw=buy ? favorable-distance : favorable+distance;
+         const double candidate=QFPlaceableStop(buy,raw,bar_open,bar_spread,minimum_distance);
+         if(QFValid(candidate))
+            QFTightenStop(buy,candidate,target);
       }
    }
 
@@ -634,6 +934,10 @@ int OnInit()
          FileWrite(g_metadata_file,"magic",InpMagic);
          FileWrite(g_metadata_file,"initial_deposit",AccountInfoDouble(ACCOUNT_BALANCE));
          FileWrite(g_metadata_file,"account_currency",AccountInfoString(ACCOUNT_CURRENCY));
+         // Same token QuantForge uses for bar localization (must match the pack).
+         FileWrite(g_metadata_file,"broker_timezone","@@BROKER_TIMEZONE@@");
+         FileWrite(g_metadata_file,"server_utc_offset_seconds_at_export",
+                   (long)(TimeTradeServer()-TimeGMT()));
          FileWrite(g_metadata_file,"started_server_time",TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS));
          FileFlush(g_metadata_file);
       }
@@ -676,6 +980,8 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    {
       g_initial_volume=0.0;
       QFCapturePositionState();
+      // First fill locks the broker day (pending place alone does not).
+      QFMarkEntrySignalTaken(iTime(_Symbol,_Period,0));
    }
    if(deal_entry==DEAL_ENTRY_OUT || deal_entry==DEAL_ENTRY_OUT_BY)
    {
@@ -766,11 +1072,12 @@ void OnTick()
    const bool short_signal=QFShortSignal(0);
    if(long_signal!=short_signal)
    {
-      // First successful market/pending place locks the broker day.
+      // Place only; day lock happens on fill (DEAL_ENTRY_IN / market position).
       if(QFOpenOrder(long_signal))
       {
-         QFMarkEntrySignalTaken(current_bar);
          QFCapturePositionState();
+         if(QFOwnPosition())
+            QFMarkEntrySignalTaken(current_bar);
       }
    }
    QFRecordEquity(current_bar);

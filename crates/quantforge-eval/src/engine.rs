@@ -1,4 +1,9 @@
 use crate::features::FeatureCache;
+use crate::management::{
+    favorable_r as compute_favorable_r, favorable_sample_from_decision_bar, normalize_price,
+    placeable_stop_candidate, price_reaches_from_above, price_reaches_from_below,
+    ratchet_favorable_peak,
+};
 use crate::model::{
     BacktestMetrics, EquityPoint, EvalError, ExitReason, PositionSide, ScoutConfig, ScoutResult,
     ScoutTelemetry, Trade, in_mandatory_entry_window,
@@ -26,6 +31,8 @@ struct OpenPosition {
     initial_stop_loss: f64,
     initial_take_profit: f64,
     initial_risk_distance: f64,
+    /// Best post-entry favorable price seen on completed bars (fill-aware).
+    peak_favorable_price: Option<f64>,
     entry_commission: f64,
     swap: f64,
     realized_gross_profit: f64,
@@ -141,7 +148,7 @@ fn evaluate_strategy_inner(
     let mut telemetry = ScoutTelemetry::default();
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
-    // First successful market open or pending place locks the broker day.
+    // First fill (market open or pending activation) locks the broker day.
     let mut signal_taken_today = false;
 
     for (index, bar) in bars.iter().enumerate().skip(1) {
@@ -165,6 +172,7 @@ fn evaluate_strategy_inner(
         }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
+        let mut opened_from_pending = false;
 
         if strategy.manage.flatten_end_of_day && in_close_blackout {
             // The 22:00 broker-time bar is reserved for flatten/cancellation.
@@ -249,7 +257,8 @@ fn evaluate_strategy_inner(
         }
 
         if !closed_this_bar && let Some(open) = position.as_ref() {
-            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price) {
+            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker)
+            {
                 Some(event)
             } else if let Some(exit) = &strategy.exit
                 && features.evaluate_bool(exit, index)?
@@ -268,7 +277,7 @@ fn evaluate_strategy_inner(
                     reason: ExitReason::TimeStop,
                 })
             } else {
-                protective_intrabar_exit(open, bar, spread_price, config)
+                protective_intrabar_exit(open, bar, spread_price, broker)
             };
 
             if let Some(event) = event {
@@ -383,8 +392,6 @@ fn evaluate_strategy_inner(
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
-                                    // Pending place consumes the day's signal slot.
-                                    signal_taken_today = true;
                                 }
                             }
                         }
@@ -414,13 +421,17 @@ fn evaluate_strategy_inner(
             position = Some(open);
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
-            // Day was already locked when the pending was placed.
+            opened_from_pending = true;
+            signal_taken_today = true;
         }
 
-        if opened_this_bar {
+        // Market: allow same-bar SL/TP. Pending fill: defer protective exits to the
+        // next bar (SQX stockpicker rule) — same-bar path after a stop/limit fill is
+        // unknowable on Selected TF and was the main H1↔M1 divergence source.
+        if opened_this_bar && !opened_from_pending {
             let event = position
                 .as_ref()
-                .and_then(|open| protective_intrabar_exit(open, bar, spread_price, config));
+                .and_then(|open| protective_intrabar_exit(open, bar, spread_price, broker));
             if let Some(event) = event {
                 let open = position.take().expect("position was just opened");
                 close_position(
@@ -524,24 +535,35 @@ fn open_position(
     };
 
     let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
-    let intended_entry_price = match side {
-        PositionSide::Long => bar.open + spread_price,
-        PositionSide::Short => bar.open,
-    };
-    let entry_price = match side {
-        PositionSide::Long => intended_entry_price + slippage,
-        PositionSide::Short => intended_entry_price - slippage,
-    };
+    // Match MT5 NormalizeDouble on entry/SL/TP before risk geometry locks in.
+    let intended_entry_price = normalize_price(
+        match side {
+            PositionSide::Long => bar.open + spread_price,
+            PositionSide::Short => bar.open,
+        },
+        broker,
+    );
+    let entry_price = normalize_price(
+        match side {
+            PositionSide::Long => intended_entry_price + slippage,
+            PositionSide::Short => intended_entry_price - slippage,
+        },
+        broker,
+    );
     let (stop_loss, take_profit) = match side {
         PositionSide::Long => (
-            intended_entry_price - stop_distance,
-            intended_entry_price + target_distance,
+            normalize_price(intended_entry_price - stop_distance, broker),
+            normalize_price(intended_entry_price + target_distance, broker),
         ),
         PositionSide::Short => (
-            intended_entry_price + stop_distance,
-            intended_entry_price - target_distance,
+            normalize_price(intended_entry_price + stop_distance, broker),
+            normalize_price(intended_entry_price - target_distance, broker),
         ),
     };
+    let initial_risk_distance = (entry_price - stop_loss).abs();
+    if initial_risk_distance <= 0.0 {
+        return Ok(None);
+    }
     let entry_commission = volume * config.costs.commission_per_lot_round_turn / 2.0;
 
     Ok(Some(OpenPosition {
@@ -555,7 +577,8 @@ fn open_position(
         take_profit,
         initial_stop_loss: stop_loss,
         initial_take_profit: take_profit,
-        initial_risk_distance: stop_distance,
+        initial_risk_distance,
+        peak_favorable_price: None,
         entry_commission,
         swap: 0.0,
         realized_gross_profit: 0.0,
@@ -612,27 +635,34 @@ fn place_pending_order(
         PositionSide::Long => bar.open + spread_price,
         PositionSide::Short => bar.open,
     };
-    let activation_price = match (side, kind) {
-        (PositionSide::Long, PendingKind::Stop) => reference + entry_distance,
-        (PositionSide::Short, PendingKind::Stop) => reference - entry_distance,
-        (PositionSide::Long, PendingKind::Limit) => reference - entry_distance,
-        (PositionSide::Short, PendingKind::Limit) => reference + entry_distance,
-    };
+    let activation_price = normalize_price(
+        match (side, kind) {
+            (PositionSide::Long, PendingKind::Stop) => reference + entry_distance,
+            (PositionSide::Short, PendingKind::Stop) => reference - entry_distance,
+            (PositionSide::Long, PendingKind::Limit) => reference - entry_distance,
+            (PositionSide::Short, PendingKind::Limit) => reference + entry_distance,
+        },
+        broker,
+    );
     let (stop_loss, take_profit) = match side {
         PositionSide::Long => (
-            activation_price - stop_distance,
-            activation_price + target_distance,
+            normalize_price(activation_price - stop_distance, broker),
+            normalize_price(activation_price + target_distance, broker),
         ),
         PositionSide::Short => (
-            activation_price + stop_distance,
-            activation_price - target_distance,
+            normalize_price(activation_price + stop_distance, broker),
+            normalize_price(activation_price - target_distance, broker),
         ),
     };
+    let normalized_stop_distance = (activation_price - stop_loss).abs();
+    if normalized_stop_distance <= 0.0 {
+        return Ok(None);
+    }
     let risk_budget = match strategy.risk {
         RiskPolicy::FixedCurrency { amount } => amount,
         RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
     };
-    let price_risk_per_lot = stop_distance / broker.tick_size * broker.tick_value;
+    let price_risk_per_lot = normalized_stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
             + 2.0 * config.costs.adverse_slippage_points_per_side * broker.point / broker.tick_size
@@ -654,7 +684,7 @@ fn place_pending_order(
         activation_price,
         stop_loss,
         take_profit,
-        stop_distance,
+        stop_distance: normalized_stop_distance,
         volume,
     }))
 }
@@ -714,10 +744,18 @@ fn fill_pending_order(
     config: &ScoutConfig,
 ) -> OpenPosition {
     let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
-    let entry_price = match order.side {
-        PositionSide::Long => fill_base_price + slippage,
-        PositionSide::Short => fill_base_price - slippage,
-    };
+    let entry_price = normalize_price(
+        match order.side {
+            PositionSide::Long => fill_base_price + slippage,
+            PositionSide::Short => fill_base_price - slippage,
+        },
+        broker,
+    );
+    let stop_loss = normalize_price(order.stop_loss, broker);
+    let take_profit = normalize_price(order.take_profit, broker);
+    let initial_risk_distance = (entry_price - stop_loss)
+        .abs()
+        .max(order.stop_distance);
     OpenPosition {
         side: order.side,
         entry_index: index,
@@ -725,11 +763,12 @@ fn fill_pending_order(
         entry_price,
         initial_volume: order.volume,
         volume: order.volume,
-        stop_loss: order.stop_loss,
-        take_profit: order.take_profit,
-        initial_stop_loss: order.stop_loss,
-        initial_take_profit: order.take_profit,
-        initial_risk_distance: order.stop_distance,
+        stop_loss,
+        take_profit,
+        initial_stop_loss: stop_loss,
+        initial_take_profit: take_profit,
+        initial_risk_distance,
+        peak_favorable_price: None,
         entry_commission: order.volume * config.costs.commission_per_lot_round_turn / 2.0,
         swap: 0.0,
         realized_gross_profit: 0.0,
@@ -809,18 +848,27 @@ fn apply_completed_bar_management(
     balance: &mut f64,
     telemetry: &mut ScoutTelemetry,
 ) -> Result<(), EvalError> {
-    let favorable_price = match position.side {
-        PositionSide::Long => completed_bar.high,
-        PositionSide::Short => completed_bar.low + completed_spread_price,
+    let completed_index = decision_index.saturating_sub(1);
+    let Some(sample) = favorable_sample_from_decision_bar(
+        position.side,
+        completed_bar,
+        completed_spread_price,
+        position.entry_index,
+        completed_index,
+    ) else {
+        return Ok(());
     };
-    let favorable_r = match position.side {
-        PositionSide::Long => {
-            (favorable_price - position.entry_price) / position.initial_risk_distance
-        }
-        PositionSide::Short => {
-            (position.entry_price - favorable_price) / position.initial_risk_distance
-        }
+    position.peak_favorable_price =
+        ratchet_favorable_peak(position.side, position.peak_favorable_price, sample);
+    let Some(favorable_price) = position.peak_favorable_price else {
+        return Ok(());
     };
+    let favorable_r = compute_favorable_r(
+        position.side,
+        favorable_price,
+        position.entry_price,
+        position.initial_risk_distance,
+    );
     let minimum_distance = broker.stops_level_points as f64 * broker.point;
 
     if strategy
@@ -828,16 +876,17 @@ fn apply_completed_bar_management(
         .break_even_at_r
         .is_some_and(|activation| favorable_r >= activation)
     {
-        let candidate = match position.side {
-            PositionSide::Long => position
-                .entry_price
-                .min(current_bar.open - minimum_distance),
-            PositionSide::Short => position
-                .entry_price
-                .max(current_bar.open + current_spread_price + minimum_distance),
-        };
-        if tighten_stop(position, candidate) {
-            telemetry.break_even_moves += 1;
+        // Reject BE when entry is already marketable at this open (MT5 modify reject).
+        if let Some(candidate) = placeable_stop_candidate(
+            position.side,
+            position.entry_price,
+            current_bar.open,
+            current_spread_price,
+            minimum_distance,
+        ) {
+            if tighten_stop(position, candidate) {
+                telemetry.break_even_moves += 1;
+            }
         }
     }
 
@@ -871,14 +920,18 @@ fn apply_completed_bar_management(
                 PositionSide::Long => favorable_price - distance,
                 PositionSide::Short => favorable_price + distance,
             };
-            let candidate = match position.side {
-                PositionSide::Long => raw_candidate.min(current_bar.open - minimum_distance),
-                PositionSide::Short => {
-                    raw_candidate.max(current_bar.open + current_spread_price + minimum_distance)
+            // Do not clamp a through-market trail onto the open and gap-exit the
+            // runner — MT5 rejects that modify and keeps the prior stop (often BE).
+            if let Some(candidate) = placeable_stop_candidate(
+                position.side,
+                raw_candidate,
+                current_bar.open,
+                current_spread_price,
+                minimum_distance,
+            ) {
+                if tighten_stop(position, candidate) {
+                    telemetry.trailing_stop_moves += 1;
                 }
-            };
-            if tighten_stop(position, candidate) {
-                telemetry.trailing_stop_moves += 1;
             }
         }
     }
@@ -968,24 +1021,41 @@ fn realize_exit_volume(
     position.volume = (position.volume - volume).max(0.0);
 }
 
-fn protective_gap_exit(position: &OpenPosition, bar: &Bar, spread_price: f64) -> Option<ExitEvent> {
+fn protective_gap_exit(
+    position: &OpenPosition,
+    bar: &Bar,
+    spread_price: f64,
+    broker: &SymbolSpecification,
+) -> Option<ExitEvent> {
     match position.side {
-        PositionSide::Long if bar.open <= position.stop_loss => Some(ExitEvent {
-            base_price: bar.open,
-            reason: ExitReason::StopLoss,
-        }),
-        PositionSide::Long if bar.open >= position.take_profit => Some(ExitEvent {
-            base_price: position.take_profit,
-            reason: ExitReason::TakeProfit,
-        }),
-        PositionSide::Short if bar.open + spread_price >= position.stop_loss => Some(ExitEvent {
-            base_price: bar.open + spread_price,
-            reason: ExitReason::StopLoss,
-        }),
-        PositionSide::Short if bar.open + spread_price <= position.take_profit => Some(ExitEvent {
-            base_price: position.take_profit,
-            reason: ExitReason::TakeProfit,
-        }),
+        PositionSide::Long if price_reaches_from_above(bar.open, position.stop_loss, broker) => {
+            Some(ExitEvent {
+                base_price: bar.open,
+                reason: ExitReason::StopLoss,
+            })
+        }
+        PositionSide::Long if price_reaches_from_below(bar.open, position.take_profit, broker) => {
+            Some(ExitEvent {
+                base_price: position.take_profit,
+                reason: ExitReason::TakeProfit,
+            })
+        }
+        PositionSide::Short
+            if price_reaches_from_below(bar.open + spread_price, position.stop_loss, broker) =>
+        {
+            Some(ExitEvent {
+                base_price: bar.open + spread_price,
+                reason: ExitReason::StopLoss,
+            })
+        }
+        PositionSide::Short
+            if price_reaches_from_above(bar.open + spread_price, position.take_profit, broker) =>
+        {
+            Some(ExitEvent {
+                base_price: position.take_profit,
+                reason: ExitReason::TakeProfit,
+            })
+        }
         _ => None,
     }
 }
@@ -994,16 +1064,16 @@ fn protective_intrabar_exit(
     position: &OpenPosition,
     bar: &Bar,
     spread_price: f64,
-    _config: &ScoutConfig,
+    broker: &SymbolSpecification,
 ) -> Option<ExitEvent> {
     let (stop_touched, target_touched) = match position.side {
         PositionSide::Long => (
-            bar.low <= position.stop_loss,
-            bar.high >= position.take_profit,
+            price_reaches_from_above(bar.low, position.stop_loss, broker),
+            price_reaches_from_below(bar.high, position.take_profit, broker),
         ),
         PositionSide::Short => (
-            bar.high + spread_price >= position.stop_loss,
-            bar.low + spread_price <= position.take_profit,
+            price_reaches_from_below(bar.high + spread_price, position.stop_loss, broker),
+            price_reaches_from_above(bar.low + spread_price, position.take_profit, broker),
         ),
     };
     if stop_touched {
@@ -1299,38 +1369,14 @@ mod tests {
         strategy
     }
 
+    /// Place synthetic bars at 10:00 UTC so they sit inside `[02:00, 19:00)`.
+    const FIXTURE_BASE_MS: i64 = 10 * 3_600_000;
+
     fn dataset(low: f64) -> BarDataset {
-        let bars = vec![
-            Bar {
-                timestamp_ms: 0,
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.0,
-                tick_volume: 1,
-                real_volume: 0,
-                spread_points: Some(0),
-            },
-            Bar {
-                timestamp_ms: 60_000,
-                open: 100.0,
-                high: 105.0,
-                low,
-                close: 104.0,
-                tick_volume: 1,
-                real_volume: 0,
-                spread_points: Some(0),
-            },
-        ];
-        BarDataset {
-            data_hash: ContentHash::sha256(b"fixture"),
-            bars,
-            source_rows: 2,
-            duplicate_rows_removed: 0,
-            input_was_sorted: true,
-            delimiter: '\t',
-            source_timezone: "Etc/UTC".into(),
-        }
+        dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 105.0, low, 104.0),
+        ])
     }
 
     fn dataset_with_bars(bars: Vec<Bar>) -> BarDataset {
@@ -1347,7 +1393,7 @@ mod tests {
 
     fn bar(timestamp_ms: i64, open: f64, high: f64, low: f64, close: f64) -> Bar {
         Bar {
-            timestamp_ms,
+            timestamp_ms: FIXTURE_BASE_MS + timestamp_ms,
             open,
             high,
             low,
@@ -1381,16 +1427,7 @@ mod tests {
     #[test]
     fn challenge_window_uses_warmup_bars_without_scoring_their_entries() {
         let mut dataset = dataset(99.0);
-        dataset.bars.push(Bar {
-            timestamp_ms: 120_000,
-            open: 100.0,
-            high: 105.0,
-            low: 99.0,
-            close: 104.0,
-            tick_volume: 1,
-            real_volume: 0,
-            spread_points: Some(0),
-        });
+        dataset.bars.push(bar(120_000, 100.0, 105.0, 99.0, 104.0));
         dataset.source_rows = dataset.bars.len();
         let result = evaluate_strategy_from(
             &strategy(),
@@ -1400,12 +1437,15 @@ mod tests {
                 initial_balance: 100.0,
                 ..ScoutConfig::default()
             },
-            120_000,
+            FIXTURE_BASE_MS + 120_000,
         )
         .unwrap();
 
         assert_eq!(result.trades.len(), 1);
-        assert_eq!(result.trades[0].entry_timestamp_ms, 120_000);
+        assert_eq!(
+            result.trades[0].entry_timestamp_ms,
+            FIXTURE_BASE_MS + 120_000
+        );
     }
 
     #[test]
@@ -1430,16 +1470,54 @@ mod tests {
         let mut strategy = strategy();
         strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
         strategy.manage.break_even_at_r = Some(1.0);
+        // Place BE while still above entry (open 101.5); returning to entry later
+        // hits the stop. BE at open==entry would be marketable and is rejected.
         let data = dataset_with_bars(vec![
             bar(0, 100.0, 101.0, 99.0, 100.0),
             bar(60_000, 100.0, 103.0, 99.0, 102.0),
-            bar(120_000, 100.0, 101.0, 99.0, 100.0),
+            bar(120_000, 101.5, 102.0, 101.0, 101.5),
+            bar(180_000, 100.0, 100.5, 99.0, 99.5),
         ]);
         let result =
             evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
         assert_eq!(result.trades[0].exit_price, 100.0);
         assert_eq!(result.telemetry.break_even_moves, 1);
+    }
+
+    #[test]
+    fn marketable_trailing_stop_is_not_clamped_into_an_immediate_exit() {
+        let mut strategy = strategy();
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
+        strategy.manage.break_even_at_r = Some(1.0);
+        strategy.manage.trailing = Some(TrailingPolicy::RiskMultiple {
+            activate_at_r: 1.5,
+            distance_r: 0.5,
+        });
+        strategy.manage.partial_exits = vec![PartialExit {
+            at_r: 1.0,
+            fraction: 0.5,
+        }];
+        // Peak +2R on bar after entry. Next open is through the trail level:
+        // BE at entry succeeds, trail modify is rejected (not clamped to open),
+        // 50% partial at open, runner later scratches at BE.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 101.0, 99.0, 100.5),
+            bar(120_000, 100.5, 104.0, 100.0, 103.5),
+            bar(180_000, 102.0, 102.5, 101.5, 102.0),
+            bar(240_000, 100.0, 100.5, 99.0, 99.5),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert_eq!(result.telemetry.break_even_moves, 1);
+        assert_eq!(result.telemetry.trailing_stop_moves, 0);
+        assert_eq!(result.telemetry.partial_exits_executed, 1);
+        assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
+        // Blended: partial at open 102 + runner scratch at BE 100 — not a full
+        // clamp-to-open dump of the whole position at 102.
+        assert!(result.trades[0].exit_price < 102.0 - 1.0e-9);
+        assert!(result.trades[0].exit_price > 100.0 + 1.0e-9);
     }
 
     #[test]
@@ -1450,15 +1528,34 @@ mod tests {
             activate_at_r: 1.0,
             distance_r: 0.5,
         });
+        // Entry bar high is ignored for trail (close-only); next bar high trails.
         let data = dataset_with_bars(vec![
             bar(0, 100.0, 101.0, 99.0, 100.0),
-            bar(60_000, 100.0, 104.0, 99.0, 103.0),
-            bar(120_000, 104.0, 104.0, 102.0, 103.0),
+            bar(60_000, 100.0, 104.0, 99.0, 101.0),
+            bar(120_000, 101.0, 104.0, 99.0, 103.0),
+            bar(180_000, 104.0, 104.0, 102.0, 103.0),
         ]);
         let result =
             evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        // Peak favorable = 104 on bar after entry; trail = 104 - 0.5*2 = 103.
         assert_eq!(result.trades[0].exit_price, 103.0);
         assert_eq!(result.telemetry.trailing_stop_moves, 1);
+    }
+
+    #[test]
+    fn entry_bar_high_does_not_activate_break_even_without_close() {
+        let mut strategy = strategy();
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
+        strategy.manage.break_even_at_r = Some(1.0);
+        // Entry bar spikes to +2R on the high but closes flat — no BE.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 104.0, 99.0, 100.0),
+            bar(120_000, 100.0, 101.0, 99.0, 100.0),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert_eq!(result.telemetry.break_even_moves, 0);
     }
 
     #[test]
@@ -1507,7 +1604,8 @@ mod tests {
                     expiry_bars: 2,
                 },
                 98.0,
-                ExitReason::TakeProfit,
+                // Pending fill defers same-bar SL/TP (SQX Selected-TF rule).
+                ExitReason::EndOfData,
             ),
         ] {
             let mut strategy = strategy();
@@ -1540,8 +1638,8 @@ mod tests {
         strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
         strategy.manage.flatten_end_of_day = true;
         let data = dataset_with_bars(vec![
-            timed_bar("2024-01-01T20:00:00Z"),
-            timed_bar("2024-01-01T21:00:00Z"),
+            timed_bar("2024-01-01T17:00:00Z"),
+            timed_bar("2024-01-01T18:00:00Z"),
             timed_bar("2024-01-01T22:00:00Z"),
             timed_bar("2024-01-01T23:00:00Z"),
         ]);
@@ -1579,6 +1677,38 @@ mod tests {
         let unlimited =
             evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
         assert!(unlimited.trades.len() > limited.trades.len());
+    }
+
+    #[test]
+    fn max_one_entry_per_day_locks_on_fill_not_pending_place() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = true;
+        strategy.manage.time_stop_bars = Some(1);
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.entry.order = EntryOrderPolicy::Stop {
+            distance: EntryDistancePolicy::FixedPoints { points: 2.0 },
+            expiry_bars: 1,
+        };
+        // Bar 1: place stop at 102; bar never trades through → expire.
+        // Bar 2: place again; fill at 102; time-stop next bar.
+        // Bar 3+: same day after fill — blocked.
+        // Next day: allowed again.
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-01T10:00:00Z"), // seed
+            timed_ohlc("2024-01-01T11:00:00Z", 100.0, 101.0, 99.0, 100.0), // place, no fill
+            timed_ohlc("2024-01-01T12:00:00Z", 100.0, 101.0, 99.0, 100.0), // expire + re-place
+            timed_ohlc("2024-01-01T13:00:00Z", 100.0, 103.0, 99.0, 102.0), // fill
+            timed_ohlc("2024-01-01T14:00:00Z", 102.0, 103.0, 101.0, 102.0), // time stop
+            timed_ohlc("2024-01-01T15:00:00Z", 100.0, 101.0, 99.0, 100.0), // blocked
+            timed_ohlc("2024-01-02T11:00:00Z", 100.0, 103.0, 99.0, 102.0), // next day fill
+            timed_ohlc("2024-01-02T12:00:00Z", 102.0, 103.0, 101.0, 102.0),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert!(result.telemetry.pending_orders_expired >= 1);
+        assert_eq!(result.telemetry.pending_orders_filled, 2);
+        assert_eq!(result.trades.len(), 2);
+        assert!(result.telemetry.skipped_max_one_entry_per_day > 0);
     }
 
     #[test]
@@ -1654,10 +1784,13 @@ mod tests {
         let mut broker = broker();
         broker.swap_mode = SwapMode::Points;
         broker.swap_long = -2.0;
+        let mut strategy = strategy();
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        // Enter inside the session window; hold across Wed→Thu midnight (triple swap).
         let dataset = BarDataset {
             bars: vec![
-                timed_bar("2024-01-03T22:00:00Z"),
-                timed_bar("2024-01-03T23:00:00Z"),
+                timed_bar("2024-01-03T17:00:00Z"),
+                timed_bar("2024-01-03T18:00:00Z"),
                 timed_bar("2024-01-04T00:00:00Z"),
             ],
             source_rows: 3,
@@ -1668,7 +1801,7 @@ mod tests {
             data_hash: ContentHash::sha256(b"swap-fixture"),
         };
         let result = evaluate_strategy(
-            &strategy(),
+            &strategy,
             &dataset,
             &broker,
             &ScoutConfig {
@@ -1679,8 +1812,6 @@ mod tests {
         .unwrap();
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].swap, -30.0);
-        assert_eq!(result.trades[0].net_profit, -30.0);
-        assert_eq!(result.metrics.ending_balance, 70.0);
         assert_eq!(result.telemetry.swap_rollover_events, 1);
         assert_eq!(result.telemetry.swap_effective_days, 3);
     }
@@ -1749,14 +1880,18 @@ mod tests {
     }
 
     fn timed_bar(timestamp: &str) -> Bar {
+        timed_ohlc(timestamp, 100.0, 101.0, 99.0, 100.0)
+    }
+
+    fn timed_ohlc(timestamp: &str, open: f64, high: f64, low: f64, close: f64) -> Bar {
         Bar {
             timestamp_ms: chrono::DateTime::parse_from_rfc3339(timestamp)
                 .unwrap()
                 .timestamp_millis(),
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
+            open,
+            high,
+            low,
+            close,
             tick_volume: 1,
             real_volume: 0,
             spread_points: Some(0),

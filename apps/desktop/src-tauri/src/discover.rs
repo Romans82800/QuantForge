@@ -1,7 +1,12 @@
 use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
 use crate::databank::{EvolveArtifact, verify_artifact};
-use quantforge_data::{BarDataset, bar_content_hash};
-use quantforge_discover::{Databank, DiscoverConfig, GateConfig, continue_evolution, evolve_new};
+use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
+use quantforge_discover::{
+    DEFAULT_FX_PACK, Databank, DiscoverConfig, DiscoverRunMode, FamilyBakeoffConfig,
+    FamilyBakeoffReport, GateConfig, PackSymbol, SearchFamily, continue_evolution_with_pack,
+    evolve_new_with_pack,
+    run_family_bakeoff as evolve_family_bakeoff,
+};
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
 use serde::{Deserialize, Serialize};
@@ -72,6 +77,20 @@ pub struct DiscoverRequest {
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_neighborhood_samples: Option<usize>,
+    /// Broker-local calendar-year folds; every year must pass (default true).
+    calendar_year_folds: Option<bool>,
+    /// Hard deflated-Sharpe floor; omit for report-only.
+    minimum_deflated_trade_sharpe: Option<f64>,
+    /// Require this many FX pack symbols profitable with identical params (0 = off).
+    multi_symbol_minimum_pass: Option<usize>,
+    /// Directory of pack H1 TSV + broker JSON files for the multi-symbol screen.
+    pack_data_dir: Option<String>,
+    /// Locked Search Family (`trend_pullback`, `momentum_burst`, …).
+    search_family: Option<String>,
+    /// `fast_scout` or `full_harvest`.
+    run_mode: Option<String>,
+    /// Early-stop when accepted pot reaches this size (Fast Scout).
+    early_stop_pot_elites: Option<usize>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -114,11 +133,14 @@ pub struct DiscoverJobView {
     rejected_gate: u64,
     rejected_deposit_gate: u64,
     rejected_precision: u64,
+    rejected_ambiguous: u64,
     rejected_oos1: u64,
     rejected_m1_fidelity: u64,
     rejected_walk_forward: u64,
     rejected_monte_carlo: u64,
     rejected_param_neighborhood: u64,
+    rejected_multi_symbol: u64,
+    rejected_deflated_sharpe: u64,
     rejected_clone: u64,
     rejected_correlated: u64,
     rejected_niche_not_improved: u64,
@@ -191,11 +213,14 @@ impl DiscoverJobView {
             rejected_gate: 0,
             rejected_deposit_gate: 0,
             rejected_precision: 0,
+            rejected_ambiguous: 0,
             rejected_oos1: 0,
             rejected_m1_fidelity: 0,
             rejected_walk_forward: 0,
             rejected_monte_carlo: 0,
             rejected_param_neighborhood: 0,
+            rejected_multi_symbol: 0,
+            rejected_deflated_sharpe: 0,
             rejected_clone: 0,
             rejected_correlated: 0,
             rejected_niche_not_improved: 0,
@@ -212,6 +237,84 @@ impl DiscoverJobView {
             message: "Configure a new search or continue an existing databank.".into(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FamilyBakeoffRequest {
+    data_path: String,
+    metadata_path: Option<String>,
+    source_timezone: Option<String>,
+    m1_data_path: String,
+    m1_metadata_path: Option<String>,
+    m1_source_timezone: Option<String>,
+    broker_path: String,
+    generations: u64,
+    initial_candidates: usize,
+    seed: u64,
+    commission_per_lot_round_turn: f64,
+    slippage_points_per_side: f64,
+    fallback_spread_points: Option<f64>,
+    validation_fraction: f64,
+    /// Search families to compare (`trend_pullback`, …). Must be non-empty.
+    #[serde(default)]
+    families: Vec<String>,
+}
+
+#[tauri::command]
+pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoffReport, String> {
+    let families = parse_bakeoff_families(&request.families)?;
+    let loaded = load_data_source(
+        &request.data_path,
+        request.metadata_path.as_deref(),
+        request.source_timezone.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let m1_loaded = load_data_source(
+        &request.m1_data_path,
+        request.m1_metadata_path.as_deref(),
+        request.m1_source_timezone.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
+    load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
+    let validation_fraction = request.validation_fraction.clamp(0.05, 0.4);
+    let sealed_fraction = 0.2;
+    let search_h1 =
+        development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
+    let oos1 = oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
+    let m1_is = development_partition(&m1_loaded.dataset, validation_fraction, sealed_fraction)?;
+    let mut discover = DiscoverConfig {
+        run_mode: DiscoverRunMode::FastScout,
+        initial_candidates: request.initial_candidates.max(20),
+        batch_size: request.initial_candidates.clamp(10, 30),
+        seed: request.seed,
+        require_m1_robustness: false,
+        require_m1_precision: false,
+        worker_threads: 0,
+        ..DiscoverConfig::default()
+    };
+    discover.scout.costs.commission_per_lot_round_turn = request.commission_per_lot_round_turn;
+    discover
+        .scout
+        .costs
+        .adverse_slippage_points_per_side = request.slippage_points_per_side;
+    discover.scout.costs.fallback_spread_points = request.fallback_spread_points;
+    let config = FamilyBakeoffConfig {
+        discover,
+        generations: request.generations.max(1),
+        families,
+    };
+    evolve_family_bakeoff(
+        &search_h1,
+        Some(&oos1),
+        &m1_is,
+        &broker,
+        &[],
+        &broker.symbol,
+        config,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -260,11 +363,14 @@ pub fn start_discover(
         rejected_gate: 0,
         rejected_deposit_gate: 0,
         rejected_precision: 0,
+        rejected_ambiguous: 0,
         rejected_oos1: 0,
         rejected_m1_fidelity: 0,
         rejected_walk_forward: 0,
         rejected_monte_carlo: 0,
         rejected_param_neighborhood: 0,
+        rejected_multi_symbol: 0,
+        rejected_deflated_sharpe: 0,
         rejected_clone: 0,
         rejected_correlated: 0,
         rejected_niche_not_improved: 0,
@@ -367,6 +473,24 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     {
         return Err("data, broker and databank paths are required".into());
     }
+    if request.mode == DiscoverMode::New {
+        let family = request
+            .search_family
+            .as_deref()
+            .ok_or("search family is required for a new Discover run")?;
+        if parse_search_family(family).is_none() {
+            return Err(format!(
+                "unknown search family '{family}' (use trend_pullback, momentum_burst, donchian_breakout, mean_reversion_band)"
+            ));
+        }
+        if let Some(mode) = request.run_mode.as_deref() {
+            if parse_run_mode(mode).is_none() {
+                return Err(format!(
+                    "unknown run mode '{mode}' (use fast_scout or full_harvest)"
+                ));
+            }
+        }
+    }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     if !run_until_stopped && request.generations == 0 {
         return Err("at least one generation is required when not running until stopped".into());
@@ -388,6 +512,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.correlation_threshold.is_some(),
             request.novelty_weight.is_some(),
             request.seed.is_some(),
+            request.search_family.is_some(),
+            request.run_mode.is_some(),
+            request.early_stop_pot_elites.is_some(),
             request.minimum_trades.is_some(),
             request.maximum_drawdown_percent.is_some(),
             request.minimum_return_percent.is_some(),
@@ -467,18 +594,19 @@ fn run_discovery(
         ));
     }
 
-    let (search_h1, h1_bars_built) = {
+    let (search_decision, decision_bars_built) = {
         let built = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
         let count = built.bars.len() as u64;
         (built, count)
     };
+    let decision_timeframe = decision_timeframe_label(&search_decision)?;
     {
         let mut view = job
             .write()
             .map_err(|_| "discover job state is unavailable".to_owned())?;
-        view.m1_bars_repaired = h1_bars_built;
+        view.m1_bars_repaired = decision_bars_built;
         view.message = format!(
-            "Built {h1_bars_built} decision bars from M1 (SQX-style) before search."
+            "Built {decision_bars_built} {decision_timeframe} decision bars from M1 before search."
         );
     }
 
@@ -486,31 +614,51 @@ fn run_discovery(
     let validation_fraction = request.validation_fraction.unwrap_or(0.2);
     let sealed_fraction = request.sealed_fraction.unwrap_or(0.2);
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| development_partition(&search_h1, validation_fraction, sealed_fraction))
+        .then(|| development_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
     let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| oos1_partition(&search_h1, validation_fraction, sealed_fraction))
+        .then(|| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
-    let new_dataset = development_dataset.as_ref().unwrap_or(&search_h1);
+    let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
     let oos1_ref = oos1_dataset.as_ref();
     let m1_is_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| clip_dataset_to_window(&m1.dataset, new_dataset))
         .transpose()?;
     let m1_eval = m1_is_dataset.as_ref().unwrap_or(&m1.dataset);
+    let pack = load_fx_pack(
+        request.pack_data_dir.as_deref(),
+        &broker.symbol,
+        validation_fraction,
+        sealed_fraction,
+        promotion_split || request.mode == DiscoverMode::Continue,
+        &decision_timeframe,
+    )?;
 
     let (mut bank, continuation_recipe_hash, starting_generation) = match request.mode {
         DiscoverMode::New => {
             update_phase(
                 job,
                 "Evaluating initial grammar population",
-                "IS search with OOS1 expectancy pick gate (0.7×) and M1 precision.",
+                &format!(
+                    "IS {decision_timeframe} search with matching-timeframe multi-symbol screen, OOS1 pick, and M1 robustness."
+                ),
             )?;
-            let bank = evolve_new(
+            let mut config = new_config(&request)?;
+            if !pack.is_empty()
+                && config.multi_symbol_minimum_pass == 0
+                && request.multi_symbol_minimum_pass.is_none()
+            {
+                // Default to 6-of-N when a pack is supplied and the UI left the gate unset.
+                config.multi_symbol_minimum_pass = 6.min(pack.len() + 1);
+            }
+            let bank = evolve_new_with_pack(
                 new_dataset,
                 oos1_ref,
                 m1_eval,
                 &broker,
-                new_config(&request)?,
+                &pack,
+                &broker.symbol,
+                config,
                 0,
             )
             .map_err(|error| error.to_string())?;
@@ -593,14 +741,14 @@ fn run_discovery(
             "Candidates are bred on IS, precision-checked on M1, then picked only if OOS1 expectancy ≥ 0.7× IS.",
         )?;
 
-        let evaluation_dataset = if bank.data_hash == search_h1.data_hash {
-            &search_h1
+        let evaluation_dataset = if bank.data_hash == search_decision.data_hash {
+            &search_decision
         } else {
             development_dataset.as_ref().ok_or_else(|| {
                 "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
             })?
         };
-        let evaluation_oos1 = if bank.data_hash == search_h1.data_hash {
+        let evaluation_oos1 = if bank.data_hash == search_decision.data_hash {
             None
         } else {
             oos1_ref
@@ -610,12 +758,14 @@ fn run_discovery(
         } else {
             m1_eval
         };
-        bank = continue_evolution(
+        bank = continue_evolution_with_pack(
             bank,
             evaluation_dataset,
             evaluation_oos1,
             evaluation_m1,
             &broker,
+            &pack,
+            &broker.symbol,
             1,
         )
         .map_err(|error| error.to_string())?;
@@ -681,6 +831,7 @@ fn run_discovery(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_discovery(
     request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
@@ -782,9 +933,10 @@ fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool)
 fn funnel_summary(bank: &Databank) -> String {
     let telemetry = &bank.telemetry;
     format!(
-        "Rejects — scout {}, deposit {}, M1 {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
+        "Rejects — scout {}, deposit {}, ambiguous {}, M1 retention {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
         telemetry.rejected_gate,
         telemetry.rejected_deposit_gate,
+        telemetry.rejected_ambiguous,
         telemetry.rejected_m1_fidelity,
         telemetry.rejected_walk_forward,
         telemetry.rejected_monte_carlo,
@@ -797,6 +949,7 @@ fn funnel_summary(bank: &Databank) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_discover_checkpoint(
     request: &DiscoverRequest,
     bank: &Databank,
@@ -908,6 +1061,113 @@ fn write_discover_checkpoint(
     Ok(())
 }
 
+/// Load matching decision-timeframe pack symbols for the identical-parameter
+/// multi-symbol gate.
+///
+/// Expects files named like `*_{SYMBOL}_{TIMEFRAME}_*.tsv`, optional
+/// `*.metadata.csv`, and `{SYMBOL}.broker.json`.
+fn load_fx_pack(
+    pack_dir: Option<&str>,
+    primary_symbol: &str,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    apply_promotion_split: bool,
+    decision_timeframe: &str,
+) -> Result<Vec<PackSymbol>, String> {
+    let Some(dir) = pack_dir.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let dir_path = Path::new(dir);
+    if !dir_path.is_dir() {
+        return Err(format!("pack data directory is not a directory: {dir}"));
+    }
+    let mut pack = Vec::new();
+    for symbol in DEFAULT_FX_PACK {
+        if symbol.eq_ignore_ascii_case(primary_symbol) {
+            continue;
+        }
+        let broker_path = dir_path.join(format!("{symbol}.broker.json"));
+        if !broker_path.is_file() {
+            continue;
+        }
+        let Some(decision_path) = find_timeframe_tsv(dir_path, symbol, decision_timeframe)? else {
+            continue;
+        };
+        let market_broker = load_bound_broker(&display_path(&broker_path), None)?;
+        // `foo.tsv` → `foo.metadata.csv` beside it.
+        let meta_beside = {
+            let stem = decision_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            decision_path.with_file_name(format!("{stem}.metadata.csv"))
+        };
+        let loaded = if meta_beside.is_file() {
+            load_data_source(
+                &display_path(&decision_path),
+                Some(&display_path(&meta_beside)),
+                None,
+            )?
+        } else {
+            load_data_source(
+                &display_path(&decision_path),
+                None,
+                Some(&market_broker.timezone),
+            )?
+        };
+        let market_broker = load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
+        let dataset = if apply_promotion_split {
+            development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
+        } else {
+            loaded.dataset
+        };
+        pack.push(PackSymbol {
+            symbol: (*symbol).into(),
+            dataset,
+            broker: market_broker,
+        });
+    }
+    Ok(pack)
+}
+
+fn find_timeframe_tsv(
+    dir: &Path,
+    symbol: &str,
+    timeframe: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut matches = Vec::new();
+    let entries = fs::read_dir(dir).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let upper = name.to_uppercase();
+        if upper.contains(&format!(
+            "_{}_{}_",
+            symbol.to_uppercase(),
+            timeframe.to_uppercase()
+        )) && (name.ends_with(".tsv") || name.ends_with(".csv"))
+        {
+            matches.push(entry.path());
+        }
+    }
+    matches.sort();
+    Ok(matches.into_iter().next())
+}
+
+fn decision_timeframe_label(dataset: &BarDataset) -> Result<String, String> {
+    let interval_ms = infer_median_interval_ms(&dataset.bars)
+        .ok_or_else(|| "cannot infer the decision timeframe".to_owned())?;
+    if interval_ms % 60_000 != 0 {
+        return Err("decision timeframe must be a whole number of minutes".into());
+    }
+    let minutes = interval_ms / 60_000;
+    Ok(if minutes % 60 == 0 {
+        format!("H{}", minutes / 60)
+    } else {
+        format!("M{minutes}")
+    })
+}
+
 fn development_partition(
     dataset: &BarDataset,
     validation_fraction: f64,
@@ -961,17 +1221,23 @@ fn clip_dataset_to_window(dataset: &BarDataset, window: &BarDataset) -> Result<B
     let (Some(first), Some(last)) = (window.bars.first(), window.bars.last()) else {
         return Err("cannot clip M1: IS window is empty".into());
     };
+    // Decision timestamps are bar *opens*. M1 must cover the full last bar
+    // `[open, open+interval)` or Judge fails "M1 high aggregate …".
+    let interval_ms = infer_median_interval_ms(&window.bars).unwrap_or(3_600_000);
     let start_ms = first.timestamp_ms;
-    let end_ms = last.timestamp_ms;
+    let end_exclusive_ms = last
+        .timestamp_ms
+        .checked_add(interval_ms)
+        .ok_or_else(|| "IS window end overflow".to_owned())?;
     let bars: Vec<_> = dataset
         .bars
         .iter()
-        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms <= end_ms)
+        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms < end_exclusive_ms)
         .cloned()
         .collect();
     if bars.len() < 2 {
         return Err(format!(
-            "M1 has fewer than 2 bars inside the IS window [{start_ms}..{end_ms}]"
+            "M1 has fewer than 2 bars inside the IS window [{start_ms}..{end_exclusive_ms})"
         ));
     }
     Ok(BarDataset {
@@ -983,6 +1249,74 @@ fn clip_dataset_to_window(dataset: &BarDataset, window: &BarDataset) -> Result<B
         source_timezone: dataset.source_timezone.clone(),
         bars,
     })
+}
+
+fn parse_search_family(value: &str) -> Option<quantforge_discover::SearchFamily> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trend_pullback" | "trendpullback" | "trend" => {
+            Some(quantforge_discover::SearchFamily::TrendPullback)
+        }
+        "momentum_burst" | "momentumburst" | "momentum" => {
+            Some(quantforge_discover::SearchFamily::MomentumBurst)
+        }
+        "donchian_breakout" | "donchianbreakout" | "breakout" => {
+            Some(quantforge_discover::SearchFamily::DonchianBreakout)
+        }
+        "mean_reversion_band" | "meanreversionband" | "mean_reversion" => {
+            Some(quantforge_discover::SearchFamily::MeanReversionBand)
+        }
+        "zscore_reversion" | "z_score_reversion" | "zscore" => {
+            Some(quantforge_discover::SearchFamily::ZScoreReversion)
+        }
+        "session_orb" | "sessionorb" | "orb" => {
+            Some(quantforge_discover::SearchFamily::SessionOrb)
+        }
+        "impulse_candle" | "impulsecandle" | "impulse" => {
+            Some(quantforge_discover::SearchFamily::ImpulseCandle)
+        }
+        "vol_squeeze_break" | "volsqueezebreak" | "vol_squeeze" => {
+            Some(quantforge_discover::SearchFamily::VolSqueezeBreak)
+        }
+        "supply_demand_reclaim" | "supplydemandreclaim" | "supply_demand" => {
+            Some(quantforge_discover::SearchFamily::SupplyDemandReclaim)
+        }
+        "sweep_reclaim" | "sweepreclaim" | "sweep" => {
+            Some(quantforge_discover::SearchFamily::SweepReclaim)
+        }
+        _ => None,
+    }
+}
+
+fn parse_bakeoff_families(values: &[String]) -> Result<Vec<SearchFamily>, String> {
+    if values.is_empty() {
+        return Err(
+            "select at least one search family for the family tester".into(),
+        );
+    }
+    let mut families = Vec::with_capacity(values.len());
+    for value in values {
+        let family = parse_search_family(value).ok_or_else(|| {
+            format!(
+                "unknown search family '{value}'"
+            )
+        })?;
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    Ok(families)
+}
+
+fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fast_scout" | "fastscout" | "scout" => {
+            Some(quantforge_discover::DiscoverRunMode::FastScout)
+        }
+        "full_harvest" | "fullharvest" | "harvest" => {
+            Some(quantforge_discover::DiscoverRunMode::FullHarvest)
+        }
+        _ => None,
+    }
 }
 
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
@@ -997,6 +1331,19 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         tournament_size: 4,
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
+        search_family: request
+            .search_family
+            .as_deref()
+            .and_then(parse_search_family)
+            .unwrap_or_default(),
+        run_mode: request
+            .run_mode
+            .as_deref()
+            .and_then(parse_run_mode)
+            .unwrap_or(quantforge_discover::DiscoverRunMode::FullHarvest),
+        allow_cross_family_mutation: false,
+        early_stop_pot_elites: request.early_stop_pot_elites,
+        trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: request.minimum_trades.unwrap_or(10),
             maximum_drawdown_percent: request.maximum_drawdown_percent.unwrap_or(40.0),
@@ -1014,7 +1361,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             minimum_return_drawdown: request.deposit_minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
-            minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.95),
+            minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.90),
         },
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
         require_m1_precision: request.require_m1_precision.unwrap_or(false),
@@ -1034,6 +1381,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_neighborhood_samples: request
             .robustness_neighborhood_samples
             .unwrap_or(8),
+        calendar_year_folds: request.calendar_year_folds.unwrap_or(true),
+        minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
+        multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -1102,11 +1452,14 @@ fn update_bank(
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
         + telemetry.rejected_precision
+        + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
         + telemetry.rejected_m1_fidelity
         + telemetry.rejected_walk_forward
         + telemetry.rejected_monte_carlo
         + telemetry.rejected_param_neighborhood
+        + telemetry.rejected_multi_symbol
+        + telemetry.rejected_deflated_sharpe
         + telemetry.rejected_evaluation;
     let hours = started.elapsed().as_secs_f64().max(1.0) / 3600.0;
     let risk = quantforge_discover::FIXED_RISK_PER_TRADE;
@@ -1134,7 +1487,7 @@ fn update_bank(
             count: *count,
         })
         .collect();
-    errors.sort_by(|left, right| right.count.cmp(&left.count));
+    errors.sort_by_key(|error| std::cmp::Reverse(error.count));
     errors.truncate(5);
 
     let mutate_after = bank.config.mutate_after_elites;
@@ -1187,11 +1540,14 @@ fn update_bank(
     view.rejected_gate = telemetry.rejected_gate;
     view.rejected_deposit_gate = telemetry.rejected_deposit_gate;
     view.rejected_precision = telemetry.rejected_precision;
+    view.rejected_ambiguous = telemetry.rejected_ambiguous;
     view.rejected_oos1 = telemetry.rejected_oos1;
     view.rejected_m1_fidelity = telemetry.rejected_m1_fidelity;
     view.rejected_walk_forward = telemetry.rejected_walk_forward;
     view.rejected_monte_carlo = telemetry.rejected_monte_carlo;
     view.rejected_param_neighborhood = telemetry.rejected_param_neighborhood;
+    view.rejected_multi_symbol = telemetry.rejected_multi_symbol;
+    view.rejected_deflated_sharpe = telemetry.rejected_deflated_sharpe;
     view.rejected_clone = telemetry.rejected_clone;
     view.rejected_correlated = telemetry.rejected_correlated;
     view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
@@ -1247,7 +1603,7 @@ mod tests {
             deposit_minimum_return_percent: Some(-100.0),
             deposit_minimum_profit_factor: Some(0.0),
             deposit_minimum_return_drawdown: Some(0.0),
-            minimum_m1_return_retention: Some(0.95),
+            minimum_m1_return_retention: Some(0.90),
             oos1_expectancy_retention: Some(0.7),
             require_m1_precision: Some(false),
             simple_exits: Some(true),
@@ -1260,6 +1616,13 @@ mod tests {
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),
             robustness_neighborhood_samples: Some(2),
+            calendar_year_folds: Some(false),
+            minimum_deflated_trade_sharpe: None,
+            multi_symbol_minimum_pass: Some(0),
+            pack_data_dir: None,
+            search_family: Some("trend_pullback".into()),
+            run_mode: Some("full_harvest".into()),
+            early_stop_pot_elites: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,
@@ -1341,6 +1704,65 @@ mod tests {
         assert!(view.phase.contains("empty"));
         assert!(!path.exists());
         assert!(view.rejected_total > 0 || view.evaluation_count > 0);
+    }
+
+    #[test]
+    fn clip_m1_covers_the_full_last_decision_bar() {
+        use quantforge_data::Bar;
+        let h1 = BarDataset {
+            data_hash: bar_content_hash(&[]),
+            source_rows: 2,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars: vec![
+                Bar {
+                    timestamp_ms: 0,
+                    open: 1.0,
+                    high: 1.1,
+                    low: 0.9,
+                    close: 1.05,
+                    tick_volume: 60,
+                    real_volume: 0,
+                    spread_points: Some(1),
+                },
+                Bar {
+                    timestamp_ms: 3_600_000,
+                    open: 1.05,
+                    high: 1.2,
+                    low: 1.0,
+                    close: 1.1,
+                    tick_volume: 60,
+                    real_volume: 0,
+                    spread_points: Some(1),
+                },
+            ],
+        };
+        let m1_bars: Vec<_> = (0..120)
+            .map(|minute| Bar {
+                timestamp_ms: minute * 60_000,
+                open: 1.0,
+                high: if minute == 90 { 1.2 } else { 1.05 },
+                low: 0.95,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(1),
+            })
+            .collect();
+        let m1 = BarDataset {
+            data_hash: bar_content_hash(&m1_bars),
+            source_rows: m1_bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars: m1_bars,
+        };
+        let clipped = clip_dataset_to_window(&m1, &h1).expect("clip");
+        assert_eq!(clipped.bars.len(), 120);
+        assert!(clipped.bars.iter().any(|bar| (bar.high - 1.2).abs() < 1e-12));
     }
 
     #[test]

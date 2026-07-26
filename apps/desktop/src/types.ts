@@ -22,6 +22,7 @@ export interface RejectionTelemetry {
   correlated: number;
   nicheNotImproved: number;
   precision: number;
+  ambiguous?: number;
   oos1: number;
   evaluation: number;
   total: number;
@@ -234,6 +235,54 @@ export type DiscoverJobStatus =
   | "completed"
   | "failed";
 
+export type SearchFamilyId =
+  | "trend_pullback"
+  | "momentum_burst"
+  | "donchian_breakout"
+  | "mean_reversion_band"
+  | "zscore_reversion"
+  | "session_orb"
+  | "impulse_candle"
+  | "vol_squeeze_break"
+  | "supply_demand_reclaim"
+  | "sweep_reclaim";
+
+export type DiscoverRunModeId = "fast_scout" | "full_harvest";
+
+export interface FamilyBakeoffRow {
+  family: SearchFamilyId;
+  medianOos1Expectancy: number;
+  medianRetention: number;
+  passRate: number;
+  elites: number;
+  potElites: number;
+  evaluations: number;
+}
+
+export interface FamilyBakeoffReport {
+  rows: FamilyBakeoffRow[];
+  recommended: SearchFamilyId | null;
+}
+
+export interface FamilyBakeoffRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+  generations: number;
+  initialCandidates: number;
+  seed: number;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  fallbackSpreadPoints: number | null;
+  validationFraction: number;
+  /** Families to test; empty is rejected by the backend. */
+  families: SearchFamilyId[];
+}
+
 export interface DiscoverRequest {
   mode: DiscoverMode;
   dataPath: string;
@@ -251,6 +300,9 @@ export interface DiscoverRequest {
   correlationThreshold: number | null;
   noveltyWeight: number | null;
   seed: number | null;
+  searchFamily: SearchFamilyId | null;
+  runMode: DiscoverRunModeId | null;
+  earlyStopPotElites: number | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
@@ -274,6 +326,10 @@ export interface DiscoverRequest {
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
   robustnessNeighborhoodSamples: number | null;
+  calendarYearFolds: boolean | null;
+  minimumDeflatedTradeSharpe: number | null;
+  multiSymbolMinimumPass: number | null;
+  packDataDir: string | null;
   commissionPerLotRoundTurn: number | null;
   slippagePointsPerSide: number | null;
   fallbackSpreadPoints: number | null;
@@ -345,11 +401,14 @@ export interface DiscoverJobView {
   rejectedGate: number;
   rejectedDepositGate: number;
   rejectedPrecision: number;
+  rejectedAmbiguous: number;
   rejectedOos1: number;
   rejectedM1Fidelity: number;
   rejectedWalkForward: number;
   rejectedMonteCarlo: number;
   rejectedParamNeighborhood: number;
+  rejectedMultiSymbol: number;
+  rejectedDeflatedSharpe: number;
   rejectedClone: number;
   rejectedCorrelated: number;
   rejectedNicheNotImproved: number;

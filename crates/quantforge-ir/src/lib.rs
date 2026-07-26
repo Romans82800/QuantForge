@@ -81,6 +81,51 @@ pub enum IndicatorExpr {
         period: u16,
         shift: u16,
     },
+    /// Broker-local opening-range high formed over `range_bars` from `start_hour`.
+    SessionRangeHigh {
+        start_hour: u8,
+        range_bars: u16,
+        shift: u16,
+    },
+    /// Broker-local opening-range low formed over `range_bars` from `start_hour`.
+    SessionRangeLow {
+        start_hour: u8,
+        range_bars: u16,
+        shift: u16,
+    },
+    /// Candle body / range ratio `|C-O|/(H-L)` on the shifted bar.
+    BodyRangeRatio {
+        shift: u16,
+    },
+    /// Close location in the candle range `(C-L)/(H-L)` on the shifted bar.
+    CloseLocationInBar {
+        shift: u16,
+    },
+    /// Percentile rank of current ATR among the prior `lookback` ATR values.
+    AtrPercentile {
+        atr_period: u16,
+        lookback: u16,
+        shift: u16,
+    },
+    /// High edge of the most recent confirmed swing-low base zone.
+    SwingBaseZoneHigh {
+        swing_left: u16,
+        swing_right: u16,
+        base_bars: u16,
+        shift: u16,
+    },
+    /// Low edge of the most recent confirmed swing-high base zone.
+    SwingBaseZoneLow {
+        swing_left: u16,
+        swing_right: u16,
+        base_bars: u16,
+        shift: u16,
+    },
+    /// `+1` bullish liquidity sweep, `-1` bearish, else `0`.
+    LiquiditySweepScore {
+        period: u16,
+        shift: u16,
+    },
 }
 
 impl IndicatorExpr {
@@ -98,7 +143,38 @@ impl IndicatorExpr {
             | Self::StandardDeviation { period, shift, .. }
             | Self::ZScore { period, shift, .. }
             | Self::PercentileInRange { period, shift, .. }
-            | Self::RateOfChange { period, shift, .. } => (period, shift),
+            | Self::RateOfChange { period, shift, .. }
+            | Self::LiquiditySweepScore { period, shift } => (period, shift),
+            Self::SessionRangeHigh {
+                range_bars, shift, ..
+            }
+            | Self::SessionRangeLow {
+                range_bars, shift, ..
+            } => (range_bars.max(2), shift),
+            Self::BodyRangeRatio { shift } | Self::CloseLocationInBar { shift } => (2, shift),
+            Self::AtrPercentile {
+                atr_period,
+                lookback,
+                shift,
+            } => (atr_period.max(lookback).max(2), shift),
+            Self::SwingBaseZoneHigh {
+                swing_left,
+                swing_right,
+                base_bars,
+                shift,
+            }
+            | Self::SwingBaseZoneLow {
+                swing_left,
+                swing_right,
+                base_bars,
+                shift,
+            } => (
+                swing_left
+                    .saturating_add(swing_right)
+                    .saturating_add(base_bars)
+                    .max(2),
+                shift,
+            ),
         }
     }
 }
@@ -256,9 +332,10 @@ pub struct ManagePolicy {
     pub time_stop_bars: Option<u16>,
     pub partial_exits: Vec<PartialExit>,
     pub flatten_end_of_day: bool,
-    /// When true, the first successful entry action (market fill or pending place)
-    /// locks the broker-local calendar day — no further market entries or pending
-    /// orders may be placed that day, even if the first trade closed early.
+    /// When true, the first fill (market open or pending activation) locks the
+    /// broker-local calendar day — no further market entries or pending orders
+    /// may be placed that day, even if the first trade closed early. An unfilled
+    /// / expired pending does not consume the day's slot.
     /// Production Discover stamps this from job config; it is not an evolvable gene.
     #[serde(default)]
     pub max_one_entry_per_day: bool,

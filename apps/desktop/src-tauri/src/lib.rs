@@ -33,6 +33,7 @@ pub fn run() {
             databank::run_fidelity_demo,
             data_lab::inspect_data,
             discover::start_discover,
+            discover::run_family_bakeoff,
             discover::get_discover_job,
             discover::pause_discover,
             discover::resume_discover,

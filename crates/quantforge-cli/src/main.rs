@@ -5,7 +5,11 @@ use quantforge_data::{
     BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
     bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
-use quantforge_discover::{Databank, DiscoverConfig, GateConfig, continue_evolution, evolve_new};
+use quantforge_discover::{
+    Databank, DiscoverConfig, DiscoverRunMode, FamilyBakeoffConfig, GateConfig,
+    MethodologyGridConfig, PermutationNullConfig, SearchFamily, continue_evolution, evolve_new,
+    run_family_bakeoff, run_methodology_grid, run_permutation_null,
+};
 use quantforge_eval::{CostModel, ScoutConfig, ScoutResult, evaluate_strategy};
 use quantforge_export_mql5::{
     ExportEvidenceCard, MetaEditorConfig, Mql5ExportConfig, TerminalConfig, TesterConfig,
@@ -15,7 +19,7 @@ use quantforge_ir::StrategyIr;
 use quantforge_parity::{
     DiffReport, IndicatorParityConfig, IndicatorParityReport, Mt5TesterMetadata, ParityRun,
     ParityTolerances, compare_indicator_reference, compare_runs, load_mt5_tester_metadata,
-    load_mt5_tester_run,
+    load_mt5_tester_run_in_timezone,
 };
 use quantforge_portfolio::{
     PortfolioCandidate, PortfolioConfig, PortfolioObjective, PortfolioReport, pack_portfolio,
@@ -128,6 +132,120 @@ enum Command {
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
     SealedFinal(SealedFinalArgs),
+    /// Stationary-bootstrap noise floor for Discover gate calibration.
+    PermutationNull(PermutationNullArgs),
+    /// Short Fast Scout per Search Family, ranked by OOS1 retention.
+    FamilyBakeoff(FamilyBakeoffArgs),
+    /// Factor grid across families: atoms × entry/exit recipes → OOS1 retention.
+    MethodologyResearch(MethodologyResearchArgs),
+}
+
+#[derive(Debug, Args)]
+struct PermutationNullArgs {
+    #[command(flatten)]
+    source: DataSourceArgs,
+    /// Broker SymbolSpecification JSON for the primary symbol.
+    #[arg(long)]
+    broker: PathBuf,
+    /// Number of synthetic Discover trials.
+    #[arg(long, default_value_t = 8)]
+    trials: usize,
+    /// Mean stationary-bootstrap block length in M1 bars.
+    #[arg(long, default_value_t = 1440)]
+    mean_block_length: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 200)]
+    initial_candidates: usize,
+    #[arg(long, default_value_t = 0)]
+    generations: u64,
+    #[arg(long)]
+    commission_per_lot_round_turn: f64,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_points_per_side: f64,
+    #[arg(long)]
+    fallback_spread_points: Option<f64>,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct FamilyBakeoffArgs {
+    #[command(flatten)]
+    source: DataSourceArgs,
+    #[arg(long)]
+    m1: PathBuf,
+    #[arg(
+        long,
+        value_name = "IANA_TIMEZONE",
+        required_unless_present = "m1_metadata",
+        conflicts_with = "m1_metadata"
+    )]
+    m1_source_timezone: Option<SourceTimezone>,
+    #[arg(
+        long,
+        value_name = "METADATA_CSV",
+        required_unless_present = "m1_source_timezone",
+        conflicts_with = "m1_source_timezone"
+    )]
+    m1_metadata: Option<PathBuf>,
+    #[arg(long)]
+    broker: PathBuf,
+    #[arg(long, default_value_t = 3)]
+    generations: u64,
+    #[arg(long, default_value_t = 60)]
+    initial_candidates: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long)]
+    commission_per_lot_round_turn: f64,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_points_per_side: f64,
+    #[arg(long)]
+    fallback_spread_points: Option<f64>,
+    /// Chronological OOS1 fraction (sealed unused).
+    #[arg(long, default_value_t = 0.2)]
+    validation_fraction: f64,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct MethodologyResearchArgs {
+    #[command(flatten)]
+    source: DataSourceArgs,
+    #[arg(long)]
+    m1: PathBuf,
+    #[arg(
+        long,
+        value_name = "IANA_TIMEZONE",
+        required_unless_present = "m1_metadata",
+        conflicts_with = "m1_metadata"
+    )]
+    m1_source_timezone: Option<SourceTimezone>,
+    #[arg(
+        long,
+        value_name = "METADATA_CSV",
+        required_unless_present = "m1_source_timezone",
+        conflicts_with = "m1_source_timezone"
+    )]
+    m1_metadata: Option<PathBuf>,
+    #[arg(long)]
+    broker: PathBuf,
+    #[arg(long, default_value_t = 40)]
+    draws_per_cell: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long)]
+    commission_per_lot_round_turn: f64,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_points_per_side: f64,
+    #[arg(long)]
+    fallback_spread_points: Option<f64>,
+    #[arg(long, default_value_t = 0.2)]
+    validation_fraction: f64,
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -198,6 +316,12 @@ struct EvolveArgs {
     structural_mutation_probability: Option<f64>,
     #[arg(long)]
     seed: Option<u64>,
+    /// Locked Search Family id (trend_pullback, session_orb, sweep_reclaim, …)
+    #[arg(long, default_value = "trend_pullback")]
+    search_family: String,
+    /// fast_scout | full_harvest
+    #[arg(long, default_value = "full_harvest")]
+    run_mode: String,
     #[arg(long)]
     minimum_trades: Option<usize>,
     #[arg(long)]
@@ -230,7 +354,7 @@ struct EvolveArgs {
     #[arg(long)]
     allow_failed_data: bool,
     /// Train on IS only and pick elites when OOS1 expectancy retains enough of IS.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     promotion_split: bool,
     #[arg(long, default_value_t = 0.2)]
     validation_fraction: f64,
@@ -340,6 +464,7 @@ struct ExportArgs {
 #[derive(Debug, Args)]
 struct ParityArgs {
     /// Manifest-bound Scout JSON produced by `quantforge scout --out`.
+    /// Also accepts Judge JSON from `quantforge judge --out`.
     #[arg(long)]
     scout_result: PathBuf,
     /// Evidence card produced by `quantforge export`.
@@ -357,6 +482,10 @@ struct ParityArgs {
     /// Tester metadata CSV emitted by the generated EA.
     #[arg(long)]
     mt5_metadata: PathBuf,
+    /// Broker timezone used to localize MT5 DEAL_TIME_MSC into UTC
+    /// (same token as bar ingestion, e.g. `ICMarkets/EST+7`).
+    #[arg(long)]
+    broker_timezone: Option<String>,
     #[arg(long, default_value_t = 100_000.0)]
     initial_balance: f64,
     #[arg(long)]
@@ -1171,7 +1300,253 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Deploy(args) => deploy_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
+        Command::PermutationNull(args) => permutation_null_command(args)?,
+        Command::FamilyBakeoff(args) => family_bakeoff_command(args)?,
+        Command::MethodologyResearch(args) => methodology_research_command(args)?,
     }
+    Ok(())
+}
+
+fn parse_cli_search_family(value: &str) -> Result<SearchFamily, Box<dyn Error>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trend_pullback" | "trend" => Ok(SearchFamily::TrendPullback),
+        "momentum_burst" | "momentum" => Ok(SearchFamily::MomentumBurst),
+        "donchian_breakout" | "breakout" => Ok(SearchFamily::DonchianBreakout),
+        "mean_reversion_band" | "mean_reversion" => Ok(SearchFamily::MeanReversionBand),
+        "zscore_reversion" | "zscore" => Ok(SearchFamily::ZScoreReversion),
+        "session_orb" | "orb" => Ok(SearchFamily::SessionOrb),
+        "impulse_candle" | "impulse" => Ok(SearchFamily::ImpulseCandle),
+        "vol_squeeze_break" | "vol_squeeze" => Ok(SearchFamily::VolSqueezeBreak),
+        "supply_demand_reclaim" | "supply_demand" => Ok(SearchFamily::SupplyDemandReclaim),
+        "sweep_reclaim" | "sweep" => Ok(SearchFamily::SweepReclaim),
+        other => Err(format!("unknown search family: {other}").into()),
+    }
+}
+
+fn parse_cli_run_mode(value: &str) -> Result<DiscoverRunMode, Box<dyn Error>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fast_scout" | "scout" => Ok(DiscoverRunMode::FastScout),
+        "full_harvest" | "harvest" => Ok(DiscoverRunMode::FullHarvest),
+        other => Err(format!("unknown run mode: {other}").into()),
+    }
+}
+
+fn family_bakeoff_command(args: FamilyBakeoffArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "family-bakeoff artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let (dataset, _) = load_source(&args.source)?;
+    let m1_source = DataSourceArgs {
+        path: args.m1.clone(),
+        source_timezone: args.m1_source_timezone,
+        metadata: args.m1_metadata.clone(),
+    };
+    let (m1, _) = load_source(&m1_source)?;
+    let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
+    broker.validate()?;
+    let search_dataset = development_partition(&dataset, args.validation_fraction, 0.2)?;
+    let oos1 = oos1_partition(&dataset, args.validation_fraction, 0.2)?;
+    let mut discover = DiscoverConfig {
+        run_mode: DiscoverRunMode::FastScout,
+        initial_candidates: args.initial_candidates,
+        batch_size: args.initial_candidates.min(30),
+        seed: args.seed,
+        require_m1_robustness: false,
+        require_m1_precision: false,
+        worker_threads: 0,
+        ..DiscoverConfig::default()
+    };
+    discover.scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
+    discover.scout.costs.adverse_slippage_points_per_side = args.slippage_points_per_side;
+    discover.scout.costs.fallback_spread_points = args.fallback_spread_points;
+    let config = FamilyBakeoffConfig {
+        discover,
+        generations: args.generations,
+        families: SearchFamily::ALL.to_vec(),
+    };
+    let report = run_family_bakeoff(
+        &search_dataset,
+        Some(&oos1),
+        &m1,
+        &broker,
+        &[],
+        &broker.symbol,
+        config,
+    )?;
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "family-bakeoff wrote {} (recommended={:?})",
+        args.out.display(),
+        report.recommended.map(|family| family.label())
+    );
+    for row in &report.rows {
+        println!(
+            "  {} retention={:.3} oos1_E={:.4} pass={:.0}% pot={} evals={}",
+            row.family.label(),
+            row.median_retention,
+            row.median_oos1_expectancy,
+            row.pass_rate * 100.0,
+            row.pot_elites,
+            row.evaluations
+        );
+    }
+    Ok(())
+}
+
+fn methodology_research_command(args: MethodologyResearchArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "methodology-research artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let (dataset, _) = load_source(&args.source)?;
+    let m1_source = DataSourceArgs {
+        path: args.m1.clone(),
+        source_timezone: args.m1_source_timezone,
+        metadata: args.m1_metadata.clone(),
+    };
+    let (_m1, _) = load_source(&m1_source)?;
+    let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
+    broker.validate()?;
+    let search_dataset = development_partition(&dataset, args.validation_fraction, 0.2)?;
+    let oos1 = oos1_partition(&dataset, args.validation_fraction, 0.2)?;
+    let mut scout = ScoutConfig::default();
+    scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
+    scout.costs.adverse_slippage_points_per_side = args.slippage_points_per_side;
+    scout.costs.fallback_spread_points = args.fallback_spread_points;
+    let config = MethodologyGridConfig {
+        seed: args.seed,
+        draws_per_cell: args.draws_per_cell,
+        scout,
+        ..MethodologyGridConfig::default()
+    };
+    let report = run_methodology_grid(&search_dataset, &oos1, &broker, config)?;
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "methodology-research wrote {} ({} evaluations)",
+        args.out.display(),
+        report.evaluations
+    );
+    for line in &report.recommendations {
+        println!("  • {line}");
+    }
+    println!("Top cells:");
+    for cell in report.cells.iter().take(12) {
+        println!(
+            "  {} {} atoms={} screened={} oos_pass={:.0}% ret={}",
+            cell.family.label(),
+            cell.recipe.label(),
+            cell.atom_count,
+            cell.screened,
+            cell.oos1_pass_rate * 100.0,
+            cell.median_retention
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".into())
+        );
+    }
+    println!("Contrasts:");
+    for contrast in &report.contrasts {
+        println!(
+            "  {} n={}/{} ret_lift={} pass_lift={:+.1}pp p={:.3} q={:.3}{}",
+            contrast.name,
+            contrast.baseline_n,
+            contrast.treatment_n,
+            contrast
+                .retention_lift
+                .map(|value| format!("{value:+.3}"))
+                .unwrap_or_else(|| "n/a".into()),
+            contrast.pass_rate_lift * 100.0,
+            contrast.p_value,
+            contrast.q_value,
+            if contrast.significant_fdr_10 {
+                " *"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn permutation_null_command(args: PermutationNullArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "permutation-null artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let (m1, metadata) = load_source(&args.source)?;
+    let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
+    broker.validate()?;
+    validate_metadata_broker_binding(metadata.as_ref(), &broker)?;
+    let mut discover = DiscoverConfig {
+        initial_candidates: args.initial_candidates,
+        batch_size: args.initial_candidates.min(100),
+        require_m1_precision: false,
+        require_m1_robustness: false,
+        calendar_year_folds: false,
+        multi_symbol_minimum_pass: 0,
+        minimum_deflated_trade_sharpe: None,
+        worker_threads: 0,
+        ..DiscoverConfig::default()
+    };
+    discover.scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
+    discover.scout.costs.adverse_slippage_points_per_side = args.slippage_points_per_side;
+    discover.scout.costs.fallback_spread_points = args.fallback_spread_points;
+    let config = PermutationNullConfig {
+        trials: args.trials,
+        mean_block_length: args.mean_block_length,
+        seed: args.seed,
+        discover,
+        generations: args.generations,
+    };
+    let report = run_permutation_null(&m1, &broker, &[], &config)?;
+    let report_hash = quantforge_core::stable_json_hash(&report)?;
+    let manifest = RunManifest::new(
+        "permutation-null",
+        RunRecipe {
+            data_hash: Some(m1.data_hash.clone()),
+            broker_spec_hash: Some(broker.content_hash()?),
+            grammar_version: Some(quantforge_discover::GRAMMAR_VERSION.into()),
+            seed: Some(args.seed),
+            config: BTreeMap::from([
+                ("source".into(), json!(display_path(&args.source.path))),
+                ("broker".into(), json!(display_path(&args.broker))),
+                ("trials".into(), json!(args.trials)),
+                ("mean_block_length".into(), json!(args.mean_block_length)),
+                ("report_hash".into(), json!(&report_hash)),
+                ("p95_profit_factor".into(), json!(report.p95_profit_factor)),
+                (
+                    "p95_return_drawdown".into(),
+                    json!(report.p95_return_drawdown),
+                ),
+                ("p95_expectancy".into(), json!(report.p95_expectancy)),
+                ("p95_trade_sharpe".into(), json!(report.p95_trade_sharpe)),
+            ]),
+            override_flags: Vec::new(),
+        },
+    )?;
+    write_json_new(
+        &args.out,
+        &json!({
+            "manifest": manifest,
+            "report": report,
+        }),
+    )?;
+    print_json(&report)?;
     Ok(())
 }
 
@@ -3117,14 +3492,51 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let scout: ScoutArtifactInput = read_json(&args.scout_result)?;
     let mut evidence: ExportEvidenceCard = read_json(&args.evidence)?;
-    if scout.strategy_fingerprint != evidence.strategy_fingerprint {
-        return Err("Scout result and MQL5 evidence reference different strategies".into());
-    }
-    if scout.manifest.recipe.broker_spec_hash.as_ref() != Some(&evidence.broker_spec_hash) {
-        return Err("Scout result and MQL5 evidence reference different broker profiles".into());
-    }
+    let (reference, data_hash, grammar_version, strategy_fingerprint, broker_spec_hash) =
+        if let Ok(judge) = read_json::<JudgeArtifactInput>(&args.scout_result) {
+            if judge.strategy_fingerprint != evidence.strategy_fingerprint {
+                return Err(
+                    "Judge result and MQL5 evidence reference different strategies".into(),
+                );
+            }
+            if judge.manifest.recipe.broker_spec_hash.as_ref()
+                != Some(&evidence.broker_spec_hash)
+            {
+                return Err(
+                    "Judge result and MQL5 evidence reference different broker profiles".into(),
+                );
+            }
+            (
+                ParityRun::from_judge(&judge.result),
+                judge.manifest.recipe.data_hash.clone(),
+                judge.manifest.recipe.grammar_version.clone(),
+                judge.strategy_fingerprint,
+                evidence.broker_spec_hash.clone(),
+            )
+        } else {
+            let scout: ScoutArtifactInput = read_json(&args.scout_result)?;
+            if scout.strategy_fingerprint != evidence.strategy_fingerprint {
+                return Err(
+                    "Scout result and MQL5 evidence reference different strategies".into(),
+                );
+            }
+            if scout.manifest.recipe.broker_spec_hash.as_ref()
+                != Some(&evidence.broker_spec_hash)
+            {
+                return Err(
+                    "Scout result and MQL5 evidence reference different broker profiles".into(),
+                );
+            }
+            (
+                ParityRun::from_scout(&scout.result),
+                scout.manifest.recipe.data_hash.clone(),
+                scout.manifest.recipe.grammar_version.clone(),
+                scout.strategy_fingerprint,
+                evidence.broker_spec_hash.clone(),
+            )
+        };
+    let _ = (strategy_fingerprint, broker_spec_hash);
     let source = fs::read(&args.mq5)?;
     if quantforge_core::ContentHash::sha256(&source) != evidence.source_hash {
         return Err("MQL5 source hash does not match the evidence card".into());
@@ -3134,10 +3546,20 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
         && source_text.contains("g_trade.Sell(volume,_Symbol,0.0,stop,target");
     evidence.mandatory_stop_loss &= protective_calls;
     evidence.mandatory_take_profit &= protective_calls;
-    let reference = ParityRun::from_scout(&scout.result);
-    let external = load_mt5_tester_run(&args.mt5_deals, &args.mt5_equity, args.initial_balance)?;
     let mt5_metadata = load_mt5_tester_metadata(&args.mt5_metadata)?;
     mt5_metadata.validate_evidence(&evidence)?;
+    let broker_timezone = args.broker_timezone.clone().or_else(|| {
+        mt5_metadata
+            .properties
+            .get("broker_timezone")
+            .cloned()
+    });
+    let external = load_mt5_tester_run_in_timezone(
+        &args.mt5_deals,
+        &args.mt5_equity,
+        args.initial_balance,
+        broker_timezone.as_deref(),
+    )?;
     let tolerances = ParityTolerances {
         trade_count_relative: args.trade_count_relative,
         trade_count_absolute: args.trade_count_absolute,
@@ -3151,9 +3573,9 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
     let manifest = RunManifest::new(
         "parity",
         RunRecipe {
-            data_hash: scout.manifest.recipe.data_hash.clone(),
+            data_hash,
             broker_spec_hash: Some(evidence.broker_spec_hash.clone()),
-            grammar_version: scout.manifest.recipe.grammar_version.clone(),
+            grammar_version,
             seed: None,
             config: BTreeMap::from([
                 (
@@ -3167,6 +3589,14 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
                 (
                     "mt5_metadata".into(),
                     json!(display_path(&args.mt5_metadata)),
+                ),
+                (
+                    "broker_timezone".into(),
+                    json!(broker_timezone),
+                ),
+                (
+                    "reference_engine".into(),
+                    json!(reference.engine),
                 ),
                 (
                     "strategy_fingerprint".into(),
@@ -3480,7 +3910,9 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
     let manifest = RunManifest::new(
         "evolve",
         RunRecipe {
-            data_hash: Some(dataset.data_hash.clone()),
+            // Discovery is fitted against the persisted databank partition
+            // (IS when promotion splitting is enabled), not the full source.
+            data_hash: Some(bank.data_hash.clone()),
             broker_spec_hash: Some(bank.broker_spec_hash.clone()),
             grammar_version: Some(quantforge_discover::GRAMMAR_VERSION.into()),
             seed: Some(bank.config.seed),
@@ -3651,10 +4083,16 @@ fn verify_portfolio_databank(
 
 fn family_name(family: quantforge_discover::FamilyStyle) -> &'static str {
     match family {
-        quantforge_discover::FamilyStyle::Trend => "trend",
-        quantforge_discover::FamilyStyle::Momentum => "momentum",
-        quantforge_discover::FamilyStyle::Breakout => "breakout",
-        quantforge_discover::FamilyStyle::MeanReversion => "mean_reversion",
+        quantforge_discover::FamilyStyle::TrendPullback => "trend_pullback",
+        quantforge_discover::FamilyStyle::MomentumBurst => "momentum_burst",
+        quantforge_discover::FamilyStyle::DonchianBreakout => "donchian_breakout",
+        quantforge_discover::FamilyStyle::MeanReversionBand => "mean_reversion_band",
+        quantforge_discover::FamilyStyle::ZScoreReversion => "zscore_reversion",
+        quantforge_discover::FamilyStyle::SessionOrb => "session_orb",
+        quantforge_discover::FamilyStyle::ImpulseCandle => "impulse_candle",
+        quantforge_discover::FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
+        quantforge_discover::FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
+        quantforge_discover::FamilyStyle::SweepReclaim => "sweep_reclaim",
     }
 }
 
@@ -4027,6 +4465,11 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         tournament_size: args.tournament_size.unwrap_or(4),
         structural_mutation_probability: args.structural_mutation_probability.unwrap_or(0.18),
         seed: args.seed.unwrap_or(42),
+        search_family: parse_cli_search_family(&args.search_family)?,
+        run_mode: parse_cli_run_mode(&args.run_mode)?,
+        allow_cross_family_mutation: false,
+        early_stop_pot_elites: None,
+        trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: args.minimum_trades.unwrap_or(10),
             maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(40.0),
@@ -4042,7 +4485,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             minimum_return_drawdown: args.minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
-            minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.95),
+            minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.90),
         },
         oos1_expectancy_retention: 0.7,
         require_m1_precision: false,
@@ -4056,6 +4499,9 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_folds: 3,
         robustness_monte_carlo_trials: 250,
         robustness_neighborhood_samples: 8,
+        calendar_year_folds: true,
+        minimum_deflated_trade_sharpe: None,
+        multi_symbol_minimum_pass: 0,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
@@ -4076,7 +4522,7 @@ fn development_partition(
     sealed_fraction: f64,
 ) -> Result<BarDataset, Box<dyn Error>> {
     let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
-    Ok(slice_partition(dataset, 0, plan.development.bar_count)?)
+    slice_partition(dataset, 0, plan.development.bar_count)
 }
 
 fn oos1_partition(
@@ -4087,7 +4533,7 @@ fn oos1_partition(
     let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
     let start = plan.development.bar_count;
     let end = start + plan.validation.bar_count;
-    Ok(slice_partition(dataset, start, end)?)
+    slice_partition(dataset, start, end)
 }
 
 fn slice_partition(

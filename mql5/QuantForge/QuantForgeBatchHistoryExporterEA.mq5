@@ -3,7 +3,7 @@
 #property description "Non-trading, chunked IC Markets OHLCV and broker-metadata batch exporter for QuantForge."
 
 input string InpSymbols="AUDUSD,GBPUSD,GBPJPY,NZDUSD,EURJPY,EURNZD,EURGBP,USDJPY,USDCHF,US500,XAUUSD";
-input string InpTimeframes="M1,H1";
+input string InpTimeframes="M1,M15,H1";
 input datetime InpFrom=D'2020.01.01 00:00:00';
 input string InpOutputDirectory="QuantForge\\ICMarkets_EST7_2020_present";
 // IC Markets server wall time follows New York local time plus seven hours:
@@ -90,6 +90,8 @@ bool ParseTimeframe(string value,ENUM_TIMEFRAMES &period,string &label)
    value=Upper(Trimmed(value));
    if(value=="M1")
       period=PERIOD_M1;
+   else if(value=="M15")
+      period=PERIOD_M15;
    else if(value=="H1")
       period=PERIOD_H1;
    else

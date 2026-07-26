@@ -479,7 +479,12 @@ entries, market plus stop/limit entries with bar-based expiry, fixed/ATR/range
 placement and protective distances, fixed/ATR/R targets, break-even, R/ATR
 trailing stops, partial exits, time stops and broker-day flattening. Management
 updates use completed bars and become active at the next bar open in Scout,
-M1 Judge and generated MT5 code. Spread, slippage, commission-aware risk sizing,
+M1 Judge and generated MT5 code. Favorable extremes for BE/trail/partials are
+fill-aware: the entry bar/minute contributes only its close; later bars use
+high/low; pre-entry minutes are ignored (no OHLC path lookahead). Stop
+modifications that would already trigger at the new bar open are rejected
+(matching MT5 `PositionModify`), and entry/SL/TP prices are digit-normalized
+like MT5 `NormalizeDouble`. Spread, slippage, commission-aware risk sizing,
 conservative same-bar ambiguity, session gates, swap, trade blotters and
 mark-to-market equity remain aligned across the engines. MT5 reopen-price swap
 modes are still rejected because they require a different position-cost basis.

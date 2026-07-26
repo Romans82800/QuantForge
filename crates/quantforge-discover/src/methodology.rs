@@ -1,0 +1,779 @@
+//! Offline methodology factor grid: what keeps OOS1 expectancy across families.
+
+use crate::grammar::{family_entries_with_count, rng_for};
+use crate::model::{DiscoverError, SearchFamily};
+use crate::{FIXED_RISK_PER_TRADE, FROZEN_ATR_PERIOD, GRAMMAR_VERSION};
+use quantforge_broker::SymbolSpecification;
+use quantforge_core::STRATEGY_IR_VERSION;
+use quantforge_data::BarDataset;
+use quantforge_eval::{BacktestMetrics, ScoutConfig, evaluate_strategy};
+use quantforge_ir::{
+    EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy, ProtectiveStops, RiskPolicy,
+    Side, StopLossPolicy, StrategyIr, StrategyMeta, TakeProfitPolicy, TrailingPolicy,
+};
+use rand::Rng;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// Exit / entry-order recipe under test (orthogonal to Search Family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactorRecipe {
+    /// Market entry, time stop only (production simple-exits shape).
+    SimpleMarket,
+    /// Stop/limit pending entry, no BE/trail.
+    PendingEntry,
+    /// Market + break-even + trailing.
+    BreakEvenTrail,
+    /// Pending + break-even + trailing.
+    PendingManaged,
+}
+
+impl FactorRecipe {
+    pub const ALL: [Self; 4] = [
+        Self::SimpleMarket,
+        Self::PendingEntry,
+        Self::BreakEvenTrail,
+        Self::PendingManaged,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SimpleMarket => "simple_market",
+            Self::PendingEntry => "pending_entry",
+            Self::BreakEvenTrail => "break_even_trail",
+            Self::PendingManaged => "pending_managed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MethodologyGridConfig {
+    pub seed: u64,
+    pub draws_per_cell: usize,
+    pub atom_counts: Vec<usize>,
+    pub families: Vec<SearchFamily>,
+    pub recipes: Vec<FactorRecipe>,
+    pub scout: ScoutConfig,
+    /// Soft IS screen before counting a draw toward OOS stats.
+    pub minimum_trades: usize,
+    pub minimum_return_percent: f64,
+    pub minimum_profit_factor: f64,
+    pub maximum_drawdown_percent: f64,
+    pub oos1_retention: f64,
+}
+
+impl Default for MethodologyGridConfig {
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            draws_per_cell: 40,
+            atom_counts: vec![1, 2, 3],
+            families: SearchFamily::ALL.to_vec(),
+            recipes: FactorRecipe::ALL.to_vec(),
+            scout: ScoutConfig::default(),
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactorDraw {
+    pub family: SearchFamily,
+    pub recipe: FactorRecipe,
+    pub atom_count: usize,
+    pub entry_kind: String,
+    pub complexity: usize,
+    pub is_expectancy: f64,
+    pub oos1_expectancy: f64,
+    pub retention: Option<f64>,
+    pub is_trades: usize,
+    pub passed_is_screen: bool,
+    pub passed_oos1_pick: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactorCellSummary {
+    pub family: SearchFamily,
+    pub recipe: FactorRecipe,
+    pub atom_count: usize,
+    pub draws: usize,
+    pub screened: usize,
+    pub oos1_pass_rate: f64,
+    pub median_retention: Option<f64>,
+    pub median_oos1_expectancy: Option<f64>,
+    pub median_complexity: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactorContrast {
+    pub name: String,
+    pub baseline: String,
+    pub treatment: String,
+    pub baseline_n: usize,
+    pub treatment_n: usize,
+    pub baseline_median_retention: Option<f64>,
+    pub treatment_median_retention: Option<f64>,
+    pub retention_lift: Option<f64>,
+    pub baseline_oos1_pass_rate: f64,
+    pub treatment_oos1_pass_rate: f64,
+    pub pass_rate_lift: f64,
+    pub p_value: f64,
+    pub q_value: f64,
+    pub significant_fdr_10: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MethodologyReport {
+    pub grammar_version: String,
+    pub config: MethodologyGridConfig,
+    pub evaluations: usize,
+    pub draws: Vec<FactorDraw>,
+    pub cells: Vec<FactorCellSummary>,
+    pub contrasts: Vec<FactorContrast>,
+    pub recommendations: Vec<String>,
+}
+
+pub fn run_methodology_grid(
+    is_dataset: &BarDataset,
+    oos1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    config: MethodologyGridConfig,
+) -> Result<MethodologyReport, DiscoverError> {
+    if config.draws_per_cell == 0 {
+        return Err(DiscoverError::InvalidConfig(
+            "draws_per_cell must be > 0".into(),
+        ));
+    }
+    if config.atom_counts.is_empty() || config.families.is_empty() || config.recipes.is_empty() {
+        return Err(DiscoverError::InvalidConfig(
+            "methodology grid needs families, atom counts, and recipes".into(),
+        ));
+    }
+
+    let mut jobs = Vec::new();
+    for family in &config.families {
+        for &atom_count in &config.atom_counts {
+            for recipe in &config.recipes {
+                for draw in 0..config.draws_per_cell {
+                    jobs.push((*family, atom_count, *recipe, draw as u64));
+                }
+            }
+        }
+    }
+
+    let scout = config.scout.clone();
+    let seed = config.seed;
+    let draws: Vec<FactorDraw> = jobs
+        .into_par_iter()
+        .map(|(family, atom_count, recipe, draw)| {
+            let sequence = mix_sequence(family, atom_count, recipe, draw);
+            let prefer_stop = draw % 2 == 0;
+            let strategy =
+                build_factor_strategy(family, seed, sequence, atom_count, recipe, prefer_stop);
+            let entry_kind = entry_kind_label(&strategy.entry.order);
+            let complexity = strategy.complexity().score;
+            let is_result = evaluate_strategy(&strategy, is_dataset, broker, &scout);
+            let oos_result = evaluate_strategy(&strategy, oos1_dataset, broker, &scout);
+            match (is_result, oos_result) {
+                (Ok(is_run), Ok(oos_run)) => {
+                    let passed_is = passes_screen(
+                        &is_run.metrics,
+                        config.minimum_trades,
+                        config.minimum_return_percent,
+                        config.minimum_profit_factor,
+                        config.maximum_drawdown_percent,
+                    );
+                    let is_e = is_run.metrics.expectancy;
+                    let oos_e = oos_run.metrics.expectancy;
+                    let retention = (is_e > 0.0 && is_e.is_finite() && oos_e.is_finite())
+                        .then_some(oos_e / is_e);
+                    let passed_oos1 = passed_is
+                        && is_e > 0.0
+                        && oos_e > 0.0
+                        && retention.is_some_and(|value| value >= config.oos1_retention);
+                    FactorDraw {
+                        family,
+                        recipe,
+                        atom_count,
+                        entry_kind,
+                        complexity,
+                        is_expectancy: is_e,
+                        oos1_expectancy: oos_e,
+                        retention,
+                        is_trades: is_run.metrics.trade_count,
+                        passed_is_screen: passed_is,
+                        passed_oos1_pick: passed_oos1,
+                    }
+                }
+                _ => FactorDraw {
+                    family,
+                    recipe,
+                    atom_count,
+                    entry_kind,
+                    complexity,
+                    is_expectancy: f64::NAN,
+                    oos1_expectancy: f64::NAN,
+                    retention: None,
+                    is_trades: 0,
+                    passed_is_screen: false,
+                    passed_oos1_pick: false,
+                },
+            }
+        })
+        .collect();
+
+    let evaluations = draws.len() * 2;
+    let cells = summarize_cells(&draws, &config);
+    let mut contrasts = build_contrasts(&draws);
+    apply_benjamini_hochberg(&mut contrasts, 0.10);
+    let recommendations = recommend(&cells, &contrasts);
+
+    Ok(MethodologyReport {
+        grammar_version: GRAMMAR_VERSION.into(),
+        config,
+        evaluations,
+        draws,
+        cells,
+        contrasts,
+        recommendations,
+    })
+}
+
+fn mix_sequence(family: SearchFamily, atom_count: usize, recipe: FactorRecipe, draw: u64) -> u64 {
+    let family_i = SearchFamily::ALL
+        .iter()
+        .position(|value| *value == family)
+        .unwrap_or(0) as u64;
+    let recipe_i = FactorRecipe::ALL
+        .iter()
+        .position(|value| *value == recipe)
+        .unwrap_or(0) as u64;
+    family_i
+        .wrapping_mul(1_000_003)
+        .wrapping_add((atom_count as u64).wrapping_mul(10_007))
+        .wrapping_add(recipe_i.wrapping_mul(97))
+        .wrapping_add(draw)
+}
+
+fn build_factor_strategy(
+    family: SearchFamily,
+    seed: u64,
+    sequence: u64,
+    atom_count: usize,
+    recipe: FactorRecipe,
+    prefer_stop: bool,
+) -> StrategyIr {
+    let mut rng = rng_for(seed, 17, sequence);
+    let (long, short) = family_entries_with_count(family, &mut rng, atom_count);
+    let order = match recipe {
+        FactorRecipe::SimpleMarket | FactorRecipe::BreakEvenTrail => EntryOrderPolicy::Market,
+        FactorRecipe::PendingEntry | FactorRecipe::PendingManaged => {
+            let distance = EntryDistancePolicy::AtrMultiple {
+                period: FROZEN_ATR_PERIOD,
+                multiplier: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5][rng.gen_range(0..6)],
+            };
+            let expiry_bars = rng.gen_range(2..=8);
+            if prefer_stop {
+                EntryOrderPolicy::Stop {
+                    distance,
+                    expiry_bars,
+                }
+            } else {
+                EntryOrderPolicy::Limit {
+                    distance,
+                    expiry_bars,
+                }
+            }
+        }
+    };
+    let manage = match recipe {
+        FactorRecipe::SimpleMarket | FactorRecipe::PendingEntry => ManagePolicy {
+            time_stop_bars: Some(rng.gen_range(4..=16)),
+            break_even_at_r: None,
+            trailing: None,
+            partial_exits: Vec::new(),
+            flatten_end_of_day: false,
+            max_one_entry_per_day: true,
+        },
+        FactorRecipe::BreakEvenTrail | FactorRecipe::PendingManaged => ManagePolicy {
+            time_stop_bars: Some(rng.gen_range(4..=16)),
+            break_even_at_r: Some(1.0),
+            trailing: Some(TrailingPolicy::RiskMultiple {
+                activate_at_r: 1.5,
+                distance_r: 1.0,
+            }),
+            partial_exits: Vec::new(),
+            flatten_end_of_day: false,
+            max_one_entry_per_day: true,
+        },
+    };
+    let atr_stop = 1.0 + (rng.gen_range(0..9) as f64) * 0.25;
+    let risk_tp = 1.0 + (rng.gen_range(0..9) as f64) * 0.25;
+    let mut strategy = StrategyIr {
+        id: format!(
+            "method-{}-a{}-{}-{sequence}",
+            family.label(),
+            atom_count,
+            recipe.label()
+        ),
+        version: STRATEGY_IR_VERSION,
+        entry: EntrySignals {
+            long: Some(long),
+            short: Some(short),
+            order,
+        },
+        exit: None,
+        filters: Vec::new(),
+        side: Side::Both,
+        risk: RiskPolicy::FixedCurrency {
+            amount: FIXED_RISK_PER_TRADE,
+        },
+        stops: ProtectiveStops {
+            stop_loss: StopLossPolicy::AtrMultiple {
+                period: FROZEN_ATR_PERIOD,
+                multiplier: atr_stop.clamp(1.0, 4.0),
+            },
+            take_profit: TakeProfitPolicy::RiskMultiple {
+                multiple: risk_tp.clamp(1.0, 4.0),
+            },
+        },
+        manage,
+        meta: StrategyMeta {
+            thesis_hint: family.label().into(),
+            complexity: 0,
+            export_safe: true,
+        },
+    };
+    strategy.meta.complexity = strategy.complexity().score.min(u16::MAX as usize) as u16;
+    strategy
+}
+
+fn passes_screen(
+    metrics: &BacktestMetrics,
+    minimum_trades: usize,
+    minimum_return_percent: f64,
+    minimum_profit_factor: f64,
+    maximum_drawdown_percent: f64,
+) -> bool {
+    let pf = metrics.profit_factor.unwrap_or(if metrics.net_profit > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    });
+    metrics.trade_count >= minimum_trades
+        && metrics.return_percent > minimum_return_percent
+        && pf >= minimum_profit_factor
+        && metrics.max_drawdown_percent <= maximum_drawdown_percent
+}
+
+fn summarize_cells(draws: &[FactorDraw], config: &MethodologyGridConfig) -> Vec<FactorCellSummary> {
+    let mut cells = Vec::new();
+    for family in &config.families {
+        for &atom_count in &config.atom_counts {
+            for recipe in &config.recipes {
+                let group: Vec<&FactorDraw> = draws
+                    .iter()
+                    .filter(|draw| {
+                        draw.family == *family
+                            && draw.recipe == *recipe
+                            && draw.atom_count == atom_count
+                    })
+                    .collect();
+                let screened: Vec<&FactorDraw> = group
+                    .iter()
+                    .copied()
+                    .filter(|draw| draw.passed_is_screen)
+                    .collect();
+                let retentions: Vec<f64> = screened.iter().filter_map(|draw| draw.retention).collect();
+                let oos_values: Vec<f64> = screened
+                    .iter()
+                    .map(|draw| draw.oos1_expectancy)
+                    .filter(|value| value.is_finite())
+                    .collect();
+                let complexities: Vec<f64> =
+                    screened.iter().map(|draw| draw.complexity as f64).collect();
+                let oos_pass = if screened.is_empty() {
+                    0.0
+                } else {
+                    screened.iter().filter(|draw| draw.passed_oos1_pick).count() as f64
+                        / screened.len() as f64
+                };
+                cells.push(FactorCellSummary {
+                    family: *family,
+                    recipe: *recipe,
+                    atom_count,
+                    draws: group.len(),
+                    screened: screened.len(),
+                    oos1_pass_rate: oos_pass,
+                    median_retention: median(&retentions),
+                    median_oos1_expectancy: median(&oos_values),
+                    median_complexity: median(&complexities),
+                });
+            }
+        }
+    }
+    cells.sort_by(|left, right| {
+        right
+            .oos1_pass_rate
+            .total_cmp(&left.oos1_pass_rate)
+            .then_with(|| {
+                right
+                    .median_retention
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&left.median_retention.unwrap_or(f64::NEG_INFINITY))
+            })
+    });
+    cells
+}
+
+fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
+    let screened: Vec<&FactorDraw> = draws
+        .iter()
+        .filter(|draw| draw.passed_is_screen && draw.retention.is_some())
+        .collect();
+    let mut contrasts = Vec::new();
+
+    // Recipe vs simple_market (pooled across families/atoms).
+    let baseline: Vec<f64> = screened
+        .iter()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket)
+        .filter_map(|draw| draw.retention)
+        .collect();
+    let baseline_pass = pass_rate(
+        &screened
+            .iter()
+            .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+    for recipe in FactorRecipe::ALL
+        .iter()
+        .copied()
+        .filter(|recipe| *recipe != FactorRecipe::SimpleMarket)
+    {
+        let treatment: Vec<f64> = screened
+            .iter()
+            .filter(|draw| draw.recipe == recipe)
+            .filter_map(|draw| draw.retention)
+            .collect();
+        let treatment_rows: Vec<&FactorDraw> = screened
+            .iter()
+            .copied()
+            .filter(|draw| draw.recipe == recipe)
+            .collect();
+        contrasts.push(contrast(
+            format!("recipe:{} vs simple_market", recipe.label()),
+            "simple_market",
+            recipe.label(),
+            &baseline,
+            &treatment,
+            baseline_pass,
+            pass_rate(&treatment_rows),
+        ));
+    }
+
+    // Atom count 2/3 vs 1 on simple_market only (clean complexity signal).
+    let atom1: Vec<f64> = screened
+        .iter()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == 1)
+        .filter_map(|draw| draw.retention)
+        .collect();
+    let atom1_rows: Vec<&FactorDraw> = screened
+        .iter()
+        .copied()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == 1)
+        .collect();
+    for atoms in [2usize, 3] {
+        let treatment: Vec<f64> = screened
+            .iter()
+            .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == atoms)
+            .filter_map(|draw| draw.retention)
+            .collect();
+        let treatment_rows: Vec<&FactorDraw> = screened
+            .iter()
+            .copied()
+            .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == atoms)
+            .collect();
+        contrasts.push(contrast(
+            format!("atoms:{atoms} vs 1 (simple_market)"),
+            "atoms=1",
+            &format!("atoms={atoms}"),
+            &atom1,
+            &treatment,
+            pass_rate(&atom1_rows),
+            pass_rate(&treatment_rows),
+        ));
+    }
+
+    // High vs low complexity terciles on simple_market.
+    let mut simple: Vec<&FactorDraw> = screened
+        .iter()
+        .copied()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket)
+        .collect();
+    if simple.len() >= 12 {
+        simple.sort_by_key(|draw| draw.complexity);
+        let third = simple.len() / 3;
+        let low = &simple[..third];
+        let high = &simple[simple.len() - third..];
+        let low_r: Vec<f64> = low.iter().filter_map(|draw| draw.retention).collect();
+        let high_r: Vec<f64> = high.iter().filter_map(|draw| draw.retention).collect();
+        contrasts.push(contrast(
+            "complexity:high vs low tercile (simple_market)".into(),
+            "low_complexity",
+            "high_complexity",
+            &low_r,
+            &high_r,
+            pass_rate(low),
+            pass_rate(high),
+        ));
+    }
+
+    // Pending stop vs limit (pooled pending recipes).
+    let stop: Vec<f64> = screened
+        .iter()
+        .filter(|draw| {
+            draw.entry_kind == "stop"
+                && matches!(
+                    draw.recipe,
+                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
+                )
+        })
+        .filter_map(|draw| draw.retention)
+        .collect();
+    let stop_rows: Vec<&FactorDraw> = screened
+        .iter()
+        .copied()
+        .filter(|draw| {
+            draw.entry_kind == "stop"
+                && matches!(
+                    draw.recipe,
+                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
+                )
+        })
+        .collect();
+    let limit: Vec<f64> = screened
+        .iter()
+        .filter(|draw| {
+            draw.entry_kind == "limit"
+                && matches!(
+                    draw.recipe,
+                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
+                )
+        })
+        .filter_map(|draw| draw.retention)
+        .collect();
+    let limit_rows: Vec<&FactorDraw> = screened
+        .iter()
+        .copied()
+        .filter(|draw| {
+            draw.entry_kind == "limit"
+                && matches!(
+                    draw.recipe,
+                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
+                )
+        })
+        .collect();
+    contrasts.push(contrast(
+        "pending:stop vs limit".into(),
+        "limit",
+        "stop",
+        &limit,
+        &stop,
+        pass_rate(&limit_rows),
+        pass_rate(&stop_rows),
+    ));
+
+    contrasts
+}
+
+fn entry_kind_label(order: &EntryOrderPolicy) -> String {
+    match order {
+        EntryOrderPolicy::Market => "market".into(),
+        EntryOrderPolicy::Stop { .. } => "stop".into(),
+        EntryOrderPolicy::Limit { .. } => "limit".into(),
+    }
+}
+
+fn contrast(
+    name: String,
+    baseline_label: &str,
+    treatment_label: &str,
+    baseline: &[f64],
+    treatment: &[f64],
+    baseline_pass: f64,
+    treatment_pass: f64,
+) -> FactorContrast {
+    let baseline_median = median(baseline);
+    let treatment_median = median(treatment);
+    let retention_lift = match (baseline_median, treatment_median) {
+        (Some(base), Some(treat)) => Some(treat - base),
+        _ => None,
+    };
+    FactorContrast {
+        name,
+        baseline: baseline_label.into(),
+        treatment: treatment_label.into(),
+        baseline_n: baseline.len(),
+        treatment_n: treatment.len(),
+        baseline_median_retention: baseline_median,
+        treatment_median_retention: treatment_median,
+        retention_lift,
+        baseline_oos1_pass_rate: baseline_pass,
+        treatment_oos1_pass_rate: treatment_pass,
+        pass_rate_lift: treatment_pass - baseline_pass,
+        p_value: mann_whitney_p(baseline, treatment),
+        q_value: 1.0,
+        significant_fdr_10: false,
+    }
+}
+
+fn pass_rate(rows: &[&FactorDraw]) -> f64 {
+    if rows.is_empty() {
+        0.0
+    } else {
+        rows.iter().filter(|draw| draw.passed_oos1_pick).count() as f64 / rows.len() as f64
+    }
+}
+
+fn recommend(cells: &[FactorCellSummary], contrasts: &[FactorContrast]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(best) = cells.iter().find(|cell| cell.screened >= 5) {
+        lines.push(format!(
+            "Best cell: {} · {} · atoms={} · OOS1 pass {:.0}% · median retention {}",
+            best.family.label(),
+            best.recipe.label(),
+            best.atom_count,
+            best.oos1_pass_rate * 100.0,
+            best.median_retention
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".into())
+        ));
+    }
+    for contrast in contrasts.iter().filter(|contrast| contrast.significant_fdr_10) {
+        lines.push(format!(
+            "FDR≤10%: {} (retention lift {:+.3}, pass lift {:+.1}pp, q={:.3})",
+            contrast.name,
+            contrast.retention_lift.unwrap_or(0.0),
+            contrast.pass_rate_lift * 100.0,
+            contrast.q_value
+        ));
+    }
+    if !contrasts.iter().any(|contrast| contrast.significant_fdr_10) {
+        lines.push(
+            "No factor contrast survived FDR 10% — prefer simplest production recipe (simple_market) unless a family cell clearly dominates."
+                .into(),
+        );
+    }
+    let family_ranks = rank_families(cells);
+    if !family_ranks.is_empty() {
+        lines.push(format!(
+            "Family ranking by mean OOS1 pass (screened cells): {}",
+            family_ranks.join(" > ")
+        ));
+    }
+    lines
+}
+
+fn rank_families(cells: &[FactorCellSummary]) -> Vec<String> {
+    let mut scores: Vec<(SearchFamily, f64, usize)> = SearchFamily::ALL
+        .iter()
+        .map(|family| {
+            let rows: Vec<&FactorCellSummary> = cells
+                .iter()
+                .filter(|cell| cell.family == *family && cell.screened > 0)
+                .collect();
+            let mean = if rows.is_empty() {
+                0.0
+            } else {
+                rows.iter().map(|cell| cell.oos1_pass_rate).sum::<f64>() / rows.len() as f64
+            };
+            (*family, mean, rows.iter().map(|cell| cell.screened).sum())
+        })
+        .collect();
+    scores.sort_by(|left, right| right.1.total_cmp(&left.1));
+    scores
+        .into_iter()
+        .filter(|(_, _, screened)| *screened > 0)
+        .take(5)
+        .map(|(family, mean, _)| format!("{} ({:.0}%)", family.label(), mean * 100.0))
+        .collect()
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
+/// Two-sided Mann–Whitney U via normal approximation (with tie correction omitted for speed).
+fn mann_whitney_p(left: &[f64], right: &[f64]) -> f64 {
+    let n1 = left.len() as f64;
+    let n2 = right.len() as f64;
+    if left.is_empty() || right.is_empty() || (n1 + n2) < 8.0 {
+        return 1.0;
+    }
+    let mut ranks = Vec::with_capacity(left.len() + right.len());
+    ranks.extend(left.iter().map(|value| (*value, 0u8)));
+    ranks.extend(right.iter().map(|value| (*value, 1u8)));
+    ranks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut u1 = 0.0;
+    for (rank_index, (_, group)) in ranks.iter().enumerate() {
+        if *group == 0 {
+            u1 += (rank_index + 1) as f64;
+        }
+    }
+    u1 -= n1 * (n1 + 1.0) / 2.0;
+    let mean = n1 * n2 / 2.0;
+    let var = n1 * n2 * (n1 + n2 + 1.0) / 12.0;
+    if var <= 0.0 {
+        return 1.0;
+    }
+    let z = ((u1 - mean).abs() - 0.5) / var.sqrt();
+    // erfc approximation for two-sided normal p
+    2.0 * norm_sf(z)
+}
+
+fn norm_sf(z: f64) -> f64 {
+    // Abramowitz & Stegun 7.1.26 erfc approximation on z/sqrt(2)
+    let x = z / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736
+                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let erfc = poly * (-x * x).exp();
+    (erfc / 2.0).clamp(0.0, 1.0)
+}
+
+fn apply_benjamini_hochberg(contrasts: &mut [FactorContrast], q: f64) {
+    let mut order: Vec<usize> = (0..contrasts.len()).collect();
+    order.sort_by(|&left, &right| contrasts[left].p_value.total_cmp(&contrasts[right].p_value));
+    let m = order.len().max(1) as f64;
+    let mut prev = 1.0_f64;
+    for (i, &index) in order.iter().enumerate().rev() {
+        let rank = (i + 1) as f64;
+        let bh = (contrasts[index].p_value * m / rank).min(prev);
+        prev = bh;
+        contrasts[index].q_value = bh;
+        contrasts[index].significant_fdr_10 = bh <= q;
+    }
+}

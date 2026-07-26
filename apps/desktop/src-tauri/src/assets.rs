@@ -73,7 +73,7 @@ fn save_library(app: &AppHandle, library: &AssetLibrary) -> Result<(), String> {
     payload.schema_version = 1;
     payload
         .assets
-        .sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+        .sort_by_key(|asset| asset.name.to_ascii_lowercase());
     let bytes = serde_json::to_vec_pretty(&payload)
         .map_err(|error| format!("cannot serialize asset library: {error}"))?;
     fs::write(&path, bytes).map_err(|error| format!("cannot write asset library: {error}"))
@@ -233,7 +233,7 @@ pub fn upsert_asset(app: AppHandle, asset: AssetProfile) -> Result<Vec<AssetProf
         next.id = format!(
             "{}-{}",
             slug(&next.name),
-            &chrono::Utc::now().timestamp_millis().to_string()
+            chrono::Utc::now().timestamp_millis()
         );
     }
     next.name = next.name.trim().to_owned();

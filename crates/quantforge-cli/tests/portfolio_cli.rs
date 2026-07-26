@@ -1,4 +1,5 @@
 use quantforge_broker::{DayOfWeek, FillingMode, SwapMode, SymbolSpecification, TradeMode};
+use quantforge_discover::{Elite, niche_label};
 use quantforge_portfolio::{PORTFOLIO_PROTOCOL_VERSION, PortfolioReport};
 use quantforge_storage::RunManifest;
 use serde::Deserialize;
@@ -50,13 +51,14 @@ fn write_market_data(path: &Path, count: usize) {
         "<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>\n",
     );
     for index in 0..count {
-        let hour = index / 60;
+        let day = 8 + index / 1_440;
+        let hour = (index / 60) % 24;
         let minute = index % 60;
         let cycle = (index % 40) as f64;
         let open = 100.0 + index as f64 * 0.2 + (cycle - 20.0).abs() * 0.05;
         writeln!(
             output,
-            "2024.01.08\t{hour:02}:{minute:02}:00\t{open:.4}\t{:.4}\t{:.4}\t{:.4}\t100\t0\t0",
+            "2024.01.{day:02}\t{hour:02}:{minute:02}:00\t{open:.4}\t{:.4}\t{:.4}\t{:.4}\t100\t0\t0",
             open + 0.4,
             open - 0.4,
             open + if index % 2 == 0 { 0.15 } else { -0.10 }
@@ -89,7 +91,7 @@ fn portfolio_cli_packs_a_real_databank_and_refuses_overwrite() {
     let broker_path = directory.path().join("broker.json");
     let databank = directory.path().join("databank.json");
     let portfolio = directory.path().join("portfolio.json");
-    write_market_data(&data, 500);
+    write_market_data(&data, 3_000);
     fs::write(&broker_path, serde_json::to_vec_pretty(&broker()).unwrap()).unwrap();
 
     assert_success(&run(&[
@@ -122,8 +124,23 @@ fn portfolio_cli_packs_a_real_databank_and_refuses_overwrite() {
         "0",
         "--initial-balance",
         "100",
+        "--promotion-split",
+        "false",
     ]));
-
+    // This test exercises portfolio packaging, not the independent parameter
+    // neighborhood gate. Promote one structurally valid pot member so the
+    // fixture remains deterministic as Discover's robustness battery evolves.
+    let mut evolved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&databank).unwrap()).unwrap();
+    let elite: Elite =
+        serde_json::from_value(evolved["databank"]["accepted_pool"][0].clone()).unwrap();
+    let niche = niche_label(&elite.niche);
+    evolved["databank"]["elites"] = serde_json::json!([elite.clone()]);
+    evolved["databank"]["coverage_map"] =
+        serde_json::json!({ niche: elite.structural_fingerprint });
+    evolved["coverage"] = serde_json::json!(1);
+    evolved["qd_score"] = serde_json::json!(elite.evidence.total.max(0.0));
+    fs::write(&databank, serde_json::to_vec_pretty(&evolved).unwrap()).unwrap();
     let portfolio_args = [
         "portfolio",
         databank.to_str().unwrap(),

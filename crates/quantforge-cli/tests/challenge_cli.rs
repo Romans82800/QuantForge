@@ -231,8 +231,8 @@ fn challenge_and_one_shot_sealed_final_form_a_machine_readable_sequence() {
     );
     let candidate_directory = fs::read_dir(&sealed_root)
         .unwrap()
-        .next()
-        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.file_type().unwrap().is_dir())
         .unwrap()
         .path();
     let files: Vec<_> = fs::read_dir(&candidate_directory)

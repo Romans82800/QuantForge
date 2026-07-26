@@ -15,6 +15,8 @@ import type {
   DiscoverJobView,
   DiscoverRequest,
   EliteDetail,
+  FamilyBakeoffReport,
+  FamilyBakeoffRequest,
   ExportRequest,
   ExportView,
   FidelityDemoRequest,
@@ -147,6 +149,10 @@ export function inspectData(request: DataLabRequest): Promise<DataLabView> {
 
 export function startDiscover(request: DiscoverRequest): Promise<DiscoverJobView> {
   return invoke<DiscoverJobView>("start_discover", { request });
+}
+
+export function runFamilyBakeoff(request: FamilyBakeoffRequest): Promise<FamilyBakeoffReport> {
+  return invoke<FamilyBakeoffReport>("run_family_bakeoff", { request });
 }
 
 export function getDiscoverJob(): Promise<DiscoverJobView> {

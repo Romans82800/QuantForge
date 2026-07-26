@@ -1,5 +1,5 @@
 use crate::model::EvalError;
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, NaiveDate, Timelike};
 use quantforge_broker::BrokerClock;
 use quantforge_data::Bar;
 use quantforge_ir::{BoolExpr, ComparisonOp, ContextValue, IndicatorExpr, NumericExpr, PriceField};
@@ -171,7 +171,8 @@ impl<'a> FeatureCache<'a> {
         };
         let key = serde_json::to_string(indicator)?;
         if !self.indicators.contains_key(&key) {
-            let values = calculate_indicator_series(self.bars, indicator);
+            let values =
+                calculate_indicator_series_with_clock(self.bars, indicator, Some(&self.broker_clock));
             self.indicators.insert(key.clone(), values);
         }
         Ok(self.indicators[&key]
@@ -187,6 +188,7 @@ trait IndicatorEvalFields {
 
 impl IndicatorEvalFields for IndicatorExpr {
     fn period_and_shift_for_eval(&self) -> (u16, u16) {
+        // Mirror IndicatorExpr::period_and_shift validation ladder.
         match *self {
             Self::Sma { period, shift, .. }
             | Self::Ema { period, shift, .. }
@@ -200,7 +202,38 @@ impl IndicatorEvalFields for IndicatorExpr {
             | Self::StandardDeviation { period, shift, .. }
             | Self::ZScore { period, shift, .. }
             | Self::PercentileInRange { period, shift, .. }
-            | Self::RateOfChange { period, shift, .. } => (period, shift),
+            | Self::RateOfChange { period, shift, .. }
+            | Self::LiquiditySweepScore { period, shift } => (period, shift),
+            Self::SessionRangeHigh {
+                range_bars, shift, ..
+            }
+            | Self::SessionRangeLow {
+                range_bars, shift, ..
+            } => (range_bars.max(2), shift),
+            Self::BodyRangeRatio { shift } | Self::CloseLocationInBar { shift } => (2, shift),
+            Self::AtrPercentile {
+                atr_period,
+                lookback,
+                shift,
+            } => (atr_period.max(lookback).max(2), shift),
+            Self::SwingBaseZoneHigh {
+                swing_left,
+                swing_right,
+                base_bars,
+                shift,
+            }
+            | Self::SwingBaseZoneLow {
+                swing_left,
+                swing_right,
+                base_bars,
+                shift,
+            } => (
+                swing_left
+                    .saturating_add(swing_right)
+                    .saturating_add(base_bars)
+                    .max(2),
+                shift,
+            ),
         }
     }
 }
@@ -228,7 +261,17 @@ fn source_series(bars: &[Bar], field: PriceField) -> Vec<f64> {
 /// `IndicatorExpr` is deliberately not applied here: shift is a lookup concern
 /// in both Scout and MQL5, while this function exposes the underlying buffer for
 /// numerical parity tests.
+///
+/// Session-range indicators require a broker clock; without one they return NaN.
 pub fn calculate_indicator_series(bars: &[Bar], indicator: &IndicatorExpr) -> Vec<f64> {
+    calculate_indicator_series_with_clock(bars, indicator, None)
+}
+
+pub fn calculate_indicator_series_with_clock(
+    bars: &[Bar],
+    indicator: &IndicatorExpr,
+    clock: Option<&BrokerClock>,
+) -> Vec<f64> {
     match *indicator {
         IndicatorExpr::Sma { source, period, .. } => {
             rolling_mean(&source_series(bars, source), period as usize)
@@ -305,7 +348,249 @@ pub fn calculate_indicator_series(bars: &[Bar], indicator: &IndicatorExpr) -> Ve
             }
             output
         }
+        IndicatorExpr::SessionRangeHigh {
+            start_hour,
+            range_bars,
+            ..
+        } => session_range_series(bars, clock, start_hour, range_bars as usize, true),
+        IndicatorExpr::SessionRangeLow {
+            start_hour,
+            range_bars,
+            ..
+        } => session_range_series(bars, clock, start_hour, range_bars as usize, false),
+        IndicatorExpr::BodyRangeRatio { .. } => bars
+            .iter()
+            .map(|bar| {
+                let range = bar.high - bar.low;
+                if range > 0.0 {
+                    (bar.close - bar.open).abs() / range
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+        IndicatorExpr::CloseLocationInBar { .. } => bars
+            .iter()
+            .map(|bar| {
+                let range = bar.high - bar.low;
+                if range > 0.0 {
+                    (bar.close - bar.low) / range
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+        IndicatorExpr::AtrPercentile {
+            atr_period,
+            lookback,
+            ..
+        } => atr_percentile_series(bars, atr_period as usize, lookback as usize),
+        IndicatorExpr::SwingBaseZoneHigh {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        } => swing_base_zone_series(
+            bars,
+            swing_left as usize,
+            swing_right as usize,
+            base_bars as usize,
+            true,
+        ),
+        IndicatorExpr::SwingBaseZoneLow {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        } => swing_base_zone_series(
+            bars,
+            swing_left as usize,
+            swing_right as usize,
+            base_bars as usize,
+            false,
+        ),
+        IndicatorExpr::LiquiditySweepScore { period, .. } => {
+            liquidity_sweep_score_series(bars, period as usize)
+        }
     }
+}
+
+fn session_range_series(
+    bars: &[Bar],
+    clock: Option<&BrokerClock>,
+    start_hour: u8,
+    range_bars: usize,
+    high: bool,
+) -> Vec<f64> {
+    let mut output = vec![f64::NAN; bars.len()];
+    let Some(clock) = clock else {
+        return output;
+    };
+    if range_bars == 0 {
+        return output;
+    }
+    let mut day_cursor: Option<NaiveDate> = None;
+    let mut window_start: Option<usize> = None;
+    let mut frozen: Option<f64> = None;
+    for (index, bar) in bars.iter().enumerate() {
+        let Ok(local) = clock.local_datetime(bar.timestamp_ms) else {
+            output[index] = frozen.unwrap_or(f64::NAN);
+            continue;
+        };
+        let day = local.date();
+        if day_cursor != Some(day) {
+            day_cursor = Some(day);
+            window_start = None;
+            frozen = None;
+        }
+        if window_start.is_none() && local.hour() as u8 >= start_hour {
+            window_start = Some(index);
+        }
+        if let Some(start) = window_start {
+            let end = start + range_bars - 1;
+            if index < end {
+                output[index] = f64::NAN;
+            } else if index == end || frozen.is_none() {
+                let slice = &bars[start..=end.min(index).min(bars.len() - 1)];
+                if slice.len() >= range_bars {
+                    let window = &bars[start..start + range_bars];
+                    frozen = Some(if high {
+                        window
+                            .iter()
+                            .map(|bar| bar.high)
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    } else {
+                        window
+                            .iter()
+                            .map(|bar| bar.low)
+                            .fold(f64::INFINITY, f64::min)
+                    });
+                }
+                output[index] = frozen.unwrap_or(f64::NAN);
+            } else {
+                output[index] = frozen.unwrap_or(f64::NAN);
+            }
+        } else {
+            output[index] = f64::NAN;
+        }
+    }
+    output
+}
+
+fn atr_percentile_series(bars: &[Bar], atr_period: usize, lookback: usize) -> Vec<f64> {
+    let atr_values = atr(bars, atr_period);
+    let mut output = vec![f64::NAN; bars.len()];
+    if lookback == 0 {
+        return output;
+    }
+    for index in 0..bars.len() {
+        if index + 1 < lookback || !atr_values[index].is_finite() {
+            continue;
+        }
+        let start = index + 1 - lookback;
+        let window = &atr_values[start..=index];
+        let current = atr_values[index];
+        let mut finite: Vec<f64> = window
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        if finite.is_empty() {
+            continue;
+        }
+        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = finite
+            .iter()
+            .filter(|value| **value <= current)
+            .count();
+        output[index] = rank as f64 / finite.len() as f64 * 100.0;
+    }
+    output
+}
+
+fn swing_base_zone_series(
+    bars: &[Bar],
+    swing_left: usize,
+    swing_right: usize,
+    base_bars: usize,
+    zone_high: bool,
+) -> Vec<f64> {
+    let mut output = vec![f64::NAN; bars.len()];
+    if swing_left == 0 || swing_right == 0 || base_bars == 0 {
+        return output;
+    }
+    let mut last_zone = f64::NAN;
+    for (index, output_value) in output.iter_mut().enumerate() {
+        // Pivot at p is confirmed once we have `swing_right` bars after it.
+        if index >= swing_right {
+            let pivot = index - swing_right;
+            if pivot >= swing_left {
+                let is_swing_low = (1..=swing_left).all(|offset| {
+                    bars[pivot].low <= bars[pivot - offset].low
+                }) && (1..=swing_right).all(|offset| {
+                    bars[pivot].low < bars[pivot + offset].low
+                });
+                let is_swing_high = (1..=swing_left).all(|offset| {
+                    bars[pivot].high >= bars[pivot - offset].high
+                }) && (1..=swing_right).all(|offset| {
+                    bars[pivot].high > bars[pivot + offset].high
+                });
+                // Demand base follows swing low; supply base follows swing high.
+                let use_pivot = if zone_high {
+                    is_swing_low
+                } else {
+                    is_swing_high
+                };
+                if use_pivot {
+                    let base_start = pivot + 1;
+                    let base_end = base_start + base_bars - 1;
+                    if base_end < bars.len() && base_end <= index {
+                        let window = &bars[base_start..=base_end];
+                        last_zone = if zone_high {
+                            window
+                                .iter()
+                                .map(|bar| bar.high)
+                                .fold(f64::NEG_INFINITY, f64::max)
+                        } else {
+                            window
+                                .iter()
+                                .map(|bar| bar.low)
+                                .fold(f64::INFINITY, f64::min)
+                        };
+                    }
+                }
+            }
+        }
+        *output_value = last_zone;
+    }
+    output
+}
+
+fn liquidity_sweep_score_series(bars: &[Bar], period: usize) -> Vec<f64> {
+    let mut output = vec![0.0; bars.len()];
+    if period == 0 {
+        return output;
+    }
+    for index in period..bars.len() {
+        let window = &bars[index - period..index];
+        let prior_high = window
+            .iter()
+            .map(|bar| bar.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let prior_low = window
+            .iter()
+            .map(|bar| bar.low)
+            .fold(f64::INFINITY, f64::min);
+        let bar = &bars[index];
+        if bar.low < prior_low && bar.close > prior_low {
+            output[index] = 1.0;
+        } else if bar.high > prior_high && bar.close < prior_high {
+            output[index] = -1.0;
+        } else {
+            output[index] = 0.0;
+        }
+    }
+    output
 }
 
 fn rolling_mean(values: &[f64], period: usize) -> Vec<f64> {
@@ -526,5 +811,128 @@ mod tests {
         assert!(values[0].is_nan());
         assert_eq!(values[1], 2.5);
         assert_eq!(values[2], 2.0);
+    }
+
+    #[test]
+    fn body_range_and_close_location_use_completed_candle_geometry() {
+        let bars = vec![Bar {
+            timestamp_ms: 0,
+            open: 10.0,
+            high: 14.0,
+            low: 8.0,
+            close: 13.0,
+            tick_volume: 0,
+            real_volume: 0,
+            spread_points: Some(0),
+        }];
+        let body = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::BodyRangeRatio { shift: 1 },
+        );
+        let location = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::CloseLocationInBar { shift: 1 },
+        );
+        assert_eq!(body[0], 0.5);
+        assert!((location[0] - 5.0 / 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn liquidity_sweep_score_marks_wick_beyond_prior_extreme() {
+        let bars = vec![
+            Bar {
+                timestamp_ms: 0,
+                open: 10.0,
+                high: 11.0,
+                low: 9.0,
+                close: 10.0,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 60_000,
+                open: 10.0,
+                high: 10.5,
+                low: 9.5,
+                close: 10.2,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 120_000,
+                open: 10.0,
+                high: 10.2,
+                low: 8.5,
+                close: 9.6,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+        ];
+        let scores = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::LiquiditySweepScore {
+                period: 2,
+                shift: 1,
+            },
+        );
+        assert_eq!(scores[0], 0.0);
+        assert_eq!(scores[1], 0.0);
+        assert_eq!(scores[2], 1.0);
+    }
+
+    #[test]
+    fn session_range_holds_after_opening_window() {
+        let clock = BrokerClock::parse("Etc/UTC").unwrap();
+        // 10:00, 11:00, 12:00 UTC on the same day.
+        let base = chrono::DateTime::parse_from_rfc3339("2024-01-02T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let bars = vec![
+            Bar {
+                timestamp_ms: base,
+                open: 1.0,
+                high: 2.0,
+                low: 0.5,
+                close: 1.5,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: base + 3_600_000,
+                open: 1.5,
+                high: 3.0,
+                low: 1.0,
+                close: 2.5,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: base + 7_200_000,
+                open: 2.5,
+                high: 2.8,
+                low: 2.0,
+                close: 2.2,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+        ];
+        let highs = calculate_indicator_series_with_clock(
+            &bars,
+            &IndicatorExpr::SessionRangeHigh {
+                start_hour: 10,
+                range_bars: 2,
+                shift: 1,
+            },
+            Some(&clock),
+        );
+        assert!(highs[0].is_nan());
+        assert_eq!(highs[1], 3.0);
+        assert_eq!(highs[2], 3.0);
     }
 }

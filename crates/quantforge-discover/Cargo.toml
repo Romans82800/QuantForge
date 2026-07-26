@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 quantforge-broker.workspace = true
 quantforge-core.workspace = true
 quantforge-data.workspace = true

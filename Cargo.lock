@@ -2554,6 +2554,7 @@ dependencies = [
 name = "quantforge-discover"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "quantforge-broker",
  "quantforge-core",
  "quantforge-data",

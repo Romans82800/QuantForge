@@ -116,6 +116,20 @@ impl SourceTimezone {
             .naive_local()
             .checked_add_signed(Duration::hours(self.wall_clock_shift_hours))
     }
+
+    /// Convert MT5 server-epoch milliseconds (DEAL_TIME_MSC / bar_time*1000) to UTC ms.
+    ///
+    /// MT5 writes server wall clock into the Unix epoch field. QuantForge bars are
+    /// already localized to true UTC via [`SourceTimezone`]; deals must use the same
+    /// mapping or parity alignment fails by the broker UTC offset (hours).
+    pub fn server_epoch_ms_to_utc_ms(self, timestamp_ms: i64) -> Option<i64> {
+        let naive = Utc.timestamp_millis_opt(timestamp_ms).single()?.naive_utc();
+        match self.localize(naive) {
+            LocalResult::Single(timestamp) => Some(timestamp.timestamp_millis()),
+            LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
+            LocalResult::None => None,
+        }
+    }
 }
 
 impl std::fmt::Display for SourceTimezone {
@@ -554,6 +568,33 @@ fn timeframe_seconds(value: &str) -> Option<u64> {
     }
 }
 
+/// Replace stamped `SPREAD=0` / missing values with the last positive spread.
+///
+/// MT5 history often writes `0` on quiet minutes even though the prior bar had a
+/// real spread. Forward-filling matches how the tester tends to retain the last
+/// known spread for ask construction better than treating every zero as free.
+///
+/// Returns how many bars were rewritten. Leading zeros/missing stay unchanged
+/// until the first positive value appears.
+pub fn forward_fill_zero_spreads(bars: &mut [Bar]) -> usize {
+    let mut last_positive = None;
+    let mut filled = 0;
+    for bar in bars {
+        match bar.spread_points {
+            Some(points) if points > 0 => {
+                last_positive = Some(points);
+            }
+            _ => {
+                if let Some(points) = last_positive {
+                    bar.spread_points = Some(points);
+                    filled += 1;
+                }
+            }
+        }
+    }
+    filled
+}
+
 /// Computes the canonical QuantForge identity for an ordered bar slice.
 ///
 /// This is also used to bind chronological development, validation and sealed
@@ -854,6 +895,74 @@ mod tests {
         let summer_server =
             parse_timestamp("2024.07.08 09:00:00", "ICMarkets/EST+7".parse().unwrap()).unwrap();
         assert_eq!(summer_utc, summer_server);
+    }
+
+    #[test]
+    fn forward_fill_replaces_zero_spreads_with_last_positive() {
+        let mut bars = vec![
+            Bar {
+                timestamp_ms: 0,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 60_000,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(8),
+            },
+            Bar {
+                timestamp_ms: 120_000,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 180_000,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: None,
+            },
+        ];
+        assert_eq!(forward_fill_zero_spreads(&mut bars), 2);
+        assert_eq!(bars[0].spread_points, Some(0));
+        assert_eq!(bars[1].spread_points, Some(8));
+        assert_eq!(bars[2].spread_points, Some(8));
+        assert_eq!(bars[3].spread_points, Some(8));
+    }
+
+    #[test]
+    fn server_epoch_ms_converts_to_the_same_utc_as_bar_wall_clocks() {
+        let tz: SourceTimezone = "ICMarkets/EST+7".parse().unwrap();
+        // Encode server wall 09:00 into the Unix epoch the way MT5 DEAL_TIME_MSC does.
+        let server_ms = parse_timestamp("2024.07.08 09:00:00", "Etc/UTC".parse().unwrap()).unwrap();
+        let utc_ms = tz.server_epoch_ms_to_utc_ms(server_ms).unwrap();
+        // Summer EST+7: server 09:00 ≡ UTC 06:00.
+        assert_eq!(
+            utc_ms,
+            parse_timestamp("2024.07.08 09:00:00", tz).unwrap()
+        );
+        assert_eq!(
+            utc_ms,
+            parse_timestamp("2024.07.08 06:00:00", "Etc/UTC".parse().unwrap()).unwrap()
+        );
     }
 
     #[test]

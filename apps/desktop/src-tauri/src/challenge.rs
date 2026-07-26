@@ -326,6 +326,7 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn challenge_one(
     strategy_path: &str,
     index: usize,

@@ -31,6 +31,7 @@ import {
   pauseDiscover,
   recordIncubation,
   resumeDiscover,
+  runFamilyBakeoff,
   runFidelityDemo,
   runM1Judge,
   runSealedFinal,
@@ -47,6 +48,7 @@ import type {
   DeployView,
   DiscoverJobView,
   DiscoverRequest,
+  DiscoverRunModeId,
   EliteDetail,
   EliteRow,
   FidelityDemoView,
@@ -54,6 +56,7 @@ import type {
   ExportRequest,
   ExportView,
   EvidenceView,
+  FamilyBakeoffReport,
   FamilyCoverage,
   JudgeRequest,
   JudgeView,
@@ -66,6 +69,7 @@ import type {
   PartitionEquityView,
   PortfolioRequest,
   PortfolioView,
+  SearchFamilyId,
   SealedRequest,
   SealedView,
   SymbolPack,
@@ -113,6 +117,68 @@ const gradeLegend = [
   "Certified",
   "Deployed",
 ];
+
+const SEARCH_FAMILIES: { id: SearchFamilyId; label: string; recipe: string }[] = [
+  {
+    id: "trend_pullback",
+    label: "TrendPullback",
+    recipe: "EMA/SMA structure + optional ROC · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "momentum_burst",
+    label: "MomentumBurst",
+    recipe: "RSI/ROC thrust atoms · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "donchian_breakout",
+    label: "DonchianBreakout",
+    recipe: "Donchian/HH-LL + optional SMA · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "mean_reversion_band",
+    label: "MeanReversionBand",
+    recipe: "RSI + percentile fades · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "zscore_reversion",
+    label: "ZScoreReversion",
+    recipe: "Close z-score extremes · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "session_orb",
+    label: "SessionOrb",
+    recipe: "Broker-local opening-range breakout · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "impulse_candle",
+    label: "ImpulseCandle",
+    recipe: "Body/range + close-in-bar thrust · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "vol_squeeze_break",
+    label: "VolSqueezeBreak",
+    recipe: "ATR-percentile squeeze then break · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "supply_demand_reclaim",
+    label: "SupplyDemandReclaim",
+    recipe: "Swing-base zone reclaim · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+  {
+    id: "sweep_reclaim",
+    label: "SweepReclaim",
+    recipe: "Liquidity sweep then reclaim · max 3 atoms · ATR14 · next-open market · mirror",
+  },
+];
+
+function familyLabel(id: SearchFamilyId): string {
+  return SEARCH_FAMILIES.find((family) => family.id === id)?.label ?? id;
+}
+
+function familyRecipe(id: SearchFamilyId | null): string {
+  if (!id) return "Choose a Search Family to lock the grammar before harvest.";
+  return SEARCH_FAMILIES.find((family) => family.id === id)?.recipe ?? id;
+}
 
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceName>("Home");
@@ -405,7 +471,7 @@ function App() {
                 </div>
                 <div>
                   <dt>Grade</dt>
-                  <dd>{workspace.researchGrade ? "research (H1 scout)" : workspace.m1FidelityVerified ? "M1 verified" : "promotion"}</dd>
+                  <dd>{workspace.researchGrade ? "research (Selected-TF scout)" : workspace.m1FidelityVerified ? "M1 verified" : "promotion"}</dd>
                 </div>
               </dl>
             </section>
@@ -753,7 +819,7 @@ function DataLabWorkspace({
           <details className="advanced-settings">
             <summary>Bound paths (auto-filled)</summary>
             <div className="form-stack compact">
-              <label className="field-row"><span>H1</span><code>{dataPath || "—"}</code></label>
+              <label className="field-row"><span>Decision TF</span><code>{dataPath || "—"}</code></label>
               <label className="field-row"><span>Metadata</span><code>{metadataPath || "—"}</code></label>
               <label className="field-row"><span>Broker</span><code>{brokerPath || "—"}</code></label>
             </div>
@@ -855,6 +921,9 @@ function DiscoverWorkspace({
     correlationThreshold: 0.85,
     noveltyWeight: 10,
     seed: 42,
+    searchFamily: null,
+    runMode: "full_harvest" as DiscoverRunModeId,
+    earlyStopPotElites: null,
     minimumTrades: 10,
     maximumDrawdownPercent: 40,
     minimumReturnPercent: 0,
@@ -865,7 +934,7 @@ function DiscoverWorkspace({
     depositMinimumReturnPercent: 0,
     depositMinimumProfitFactor: 1,
     depositMinimumReturnDrawdown: 0,
-    minimumM1ReturnRetention: 0.95,
+    minimumM1ReturnRetention: 0.90,
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: false,
     simpleExits: true,
@@ -878,6 +947,10 @@ function DiscoverWorkspace({
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
     robustnessNeighborhoodSamples: 8,
+    calendarYearFolds: true,
+    minimumDeflatedTradeSharpe: null,
+    multiSymbolMinimumPass: null,
+    packDataDir: null,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
     fallbackSpreadPoints: null,
@@ -890,6 +963,14 @@ function DiscoverWorkspace({
   }));
   const [job, setJob] = useState<DiscoverJobView | null>(null);
   const [busy, setBusy] = useState(false);
+  const [testerFamilies, setTesterFamilies] = useState<SearchFamilyId[]>(
+    SEARCH_FAMILIES.map((family) => family.id),
+  );
+  const [testerGenerations, setTesterGenerations] = useState(3);
+  const [testerCandidates, setTesterCandidates] = useState(60);
+  const [testerSeed, setTesterSeed] = useState(42);
+  const [testerBusy, setTesterBusy] = useState(false);
+  const [testerReport, setTesterReport] = useState<FamilyBakeoffReport | null>(null);
   const active = job?.status === "running" || job?.status === "paused";
 
   useEffect(() => {
@@ -928,6 +1009,9 @@ function DiscoverWorkspace({
             correlationThreshold: null,
             noveltyWeight: null,
             seed: null,
+            searchFamily: null,
+            runMode: null,
+            earlyStopPotElites: null,
             minimumTrades: null,
             maximumDrawdownPercent: null,
             minimumReturnPercent: null,
@@ -951,6 +1035,10 @@ function DiscoverWorkspace({
             robustnessFolds: null,
             robustnessMonteCarloTrials: null,
             robustnessNeighborhoodSamples: null,
+            calendarYearFolds: null,
+            minimumDeflatedTradeSharpe: null,
+            multiSymbolMinimumPass: null,
+            packDataDir: null,
             commissionPerLotRoundTurn: null,
             slippagePointsPerSide: null,
             fallbackSpreadPoints: null,
@@ -978,6 +1066,59 @@ function DiscoverWorkspace({
     }
   }
 
+  function toggleTesterFamily(id: SearchFamilyId) {
+    setTesterFamilies((current) =>
+      current.includes(id)
+        ? current.filter((family) => family !== id)
+        : [...current, id],
+    );
+  }
+
+  async function runTester() {
+    if (testerFamilies.length < 1) {
+      onError("Select at least one search family for the family tester.");
+      return;
+    }
+    if (!form.dataPath || !form.m1DataPath || !form.brokerPath) {
+      onError("Choose a symbol (decision timeframe, M1, broker) before running the family tester.");
+      return;
+    }
+    setTesterBusy(true);
+    onError(null);
+    try {
+      const bound = bindDiscoverTimezone(form);
+      const report = await runFamilyBakeoff({
+        dataPath: bound.dataPath,
+        metadataPath: bound.metadataPath,
+        sourceTimezone: bound.sourceTimezone,
+        m1DataPath: bound.m1DataPath,
+        m1MetadataPath: bound.m1MetadataPath,
+        m1SourceTimezone: bound.m1SourceTimezone,
+        brokerPath: bound.brokerPath,
+        generations: Math.max(1, testerGenerations),
+        initialCandidates: Math.max(20, testerCandidates),
+        seed: testerSeed,
+        commissionPerLotRoundTurn: form.commissionPerLotRoundTurn ?? 7,
+        slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
+        fallbackSpreadPoints: form.fallbackSpreadPoints,
+        validationFraction: form.validationFraction ?? 0.2,
+        families: testerFamilies,
+      });
+      setTesterReport(report);
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setTesterBusy(false);
+    }
+  }
+
+  function applyFamily(id: SearchFamilyId) {
+    update("searchFamily", id);
+    if (form.mode === "continue") {
+      update("mode", "new");
+    }
+  }
+
   const progress = discoverProgress(
     job?.completedGenerations ?? 0,
     job?.requestedGenerations ?? 0,
@@ -993,6 +1134,7 @@ function DiscoverWorkspace({
   const rejected = job?.rejectedTotal ?? 0;
   return (
     <div className="discover-layout">
+      <div className="discover-main">
       <section className="panel discover-form">
         <div className="panel-heading">
           <div><p className="eyebrow">Job contract</p><h2>Configure deterministic evolution</h2></div>
@@ -1002,6 +1144,48 @@ function DiscoverWorkspace({
           </div>
         </div>
         <fieldset disabled={active || busy}>
+          {form.mode === "new" ? (
+            <div className="hypothesis-strip">
+              <div className="hypothesis-heading">
+                <p className="eyebrow">Hypothesis</p>
+                <h3>Search Family + run mode</h3>
+              </div>
+              <div className="family-chips" role="group" aria-label="Search Family">
+                {SEARCH_FAMILIES.map((family) => (
+                  <button
+                    key={family.id}
+                    type="button"
+                    className={form.searchFamily === family.id ? "family-chip active" : "family-chip"}
+                    onClick={() => update("searchFamily", family.id)}
+                  >
+                    {family.label}
+                  </button>
+                ))}
+              </div>
+              <div className="mode-toggle run-mode-toggle">
+                <button
+                  type="button"
+                  className={form.runMode === "fast_scout" ? "active" : ""}
+                  onClick={() => update("runMode", "fast_scout")}
+                >
+                  Fast Scout
+                </button>
+                <button
+                  type="button"
+                  className={form.runMode === "full_harvest" ? "active" : ""}
+                  onClick={() => update("runMode", "full_harvest")}
+                >
+                  Full Harvest
+                </button>
+              </div>
+              <p className="recipe-summary">{familyRecipe(form.searchFamily)}</p>
+            </div>
+          ) : (
+            <p className="immutable-note">
+              Continuation loads Search Family, run mode, grammar, seed, gates and cost model from the
+              verified databank. Only the generation count can change.
+            </p>
+          )}
           <div className="form-stack compact">
             <SymbolSelect
               disabled={active || busy}
@@ -1034,8 +1218,8 @@ function DiscoverWorkspace({
             <details className="advanced-settings">
               <summary>Bound paths (auto-filled from symbol)</summary>
               <div className="form-stack compact">
-                <label className="field-row"><span>H1</span><code>{form.dataPath || "—"}</code></label>
-                <label className="field-row"><span>H1 metadata</span><code>{form.metadataPath || "—"}</code></label>
+                <label className="field-row"><span>Decision TF</span><code>{form.dataPath || "—"}</code></label>
+                <label className="field-row"><span>Decision metadata</span><code>{form.metadataPath || "—"}</code></label>
                 <label className="field-row"><span>M1</span><code>{form.m1DataPath || "—"}</code></label>
                 <label className="field-row"><span>M1 metadata</span><code>{form.m1MetadataPath || "—"}</code></label>
                 <label className="field-row"><span>Broker</span><code>{form.brokerPath || "—"}</code></label>
@@ -1066,13 +1250,21 @@ function DiscoverWorkspace({
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
               <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
               <NumberField label="OOS2 display reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              <label className="field">
+                <span>FX pack directory (matching-timeframe screen)</span>
+                <input
+                  value={form.packDataDir ?? ""}
+                  onChange={(event) => update("packDataDir", event.target.value || null)}
+                  placeholder="ICMarkets_EST7_2020_present"
+                />
+              </label>
             </>}
           </div>
           {form.mode === "new" ? (
             <>
               <details className="advanced-settings" open>
                 <summary>Scout gates — random search screen</summary>
-                <p className="immutable-note">Cheap H1 filter. Keep these loose so the databank pot can fill before breeding.</p>
+                <p className="immutable-note">Cheap Selected-TF filter. Keep these loose so the databank pot can fill before breeding.</p>
                 <div className="numeric-grid">
                   <NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value)} min={0} />
                   <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
@@ -1083,7 +1275,7 @@ function DiscoverWorkspace({
               </details>
               <details className="advanced-settings" open>
                 <summary>Deposit gates — enter the initial pot</summary>
-                <p className="immutable-note">H1 metrics to join the breeding pot. Databank needs M1 IS robustness then OOS1 ≥0.7×.</p>
+                <p className="immutable-note">Selected-TF metrics to join the breeding pot. Databank needs M1 IS robustness then OOS1 ≥0.7×.</p>
                 <div className="numeric-grid">
                   <NumberField label="Minimum trades" value={form.depositMinimumTrades} onChange={(value) => update("depositMinimumTrades", value)} min={0} />
                   <NumberField label="Maximum drawdown %" value={form.depositMaximumDrawdownPercent} onChange={(value) => update("depositMaximumDrawdownPercent", value)} step={0.1} />
@@ -1094,12 +1286,14 @@ function DiscoverWorkspace({
               </details>
               <details className="advanced-settings" open>
                 <summary>M1 robustness — on IS, before OOS1</summary>
-                <p className="immutable-note">SQX-style: M1 WFO/MC/±10% on IS only. OOS1 0.7× expectancy retention runs after. Pot fills on deposit; databank needs robustness + OOS1.</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood before deposit</span></label>
+                <p className="immutable-note">SQX-style: pot fills on the Selected-TF deposit first. M1 WFO/MC/±10% then OOS1 0.7× run only for pot members (databank path). OOS2 never used in Discover.</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood for databank (after pot)</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? true} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="Param samples (±10%)" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
+                  <NumberField label="Multi-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
                 </div>
               </details>
               <details className="advanced-settings">
@@ -1117,20 +1311,33 @@ function DiscoverWorkspace({
                 </div>
               </details>
             </>
-          ) : (
-            <p className="immutable-note">Continuation loads the grammar, seed, gates and cost model from the verified databank. Only the generation count can change.</p>
-          )}
+          ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">SQX-style default: H1 Selected-TF scout (fast). Turn on M1 precision only if you want in-loop fidelity. OOS1 pick still applies. OOS2 never used in Discover.</p>
-            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>H1 scout only (SQX Selected TF — defer M1 to Fidelity demo)</span></label>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.simpleExits ?? true} onChange={(event) => update("simpleExits", event.target.checked)} /><span>Simple exits (market + SL/TP + max 16 bars; no trail/BE/stop-limit)</span></label>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one signal/day (first market or pending locks the day; entries only 02:00–19:00 broker)</span></label>
+            <p className="immutable-note">SQX-style default: Selected-TF H1/M15 scout using completed bars and next-open market entries. Promotion still requires M1 fidelity and robustness; OOS2 is never used in Discover.</p>
+            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>Fast Selected-TF scout (M1 runs after the deposit gate)</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked disabled /><span>High-parity profile locked (next-open market + SL/TP + max 16 bars; no trail/BE/partials)</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day; entries only 02:00–19:00 broker)</span></label>
             <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Close positions and cancel pending orders at 22:00 broker time</span></label>
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: H1 scout → deposit → initial pot → M1 robustness on IS → OOS1 (≥0.7× IS expectancy) → databank. Expectancy shown in R ($1,000 risk).</p>
-          <button className="primary" disabled={active || busy || !form.dataPath || !form.m1DataPath || !form.brokerPath || !form.databankPath || (!(form.runUntilStopped ?? true) && form.generations < 1)} onClick={start}>{busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}</button>
+          <p>Pipeline: hypothesis → H1/M15 scout → deposit → pot (breeding bag, no niche block) → M1 robustness on pot members → OOS1 (≥0.7× IS expectancy) → databank (MAP-Elites niches). Expectancy in R ($1,000 risk). Methodology Researcher (full recipe grid + FDR) is not shipped yet — use Family Tester below.</p>
+          <button
+            className="primary"
+            disabled={
+              active
+              || busy
+              || !form.dataPath
+              || !form.m1DataPath
+              || !form.brokerPath
+              || !form.databankPath
+              || (form.mode === "new" && !form.searchFamily)
+              || (!(form.runUntilStopped ?? true) && form.generations < 1)
+            }
+            onClick={start}
+          >
+            {busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}
+          </button>
         </div>
       </section>
 
@@ -1162,8 +1369,9 @@ function DiscoverWorkspace({
             <ul>
               <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
               <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
+              <li><span>Ambiguous same-bar</span><strong>{formatNumber(job?.rejectedAmbiguous ?? 0)}</strong></li>
               <li><span>OOS1 pick</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
-              <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
+              <li><span>M1 retention (95/80/130)</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
               <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
               <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
               <li><span>Param ±10%</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
@@ -1183,7 +1391,7 @@ function DiscoverWorkspace({
               </p>
             )}
             {(job?.m1BarsRepaired ?? 0) > 0 && (
-              <p className="funnel-best">Aligned {formatNumber(job!.m1BarsRepaired)} H1 bars to M1 OHLC before search.</p>
+              <p className="funnel-best">Aligned {formatNumber(job!.m1BarsRepaired)} decision bars to M1 OHLC before search.</p>
             )}
             {(job?.topEvaluationErrors?.length ?? 0) > 0 && (
               <div className="eval-errors">
@@ -1204,6 +1412,128 @@ function DiscoverWorkspace({
           {job?.status === "completed" && job.outputPath && <div className="completion-card"><div><span>Checkpoint</span><code>{job.outputPath}</code></div><button className="primary" onClick={() => onOpenDatabank(job.outputPath!)}>Open in Databank</button></div>}
           {job?.status === "completed" && !job.outputPath && <div className="job-empty-note">{job.message}</div>}
           {job?.status === "failed" && <div className="job-error">{job.message}</div>}
+        </div>
+      </section>
+      </div>
+
+      <section className="panel family-tester-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Methodology lite</p>
+            <h2>Family tester</h2>
+          </div>
+          <span className="read-only-badge">OOS1 rank · no sealed</span>
+        </div>
+        <div className="family-tester-body">
+          <p className="immutable-note">
+            Short Fast Scout per selected family on IS, ranked by OOS1 retention. Advises which grammar to harvest —
+            does not auto-start Discover. Full Methodology Researcher (recipe grid + FDR) comes later.
+          </p>
+          <div className="family-tester-toggles" role="group" aria-label="Families to test">
+            {SEARCH_FAMILIES.map((family) => (
+              <label key={family.id} className="check-field">
+                <input
+                  type="checkbox"
+                  checked={testerFamilies.includes(family.id)}
+                  disabled={active || testerBusy}
+                  onChange={() => toggleTesterFamily(family.id)}
+                />
+                <span>{family.label}</span>
+              </label>
+            ))}
+          </div>
+          <div className="numeric-grid family-tester-numbers">
+            <NumberField
+              label="Generations / family"
+              value={testerGenerations}
+              onChange={(value) => setTesterGenerations(value ?? 3)}
+              min={1}
+            />
+            <NumberField
+              label="Initial candidates"
+              value={testerCandidates}
+              onChange={(value) => setTesterCandidates(value ?? 60)}
+              min={20}
+            />
+            <NumberField
+              label="Seed"
+              value={testerSeed}
+              onChange={(value) => setTesterSeed(value ?? 42)}
+              min={0}
+            />
+          </div>
+          <div className="family-tester-actions">
+            <button
+              className="primary"
+              disabled={
+                active
+                || testerBusy
+                || testerFamilies.length < 1
+                || !form.dataPath
+                || !form.m1DataPath
+                || !form.brokerPath
+              }
+              onClick={() => void runTester()}
+            >
+              {testerBusy ? "Running family tester…" : "Run family tester"}
+            </button>
+            {testerReport?.recommended && (
+              <button
+                className="secondary"
+                disabled={active || testerBusy}
+                onClick={() => applyFamily(testerReport.recommended!)}
+              >
+                Use recommended ({familyLabel(testerReport.recommended)})
+              </button>
+            )}
+          </div>
+          {testerReport && (
+            <div className="family-tester-results">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Family</th>
+                    <th>OOS1 E</th>
+                    <th>Retention</th>
+                    <th>Pass</th>
+                    <th>Elites</th>
+                    <th>Pot</th>
+                    <th>Evals</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {testerReport.rows.map((row) => {
+                    const recommended = testerReport.recommended === row.family;
+                    return (
+                      <tr key={row.family} className={recommended ? "recommended" : undefined}>
+                        <td>
+                          {familyLabel(row.family)}
+                          {recommended ? " · recommended" : ""}
+                        </td>
+                        <td>{formatNumber(row.medianOos1Expectancy, 3)}</td>
+                        <td>{formatNumber(row.medianRetention, 3)}</td>
+                        <td>{formatNumber(row.passRate * 100, 0)}%</td>
+                        <td>{formatNumber(row.elites)}</td>
+                        <td>{formatNumber(row.potElites)}</td>
+                        <td>{formatNumber(row.evaluations)}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={active || testerBusy}
+                            onClick={() => applyFamily(row.family)}
+                          >
+                            Use
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </section>
     </div>
@@ -1524,7 +1854,7 @@ function FidelityDemoPanel({
         m1MetadataPath: workspace.m1MetadataPath,
         m1SourceTimezone: workspace.m1MetadataPath ? null : "Etc/UTC",
         outputPath,
-        returnRetention: 0.8,
+        returnRetention: 0.90,
         tradeRetention: 0.8,
         drawdownExpansion: 1.3,
       });
@@ -1551,7 +1881,7 @@ function FidelityDemoPanel({
         </button>
       </div>
       <p className="immutable-note">
-        Research bank from H1 scout. Retest elites on M1 with SQX-style bands (≥80% return &amp; trades, DD ≤130% of H1).
+        Research bank from an H1/M15 scout. Retest elites on M1 with strict bands (≥90% return, ≥80% trades, DD ≤130% of Selected TF).
         Passers are written to a new promotion-grade databank.
       </p>
       {result && (

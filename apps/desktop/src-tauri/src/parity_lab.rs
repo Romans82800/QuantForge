@@ -8,7 +8,8 @@ use quantforge_eval::CostModel;
 use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
 use quantforge_ir::StrategyIr;
 use quantforge_parity::{
-    ParityRun, ParityTolerances, compare_runs, load_mt5_tester_metadata, load_mt5_tester_run,
+    ParityRun, ParityTolerances, compare_runs, load_mt5_tester_metadata,
+    load_mt5_tester_run_in_timezone,
 };
 use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,9 @@ pub struct ParityRequest {
     mt5_deals_path: String,
     mt5_equity_path: String,
     mt5_metadata_path: String,
+    /// Same timezone token used for bar ingestion (e.g. ICMarkets/EST+7).
+    #[serde(default)]
+    broker_timezone: Option<String>,
     output_path: String,
     initial_balance: f64,
     trade_count_relative: f64,
@@ -388,13 +392,25 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
     let out = ensure_new(&request.output_path, "parity artifact")?;
     let reference_bytes = fs::read(&request.reference_path)
         .map_err(|error| format!("cannot read parity reference: {error}"))?;
-    let (reference_manifest, reference_fingerprint, reference_result) = if let Ok(scout) =
-        serde_json::from_slice::<ScoutArtifactInput>(&reference_bytes)
+    let (reference_manifest, reference_fingerprint, reference) = if let Ok(judge) =
+        serde_json::from_slice::<JudgeArtifact>(&reference_bytes)
     {
-        (scout.manifest, scout.strategy_fingerprint, scout.result)
+        (
+            judge.manifest,
+            judge.strategy_fingerprint,
+            ParityRun::from_judge(&judge.result),
+        )
+    } else if let Ok(scout) = serde_json::from_slice::<ScoutArtifactInput>(&reference_bytes) {
+        (
+            scout.manifest,
+            scout.strategy_fingerprint,
+            ParityRun::from_scout(&scout.result),
+        )
     } else {
         let challenge: ChallengeArtifact = serde_json::from_slice(&reference_bytes)
-            .map_err(|error| format!("reference is neither Scout nor Challenge JSON: {error}"))?;
+            .map_err(|error| {
+                format!("reference is neither Judge, Scout, nor Challenge JSON: {error}")
+            })?;
         challenge
             .report
             .validate_integrity()
@@ -402,7 +418,7 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         (
             challenge.manifest,
             challenge.report.binding.strategy_fingerprint,
-            challenge.report.baseline,
+            ParityRun::from_scout(&challenge.report.baseline),
         )
     };
     let mut evidence: quantforge_export_mql5::ExportEvidenceCard =
@@ -422,18 +438,22 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         && source_text.contains("g_trade.Sell(volume,_Symbol,0.0,stop,target");
     evidence.mandatory_stop_loss &= protective_calls;
     evidence.mandatory_take_profit &= protective_calls;
-    let reference = ParityRun::from_scout(&reference_result);
-    let external = load_mt5_tester_run(
-        &request.mt5_deals_path,
-        &request.mt5_equity_path,
-        request.initial_balance,
-    )
-    .map_err(|error| error.to_string())?;
     let metadata =
         load_mt5_tester_metadata(&request.mt5_metadata_path).map_err(|error| error.to_string())?;
     metadata
         .validate_evidence(&evidence)
         .map_err(|error| error.to_string())?;
+    let broker_timezone = request
+        .broker_timezone
+        .clone()
+        .or_else(|| metadata.properties.get("broker_timezone").cloned());
+    let external = load_mt5_tester_run_in_timezone(
+        &request.mt5_deals_path,
+        &request.mt5_equity_path,
+        request.initial_balance,
+        broker_timezone.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let tolerances = ParityTolerances {
         trade_count_relative: request.trade_count_relative,
         trade_count_absolute: request.trade_count_absolute,
@@ -461,6 +481,7 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
                 "mt5_metadata".into(),
                 recipe_path(&request.mt5_metadata_path),
             ),
+            ("broker_timezone".into(), json!(&broker_timezone)),
             (
                 "strategy_fingerprint".into(),
                 json!(&evidence.strategy_fingerprint),
