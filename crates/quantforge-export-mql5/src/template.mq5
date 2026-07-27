@@ -15,6 +15,7 @@ input string InpParityPrefix="@@PARITY_PREFIX@@";
 CTrade g_trade;
 datetime g_last_bar=0;
 datetime g_last_exit_bar=0;
+int g_decision_bars_seen=0;
 int g_entry_day_key=0;
 int g_entries_today=0;
 int g_deals_file=INVALID_HANDLE;
@@ -55,6 +56,18 @@ double QFBufferValue(const int handle,const int shift)
    return values[0];
 }
 
+double QFBufferValueAt(const int handle,const int buffer,const int shift)
+{
+   if(handle==INVALID_HANDLE || buffer<0 || shift<0)
+      return EMPTY_VALUE;
+   double values[1];
+   const int copied=CopyBuffer(handle,buffer,shift,1,values);
+   IndicatorRelease(handle);
+   if(copied!=1)
+      return EMPTY_VALUE;
+   return values[0];
+}
+
 double QFMA(const ENUM_MA_METHOD method,const ENUM_APPLIED_PRICE source,
             const int period,const int shift)
 {
@@ -69,6 +82,25 @@ double QFRSI(const ENUM_APPLIED_PRICE source,const int period,const int shift)
 double QFATR(const int period,const int shift)
 {
    return QFBufferValue(iATR(_Symbol,_Period,period),shift);
+}
+
+double QFADX(const int period,const int shift)
+{
+   // QuantForge's typed ADX/+DI/-DI implementation uses Welles Wilder
+   // smoothing. MT5 exposes that exact buffer family separately from iADX.
+   return QFBufferValue(iADXWilder(_Symbol,_Period,period),shift);
+}
+
+double QFPlusDI(const int period,const int shift)
+{
+   const int handle=iADXWilder(_Symbol,_Period,period);
+   return QFBufferValueAt(handle,1,shift);
+}
+
+double QFMinusDI(const int period,const int shift)
+{
+   const int handle=iADXWilder(_Symbol,_Period,period);
+   return QFBufferValueAt(handle,2,shift);
 }
 
 double QFStdDev(const ENUM_APPLIED_PRICE source,const int period,const int shift)
@@ -932,6 +964,13 @@ int OnInit()
          FileWrite(g_metadata_file,"symbol",_Symbol);
          FileWrite(g_metadata_file,"timeframe",EnumToString(_Period));
          FileWrite(g_metadata_file,"magic",InpMagic);
+         FileWrite(g_metadata_file,"deviation_points",InpDeviationPoints);
+         FileWrite(g_metadata_file,"max_spread_points",InpMaxSpreadPoints);
+         FileWrite(g_metadata_file,"estimated_slippage_points_per_side",
+                   InpEstimatedSlippagePointsPerSide);
+         FileWrite(g_metadata_file,"commission_per_lot_round_turn",
+                   InpCommissionPerLotRoundTurn);
+         FileWrite(g_metadata_file,"risk_budget",QFRiskBudget());
          FileWrite(g_metadata_file,"initial_deposit",AccountInfoDouble(ACCOUNT_BALANCE));
          FileWrite(g_metadata_file,"account_currency",AccountInfoString(ACCOUNT_CURRENCY));
          // Same token QuantForge uses for bar localization (must match the pack).
@@ -1012,6 +1051,7 @@ void OnTick()
    if(current_bar<=0 || current_bar==g_last_bar)
       return;
    g_last_bar=current_bar;
+   g_decision_bars_seen++;
 
    if(QFFlattenEndOfDay() && QFInCloseBlackout())
    {
@@ -1048,6 +1088,13 @@ void OnTick()
       return;
    }
    if(!QFInMandatoryEntryWindow(current_bar))
+   {
+      QFRecordEquity(current_bar);
+      return;
+   }
+   // MT5 retains pre-test indicator history while QuantForge packs begin at
+   // the selected date. Wait for the shared recursive-buffer convergence gate.
+   if(g_decision_bars_seen<320)
    {
       QFRecordEquity(current_bar);
       return;

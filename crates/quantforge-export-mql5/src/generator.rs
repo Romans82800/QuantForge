@@ -287,6 +287,15 @@ fn indicator_expr(indicator: &IndicatorExpr, extra_shift: &str) -> String {
         IndicatorExpr::Atr { period, shift } => {
             format!("QFATR({},({}+{}))", period, shift, extra_shift)
         }
+        IndicatorExpr::Adx { period, shift } => {
+            format!("QFADX({},({}+{}))", period, shift, extra_shift)
+        }
+        IndicatorExpr::PlusDi { period, shift } => {
+            format!("QFPlusDI({},({}+{}))", period, shift, extra_shift)
+        }
+        IndicatorExpr::MinusDi { period, shift } => {
+            format!("QFMinusDI({},({}+{}))", period, shift, extra_shift)
+        }
         IndicatorExpr::DonchianHigh { period, shift } => format!(
             "QFExtreme(MODE_HIGH,1,{},({}+{}),true)",
             period, shift, extra_shift
@@ -768,6 +777,8 @@ mod tests {
                 .contains("g_trade.Buy(volume,_Symbol,0.0,stop,target")
         );
         assert!(first.source.contains("QFCrossAbove"));
+        assert!(first.source.contains("iADXWilder"));
+        assert!(first.source.contains("g_decision_bars_seen<320"));
         assert!(!first.source.contains("@@"));
         assert!(first.evidence.mandatory_stop_loss);
         assert!(first.evidence.mandatory_take_profit);

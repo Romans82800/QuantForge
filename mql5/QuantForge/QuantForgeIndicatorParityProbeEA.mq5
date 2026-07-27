@@ -12,22 +12,23 @@ int g_ema=INVALID_HANDLE;
 int g_wma=INVALID_HANDLE;
 int g_rsi=INVALID_HANDLE;
 int g_atr=INVALID_HANDLE;
+int g_adx=INVALID_HANDLE;
 int g_stddev=INVALID_HANDLE;
 int g_attempts=0;
 bool g_finished=false;
 
 void ReleaseHandles()
 {
-   int handles[]={g_sma,g_ema,g_wma,g_rsi,g_atr,g_stddev};
+   int handles[]={g_sma,g_ema,g_wma,g_rsi,g_atr,g_adx,g_stddev};
    for(int index=0;index<ArraySize(handles);index++)
       if(handles[index]!=INVALID_HANDLE)
          IndicatorRelease(handles[index]);
-   g_sma=g_ema=g_wma=g_rsi=g_atr=g_stddev=INVALID_HANDLE;
+   g_sma=g_ema=g_wma=g_rsi=g_atr=g_adx=g_stddev=INVALID_HANDLE;
 }
 
 bool BuffersReady()
 {
-   int handles[]={g_sma,g_ema,g_wma,g_rsi,g_atr,g_stddev};
+   int handles[]={g_sma,g_ema,g_wma,g_rsi,g_atr,g_adx,g_stddev};
    for(int index=0;index<ArraySize(handles);index++)
       if(handles[index]==INVALID_HANDLE || BarsCalculated(handles[index])<InpBars)
          return false;
@@ -43,6 +44,20 @@ bool CopyReferenceBuffer(const int handle,const int count,double &values[])
    {
       Print("QuantForge indicator probe CopyBuffer failed. copied=",copied,
             " expected=",count," error=",GetLastError());
+      return false;
+   }
+   return true;
+}
+
+bool CopyReferenceBufferAt(const int handle,const int buffer,const int count,double &values[])
+{
+   ArrayResize(values,count);
+   ResetLastError();
+   const int copied=CopyBuffer(handle,buffer,1,count,values);
+   if(copied!=count)
+   {
+      Print("QuantForge indicator probe CopyBuffer failed. buffer=",buffer,
+            " copied=",copied," expected=",count," error=",GetLastError());
       return false;
    }
    return true;
@@ -70,12 +85,15 @@ bool ExportReferencePack()
    }
    ArrayResize(rates,count);
 
-   double sma[],ema[],wma[],rsi[],atr_values[],stddev[];
+   double sma[],ema[],wma[],rsi[],atr_values[],adx[],plus_di[],minus_di[],stddev[];
    if(!CopyReferenceBuffer(g_sma,count,sma)
       || !CopyReferenceBuffer(g_ema,count,ema)
       || !CopyReferenceBuffer(g_wma,count,wma)
       || !CopyReferenceBuffer(g_rsi,count,rsi)
       || !CopyReferenceBuffer(g_atr,count,atr_values)
+      || !CopyReferenceBufferAt(g_adx,0,count,adx)
+      || !CopyReferenceBufferAt(g_adx,1,count,plus_di)
+      || !CopyReferenceBufferAt(g_adx,2,count,minus_di)
       || !CopyReferenceBuffer(g_stddev,count,stddev))
       return false;
 
@@ -92,7 +110,7 @@ bool ExportReferencePack()
 
    FileWrite(file,
              "timestamp_ms","server_time","open","high","low","close",
-             "sma","ema","wma","rsi","atr","donchian_high","donchian_low",
+             "sma","ema","wma","rsi","atr","adx","plus_di","minus_di","donchian_high","donchian_low",
              "highest_close","lowest_close","standard_deviation","zscore",
              "percentile_in_range","rate_of_change","session_hour","day_of_week",
              "terminal_build","broker","server","symbol","timeframe","period");
@@ -144,6 +162,9 @@ bool ExportReferencePack()
                 DoubleToString(wma[index],16),
                 DoubleToString(rsi[index],16),
                 DoubleToString(atr_values[index],16),
+                DoubleToString(adx[index],16),
+                DoubleToString(plus_di[index],16),
+                DoubleToString(minus_di[index],16),
                 DoubleToString(donchian_high,16),
                 DoubleToString(donchian_low,16),
                 DoubleToString(highest_close,16),
@@ -215,9 +236,13 @@ int OnInit()
    g_wma=iMA(_Symbol,_Period,InpPeriod,0,MODE_LWMA,PRICE_CLOSE);
    g_rsi=iRSI(_Symbol,_Period,InpPeriod,PRICE_CLOSE);
    g_atr=iATR(_Symbol,_Period,InpPeriod);
+   // Match the QuantForge engine's typed DMI implementation: Welles Wilder
+   // smoothing for ADX and the +/- directional-index buffers.
+   g_adx=iADXWilder(_Symbol,_Period,InpPeriod);
    g_stddev=iStdDev(_Symbol,_Period,InpPeriod,0,MODE_SMA,PRICE_CLOSE);
    if(g_sma==INVALID_HANDLE || g_ema==INVALID_HANDLE || g_wma==INVALID_HANDLE
-      || g_rsi==INVALID_HANDLE || g_atr==INVALID_HANDLE || g_stddev==INVALID_HANDLE)
+      || g_rsi==INVALID_HANDLE || g_atr==INVALID_HANDLE || g_adx==INVALID_HANDLE
+      || g_stddev==INVALID_HANDLE)
    {
       Print("QuantForge indicator probe could not create indicator handles. error=",GetLastError());
       ReleaseHandles();

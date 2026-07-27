@@ -8,8 +8,9 @@ use quantforge_core::STRATEGY_IR_VERSION;
 use quantforge_data::BarDataset;
 use quantforge_eval::{BacktestMetrics, ScoutConfig, evaluate_strategy};
 use quantforge_ir::{
-    EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy, ProtectiveStops, RiskPolicy,
-    Side, StopLossPolicy, StrategyIr, StrategyMeta, TakeProfitPolicy, TrailingPolicy,
+    EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy, PartialExit,
+    ProtectiveStops, RiskPolicy, Side, StopLossPolicy, StrategyIr, StrategyMeta,
+    TakeProfitPolicy, TrailingPolicy,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -21,28 +22,36 @@ use serde::{Deserialize, Serialize};
 pub enum FactorRecipe {
     /// Market entry, time stop only (production simple-exits shape).
     SimpleMarket,
-    /// Stop/limit pending entry, no BE/trail.
-    PendingEntry,
-    /// Market + break-even + trailing.
-    BreakEvenTrail,
-    /// Pending + break-even + trailing.
-    PendingManaged,
+    /// Market entry with a single break-even move.
+    BreakEven,
+    /// Market entry with a risk-multiple trailing stop.
+    TrailingStop,
+    /// Market entry with one partial exit.
+    PartialExit,
+    /// Stop pending entry, with no management feature.
+    StopEntry,
+    /// Limit pending entry, with no management feature.
+    LimitEntry,
 }
 
 impl FactorRecipe {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::SimpleMarket,
-        Self::PendingEntry,
-        Self::BreakEvenTrail,
-        Self::PendingManaged,
+        Self::BreakEven,
+        Self::TrailingStop,
+        Self::PartialExit,
+        Self::StopEntry,
+        Self::LimitEntry,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::SimpleMarket => "simple_market",
-            Self::PendingEntry => "pending_entry",
-            Self::BreakEvenTrail => "break_even_trail",
-            Self::PendingManaged => "pending_managed",
+            Self::BreakEven => "break_even",
+            Self::TrailingStop => "trailing_stop",
+            Self::PartialExit => "partial_exit",
+            Self::StopEntry => "stop_entry",
+            Self::LimitEntry => "limit_entry",
         }
     }
 }
@@ -177,9 +186,7 @@ pub fn run_methodology_grid(
         .into_par_iter()
         .map(|(family, atom_count, recipe, draw)| {
             let sequence = mix_sequence(family, atom_count, recipe, draw);
-            let prefer_stop = draw % 2 == 0;
-            let strategy =
-                build_factor_strategy(family, seed, sequence, atom_count, recipe, prefer_stop);
+            let strategy = build_factor_strategy(family, seed, sequence, atom_count, recipe);
             let entry_kind = entry_kind_label(&strategy.entry.order);
             let complexity = strategy.complexity().score;
             let is_result = evaluate_strategy(&strategy, is_dataset, broker, &scout);
@@ -271,19 +278,21 @@ fn build_factor_strategy(
     sequence: u64,
     atom_count: usize,
     recipe: FactorRecipe,
-    prefer_stop: bool,
 ) -> StrategyIr {
     let mut rng = rng_for(seed, 17, sequence);
     let (long, short) = family_entries_with_count(family, &mut rng, atom_count);
     let order = match recipe {
-        FactorRecipe::SimpleMarket | FactorRecipe::BreakEvenTrail => EntryOrderPolicy::Market,
-        FactorRecipe::PendingEntry | FactorRecipe::PendingManaged => {
+        FactorRecipe::SimpleMarket
+        | FactorRecipe::BreakEven
+        | FactorRecipe::TrailingStop
+        | FactorRecipe::PartialExit => EntryOrderPolicy::Market,
+        FactorRecipe::StopEntry | FactorRecipe::LimitEntry => {
             let distance = EntryDistancePolicy::AtrMultiple {
                 period: FROZEN_ATR_PERIOD,
                 multiplier: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5][rng.gen_range(0..6)],
             };
             let expiry_bars = rng.gen_range(2..=8);
-            if prefer_stop {
+            if recipe == FactorRecipe::StopEntry {
                 EntryOrderPolicy::Stop {
                     distance,
                     expiry_bars,
@@ -297,7 +306,7 @@ fn build_factor_strategy(
         }
     };
     let manage = match recipe {
-        FactorRecipe::SimpleMarket | FactorRecipe::PendingEntry => ManagePolicy {
+        FactorRecipe::SimpleMarket | FactorRecipe::StopEntry | FactorRecipe::LimitEntry => ManagePolicy {
             time_stop_bars: Some(rng.gen_range(4..=16)),
             break_even_at_r: None,
             trailing: None,
@@ -305,14 +314,27 @@ fn build_factor_strategy(
             flatten_end_of_day: false,
             max_one_entry_per_day: true,
         },
-        FactorRecipe::BreakEvenTrail | FactorRecipe::PendingManaged => ManagePolicy {
+        FactorRecipe::BreakEven => ManagePolicy {
             time_stop_bars: Some(rng.gen_range(4..=16)),
             break_even_at_r: Some(1.0),
-            trailing: Some(TrailingPolicy::RiskMultiple {
-                activate_at_r: 1.5,
-                distance_r: 1.0,
-            }),
+            trailing: None,
             partial_exits: Vec::new(),
+            flatten_end_of_day: false,
+            max_one_entry_per_day: true,
+        },
+        FactorRecipe::TrailingStop => ManagePolicy {
+            time_stop_bars: Some(rng.gen_range(4..=16)),
+            break_even_at_r: None,
+            trailing: Some(TrailingPolicy::RiskMultiple { activate_at_r: 1.5, distance_r: 1.0 }),
+            partial_exits: Vec::new(),
+            flatten_end_of_day: false,
+            max_one_entry_per_day: true,
+        },
+        FactorRecipe::PartialExit => ManagePolicy {
+            time_stop_bars: Some(rng.gen_range(4..=16)),
+            break_even_at_r: None,
+            trailing: None,
+            partial_exits: vec![PartialExit { at_r: 1.0, fraction: 0.5 }],
             flatten_end_of_day: false,
             max_one_entry_per_day: true,
         },
@@ -539,15 +561,11 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
         ));
     }
 
-    // Pending stop vs limit (pooled pending recipes).
+    // Pending stop vs limit: isolated entry-order contrast.
     let stop: Vec<f64> = screened
         .iter()
         .filter(|draw| {
-            draw.entry_kind == "stop"
-                && matches!(
-                    draw.recipe,
-                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
-                )
+            draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry
         })
         .filter_map(|draw| draw.retention)
         .collect();
@@ -555,21 +573,13 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
         .iter()
         .copied()
         .filter(|draw| {
-            draw.entry_kind == "stop"
-                && matches!(
-                    draw.recipe,
-                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
-                )
+            draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry
         })
         .collect();
     let limit: Vec<f64> = screened
         .iter()
         .filter(|draw| {
-            draw.entry_kind == "limit"
-                && matches!(
-                    draw.recipe,
-                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
-                )
+            draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry
         })
         .filter_map(|draw| draw.retention)
         .collect();
@@ -577,11 +587,7 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
         .iter()
         .copied()
         .filter(|draw| {
-            draw.entry_kind == "limit"
-                && matches!(
-                    draw.recipe,
-                    FactorRecipe::PendingEntry | FactorRecipe::PendingManaged
-                )
+            draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry
         })
         .collect();
     contrasts.push(contrast(

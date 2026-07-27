@@ -43,6 +43,21 @@ pub enum IndicatorExpr {
         period: u16,
         shift: u16,
     },
+    /// Wilder's Average Directional Index (MT5 iADX buffer 0).
+    Adx {
+        period: u16,
+        shift: u16,
+    },
+    /// Positive directional indicator (MT5 iADX buffer 1).
+    PlusDi {
+        period: u16,
+        shift: u16,
+    },
+    /// Negative directional indicator (MT5 iADX buffer 2).
+    MinusDi {
+        period: u16,
+        shift: u16,
+    },
     DonchianHigh {
         period: u16,
         shift: u16,
@@ -136,6 +151,9 @@ impl IndicatorExpr {
             | Self::Wma { period, shift, .. }
             | Self::Rsi { period, shift, .. }
             | Self::Atr { period, shift }
+            | Self::Adx { period, shift }
+            | Self::PlusDi { period, shift }
+            | Self::MinusDi { period, shift }
             | Self::DonchianHigh { period, shift }
             | Self::DonchianLow { period, shift }
             | Self::Highest { period, shift, .. }

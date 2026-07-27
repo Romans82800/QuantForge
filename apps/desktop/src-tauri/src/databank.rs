@@ -3,7 +3,9 @@ use quantforge_data::{DataQualityReport, QualityGrade};
 use quantforge_discover::{
     Databank, Elite, FamilyStyle, LongShortSkewBucket, NicheKey, ThreeLevelBucket, niche_label,
 };
-use quantforge_storage::RunManifest;
+use crate::data_lab::load_bound_broker;
+use quantforge_export_mql5::{generate_bundle, Mql5ExportConfig, TesterConfig};
+use quantforge_storage::{write_text_new, RunManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -34,6 +36,8 @@ struct LoadedDatabank {
     source: String,
     broker: String,
     metadata_path: Option<String>,
+    m1_source: Option<String>,
+    m1_metadata_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -71,6 +75,11 @@ pub struct DatabankWorkspace {
     require_m1_precision: bool,
     m1_fidelity_verified: bool,
     simple_exits: bool,
+    allow_break_even: bool,
+    allow_trailing_stops: bool,
+    allow_partial_exits: bool,
+    allow_stop_entries: bool,
+    allow_limit_entries: bool,
     max_one_entry_per_day: bool,
     families: Vec<FamilyCoverage>,
     elites: Vec<EliteRow>,
@@ -82,6 +91,30 @@ pub struct BatchExportView {
     directory: String,
     index_path: String,
     strategy_paths: Vec<String>,
+}
+
+/// A self-contained set of MQL5 experts produced directly from a databank
+/// selection.  This is deliberately separate from the individual parity
+/// workflow: these are research exports, with live trading disabled, not a
+/// deployment certification.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEaExportRequest {
+    fingerprints: Vec<String>,
+    directory: String,
+    timeframe: String,
+    base_magic: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEaExportView {
+    directory: String,
+    index_path: String,
+    expert_paths: Vec<String>,
+    settings_paths: Vec<String>,
+    tester_paths: Vec<String>,
+    evidence_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -181,6 +214,7 @@ pub struct PartitionEquityPoint {
 pub struct PartitionEquityView {
     fingerprint: String,
     strategy_id: String,
+    execution_engine: String,
     initial_balance: f64,
     points: Vec<PartitionEquityPoint>,
     is_end_timestamp_ms: i64,
@@ -238,6 +272,10 @@ fn load_databank_path(
     let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
     let metadata_path = companion_metadata_path(&artifact.source);
+    let m1_source = manifest_path(&artifact, "m1_source");
+    let m1_metadata_path = m1_source
+        .as_deref()
+        .and_then(companion_metadata_path);
     *state
         .loaded
         .write()
@@ -246,6 +284,8 @@ fn load_databank_path(
         source: artifact.source,
         broker: artifact.broker,
         metadata_path,
+        m1_source,
+        m1_metadata_path,
     });
     Ok(workspace)
 }
@@ -283,12 +323,22 @@ pub async fn get_elite_partition_equity(
             loaded.source.clone(),
             loaded.broker.clone(),
             loaded.metadata_path.clone(),
+            loaded.m1_source.clone(),
+            loaded.m1_metadata_path.clone(),
             loaded.bank.config.scout.clone(),
         )
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let (elite, source, broker_path, metadata_path, scout) = snapshot;
-        partition_equity_for_elite(&elite, &source, metadata_path.as_deref(), &broker_path, &scout)
+        let (elite, source, broker_path, metadata_path, m1_source, m1_metadata_path, scout) = snapshot;
+        partition_equity_for_elite(
+            &elite,
+            &source,
+            metadata_path.as_deref(),
+            &broker_path,
+            m1_source.as_deref(),
+            m1_metadata_path.as_deref(),
+            &scout,
+        )
     })
     .await
     .map_err(|error| format!("partition equity task failed: {error}"))?
@@ -299,16 +349,33 @@ fn partition_equity_for_elite(
     source: &str,
     metadata_path: Option<&str>,
     broker_path: &str,
+    m1_source: Option<&str>,
+    m1_metadata_path: Option<&str>,
     scout: &quantforge_eval::ScoutConfig,
 ) -> Result<PartitionEquityView, String> {
     let loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
     // slice whose path still points at full history, this is the right series.
     let broker = crate::data_lab::load_bound_broker(broker_path, loaded.metadata.as_ref())?;
+    let m1_source = m1_source.ok_or_else(|| {
+        "This legacy databank does not bind its M1 source; reopen it through Discover and run a new M1-verified search before using its full-run curve.".to_owned()
+    })?;
+    let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
+    crate::data_lab::load_bound_broker(broker_path, m1.metadata.as_ref())?;
     let plan = quantforge_quality::DataSplitPlan::chronological(&loaded.dataset, 0.2, 0.2)
         .map_err(|error| error.to_string())?;
-    let result = quantforge_eval::evaluate_strategy(&elite.strategy, &loaded.dataset, &broker, scout)
-        .map_err(|error| error.to_string())?;
+    let result = quantforge_tick::evaluate_strategy_m1(
+        &elite.strategy,
+        &loaded.dataset,
+        &m1.dataset,
+        &broker,
+        &quantforge_tick::JudgeConfig {
+            initial_balance: scout.initial_balance,
+            costs: scout.costs.clone(),
+            allow_execution_gaps: false,
+        },
+    )
+    .map_err(|error| format!("M1 full-run replay failed: {error}"))?;
 
     let is_end = plan.development.end_timestamp_ms_exclusive;
     let oos1_end = plan.validation.end_timestamp_ms_exclusive;
@@ -343,6 +410,7 @@ fn partition_equity_for_elite(
     Ok(PartitionEquityView {
         fingerprint: elite.structural_fingerprint.as_str().into(),
         strategy_id: elite.strategy.id.clone(),
+        execution_engine: result.engine.clone(),
         initial_balance: scout.initial_balance,
         points,
         is_end_timestamp_ms: is_end,
@@ -497,6 +565,192 @@ pub fn export_elite_strategies(
 ) -> Result<BatchExportView, String> {
     export_elite_strategies_to(&fingerprints, Path::new(&directory), &state)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn export_elite_eas(
+    request: BatchEaExportRequest,
+    state: State<'_, DesktopState>,
+) -> Result<BatchEaExportView, String> {
+    export_elite_eas_to(&request, Path::new(&request.directory), &state)
+        .map_err(|error| error.to_string())
+}
+
+fn export_elite_eas_to(
+    request: &BatchEaExportRequest,
+    directory: &Path,
+    state: &DesktopState,
+) -> Result<BatchEaExportView, DesktopError> {
+    if request.fingerprints.is_empty() {
+        return Err(DesktopError::InvalidExport(
+            "select at least one elite".into(),
+        ));
+    }
+    if !directory.is_dir() {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} is not an existing directory",
+            directory.display()
+        )));
+    }
+    if directory
+        .read_dir()
+        .map_err(DesktopError::Io)?
+        .next()
+        .transpose()
+        .map_err(DesktopError::Io)?
+        .is_some()
+    {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} is not empty; choose an empty folder",
+            directory.display()
+        )));
+    }
+    let unique: std::collections::BTreeSet<_> = request.fingerprints.iter().collect();
+    if unique.len() != request.fingerprints.len() {
+        return Err(DesktopError::InvalidExport(
+            "the selection contains duplicate fingerprints".into(),
+        ));
+    }
+    if request.base_magic == 0 {
+        return Err(DesktopError::InvalidExport(
+            "base magic must be greater than zero".into(),
+        ));
+    }
+    let final_magic = request
+        .base_magic
+        .checked_add(request.fingerprints.len().saturating_sub(1) as u64)
+        .ok_or_else(|| DesktopError::InvalidExport("base magic is too large".into()))?;
+    if final_magic == 0 {
+        return Err(DesktopError::InvalidExport(
+            "base magic range may not include zero".into(),
+        ));
+    }
+
+    let loaded = state
+        .loaded
+        .read()
+        .map_err(|_| DesktopError::StateUnavailable)?;
+    let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
+    let broker = load_bound_broker(&loaded.broker, None).map_err(DesktopError::InvalidExport)?;
+    let symbol_stem = safe_file_stem(&broker.symbol);
+    let costs = &loaded.bank.config.scout.costs;
+    let mut exports = Vec::with_capacity(request.fingerprints.len());
+    for (offset, fingerprint) in request.fingerprints.iter().enumerate() {
+        let elite = loaded
+            .bank
+            .elites
+            .iter()
+            .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+            .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()))?;
+        let unique_number = request.base_magic + offset as u64;
+        let expert_name = format!(
+            "{}_{}_{}",
+            symbol_stem,
+            family_name(elite.niche.family),
+            unique_number
+        );
+        let config = Mql5ExportConfig {
+            expert_name: expert_name.clone(),
+            expert_directory: "QuantForge".into(),
+            timeframe: request.timeframe.clone(),
+            magic: unique_number,
+            deviation_points: 10,
+            max_spread_points: costs.max_spread_points,
+            estimated_slippage_points_per_side: costs.adverse_slippage_points_per_side,
+            commission_per_lot_round_turn: costs.commission_per_lot_round_turn,
+            allow_live_trading_default: false,
+            tester: TesterConfig {
+                deposit: loaded.bank.config.scout.initial_balance,
+                model: 4,
+                ..TesterConfig::default()
+            },
+        };
+        let bundle = generate_bundle(&elite.strategy, &broker, &config)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        let strategy_path = directory.join(format!("{expert_name}.strategy.ir.json"));
+        let source_path = directory.join(format!("{expert_name}.mq5"));
+        let settings_path = directory.join(format!("{expert_name}.set"));
+        let tester_path = directory.join(format!("{expert_name}.tester.ini"));
+        let evidence_path = directory.join(format!("{expert_name}.evidence.json"));
+        exports.push((
+            elite,
+            expert_name,
+            config.magic,
+            bundle,
+            strategy_path,
+            source_path,
+            settings_path,
+            tester_path,
+            evidence_path,
+        ));
+    }
+    let index_path = directory.join("quantforge-ea-batch.json");
+    if index_path.exists() {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} already exists; choose an empty folder",
+            index_path.display()
+        )));
+    }
+
+    for (elite, _, _, bundle, strategy, source, settings, tester, evidence) in &exports {
+        quantforge_storage::write_json_new(strategy, &elite.strategy)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        write_text_new(source, &bundle.source)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        write_text_new(settings, &bundle.set_file)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        write_text_new(tester, &bundle.tester_ini)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        quantforge_storage::write_json_new(evidence, &bundle.evidence)
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    }
+    let index = serde_json::json!({
+        "schema_version": 1,
+        "kind": "quantforge-mql5-ea-batch",
+        "purpose": "research export; generated experts default to live trading disabled",
+        "grammar_version": loaded.bank.grammar_version,
+        "data_hash": loaded.bank.data_hash,
+        "execution_data_hash": loaded.bank.execution_data_hash,
+        "broker_spec_hash": loaded.bank.broker_spec_hash,
+        "timeframe": request.timeframe,
+        "tester_model": "every tick based on real ticks",
+        "strategies": exports.iter().map(|(elite, expert_name, magic, _, strategy, source, settings, tester, evidence)| serde_json::json!({
+            "fingerprint": elite.structural_fingerprint,
+            "strategy_id": elite.strategy.id,
+            "family": family_name(elite.niche.family),
+            "grade": "illuminated",
+            "magic": magic,
+            "expert_name": expert_name,
+            "strategy_ir": canonical_display(strategy),
+            "source": canonical_display(source),
+            "settings": canonical_display(settings),
+            "tester": canonical_display(tester),
+            "evidence": canonical_display(evidence),
+        })).collect::<Vec<_>>(),
+    });
+    quantforge_storage::write_json_new(&index_path, &index)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+
+    Ok(BatchEaExportView {
+        directory: canonical_display(directory),
+        index_path: canonical_display(&index_path),
+        expert_paths: exports
+            .iter()
+            .map(|(_, _, _, _, _, source, _, _, _)| canonical_display(source))
+            .collect(),
+        settings_paths: exports
+            .iter()
+            .map(|(_, _, _, _, _, _, settings, _, _)| canonical_display(settings))
+            .collect(),
+        tester_paths: exports
+            .iter()
+            .map(|(_, _, _, _, _, _, _, tester, _)| canonical_display(tester))
+            .collect(),
+        evidence_paths: exports
+            .iter()
+            .map(|(_, _, _, _, _, _, _, _, evidence)| canonical_display(evidence))
+            .collect(),
+    })
 }
 
 fn export_elite_strategies_to(
@@ -701,6 +955,11 @@ fn workspace_view(
         require_m1_precision: bank.config.require_m1_precision,
         m1_fidelity_verified: artifact_m1_fidelity_verified(artifact),
         simple_exits: bank.config.simple_exits,
+        allow_break_even: bank.config.allow_break_even,
+        allow_trailing_stops: bank.config.allow_trailing_stops,
+        allow_partial_exits: bank.config.allow_partial_exits,
+        allow_stop_entries: bank.config.allow_stop_entries,
+        allow_limit_entries: bank.config.allow_limit_entries,
         max_one_entry_per_day: bank.config.max_one_entry_per_day,
         families: coverage_families(bank),
         elites: bank.elites.iter().map(elite_row).collect(),

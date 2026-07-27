@@ -37,13 +37,26 @@ pub fn run_mt5_tester(
     let prior_deals = modified(&deals_path);
     let prior_equity = modified(&equity_path);
     let prior_metadata = modified(&metadata_path);
-    // Like MetaEditor, terminal64 under Wine is unreliable when /config
-    // contains spaces. Stage identical INI bytes at a space-free path.
-    let staging = config
-        .wine_binary
-        .is_some()
-        .then(tempfile::tempdir)
-        .transpose()?;
+    // terminal64 under Wine ignores /config paths on the Z: drive and silently
+    // reuses the last tester job. Stage the identical INI beneath the prefix's
+    // drive_c so the command resolves to a native C: path. The directory name
+    // is deliberately space-free because terminal64 is also unreliable when
+    // the /config argument contains spaces.
+    let staging = if config.wine_binary.is_some() {
+        let prefix = config.wine_prefix.as_ref().ok_or_else(|| {
+            ExportError::Compilation("Wine tester execution requires a WINEPREFIX".into())
+        })?;
+        let drive_c = prefix.join("drive_c");
+        if !drive_c.is_dir() {
+            return Err(ExportError::Compilation(format!(
+                "Wine prefix has no drive_c directory: {}",
+                drive_c.display()
+            )));
+        }
+        Some(tempfile::Builder::new().prefix("qf-tester-").tempdir_in(drive_c)?)
+    } else {
+        None
+    };
     let command_ini = if let Some(staging) = &staging {
         let path = staging.path().join("quantforge-tester.ini");
         fs::copy(&tester_ini, &path)?;

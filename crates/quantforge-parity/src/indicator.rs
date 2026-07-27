@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-pub const INDICATOR_PARITY_PROTOCOL_VERSION: &str = "mt5-indicator-parity-v1";
+pub const INDICATOR_PARITY_PROTOCOL_VERSION: &str = "mt5-indicator-parity-v2";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -78,6 +78,9 @@ struct ReferenceRow {
     wma: f64,
     rsi: f64,
     atr: f64,
+    adx: f64,
+    plus_di: f64,
+    minus_di: f64,
     donchian_high: f64,
     donchian_low: f64,
     highest_close: f64,
@@ -219,6 +222,21 @@ pub fn compare_indicator_reference(
             "atr",
             IndicatorExpr::Atr { period, shift: 0 },
             rows.iter().map(|row| row.atr).collect(),
+        ),
+        (
+            "adx",
+            IndicatorExpr::Adx { period, shift: 0 },
+            rows.iter().map(|row| row.adx).collect(),
+        ),
+        (
+            "plus_di",
+            IndicatorExpr::PlusDi { period, shift: 0 },
+            rows.iter().map(|row| row.plus_di).collect(),
+        ),
+        (
+            "minus_di",
+            IndicatorExpr::MinusDi { period, shift: 0 },
+            rows.iter().map(|row| row.minus_di).collect(),
         ),
         (
             "donchian_high",
@@ -434,6 +452,9 @@ mod tests {
             shift: 0,
         });
         let atr = series(IndicatorExpr::Atr { period, shift: 0 });
+        let adx = series(IndicatorExpr::Adx { period, shift: 0 });
+        let plus_di = series(IndicatorExpr::PlusDi { period, shift: 0 });
+        let minus_di = series(IndicatorExpr::MinusDi { period, shift: 0 });
         let donchian_high = series(IndicatorExpr::DonchianHigh { period, shift: 0 });
         let donchian_low = series(IndicatorExpr::DonchianLow { period, shift: 0 });
         let highest_close = series(IndicatorExpr::Highest {
@@ -481,6 +502,9 @@ mod tests {
                 wma: wma[index],
                 rsi: rsi[index],
                 atr: atr[index],
+                adx: adx[index],
+                plus_di: plus_di[index],
+                minus_di: minus_di[index],
                 donchian_high: donchian_high[index],
                 donchian_low: donchian_low[index],
                 highest_close: highest_close[index],

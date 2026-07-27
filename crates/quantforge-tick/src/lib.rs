@@ -23,6 +23,10 @@ use thiserror::Error;
 
 pub const ENGINE_TIER: &str = "m1-judge";
 
+// Must match the execution gate in quantforge-eval and the generated MQL5
+// template. MT5 has pre-test indicator history while an imported pack does not.
+const PARITY_SIGNAL_WARMUP_BARS: usize = 320;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeConfig {
     pub initial_balance: f64,
@@ -190,6 +194,11 @@ pub fn evaluate_strategy_m1(
     // M1 spread only — do not forward-fill decision bars (H1 can stamp 100+ pt
     // spikes that would poison every subsequent hour if carried).
     let decision_bars = &decision_dataset.bars;
+    let signal_warmup_bars = if decision_bars.len() > PARITY_SIGNAL_WARMUP_BARS {
+        PARITY_SIGNAL_WARMUP_BARS
+    } else {
+        0
+    };
     let mut m1_bars_owned = m1_dataset.bars.clone();
     forward_fill_zero_spreads(&mut m1_bars_owned);
     let m1_bars = &m1_bars_owned;
@@ -415,6 +424,7 @@ pub fn evaluate_strategy_m1(
             && pending.is_none()
             && !closed_this_decision
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && decision_index >= signal_warmup_bars
         {
             let filters_pass = strategy
                 .filters

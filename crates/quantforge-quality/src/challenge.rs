@@ -628,8 +628,7 @@ fn run_purged_folds(
         }
         let purge_start = start.saturating_sub(config.purge_bars);
         let embargo_end = end.saturating_add(config.embargo_bars).min(total);
-        let context_bars =
-            purged_fold_context_bars(&validation.bars, purge_start, start, end);
+        let context_bars = purged_fold_context_bars(&validation.bars, purge_start, start, end);
         let context = derived_dataset(validation, context_bars);
         let result = evaluate_strategy_from(
             strategy,
@@ -910,7 +909,8 @@ fn perturb_strategy(
         perturb_bool(filter, fraction, rng);
     }
     match &mut neighbor.risk {
-        RiskPolicy::FixedCurrency { amount } => perturb_positive(amount, fraction, 0.01, rng),
+        // Fixed-dollar risk is a research invariant, not a tunable parameter.
+        RiskPolicy::FixedCurrency { .. } => {}
         RiskPolicy::PercentBalance { percent } => perturb_positive(percent, fraction, 0.01, rng),
     }
     match &mut neighbor.stops.stop_loss {
@@ -1050,6 +1050,9 @@ fn perturb_indicator(indicator: &mut IndicatorExpr, fraction: f64, rng: &mut Cha
         | IndicatorExpr::Wma { period, .. }
         | IndicatorExpr::Rsi { period, .. }
         | IndicatorExpr::Atr { period, .. }
+        | IndicatorExpr::Adx { period, .. }
+        | IndicatorExpr::PlusDi { period, .. }
+        | IndicatorExpr::MinusDi { period, .. }
         | IndicatorExpr::DonchianHigh { period, .. }
         | IndicatorExpr::DonchianLow { period, .. }
         | IndicatorExpr::Highest { period, .. }
@@ -1454,7 +1457,10 @@ mod tests {
         let purge_start = start - purge_bars;
         let context = purged_fold_context_bars(&bars, purge_start, start, end);
         assert_eq!(context.len(), purge_start + (end - start));
-        assert_eq!(context[purge_start - 1].timestamp_ms, bars[purge_start - 1].timestamp_ms);
+        assert_eq!(
+            context[purge_start - 1].timestamp_ms,
+            bars[purge_start - 1].timestamp_ms
+        );
         assert_eq!(context[purge_start].timestamp_ms, bars[start].timestamp_ms);
         // Purged timestamps must not appear.
         let purged: std::collections::BTreeSet<_> = bars[purge_start..start]
@@ -1467,7 +1473,11 @@ mod tests {
                 .all(|bar| !purged.contains(&bar.timestamp_ms))
         );
         // Post-test (embargo region) must not appear.
-        assert!(context.iter().all(|bar| bar.timestamp_ms < bars[end].timestamp_ms));
+        assert!(
+            context
+                .iter()
+                .all(|bar| bar.timestamp_ms < bars[end].timestamp_ms)
+        );
     }
 
     #[test]

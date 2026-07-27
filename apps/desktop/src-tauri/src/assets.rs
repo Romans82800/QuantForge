@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,45 @@ struct AssetLibrary {
     assets: Vec<AssetProfile>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSearchRangeProfile {
+    pub id: String,
+    pub name: String,
+    pub ranges: quantforge_discover::SearchRangeProfile,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SearchRangeLibrary {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    profiles: Vec<SavedSearchRangeProfile>,
+}
+
+/// Reusable Discover form snapshot. The form remains client-owned because its
+/// path fields are machine-local, while this library makes the snapshot durable
+/// across application restarts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDiscoverProfile {
+    pub id: String,
+    pub name: String,
+    pub settings: Value,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverProfileLibrary {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    profiles: Vec<SavedDiscoverProfile>,
+}
+
 fn library_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -53,6 +93,64 @@ fn library_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve app config dir: {error}"))?;
     fs::create_dir_all(&dir).map_err(|error| format!("cannot create config dir: {error}"))?;
     Ok(dir.join("asset-library.json"))
+}
+
+fn search_range_library_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("cannot resolve app config dir: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("cannot create app config dir: {error}"))?;
+    Ok(dir.join("search-range-profiles.json"))
+}
+
+fn discover_profile_library_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("cannot resolve app config dir: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("cannot create app config dir: {error}"))?;
+    Ok(dir.join("discover-profiles.json"))
+}
+
+fn load_search_range_library(app: &AppHandle) -> Result<SearchRangeLibrary, String> {
+    let path = search_range_library_path(app)?;
+    if !path.exists() {
+        return Ok(SearchRangeLibrary { schema_version: 1, profiles: Vec::new() });
+    }
+    serde_json::from_slice(&fs::read(&path).map_err(|error| format!("cannot read search profiles: {error}"))?)
+        .map_err(|error| format!("search profiles are invalid: {error}"))
+}
+
+fn save_search_range_library(app: &AppHandle, library: &SearchRangeLibrary) -> Result<(), String> {
+    let path = search_range_library_path(app)?;
+    let bytes = serde_json::to_vec_pretty(library)
+        .map_err(|error| format!("cannot serialize search profiles: {error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("cannot save search profiles: {error}"))
+}
+
+fn load_discover_profile_library(app: &AppHandle) -> Result<DiscoverProfileLibrary, String> {
+    let path = discover_profile_library_path(app)?;
+    if !path.exists() {
+        return Ok(DiscoverProfileLibrary {
+            schema_version: 1,
+            profiles: Vec::new(),
+        });
+    }
+    serde_json::from_slice(
+        &fs::read(&path).map_err(|error| format!("cannot read Discover profiles: {error}"))?,
+    )
+    .map_err(|error| format!("Discover profiles are invalid: {error}"))
+}
+
+fn save_discover_profile_library(
+    app: &AppHandle,
+    library: &DiscoverProfileLibrary,
+) -> Result<(), String> {
+    let path = discover_profile_library_path(app)?;
+    let bytes = serde_json::to_vec_pretty(library)
+        .map_err(|error| format!("cannot serialize Discover profiles: {error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("cannot save Discover profiles: {error}"))
 }
 
 fn load_library(app: &AppHandle) -> Result<AssetLibrary, String> {
@@ -197,6 +295,108 @@ fn canonical_display(path: &Path) -> String {
 pub fn list_symbols() -> Result<Vec<SymbolPack>, String> {
     let root = resolve_data_pack_root()?;
     scan_symbols(&root)
+}
+
+#[tauri::command]
+pub fn list_search_range_profiles(app: AppHandle) -> Result<Vec<SavedSearchRangeProfile>, String> {
+    let mut profiles = load_search_range_library(&app)?.profiles;
+    profiles.sort_by_key(|profile| profile.name.to_ascii_lowercase());
+    Ok(profiles)
+}
+
+#[tauri::command]
+pub fn save_search_range_profile(
+    app: AppHandle,
+    profile: SavedSearchRangeProfile,
+) -> Result<Vec<SavedSearchRangeProfile>, String> {
+    if profile.name.trim().is_empty() {
+        return Err("profile name is required".into());
+    }
+    profile.ranges.validate().map_err(|error| error.to_string())?;
+    let mut library = load_search_range_library(&app)?;
+    let id = if profile.id.trim().is_empty() {
+        format!("range-{}", chrono::Utc::now().timestamp_millis())
+    } else {
+        profile.id.clone()
+    };
+    let next = SavedSearchRangeProfile {
+        id: id.clone(),
+        name: profile.name.trim().to_owned(),
+        ranges: profile.ranges,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(existing) = library.profiles.iter_mut().find(|item| item.id == id) {
+        *existing = next;
+    } else {
+        library.profiles.push(next);
+    }
+    library.schema_version = 1;
+    save_search_range_library(&app, &library)?;
+    list_search_range_profiles(app)
+}
+
+#[tauri::command]
+pub fn delete_search_range_profile(app: AppHandle, id: String) -> Result<Vec<SavedSearchRangeProfile>, String> {
+    let mut library = load_search_range_library(&app)?;
+    let before = library.profiles.len();
+    library.profiles.retain(|profile| profile.id != id);
+    if library.profiles.len() == before {
+        return Err("search profile was not found".into());
+    }
+    save_search_range_library(&app, &library)?;
+    list_search_range_profiles(app)
+}
+
+#[tauri::command]
+pub fn list_discover_profiles(app: AppHandle) -> Result<Vec<SavedDiscoverProfile>, String> {
+    let mut profiles = load_discover_profile_library(&app)?.profiles;
+    profiles.sort_by_key(|profile| profile.name.to_ascii_lowercase());
+    Ok(profiles)
+}
+
+#[tauri::command]
+pub fn save_discover_profile(
+    app: AppHandle,
+    profile: SavedDiscoverProfile,
+) -> Result<Vec<SavedDiscoverProfile>, String> {
+    if profile.name.trim().is_empty() {
+        return Err("Discover profile name is required".into());
+    }
+    if !profile.settings.is_object() {
+        return Err("Discover profile settings must be an object".into());
+    }
+    let mut library = load_discover_profile_library(&app)?;
+    let id = if profile.id.trim().is_empty() {
+        format!("discover-{}", chrono::Utc::now().timestamp_millis())
+    } else {
+        profile.id.clone()
+    };
+    let next = SavedDiscoverProfile {
+        id: id.clone(),
+        name: profile.name.trim().to_owned(),
+        settings: profile.settings,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(existing) = library.profiles.iter_mut().find(|item| item.id == id) {
+        *existing = next;
+    } else {
+        library.profiles.push(next);
+    }
+    library.schema_version = 1;
+    save_discover_profile_library(&app, &library)?;
+    list_discover_profiles(app)
+}
+
+#[tauri::command]
+pub fn delete_discover_profile(app: AppHandle, id: String) -> Result<Vec<SavedDiscoverProfile>, String> {
+    let mut library = load_discover_profile_library(&app)?;
+    let before = library.profiles.len();
+    library.profiles.retain(|profile| profile.id != id);
+    if library.profiles.len() == before {
+        return Err("Discover profile was not found".into());
+    }
+    save_discover_profile_library(&app, &library)?;
+    list_discover_profiles(app)
 }
 
 #[tauri::command]

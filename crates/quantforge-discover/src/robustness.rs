@@ -2,10 +2,12 @@
 
 use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};
+use quantforge_core::FloatPolicy;
 use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
-use quantforge_ir::StrategyIr;
+use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
 use quantforge_quality::{monte_carlo_from_trade_profits, perturb_strategy_parameters};
 use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+use quantforge_eval::{ScoutResult, ScoutTelemetry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RobustnessReject {
@@ -31,6 +33,13 @@ pub(crate) struct RobustnessConfig {
     pub minimum_passing_fold_fraction: f64,
     pub minimum_neighborhood_survival_fraction: f64,
     pub parameter_perturbation_fraction: f64,
+    /// Search-profile bounds used by the dedicated ADX plateau check.
+    pub adx_period_min: u16,
+    pub adx_period_max: u16,
+    pub adx_period_step: u16,
+    pub adx_threshold_min: f64,
+    pub adx_threshold_max: f64,
+    pub adx_threshold_step: f64,
     /// When true, folds are broker-local calendar years and every year must pass.
     pub calendar_year_folds: bool,
 }
@@ -49,7 +58,7 @@ pub(crate) fn run_m1_predeposit_robustness(
     broker: &SymbolSpecification,
     config: &RobustnessConfig,
     h1_metrics: &quantforge_eval::BacktestMetrics,
-) -> Result<(), RobustnessReject> {
+) -> Result<ScoutResult, RobustnessReject> {
     let judge = JudgeConfig {
         initial_balance: config.initial_balance,
         costs: config.costs.clone(),
@@ -57,6 +66,15 @@ pub(crate) fn run_m1_predeposit_robustness(
     };
     let baseline = evaluate_strategy_m1(strategy, is_decision, m1_dataset, broker, &judge)
         .map_err(|_| RobustnessReject::M1Fidelity)?;
+    // This is deliberately the result that leaves the robustness battery.  The
+    // selected-timeframe run is a scout; the databank must retain the exact M1
+    // chronology, equity path and metrics that were actually admitted.
+    let baseline_result = ScoutResult {
+        trades: baseline.trades.clone(),
+        equity: baseline.equity.clone(),
+        metrics: baseline.metrics.clone(),
+        telemetry: ScoutTelemetry::default(),
+    };
     // SQX-style: M1 must retain Selected-TF results, not re-clear absolute deposit gates.
     if !passes_sqx_m1_retention(
         h1_metrics,
@@ -145,32 +163,11 @@ pub(crate) fn run_m1_predeposit_robustness(
         ) else {
             continue;
         };
-        let Ok(result) =
-            evaluate_strategy_m1(&neighbor, is_decision, m1_dataset, broker, &judge)
+        let Ok(result) = evaluate_strategy_m1(&neighbor, is_decision, m1_dataset, broker, &judge)
         else {
             continue;
         };
-        let return_ratio = if baseline.metrics.return_percent > 0.0 {
-            result.metrics.return_percent / baseline.metrics.return_percent
-        } else {
-            1.0
-        };
-        let trade_ratio = if baseline.metrics.trade_count == 0 {
-            0.0
-        } else {
-            result.metrics.trade_count as f64 / baseline.metrics.trade_count as f64
-        };
-        let dd_limit = if baseline.metrics.max_drawdown_percent > 0.0 {
-            baseline.metrics.max_drawdown_percent * 1.5
-        } else {
-            config.maximum_drawdown_percent
-        };
-        if result.metrics.return_percent > config.minimum_return_percent
-            && return_ratio >= 0.5
-            && result.metrics.max_drawdown_percent <= dd_limit
-            && result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent
-            && trade_ratio >= 0.5
-        {
+        if neighborhood_survives(&result.metrics, &baseline.metrics, config) {
             surviving += 1;
         }
     }
@@ -178,7 +175,255 @@ pub(crate) fn run_m1_predeposit_robustness(
     if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
         return Err(RobustnessReject::ParamNeighborhood);
     }
-    Ok(())
+
+    // ADX gets an explicit local plateau check. The generic ±10% neighborhood
+    // perturbs many genes at once; that cannot prove that ADX itself is not a
+    // single lucky threshold or period. These neighbours isolate one search
+    // profile step in each available direction and require 3 of 4 to survive.
+    let plateau_neighbors = adx_plateau_neighbors(strategy, config);
+    if !plateau_neighbors.is_empty() {
+        let passing = plateau_neighbors
+            .iter()
+            .filter_map(|neighbor| {
+                evaluate_strategy_m1(neighbor, is_decision, m1_dataset, broker, &judge)
+                    .ok()
+                    .map(|result| neighborhood_survives(&result.metrics, &baseline.metrics, config))
+            })
+            .filter(|passed| *passed)
+            .count();
+        let plateau_survival = passing as f64 / plateau_neighbors.len() as f64;
+        if plateau_survival + 1e-12 < 0.75 {
+            return Err(RobustnessReject::ParamNeighborhood);
+        }
+    }
+    Ok(baseline_result)
+}
+
+fn neighborhood_survives(
+    candidate: &quantforge_eval::BacktestMetrics,
+    baseline: &quantforge_eval::BacktestMetrics,
+    config: &RobustnessConfig,
+) -> bool {
+    let return_ratio = if baseline.return_percent > 0.0 {
+        candidate.return_percent / baseline.return_percent
+    } else {
+        1.0
+    };
+    let trade_ratio = if baseline.trade_count == 0 {
+        0.0
+    } else {
+        candidate.trade_count as f64 / baseline.trade_count as f64
+    };
+    let dd_limit = if baseline.max_drawdown_percent > 0.0 {
+        baseline.max_drawdown_percent * 1.5
+    } else {
+        config.maximum_drawdown_percent
+    };
+    candidate.return_percent > config.minimum_return_percent
+        && return_ratio >= 0.5
+        && candidate.max_drawdown_percent <= dd_limit
+        && candidate.max_drawdown_percent <= config.maximum_drawdown_percent
+        && trade_ratio >= 0.5
+}
+
+fn adx_plateau_neighbors(strategy: &StrategyIr, config: &RobustnessConfig) -> Vec<StrategyIr> {
+    if !strategy_uses_adx(strategy) {
+        return Vec::new();
+    }
+    let mut variants = Vec::new();
+    for direction in [-1_i32, 1] {
+        let mut neighbor = strategy.clone();
+        if adjust_adx_periods(&mut neighbor, direction, config)
+            && let Ok(neighbor) = canonicalize_neighbor(neighbor)
+        {
+            variants.push(neighbor);
+        }
+    }
+    for direction in [-1.0_f64, 1.0] {
+        let mut neighbor = strategy.clone();
+        if adjust_adx_thresholds(&mut neighbor, direction, config)
+            && let Ok(neighbor) = canonicalize_neighbor(neighbor)
+        {
+            variants.push(neighbor);
+        }
+    }
+    variants
+}
+
+fn canonicalize_neighbor(mut strategy: StrategyIr) -> Result<StrategyIr, ()> {
+    strategy.id = format!("{}-adx-plateau", strategy.id);
+    let strategy = strategy
+        .canonicalized(FloatPolicy::default())
+        .map_err(|_| ())?;
+    strategy
+        .validate_export_safe(quantforge_ir::IrLimits::default())
+        .map_err(|_| ())?;
+    Ok(strategy)
+}
+
+fn strategy_uses_adx(strategy: &StrategyIr) -> bool {
+    strategy
+        .entry
+        .long
+        .iter()
+        .chain(strategy.entry.short.iter())
+        .chain(strategy.exit.iter())
+        .chain(strategy.filters.iter())
+        .any(bool_uses_adx)
+}
+
+fn bool_uses_adx(expression: &BoolExpr) -> bool {
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => numeric_uses_adx(left) || numeric_uses_adx(right),
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => numeric_uses_adx(value) || numeric_uses_adx(lower) || numeric_uses_adx(upper),
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            children.iter().any(bool_uses_adx)
+        }
+        BoolExpr::Not { child } => bool_uses_adx(child),
+    }
+}
+
+fn numeric_uses_adx(expression: &NumericExpr) -> bool {
+    matches!(
+        expression,
+        NumericExpr::Indicator {
+            value: IndicatorExpr::Adx { .. }
+        }
+    )
+}
+
+fn adjust_adx_periods(
+    strategy: &mut StrategyIr,
+    direction: i32,
+    config: &RobustnessConfig,
+) -> bool {
+    let mut changed = false;
+    for expression in strategy
+        .entry
+        .long
+        .iter_mut()
+        .chain(strategy.entry.short.iter_mut())
+        .chain(strategy.exit.iter_mut())
+        .chain(strategy.filters.iter_mut())
+    {
+        adjust_adx_periods_bool(expression, direction, config, &mut changed);
+    }
+    changed
+}
+
+fn adjust_adx_periods_bool(
+    expression: &mut BoolExpr,
+    direction: i32,
+    config: &RobustnessConfig,
+    changed: &mut bool,
+) {
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            adjust_adx_periods_numeric(left, direction, config, changed);
+            adjust_adx_periods_numeric(right, direction, config, changed);
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            adjust_adx_periods_numeric(value, direction, config, changed);
+            adjust_adx_periods_numeric(lower, direction, config, changed);
+            adjust_adx_periods_numeric(upper, direction, config, changed);
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children {
+                adjust_adx_periods_bool(child, direction, config, changed);
+            }
+        }
+        BoolExpr::Not { child } => adjust_adx_periods_bool(child, direction, config, changed),
+    }
+}
+
+fn adjust_adx_periods_numeric(
+    expression: &mut NumericExpr,
+    direction: i32,
+    config: &RobustnessConfig,
+    changed: &mut bool,
+) {
+    if let NumericExpr::Indicator {
+        value: IndicatorExpr::Adx { period, .. },
+    } = expression
+    {
+        let candidate = (*period as i32)
+            .saturating_add(direction.saturating_mul(config.adx_period_step as i32));
+        if candidate >= config.adx_period_min as i32 && candidate <= config.adx_period_max as i32 {
+            *period = candidate as u16;
+            *changed = true;
+        }
+    }
+}
+
+fn adjust_adx_thresholds(
+    strategy: &mut StrategyIr,
+    direction: f64,
+    config: &RobustnessConfig,
+) -> bool {
+    let mut changed = false;
+    for expression in strategy
+        .entry
+        .long
+        .iter_mut()
+        .chain(strategy.entry.short.iter_mut())
+        .chain(strategy.exit.iter_mut())
+        .chain(strategy.filters.iter_mut())
+    {
+        adjust_adx_thresholds_bool(expression, direction, config, &mut changed);
+    }
+    changed
+}
+
+fn adjust_adx_thresholds_bool(
+    expression: &mut BoolExpr,
+    direction: f64,
+    config: &RobustnessConfig,
+    changed: &mut bool,
+) {
+    match expression {
+        BoolExpr::Compare { left, right, .. } => {
+            if numeric_uses_adx(left) {
+                adjust_constant(right, direction, config, changed);
+            }
+            if numeric_uses_adx(right) {
+                adjust_constant(left, direction, config, changed);
+            }
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children {
+                adjust_adx_thresholds_bool(child, direction, config, changed);
+            }
+        }
+        BoolExpr::Not { child } => adjust_adx_thresholds_bool(child, direction, config, changed),
+        BoolExpr::CrossAbove { .. } | BoolExpr::CrossBelow { .. } | BoolExpr::Between { .. } => {}
+    }
+}
+
+fn adjust_constant(
+    expression: &mut NumericExpr,
+    direction: f64,
+    config: &RobustnessConfig,
+    changed: &mut bool,
+) {
+    if let NumericExpr::Constant { value } = expression {
+        let candidate = *value + direction * config.adx_threshold_step;
+        if candidate >= config.adx_threshold_min && candidate <= config.adx_threshold_max {
+            *value = candidate;
+            *changed = true;
+        }
+    }
 }
 
 fn contiguous_fold_ranges(bar_count: usize, folds: usize) -> Vec<(usize, usize)> {

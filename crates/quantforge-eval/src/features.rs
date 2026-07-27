@@ -171,8 +171,11 @@ impl<'a> FeatureCache<'a> {
         };
         let key = serde_json::to_string(indicator)?;
         if !self.indicators.contains_key(&key) {
-            let values =
-                calculate_indicator_series_with_clock(self.bars, indicator, Some(&self.broker_clock));
+            let values = calculate_indicator_series_with_clock(
+                self.bars,
+                indicator,
+                Some(&self.broker_clock),
+            );
             self.indicators.insert(key.clone(), values);
         }
         Ok(self.indicators[&key]
@@ -195,6 +198,9 @@ impl IndicatorEvalFields for IndicatorExpr {
             | Self::Wma { period, shift, .. }
             | Self::Rsi { period, shift, .. }
             | Self::Atr { period, shift }
+            | Self::Adx { period, shift }
+            | Self::PlusDi { period, shift }
+            | Self::MinusDi { period, shift }
             | Self::DonchianHigh { period, shift }
             | Self::DonchianLow { period, shift }
             | Self::Highest { period, shift, .. }
@@ -286,6 +292,9 @@ pub fn calculate_indicator_series_with_clock(
             rsi(&source_series(bars, source), period as usize)
         }
         IndicatorExpr::Atr { period, .. } => atr(bars, period as usize),
+        IndicatorExpr::Adx { period, .. } => directional_index(bars, period as usize).0,
+        IndicatorExpr::PlusDi { period, .. } => directional_index(bars, period as usize).1,
+        IndicatorExpr::MinusDi { period, .. } => directional_index(bars, period as usize).2,
         IndicatorExpr::DonchianHigh { period, .. } => rolling_extreme(
             &source_series(bars, PriceField::High),
             period as usize,
@@ -499,10 +508,7 @@ fn atr_percentile_series(bars: &[Bar], atr_period: usize, lookback: usize) -> Ve
             continue;
         }
         finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let rank = finite
-            .iter()
-            .filter(|value| **value <= current)
-            .count();
+        let rank = finite.iter().filter(|value| **value <= current).count();
         output[index] = rank as f64 / finite.len() as f64 * 100.0;
     }
     output
@@ -525,16 +531,12 @@ fn swing_base_zone_series(
         if index >= swing_right {
             let pivot = index - swing_right;
             if pivot >= swing_left {
-                let is_swing_low = (1..=swing_left).all(|offset| {
-                    bars[pivot].low <= bars[pivot - offset].low
-                }) && (1..=swing_right).all(|offset| {
-                    bars[pivot].low < bars[pivot + offset].low
-                });
-                let is_swing_high = (1..=swing_left).all(|offset| {
-                    bars[pivot].high >= bars[pivot - offset].high
-                }) && (1..=swing_right).all(|offset| {
-                    bars[pivot].high > bars[pivot + offset].high
-                });
+                let is_swing_low = (1..=swing_left)
+                    .all(|offset| bars[pivot].low <= bars[pivot - offset].low)
+                    && (1..=swing_right).all(|offset| bars[pivot].low < bars[pivot + offset].low);
+                let is_swing_high = (1..=swing_left)
+                    .all(|offset| bars[pivot].high >= bars[pivot - offset].high)
+                    && (1..=swing_right).all(|offset| bars[pivot].high > bars[pivot + offset].high);
                 // Demand base follows swing low; supply base follows swing high.
                 let use_pivot = if zone_high {
                     is_swing_low
@@ -732,6 +734,56 @@ fn atr(bars: &[Bar], period: usize) -> Vec<f64> {
     rolling_mean(&true_ranges, period)
 }
 
+/// Wilder DMI/ADX buffers matching MT5 `iADX`: `(ADX, +DI, -DI)`.
+fn directional_index(bars: &[Bar], period: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let len = bars.len();
+    let mut adx = vec![f64::NAN; len];
+    let mut plus_di = vec![f64::NAN; len];
+    let mut minus_di = vec![f64::NAN; len];
+    if period == 0 || len <= period {
+        return (adx, plus_di, minus_di);
+    }
+    let mut trs = vec![0.0; len];
+    let mut plus = vec![0.0; len];
+    let mut minus = vec![0.0; len];
+    for index in 1..len {
+        let up = bars[index].high - bars[index - 1].high;
+        let down = bars[index - 1].low - bars[index].low;
+        plus[index] = if up > down && up > 0.0 { up } else { 0.0 };
+        minus[index] = if down > up && down > 0.0 { down } else { 0.0 };
+        trs[index] = (bars[index].high - bars[index].low)
+            .max((bars[index].high - bars[index - 1].close).abs())
+            .max((bars[index].low - bars[index - 1].close).abs());
+    }
+    let mut smooth_tr: f64 = trs[1..=period].iter().sum();
+    let mut smooth_plus: f64 = plus[1..=period].iter().sum();
+    let mut smooth_minus: f64 = minus[1..=period].iter().sum();
+    let mut dx = vec![f64::NAN; len];
+    for index in period..len {
+        if index > period {
+            smooth_tr = smooth_tr - smooth_tr / period as f64 + trs[index];
+            smooth_plus = smooth_plus - smooth_plus / period as f64 + plus[index];
+            smooth_minus = smooth_minus - smooth_minus / period as f64 + minus[index];
+        }
+        if smooth_tr > 0.0 {
+            plus_di[index] = 100.0 * smooth_plus / smooth_tr;
+            minus_di[index] = 100.0 * smooth_minus / smooth_tr;
+            let total = plus_di[index] + minus_di[index];
+            if total > 0.0 {
+                dx[index] = 100.0 * (plus_di[index] - minus_di[index]).abs() / total;
+            }
+        }
+    }
+    let first_adx = period.saturating_mul(2).saturating_sub(1);
+    if first_adx < len {
+        adx[first_adx] = dx[period..=first_adx].iter().sum::<f64>() / period as f64;
+        for index in first_adx + 1..len {
+            adx[index] = (adx[index - 1] * (period - 1) as f64 + dx[index]) / period as f64;
+        }
+    }
+    (adx, plus_di, minus_di)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +866,34 @@ mod tests {
     }
 
     #[test]
+    fn directional_index_exposes_finite_adx_and_directional_buffers_after_warmup() {
+        let bars: Vec<_> = (0..80)
+            .map(|index| {
+                let base = 100.0 + index as f64 * 0.2;
+                Bar {
+                    timestamp_ms: index as i64 * 60_000,
+                    open: base,
+                    high: base + 1.0,
+                    low: base - 0.25,
+                    close: base + 0.75,
+                    tick_volume: 1,
+                    real_volume: 0,
+                    spread_points: Some(0),
+                }
+            })
+            .collect();
+        let period = 14;
+        let adx = calculate_indicator_series(&bars, &IndicatorExpr::Adx { period, shift: 0 });
+        let plus = calculate_indicator_series(&bars, &IndicatorExpr::PlusDi { period, shift: 0 });
+        let minus = calculate_indicator_series(&bars, &IndicatorExpr::MinusDi { period, shift: 0 });
+        let index = 2 * period as usize;
+        assert!(adx[index].is_finite());
+        assert!(plus[index].is_finite());
+        assert!(minus[index].is_finite());
+        assert!(plus[index] > minus[index]);
+    }
+
+    #[test]
     fn body_range_and_close_location_use_completed_candle_geometry() {
         let bars = vec![Bar {
             timestamp_ms: 0,
@@ -825,14 +905,9 @@ mod tests {
             real_volume: 0,
             spread_points: Some(0),
         }];
-        let body = calculate_indicator_series(
-            &bars,
-            &IndicatorExpr::BodyRangeRatio { shift: 1 },
-        );
-        let location = calculate_indicator_series(
-            &bars,
-            &IndicatorExpr::CloseLocationInBar { shift: 1 },
-        );
+        let body = calculate_indicator_series(&bars, &IndicatorExpr::BodyRangeRatio { shift: 1 });
+        let location =
+            calculate_indicator_series(&bars, &IndicatorExpr::CloseLocationInBar { shift: 1 });
         assert_eq!(body[0], 0.5);
         assert!((location[0] - 5.0 / 6.0).abs() < 1e-12);
     }

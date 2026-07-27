@@ -4,6 +4,7 @@ export type WorkspaceName =
   | "Home"
   | "Databank"
   | "Discover"
+  | "Search Settings"
   | "Vault"
   | "Data Lab"
   | "Parity Lab"
@@ -62,6 +63,7 @@ export interface PartitionEquityPoint {
 export interface PartitionEquityView {
   fingerprint: string;
   strategyId: string;
+  executionEngine: string;
   initialBalance: number;
   points: PartitionEquityPoint[];
   isEndTimestampMs: number;
@@ -147,6 +149,11 @@ export interface DatabankWorkspace {
   requireM1Precision: boolean;
   m1FidelityVerified: boolean;
   simpleExits: boolean;
+  allowBreakEven: boolean;
+  allowTrailingStops: boolean;
+  allowPartialExits: boolean;
+  allowStopEntries: boolean;
+  allowLimitEntries: boolean;
   maxOneEntryPerDay: boolean;
   families: FamilyCoverage[];
   elites: EliteRow[];
@@ -156,6 +163,22 @@ export interface BatchExportView {
   directory: string;
   indexPath: string;
   strategyPaths: string[];
+}
+
+export interface BatchEaExportRequest {
+  fingerprints: string[];
+  directory: string;
+  timeframe: string;
+  baseMagic: number;
+}
+
+export interface BatchEaExportView {
+  directory: string;
+  indexPath: string;
+  expertPaths: string[];
+  settingsPaths: string[];
+  testerPaths: string[];
+  evidencePaths: string[];
 }
 
 export interface EliteDetail {
@@ -251,11 +274,13 @@ export type DiscoverRunModeId = "fast_scout" | "full_harvest";
 
 export interface FamilyBakeoffRow {
   family: SearchFamilyId;
-  medianOos1Expectancy: number;
+  medianIsExpectancyR: number;
+  medianOos1ExpectancyR: number;
   medianRetention: number;
   passRate: number;
   elites: number;
   potElites: number;
+  oos1Tested: number;
   evaluations: number;
 }
 
@@ -286,6 +311,7 @@ export interface FamilyBakeoffRequest {
 export interface DiscoverRequest {
   mode: DiscoverMode;
   dataPath: string;
+  decisionTimeframe: "H1" | "M15" | null;
   metadataPath: string | null;
   sourceTimezone: string | null;
   m1DataPath: string;
@@ -303,6 +329,7 @@ export interface DiscoverRequest {
   searchFamily: SearchFamilyId | null;
   runMode: DiscoverRunModeId | null;
   earlyStopPotElites: number | null;
+  searchRanges: SearchRangeProfile | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
@@ -317,6 +344,11 @@ export interface DiscoverRequest {
   oos1ExpectancyRetention: number | null;
   requireM1Precision: boolean | null;
   simpleExits: boolean | null;
+  allowBreakEven: boolean | null;
+  allowTrailingStops: boolean | null;
+  allowPartialExits: boolean | null;
+  allowStopEntries: boolean | null;
+  allowLimitEntries: boolean | null;
   flattenAt22: boolean | null;
   maxOneEntryPerDay: boolean | null;
   mutateAfterElites: number | null;
@@ -338,6 +370,52 @@ export interface DiscoverRequest {
   promotionSplit: boolean | null;
   validationFraction: number | null;
   sealedFraction: number | null;
+}
+
+export interface SavedDiscoverProfile {
+  id: string;
+  name: string;
+  settings: DiscoverRequest;
+  updatedAt: string;
+}
+
+export interface SearchRange {
+  minimum: number;
+  maximum: number;
+  step: number;
+}
+
+export interface SearchRangeProfile {
+  indicatorPeriod: SearchRange;
+  atrPeriod: SearchRange;
+  atrStopMultiple: SearchRange;
+  atrTargetMultiple: SearchRange;
+  riskTargetMultiple: SearchRange;
+  pendingDistanceAtr: SearchRange;
+  pendingExpiryBars: SearchRange;
+  timeStopBars: SearchRange;
+  rsiUpper: SearchRange;
+  rsiLower: SearchRange;
+  adxThreshold: SearchRange;
+  rocThreshold: SearchRange;
+  percentileLow: SearchRange;
+  zscoreThreshold: SearchRange;
+  impulseBodyRatio: SearchRange;
+  impulseCloseLocation: SearchRange;
+  atrPercentileMax: SearchRange;
+  atrPercentileLookback: SearchRange;
+  sessionStartHour: SearchRange;
+  sessionRangeBars: SearchRange;
+  swingBars: SearchRange;
+  baseBars: SearchRange;
+  liquiditySweepThreshold: SearchRange;
+}
+
+export interface SavedSearchRangeProfile {
+  id: string;
+  name: string;
+  ranges: SearchRangeProfile;
+  updatedAt: string;
 }
 
 export interface EvaluationErrorCount {

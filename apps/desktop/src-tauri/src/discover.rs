@@ -1,16 +1,18 @@
-use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
-use crate::databank::{EvolveArtifact, verify_artifact};
-use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
+use crate::data_lab::{build_decision_from_m1, display_path, load_bound_broker, load_data_source};
+use crate::databank::{verify_artifact, EvolveArtifact};
+use quantforge_data::{
+    bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms, BarDataset,
+};
 use quantforge_discover::{
-    DEFAULT_FX_PACK, Databank, DiscoverConfig, DiscoverRunMode, FamilyBakeoffConfig,
-    FamilyBakeoffReport, GateConfig, PackSymbol, SearchFamily, continue_evolution_with_pack,
-    evolve_new_with_pack,
-    run_family_bakeoff as evolve_family_bakeoff,
+    continue_evolution_with_pack, evolve_new_with_pack,
+    run_family_bakeoff as evolve_family_bakeoff, Databank, DiscoverConfig, DiscoverRunMode,
+    FamilyBakeoffConfig, FamilyBakeoffReport, GateConfig, PackSymbol, SearchFamily,
+    SearchRangeProfile, DEFAULT_FX_PACK,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
-use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
+use quantforge_storage::{write_json_new, write_json_versioned, RunManifest, RunRecipe};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -27,11 +29,29 @@ pub enum DiscoverMode {
     Continue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum DecisionTimeframe {
+    H1,
+    M15,
+}
+
+impl DecisionTimeframe {
+    const fn interval_ms(self) -> i64 {
+        match self {
+            Self::H1 => 3_600_000,
+            Self::M15 => 900_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverRequest {
     mode: DiscoverMode,
     data_path: String,
+    /// M15 is deterministically built from the bound M1 execution stream.
+    decision_timeframe: Option<DecisionTimeframe>,
     metadata_path: Option<String>,
     source_timezone: Option<String>,
     m1_data_path: String,
@@ -65,8 +85,14 @@ pub struct DiscoverRequest {
     oos1_expectancy_retention: Option<f64>,
     /// SQX Selected-TF style when false (default): skip M1 during Discover.
     require_m1_precision: Option<bool>,
-    /// Market + SL/TP + time stop ≤ 16; no trailing/BE/partials/stop-limit entries.
+    /// Legacy selected-TF compatibility profile. Explicit feature toggles below
+    /// take precedence and require direct M1 precision.
     simple_exits: Option<bool>,
+    allow_break_even: Option<bool>,
+    allow_trailing_stops: Option<bool>,
+    allow_partial_exits: Option<bool>,
+    allow_stop_entries: Option<bool>,
+    allow_limit_entries: Option<bool>,
     flatten_at_22: Option<bool>,
     /// Cap to one filled entry per broker-local day (default true).
     max_one_entry_per_day: Option<bool>,
@@ -77,7 +103,7 @@ pub struct DiscoverRequest {
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_neighborhood_samples: Option<usize>,
-    /// Broker-local calendar-year folds; every year must pass (default true).
+    /// Broker-local calendar-year folds; every year must pass (strict opt-in).
     calendar_year_folds: Option<bool>,
     /// Hard deflated-Sharpe floor; omit for report-only.
     minimum_deflated_trade_sharpe: Option<f64>,
@@ -91,6 +117,7 @@ pub struct DiscoverRequest {
     run_mode: Option<String>,
     /// Early-stop when accepted pot reaches this size (Fast Scout).
     early_stop_pot_elites: Option<usize>,
+    search_ranges: Option<SearchRangeProfile>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -280,8 +307,7 @@ pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoff
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
     let validation_fraction = request.validation_fraction.clamp(0.05, 0.4);
     let sealed_fraction = 0.2;
-    let search_h1 =
-        development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
+    let search_h1 = development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
     let oos1 = oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
     let m1_is = development_partition(&m1_loaded.dataset, validation_fraction, sealed_fraction)?;
     let mut discover = DiscoverConfig {
@@ -295,10 +321,7 @@ pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoff
         ..DiscoverConfig::default()
     };
     discover.scout.costs.commission_per_lot_round_turn = request.commission_per_lot_round_turn;
-    discover
-        .scout
-        .costs
-        .adverse_slippage_points_per_side = request.slippage_points_per_side;
+    discover.scout.costs.adverse_slippage_points_per_side = request.slippage_points_per_side;
     discover.scout.costs.fallback_spread_points = request.fallback_spread_points;
     let config = FamilyBakeoffConfig {
         discover,
@@ -528,6 +551,11 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.minimum_m1_return_retention.is_some(),
             request.require_m1_precision.is_some(),
             request.simple_exits.is_some(),
+            request.allow_break_even.is_some(),
+            request.allow_trailing_stops.is_some(),
+            request.allow_partial_exits.is_some(),
+            request.allow_stop_entries.is_some(),
+            request.allow_limit_entries.is_some(),
             request.flatten_at_22.is_some(),
             request.max_one_entry_per_day.is_some(),
             request.mutate_after_elites.is_some(),
@@ -594,8 +622,15 @@ fn run_discovery(
         ));
     }
 
+    let decision_timeframe = request.decision_timeframe.unwrap_or(DecisionTimeframe::H1);
     let (search_decision, decision_bars_built) = {
-        let built = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
+        let built = match decision_timeframe {
+            DecisionTimeframe::H1 => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
+            DecisionTimeframe::M15 => {
+                build_timeframe_from_m1(&m1.dataset, DecisionTimeframe::M15.interval_ms(), None)
+                    .map_err(|error| error.to_string())?
+            }
+        };
         let count = built.bars.len() as u64;
         (built, count)
     };
@@ -621,10 +656,11 @@ fn run_discovery(
         .transpose()?;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
     let oos1_ref = oos1_dataset.as_ref();
-    let m1_is_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| clip_dataset_to_window(&m1.dataset, new_dataset))
-        .transpose()?;
-    let m1_eval = m1_is_dataset.as_ref().unwrap_or(&m1.dataset);
+    // Always retain the full M1 stream.  The evaluator only consumes the M1
+    // minutes covered by the supplied decision partition, so this lets OOS1 be
+    // replayed at the same precision as IS instead of comparing M1 IS against
+    // an H1/M15 OOS result.
+    let m1_eval = &m1.dataset;
     let pack = load_fx_pack(
         request.pack_data_dir.as_deref(),
         &broker.symbol,
@@ -697,7 +733,10 @@ fn run_discovery(
             &bank,
             display_path(Path::new(&request.data_path)),
             display_path(Path::new(&request.broker_path)),
-            loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+            loaded
+                .metadata
+                .as_ref()
+                .map(|value| value.metadata_hash.clone()),
             &quality,
             &m1_quality,
             &m1.dataset.data_hash,
@@ -785,7 +824,10 @@ fn run_discovery(
                 &bank,
                 display_path(Path::new(&request.data_path)),
                 display_path(Path::new(&request.broker_path)),
-                loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+                loaded
+                    .metadata
+                    .as_ref()
+                    .map(|value| value.metadata_hash.clone()),
                 &quality,
                 &m1_quality,
                 &m1.dataset.data_hash,
@@ -890,7 +932,10 @@ fn finish_discovery(
         &bank,
         display_path(Path::new(&request.data_path)),
         display_path(Path::new(&request.broker_path)),
-        loaded.metadata.as_ref().map(|value| value.metadata_hash.clone()),
+        loaded
+            .metadata
+            .as_ref()
+            .map(|value| value.metadata_hash.clone()),
         quality,
         m1_quality,
         &m1.dataset.data_hash,
@@ -1008,7 +1053,11 @@ fn write_discover_checkpoint(
         ("sealed_fraction".into(), json!(sealed_fraction)),
         (
             "stopped_early".into(),
-            json!(stop_was_early(completed_now, soft_budget, run_until_stopped)),
+            json!(stop_was_early(
+                completed_now,
+                soft_budget,
+                run_until_stopped
+            )),
         ),
         ("run_until_stopped".into(), json!(run_until_stopped)),
         ("partial_checkpoint".into(), json!(partial)),
@@ -1016,16 +1065,16 @@ fn write_discover_checkpoint(
             "require_m1_precision".into(),
             json!(bank.config.require_m1_precision),
         ),
-        (
-            "research_grade".into(),
-            json!(!bank.config.require_m1_precision),
-        ),
+        ("research_grade".into(), json!(false)),
         ("simple_exits".into(), json!(bank.config.simple_exits)),
         (
             "max_one_entry_per_day".into(),
             json!(bank.config.max_one_entry_per_day),
         ),
-        ("m1_fidelity_verified".into(), json!(false)),
+        (
+            "m1_fidelity_verified".into(),
+            json!(bank.config.require_m1_robustness),
+        ),
     ]);
     if let Some(recipe_hash) = continuation_recipe_hash {
         manifest_config.insert("continued_recipe_hash".into(), json!(recipe_hash));
@@ -1115,7 +1164,8 @@ fn load_fx_pack(
                 Some(&market_broker.timezone),
             )?
         };
-        let market_broker = load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
+        let market_broker =
+            load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
         let dataset = if apply_promotion_split {
             development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
         } else {
@@ -1217,6 +1267,7 @@ fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<Bar
     })
 }
 
+#[cfg(test)]
 fn clip_dataset_to_window(dataset: &BarDataset, window: &BarDataset) -> Result<BarDataset, String> {
     let (Some(first), Some(last)) = (window.bars.first(), window.bars.last()) else {
         return Err("cannot clip M1: IS window is empty".into());
@@ -1268,9 +1319,7 @@ fn parse_search_family(value: &str) -> Option<quantforge_discover::SearchFamily>
         "zscore_reversion" | "z_score_reversion" | "zscore" => {
             Some(quantforge_discover::SearchFamily::ZScoreReversion)
         }
-        "session_orb" | "sessionorb" | "orb" => {
-            Some(quantforge_discover::SearchFamily::SessionOrb)
-        }
+        "session_orb" | "sessionorb" | "orb" => Some(quantforge_discover::SearchFamily::SessionOrb),
         "impulse_candle" | "impulsecandle" | "impulse" => {
             Some(quantforge_discover::SearchFamily::ImpulseCandle)
         }
@@ -1289,17 +1338,12 @@ fn parse_search_family(value: &str) -> Option<quantforge_discover::SearchFamily>
 
 fn parse_bakeoff_families(values: &[String]) -> Result<Vec<SearchFamily>, String> {
     if values.is_empty() {
-        return Err(
-            "select at least one search family for the family tester".into(),
-        );
+        return Err("select at least one search family for the family tester".into());
     }
     let mut families = Vec::with_capacity(values.len());
     for value in values {
-        let family = parse_search_family(value).ok_or_else(|| {
-            format!(
-                "unknown search family '{value}'"
-            )
-        })?;
+        let family =
+            parse_search_family(value).ok_or_else(|| format!("unknown search family '{value}'"))?;
         if !families.contains(&family) {
             families.push(family);
         }
@@ -1353,9 +1397,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         },
         deposit_gates: GateConfig {
             minimum_trades: request.deposit_minimum_trades.unwrap_or(20),
-            maximum_drawdown_percent: request
-                .deposit_maximum_drawdown_percent
-                .unwrap_or(30.0),
+            maximum_drawdown_percent: request.deposit_maximum_drawdown_percent.unwrap_or(30.0),
             minimum_return_percent: request.deposit_minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: request.deposit_minimum_profit_factor.unwrap_or(1.0),
             minimum_return_drawdown: request.deposit_minimum_return_drawdown.unwrap_or(0.0),
@@ -1363,9 +1405,15 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.90),
         },
+        search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
         require_m1_precision: request.require_m1_precision.unwrap_or(false),
         simple_exits: request.simple_exits.unwrap_or(true),
+        allow_break_even: request.allow_break_even.unwrap_or(false),
+        allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
+        allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
+        allow_stop_entries: request.allow_stop_entries.unwrap_or(false),
+        allow_limit_entries: request.allow_limit_entries.unwrap_or(false),
         flatten_at_22: request.flatten_at_22.unwrap_or(false),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
@@ -1378,10 +1426,8 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
-        robustness_neighborhood_samples: request
-            .robustness_neighborhood_samples
-            .unwrap_or(8),
-        calendar_year_folds: request.calendar_year_folds.unwrap_or(true),
+        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(8),
+        calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
         scout: ScoutConfig {
@@ -1579,6 +1625,7 @@ mod tests {
         DiscoverRequest {
             mode: DiscoverMode::New,
             data_path: fixture("EURUSD_M15_sample.tsv"),
+            decision_timeframe: Some(DecisionTimeframe::M15),
             metadata_path: Some(fixture("EURUSD_M15_sample.metadata.csv")),
             source_timezone: None,
             m1_data_path: fixture("EURUSD_M1_sample.tsv"),
@@ -1607,6 +1654,11 @@ mod tests {
             oos1_expectancy_retention: Some(0.7),
             require_m1_precision: Some(false),
             simple_exits: Some(true),
+            allow_break_even: Some(false),
+            allow_trailing_stops: Some(false),
+            allow_partial_exits: Some(false),
+            allow_stop_entries: Some(false),
+            allow_limit_entries: Some(false),
             flatten_at_22: Some(false),
             max_one_entry_per_day: Some(true),
             mutate_after_elites: Some(0),
@@ -1623,6 +1675,7 @@ mod tests {
             search_family: Some("trend_pullback".into()),
             run_mode: Some("full_harvest".into()),
             early_stop_pot_elites: None,
+            search_ranges: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,
@@ -1762,7 +1815,10 @@ mod tests {
         };
         let clipped = clip_dataset_to_window(&m1, &h1).expect("clip");
         assert_eq!(clipped.bars.len(), 120);
-        assert!(clipped.bars.iter().any(|bar| (bar.high - 1.2).abs() < 1e-12));
+        assert!(clipped
+            .bars
+            .iter()
+            .any(|bar| (bar.high - 1.2).abs() < 1e-12));
     }
 
     #[test]

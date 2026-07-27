@@ -52,6 +52,192 @@ pub struct PrecisionGateConfig {
     pub minimum_return_retention: f64,
 }
 
+/// A discrete numeric gene ladder. Values are sampled and mutated only on this
+/// grid, which makes the researcher-selected search space explicit and auditable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchRange {
+    pub minimum: f64,
+    pub maximum: f64,
+    pub step: f64,
+}
+
+impl SearchRange {
+    pub const fn new(minimum: f64, maximum: f64, step: f64) -> Self {
+        Self {
+            minimum,
+            maximum,
+            step,
+        }
+    }
+
+    pub fn validate(&self, name: &str) -> Result<(), DiscoverError> {
+        if !self.minimum.is_finite()
+            || !self.maximum.is_finite()
+            || !self.step.is_finite()
+            || self.step <= 0.0
+            || self.maximum < self.minimum
+        {
+            return Err(DiscoverError::InvalidConfig(format!(
+                "search range `{name}` requires finite min/max and a positive step"
+            )));
+        }
+        let steps = (self.maximum - self.minimum) / self.step;
+        if steps > 1_000.0 {
+            return Err(DiscoverError::InvalidConfig(format!(
+                "search range `{name}` has more than 1,000 discrete values"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// User-controlled numeric gene space. This profile is stored inside every
+/// databank and is immutable on continuation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchRangeProfile {
+    #[serde(rename = "indicatorPeriod", alias = "indicator_period")]
+    pub indicator_period: SearchRange,
+    #[serde(rename = "atrPeriod", alias = "atr_period")]
+    pub atr_period: SearchRange,
+    #[serde(rename = "atrStopMultiple", alias = "atr_stop_multiple")]
+    pub atr_stop_multiple: SearchRange,
+    #[serde(rename = "atrTargetMultiple", alias = "atr_target_multiple")]
+    pub atr_target_multiple: SearchRange,
+    #[serde(rename = "riskTargetMultiple", alias = "risk_target_multiple")]
+    pub risk_target_multiple: SearchRange,
+    #[serde(rename = "pendingDistanceAtr", alias = "pending_distance_atr")]
+    pub pending_distance_atr: SearchRange,
+    #[serde(rename = "pendingExpiryBars", alias = "pending_expiry_bars")]
+    pub pending_expiry_bars: SearchRange,
+    #[serde(rename = "timeStopBars", alias = "time_stop_bars")]
+    pub time_stop_bars: SearchRange,
+    #[serde(rename = "rsiUpper", alias = "rsi_upper")]
+    pub rsi_upper: SearchRange,
+    #[serde(rename = "rsiLower", alias = "rsi_lower")]
+    pub rsi_lower: SearchRange,
+    #[serde(rename = "adxThreshold", alias = "adx_threshold")]
+    pub adx_threshold: SearchRange,
+    #[serde(rename = "rocThreshold", alias = "roc_threshold")]
+    pub roc_threshold: SearchRange,
+    #[serde(rename = "percentileLow", alias = "percentile_low")]
+    pub percentile_low: SearchRange,
+    #[serde(rename = "zscoreThreshold", alias = "zscore_threshold")]
+    pub zscore_threshold: SearchRange,
+    #[serde(rename = "impulseBodyRatio", alias = "impulse_body_ratio")]
+    pub impulse_body_ratio: SearchRange,
+    #[serde(rename = "impulseCloseLocation", alias = "impulse_close_location")]
+    pub impulse_close_location: SearchRange,
+    #[serde(rename = "atrPercentileMax", alias = "atr_percentile_max")]
+    pub atr_percentile_max: SearchRange,
+    #[serde(rename = "atrPercentileLookback", alias = "atr_percentile_lookback")]
+    pub atr_percentile_lookback: SearchRange,
+    #[serde(rename = "sessionStartHour", alias = "session_start_hour")]
+    pub session_start_hour: SearchRange,
+    #[serde(rename = "sessionRangeBars", alias = "session_range_bars")]
+    pub session_range_bars: SearchRange,
+    #[serde(rename = "swingBars", alias = "swing_bars")]
+    pub swing_bars: SearchRange,
+    #[serde(rename = "baseBars", alias = "base_bars")]
+    pub base_bars: SearchRange,
+    #[serde(
+        rename = "liquiditySweepThreshold",
+        alias = "liquidity_sweep_threshold"
+    )]
+    pub liquidity_sweep_threshold: SearchRange,
+}
+
+impl Default for SearchRangeProfile {
+    fn default() -> Self {
+        Self {
+            indicator_period: SearchRange::new(10.0, 20.0, 1.0),
+            atr_period: SearchRange::new(14.0, 14.0, 1.0),
+            atr_stop_multiple: SearchRange::new(1.5, 4.0, 0.25),
+            atr_target_multiple: SearchRange::new(2.0, 6.0, 0.5),
+            risk_target_multiple: SearchRange::new(1.5, 4.5, 0.25),
+            pending_distance_atr: SearchRange::new(0.25, 2.0, 0.25),
+            pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
+            time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
+            rsi_upper: SearchRange::new(52.0, 65.0, 1.0),
+            rsi_lower: SearchRange::new(20.0, 40.0, 1.0),
+            adx_threshold: SearchRange::new(20.0, 35.0, 1.0),
+            roc_threshold: SearchRange::new(0.1, 2.5, 0.1),
+            percentile_low: SearchRange::new(5.0, 25.0, 1.0),
+            zscore_threshold: SearchRange::new(1.0, 2.5, 0.1),
+            impulse_body_ratio: SearchRange::new(0.55, 0.75, 0.05),
+            impulse_close_location: SearchRange::new(0.70, 0.90, 0.05),
+            atr_percentile_max: SearchRange::new(15.0, 35.0, 1.0),
+            atr_percentile_lookback: SearchRange::new(20.0, 60.0, 20.0),
+            session_start_hour: SearchRange::new(7.0, 14.0, 1.0),
+            session_range_bars: SearchRange::new(2.0, 4.0, 1.0),
+            swing_bars: SearchRange::new(2.0, 4.0, 1.0),
+            base_bars: SearchRange::new(2.0, 4.0, 1.0),
+            liquidity_sweep_threshold: SearchRange::new(0.0, 0.5, 0.5),
+        }
+    }
+}
+
+impl SearchRangeProfile {
+    pub fn validate(&self) -> Result<(), DiscoverError> {
+        for (name, range) in [
+            ("indicator_period", &self.indicator_period),
+            ("atr_period", &self.atr_period),
+            ("atr_stop_multiple", &self.atr_stop_multiple),
+            ("atr_target_multiple", &self.atr_target_multiple),
+            ("risk_target_multiple", &self.risk_target_multiple),
+            ("pending_distance_atr", &self.pending_distance_atr),
+            ("pending_expiry_bars", &self.pending_expiry_bars),
+            ("time_stop_bars", &self.time_stop_bars),
+            ("rsi_upper", &self.rsi_upper),
+            ("rsi_lower", &self.rsi_lower),
+            ("adx_threshold", &self.adx_threshold),
+            ("roc_threshold", &self.roc_threshold),
+            ("percentile_low", &self.percentile_low),
+            ("zscore_threshold", &self.zscore_threshold),
+            ("impulse_body_ratio", &self.impulse_body_ratio),
+            ("impulse_close_location", &self.impulse_close_location),
+            ("atr_percentile_max", &self.atr_percentile_max),
+            ("atr_percentile_lookback", &self.atr_percentile_lookback),
+            ("session_start_hour", &self.session_start_hour),
+            ("session_range_bars", &self.session_range_bars),
+            ("swing_bars", &self.swing_bars),
+            ("base_bars", &self.base_bars),
+            ("liquidity_sweep_threshold", &self.liquidity_sweep_threshold),
+        ] {
+            range.validate(name)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod search_range_profile_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_browser_camel_case_and_existing_snake_case_profiles() {
+        let camel: SearchRangeProfile = serde_json::from_value(serde_json::json!({
+            "indicatorPeriod": { "minimum": 12.0, "maximum": 12.0, "step": 1.0 },
+            "adxThreshold": { "minimum": 24.0, "maximum": 24.0, "step": 1.0 }
+        }))
+        .expect("browser profile must deserialize");
+        assert_eq!(camel.indicator_period, SearchRange::new(12.0, 12.0, 1.0));
+        assert_eq!(camel.adx_threshold, SearchRange::new(24.0, 24.0, 1.0));
+
+        let snake: SearchRangeProfile = serde_json::from_value(serde_json::json!({
+            "indicator_period": { "minimum": 16.0, "maximum": 16.0, "step": 1.0 },
+            "adx_threshold": { "minimum": 28.0, "maximum": 28.0, "step": 1.0 }
+        }))
+        .expect("existing local profile must deserialize");
+        assert_eq!(snake.indicator_period, SearchRange::new(16.0, 16.0, 1.0));
+        assert_eq!(snake.adx_threshold, SearchRange::new(28.0, 28.0, 1.0));
+
+        let encoded = serde_json::to_value(camel).expect("profile must serialize");
+        assert!(encoded.get("indicatorPeriod").is_some());
+        assert!(encoded.get("indicator_period").is_none());
+    }
+}
+
 impl Default for PrecisionGateConfig {
     fn default() -> Self {
         Self {
@@ -252,6 +438,9 @@ pub struct DiscoverConfig {
     #[serde(default = "GateConfig::deposit_defaults")]
     pub deposit_gates: GateConfig,
     pub precision: PrecisionGateConfig,
+    /// Immutable numeric search space for indicators, stops and management genes.
+    #[serde(default)]
+    pub search_ranges: SearchRangeProfile,
     /// OOS1 expectancy must be at least this fraction of IS expectancy before a
     /// candidate may enter the databank (promotion-grade IS/OOS1/OOS2 workflow).
     #[serde(default = "default_oos1_expectancy_retention")]
@@ -264,6 +453,18 @@ pub struct DiscoverConfig {
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
+    /// Individually opt-in execution genes.  They are off in the selected-TF
+    /// high-parity profile and require direct M1 precision when enabled.
+    #[serde(default)]
+    pub allow_break_even: bool,
+    #[serde(default)]
+    pub allow_trailing_stops: bool,
+    #[serde(default)]
+    pub allow_partial_exits: bool,
+    #[serde(default)]
+    pub allow_stop_entries: bool,
+    #[serde(default)]
+    pub allow_limit_entries: bool,
     /// Mandatory portfolio protection applied to every generated strategy.
     /// When enabled, exposure is flattened and entries are blocked from 22:00
     /// until the next broker day.
@@ -363,7 +564,7 @@ fn default_robustness_neighborhood_samples() -> usize {
 }
 
 fn default_calendar_year_folds() -> bool {
-    true
+    false
 }
 
 fn default_minimum_deflated_trade_sharpe() -> Option<f64> {
@@ -393,9 +594,15 @@ impl Default for DiscoverConfig {
             gates: GateConfig::default(),
             deposit_gates: GateConfig::deposit_defaults(),
             precision: PrecisionGateConfig::default(),
+            search_ranges: SearchRangeProfile::default(),
             oos1_expectancy_retention: default_oos1_expectancy_retention(),
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
+            allow_break_even: false,
+            allow_trailing_stops: false,
+            allow_partial_exits: false,
+            allow_stop_entries: false,
+            allow_limit_entries: false,
             flatten_at_22: false,
             max_one_entry_per_day: default_max_one_entry_per_day(),
             mutate_after_elites: default_mutate_after_elites(),
@@ -422,7 +629,7 @@ impl DiscoverConfig {
                 self.batch_size = self.batch_size.clamp(20, 40);
                 self.require_m1_precision = false;
                 self.require_m1_robustness = false;
-                self.simple_exits = true;
+                self.simple_exits = !self.has_complex_execution();
                 self.allow_cross_family_mutation = false;
                 if self.early_stop_pot_elites.is_none() {
                     self.early_stop_pot_elites = Some(8);
@@ -430,17 +637,30 @@ impl DiscoverConfig {
                 self.mutate_after_elites = self.mutate_after_elites.min(20);
             }
             DiscoverRunMode::FullHarvest => {
-                self.simple_exits = true;
+                // Do not silently erase an explicitly selected execution module.
+                // A run with no modules retains the selected-TF high-parity shape.
+                if !self.has_complex_execution() {
+                    self.simple_exits = true;
+                } else {
+                    self.simple_exits = false;
+                }
                 self.allow_cross_family_mutation = false;
             }
         }
     }
 
+    pub const fn has_complex_execution(&self) -> bool {
+        self.allow_break_even
+            || self.allow_trailing_stops
+            || self.allow_partial_exits
+            || self.allow_stop_entries
+            || self.allow_limit_entries
+    }
+
     /// Planned evaluations for honesty UI: initial + batch × generations.
     pub fn planned_evaluations(&self, generations: u64) -> u64 {
-        (self.initial_candidates as u64).saturating_add(
-            (self.batch_size as u64).saturating_mul(generations),
-        )
+        (self.initial_candidates as u64)
+            .saturating_add((self.batch_size as u64).saturating_mul(generations))
     }
 
     pub fn exceeds_trial_budget_warning(&self, generations: u64) -> bool {
@@ -448,6 +668,11 @@ impl DiscoverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
+        if self.has_complex_execution() && !self.require_m1_precision {
+            return Err(DiscoverError::InvalidConfig(
+                "break-even, trailing, partial and pending-entry genes require M1 precision".into(),
+            ));
+        }
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
@@ -533,8 +758,7 @@ impl DiscoverConfig {
                     "robustness_folds must be at least 2".into(),
                 ));
             }
-            if self.robustness_monte_carlo_trials == 0
-                || self.robustness_neighborhood_samples == 0
+            if self.robustness_monte_carlo_trials == 0 || self.robustness_neighborhood_samples == 0
             {
                 return Err(DiscoverError::InvalidConfig(
                     "robustness Monte Carlo trials and neighborhood samples must be positive"
@@ -542,6 +766,7 @@ impl DiscoverConfig {
                 ));
             }
         }
+        self.search_ranges.validate()?;
         self.scout.validate()?;
         Ok(())
     }
@@ -832,9 +1057,7 @@ impl Databank {
                 self.grammar_version, GRAMMAR_VERSION
             )));
         }
-        if self.evaluation_count == 0
-            || (self.elites.is_empty() && self.accepted_pool.is_empty())
-        {
+        if self.evaluation_count == 0 || (self.elites.is_empty() && self.accepted_pool.is_empty()) {
             return Err(DiscoverError::IncompatibleDatabank(
                 "a databank requires evaluations and either an accepted pot or databank elites"
                     .into(),
@@ -901,8 +1124,7 @@ fn validate_archive_entries(
         );
         let coverage_ok = match kind {
             ArchiveKind::MapElites => {
-                coverage_map.get(&niche_label(&elite.niche))
-                    == Some(&elite.structural_fingerprint)
+                coverage_map.get(&niche_label(&elite.niche)) == Some(&elite.structural_fingerprint)
             }
             ArchiveKind::BreedingBag => {
                 coverage_map.get(&elite.structural_fingerprint.to_string())

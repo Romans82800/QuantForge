@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   DatabankWorkspace,
+  BatchEaExportRequest,
+  BatchEaExportView,
   BatchExportView,
   CertifyRequest,
   AssembleEvidenceRequest,
@@ -39,6 +41,8 @@ import type {
   AssetProfile,
   SymbolPack,
   PartitionEquityView,
+  SavedDiscoverProfile,
+  SavedSearchRangeProfile,
 } from "./types";
 
 async function chooseFile(
@@ -88,6 +92,22 @@ export async function exportEliteStrategies(
   return directory
     ? invoke<BatchExportView>("export_elite_strategies", { fingerprints, directory })
     : null;
+}
+
+export async function exportEliteEas(
+  fingerprints: string[],
+  timeframe: string,
+  baseMagic: number,
+): Promise<BatchEaExportView | null> {
+  const directory = await chooseDirectory("Choose an empty folder for the EA batch");
+  if (!directory) return null;
+  const request: BatchEaExportRequest = {
+    fingerprints,
+    directory,
+    timeframe,
+    baseMagic,
+  };
+  return invoke<BatchEaExportView>("export_elite_eas", { request });
 }
 
 export function chooseDataFile(): Promise<string | null> {
@@ -233,6 +253,30 @@ export function listAssets(): Promise<AssetProfile[]> {
 
 export function listSymbols(): Promise<SymbolPack[]> {
   return invoke<SymbolPack[]>("list_symbols");
+}
+
+export function listSearchRangeProfiles(): Promise<SavedSearchRangeProfile[]> {
+  return invoke<SavedSearchRangeProfile[]>("list_search_range_profiles");
+}
+
+export function saveSearchRangeProfile(profile: SavedSearchRangeProfile): Promise<SavedSearchRangeProfile[]> {
+  return invoke<SavedSearchRangeProfile[]>("save_search_range_profile", { profile });
+}
+
+export function deleteSearchRangeProfile(id: string): Promise<SavedSearchRangeProfile[]> {
+  return invoke<SavedSearchRangeProfile[]>("delete_search_range_profile", { id });
+}
+
+export function listDiscoverProfiles(): Promise<SavedDiscoverProfile[]> {
+  return invoke<SavedDiscoverProfile[]>("list_discover_profiles");
+}
+
+export function saveDiscoverProfile(profile: SavedDiscoverProfile): Promise<SavedDiscoverProfile[]> {
+  return invoke<SavedDiscoverProfile[]>("save_discover_profile", { profile });
+}
+
+export function deleteDiscoverProfile(id: string): Promise<SavedDiscoverProfile[]> {
+  return invoke<SavedDiscoverProfile[]>("delete_discover_profile", { id });
 }
 
 export function getElitePartitionEquity(fingerprint: string): Promise<PartitionEquityView> {

@@ -18,6 +18,12 @@ use quantforge_ir::{
     StrategyIr, TakeProfitPolicy, TrailingPolicy,
 };
 
+// Recursive MT5 indicator buffers retain chart history before the selected
+// test period. Imported QuantForge packs deliberately start at that period.
+// A short common convergence gate prevents a pre-history signal from
+// desynchronising the daily-entry ledger.
+const PARITY_SIGNAL_WARMUP_BARS: usize = 320;
+
 #[derive(Debug)]
 struct OpenPosition {
     side: PositionSide,
@@ -139,6 +145,13 @@ fn evaluate_strategy_inner(
     // generated and removes parameter noise below the documented float policy.
     let strategy = strategy.canonicalized(FloatPolicy::default())?;
     let bars = &dataset.bars;
+    // Retain short synthetic fixtures used by unit tests, but apply the gate
+    // to all production datasets.
+    let signal_warmup_bars = if bars.len() > PARITY_SIGNAL_WARMUP_BARS {
+        PARITY_SIGNAL_WARMUP_BARS
+    } else {
+        0
+    };
     let mut features = FeatureCache::new(bars, &broker.timezone)?;
     let mut balance = config.initial_balance;
     let mut position: Option<OpenPosition> = None;
@@ -308,6 +321,7 @@ fn evaluate_strategy_inner(
             && pending.is_none()
             && !closed_this_bar
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && index >= signal_warmup_bars
             && entry_start_timestamp_ms.is_none_or(|start| bar.timestamp_ms >= start)
         {
             let filters_pass = strategy

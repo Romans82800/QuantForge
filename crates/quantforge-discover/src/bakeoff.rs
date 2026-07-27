@@ -1,10 +1,11 @@
 //! Short Fast Scout per Search Family, ranked by OOS1 retention.
 
-use crate::engine::evolve_new_with_pack;
+use crate::engine::{evolve_new_with_pack, passes_oos1_pick};
 use crate::model::{DiscoverConfig, DiscoverError, DiscoverRunMode, SearchFamily};
 use crate::multi_symbol::PackSymbol;
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
+use quantforge_eval::evaluate_strategy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,7 +25,9 @@ impl Default for FamilyBakeoffConfig {
             initial_candidates: 60,
             batch_size: 30,
             mutate_after_elites: 12,
-            early_stop_pot_elites: Some(6),
+            // A comparison needs the same planned sample for every family.
+            // Fast Scout otherwise stops once a pot reaches eight members.
+            early_stop_pot_elites: Some(usize::MAX),
             worker_threads: 1,
             ..DiscoverConfig::default()
         };
@@ -40,11 +43,16 @@ impl Default for FamilyBakeoffConfig {
 #[serde(rename_all = "camelCase")]
 pub struct FamilyBakeoffRow {
     pub family: SearchFamily,
-    pub median_oos1_expectancy: f64,
+    /// Expectancy normalized by the fixed $1,000 risk policy.
+    pub median_is_expectancy_r: f64,
+    /// Expectancy normalized by the fixed $1,000 risk policy.
+    pub median_oos1_expectancy_r: f64,
     pub median_retention: f64,
+    /// OOS1 passes / every current unique candidate in the eligible pot.
     pub pass_rate: f64,
     pub elites: usize,
     pub pot_elites: usize,
+    pub oos1_tested: usize,
     pub evaluations: u64,
 }
 
@@ -55,7 +63,8 @@ pub struct FamilyBakeoffReport {
     pub recommended: Option<SearchFamily>,
 }
 
-/// Run a short Fast Scout for each family and rank by median OOS1 retention.
+/// Run an equal-budget Fast Scout for each family, then independently recheck
+/// every retained pot member on OOS1 before ranking it.
 pub fn run_family_bakeoff(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
@@ -70,6 +79,10 @@ pub fn run_family_bakeoff(
         let mut discover = config.discover.clone();
         discover.search_family = *family;
         discover.run_mode = DiscoverRunMode::FastScout;
+        // Keep each family on the same planned evaluation budget even when the
+        // caller supplied a generic DiscoverConfig rather than this type's
+        // default preset.
+        discover.early_stop_pot_elites = Some(usize::MAX);
         discover.apply_run_mode();
         let bank = evolve_new_with_pack(
             dataset,
@@ -81,34 +94,49 @@ pub fn run_family_bakeoff(
             discover,
             config.generations,
         )?;
-        let retentions: Vec<f64> = bank
-            .accepted_pool
-            .iter()
-            .chain(bank.elites.iter())
-            .filter_map(|elite| elite.oos1_expectancy_ratio)
-            .collect();
-        let oos1_values: Vec<f64> = bank
-            .accepted_pool
-            .iter()
-            .chain(bank.elites.iter())
-            .filter_map(|elite| elite.oos1_expectancy)
-            .collect();
-        let pass_rate = if retentions.is_empty() {
+        // Production Discover preserves OOS1 metrics only for candidates that
+        // pass OOS1 into the databank. Aggregating those persisted fields here
+        // made the tester display a mechanical 100% pass rate. Re-evaluate
+        // every current pot member on the held-out OOS1 partition instead.
+        let mut is_values_r = Vec::with_capacity(bank.accepted_pool.len());
+        let mut oos1_values_r = Vec::with_capacity(bank.accepted_pool.len());
+        let mut retentions = Vec::with_capacity(bank.accepted_pool.len());
+        let mut passes = 0usize;
+        if let Some(oos1) = oos1_dataset {
+            for elite in &bank.accepted_pool {
+                let oos1_result =
+                    evaluate_strategy(&elite.strategy, oos1, broker, &bank.config.scout)?;
+                let is_expectancy = elite.is_expectancy;
+                let oos1_expectancy = oos1_result.metrics.expectancy;
+                is_values_r.push(is_expectancy / crate::FIXED_RISK_PER_TRADE);
+                oos1_values_r.push(oos1_expectancy / crate::FIXED_RISK_PER_TRADE);
+                if is_expectancy > 0.0 && is_expectancy.is_finite() && oos1_expectancy.is_finite() {
+                    retentions.push(oos1_expectancy / is_expectancy);
+                }
+                if passes_oos1_pick(
+                    is_expectancy,
+                    oos1_expectancy,
+                    bank.config.oos1_expectancy_retention,
+                ) {
+                    passes += 1;
+                }
+            }
+        }
+        let oos1_tested = oos1_values_r.len();
+        let pass_rate = if oos1_tested == 0 {
             0.0
         } else {
-            retentions
-                .iter()
-                .filter(|&&value| value >= bank.config.oos1_expectancy_retention)
-                .count() as f64
-                / retentions.len() as f64
+            passes as f64 / oos1_tested as f64
         };
         rows.push(FamilyBakeoffRow {
             family: *family,
-            median_oos1_expectancy: median(&oos1_values),
+            median_is_expectancy_r: median(&is_values_r),
+            median_oos1_expectancy_r: median(&oos1_values_r),
             median_retention: median(&retentions),
             pass_rate,
             elites: bank.elites.len(),
             pot_elites: bank.accepted_pool.len(),
+            oos1_tested,
             evaluations: bank.evaluation_count,
         });
     }
@@ -119,14 +147,19 @@ pub fn run_family_bakeoff(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 right
-                    .median_oos1_expectancy
-                    .partial_cmp(&left.median_oos1_expectancy)
+                    .median_oos1_expectancy_r
+                    .partial_cmp(&left.median_oos1_expectancy_r)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
     let recommended = rows
         .iter()
-        .find(|row| row.pot_elites > 0 || row.elites > 0)
+        .find(|row| {
+            row.oos1_tested >= 10
+                && row.pass_rate >= 0.50
+                && row.median_retention >= 0.70
+                && row.median_oos1_expectancy_r > 0.0
+        })
         .map(|row| row.family);
     Ok(FamilyBakeoffReport { rows, recommended })
 }
@@ -154,20 +187,24 @@ mod tests {
         let mut rows = [
             FamilyBakeoffRow {
                 family: SearchFamily::TrendPullback,
-                median_oos1_expectancy: 0.2,
+                median_is_expectancy_r: 0.2,
+                median_oos1_expectancy_r: 0.2,
                 median_retention: 0.5,
                 pass_rate: 0.2,
                 elites: 0,
                 pot_elites: 1,
+                oos1_tested: 1,
                 evaluations: 10,
             },
             FamilyBakeoffRow {
                 family: SearchFamily::MomentumBurst,
-                median_oos1_expectancy: 0.1,
+                median_is_expectancy_r: 0.1,
+                median_oos1_expectancy_r: 0.1,
                 median_retention: 0.9,
                 pass_rate: 0.8,
                 elites: 1,
                 pot_elites: 2,
+                oos1_tested: 2,
                 evaluations: 10,
             },
         ];

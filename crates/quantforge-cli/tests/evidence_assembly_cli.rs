@@ -193,6 +193,7 @@ fn write_databank(
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: 0.0,
         },
+        search_ranges: quantforge_discover::SearchRangeProfile::default(),
         oos1_expectancy_retention: 0.0,
         require_m1_precision: false,
         simple_exits: false,
@@ -413,6 +414,40 @@ fn write_parity(
             ("timeframe".into(), "PERIOD_M15".into()),
             ("terminal_build".into(), "5000".into()),
             ("server".into(), "Fixture-Server".into()),
+            ("magic".into(), bundle.evidence.config.magic.to_string()),
+            (
+                "deviation_points".into(),
+                bundle.evidence.config.deviation_points.to_string(),
+            ),
+            (
+                "max_spread_points".into(),
+                bundle
+                    .evidence
+                    .config
+                    .max_spread_points
+                    .unwrap_or(0.0)
+                    .to_string(),
+            ),
+            (
+                "estimated_slippage_points_per_side".into(),
+                bundle
+                    .evidence
+                    .config
+                    .estimated_slippage_points_per_side
+                    .to_string(),
+            ),
+            (
+                "commission_per_lot_round_turn".into(),
+                bundle
+                    .evidence
+                    .config
+                    .commission_per_lot_round_turn
+                    .to_string(),
+            ),
+            (
+                "initial_deposit".into(),
+                bundle.evidence.config.tester.deposit.to_string(),
+            ),
         ]),
     };
     let run_manifest = manifest(

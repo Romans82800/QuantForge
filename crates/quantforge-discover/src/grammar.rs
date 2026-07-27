@@ -1,5 +1,5 @@
-use crate::model::{FamilyStyle, SearchFamily};
 use crate::FROZEN_ATR_PERIOD;
+use crate::model::{FamilyStyle, SearchFamily, SearchRange, SearchRangeProfile};
 use quantforge_core::{FloatPolicy, STRATEGY_IR_VERSION};
 use quantforge_ir::{
     BoolExpr, ComparisonOp, ContextValue, EntryDistancePolicy, EntryOrderPolicy, EntrySignals,
@@ -13,9 +13,8 @@ use rand_chacha::ChaCha8Rng;
 const PERIODS: [u16; 3] = [10, 14, 20];
 /// ATR / R-multiple ladder in 0.25 steps (cross-symbol comparable).
 /// Floor 1.5× matches SQX Build MinSLATRMultiple for Selected-TF-safe stops.
-const ATR_STOP_MULTIPLIERS: [f64; 11] = [
-    1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0,
-];
+const ATR_STOP_MULTIPLIERS: [f64; 11] =
+    [1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0];
 /// TP floor 2.0× — SQX USDJPY builds used MinPT ≥ 60 pips / ≥2 ATR.
 const ATR_TP_MULTIPLIERS: [f64; 9] = [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
 const ATR_ENTRY_MULTIPLIERS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
@@ -63,6 +62,234 @@ pub(crate) fn rng_for(seed: u64, stream: u64, sequence: u64) -> ChaCha8Rng {
             ^ sequence.wrapping_mul(0xbf58_476d_1ce4_e5b9),
     );
     ChaCha8Rng::seed_from_u64(mixed)
+}
+
+/// Resample every numeric gene that has an explicit researcher-controlled
+/// range. Called after seed/mutation construction, before evaluation.
+pub(crate) fn apply_search_ranges(
+    strategy: &mut StrategyIr,
+    rng: &mut ChaCha8Rng,
+    ranges: &SearchRangeProfile,
+) {
+    apply_expression_ranges(strategy.entry.long.as_mut(), rng, ranges);
+    apply_expression_ranges(strategy.entry.short.as_mut(), rng, ranges);
+    for filter in &mut strategy.filters {
+        apply_expression_ranges(Some(filter), rng, ranges);
+    }
+    let atr_period = sample_u16(rng, &ranges.atr_period);
+    strategy.stops.stop_loss = StopLossPolicy::AtrMultiple {
+        period: atr_period,
+        multiplier: sample_range(rng, &ranges.atr_stop_multiple),
+    };
+    strategy.stops.take_profit = if rng.gen_bool(0.7) {
+        TakeProfitPolicy::RiskMultiple {
+            multiple: sample_range(rng, &ranges.risk_target_multiple),
+        }
+    } else {
+        TakeProfitPolicy::AtrMultiple {
+            period: atr_period,
+            multiplier: sample_range(rng, &ranges.atr_target_multiple),
+        }
+    };
+    match &mut strategy.entry.order {
+        EntryOrderPolicy::Market => {}
+        EntryOrderPolicy::Stop {
+            distance,
+            expiry_bars,
+        }
+        | EntryOrderPolicy::Limit {
+            distance,
+            expiry_bars,
+        } => {
+            *distance = EntryDistancePolicy::AtrMultiple {
+                period: atr_period,
+                multiplier: sample_range(rng, &ranges.pending_distance_atr),
+            };
+            *expiry_bars = sample_u16(rng, &ranges.pending_expiry_bars);
+        }
+    }
+    if strategy.manage.time_stop_bars.is_some() {
+        strategy.manage.time_stop_bars = Some(sample_u16(rng, &ranges.time_stop_bars));
+    }
+    if let Some(TrailingPolicy::AtrMultiple {
+        period, multiplier, ..
+    }) = &mut strategy.manage.trailing
+    {
+        *period = atr_period;
+        *multiplier = sample_range(rng, &ranges.atr_stop_multiple);
+    }
+}
+
+fn apply_expression_ranges(
+    expression: Option<&mut BoolExpr>,
+    rng: &mut ChaCha8Rng,
+    ranges: &SearchRangeProfile,
+) {
+    let Some(expression) = expression else { return };
+    match expression {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            apply_numeric_ranges(left, right, rng, ranges);
+            apply_numeric_ranges(right, left, rng, ranges);
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            apply_numeric_ranges(value, lower, rng, ranges);
+            apply_numeric_ranges(value, upper, rng, ranges);
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children {
+                apply_expression_ranges(Some(child), rng, ranges);
+            }
+        }
+        BoolExpr::Not { child } => apply_expression_ranges(Some(child), rng, ranges),
+    }
+}
+
+fn apply_numeric_ranges(
+    indicator: &mut NumericExpr,
+    other: &mut NumericExpr,
+    rng: &mut ChaCha8Rng,
+    ranges: &SearchRangeProfile,
+) {
+    let NumericExpr::Indicator { value } = indicator else {
+        return;
+    };
+    let constant = match other {
+        NumericExpr::Constant { value } => Some(value),
+        _ => None,
+    };
+    match value {
+        IndicatorExpr::Sma { period, .. }
+        | IndicatorExpr::Ema { period, .. }
+        | IndicatorExpr::Wma { period, .. }
+        | IndicatorExpr::DonchianHigh { period, .. }
+        | IndicatorExpr::DonchianLow { period, .. }
+        | IndicatorExpr::Highest { period, .. }
+        | IndicatorExpr::Lowest { period, .. }
+        | IndicatorExpr::StandardDeviation { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period)
+        }
+        IndicatorExpr::LiquiditySweepScore { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                let magnitude = sample_range(rng, &ranges.liquidity_sweep_threshold);
+                *value = if *value < 0.0 { -magnitude } else { magnitude };
+            }
+        }
+        IndicatorExpr::Rsi { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                *value = if *value >= 50.0 {
+                    sample_range(rng, &ranges.rsi_upper)
+                } else {
+                    sample_range(rng, &ranges.rsi_lower)
+                };
+            }
+        }
+        IndicatorExpr::Adx { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                *value = sample_range(rng, &ranges.adx_threshold);
+            }
+        }
+        IndicatorExpr::PlusDi { period, .. } | IndicatorExpr::MinusDi { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+        }
+        IndicatorExpr::RateOfChange { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                let magnitude = sample_range(rng, &ranges.roc_threshold);
+                *value = if *value < 0.0 { -magnitude } else { magnitude };
+            }
+        }
+        IndicatorExpr::ZScore { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                let magnitude = sample_range(rng, &ranges.zscore_threshold);
+                *value = if *value < 0.0 { -magnitude } else { magnitude };
+            }
+        }
+        IndicatorExpr::PercentileInRange { period, .. } => {
+            *period = sample_u16(rng, &ranges.indicator_period);
+            if let Some(value) = constant {
+                let low = sample_range(rng, &ranges.percentile_low);
+                *value = if *value > 50.0 { 100.0 - low } else { low };
+            }
+        }
+        IndicatorExpr::Atr { period, .. } => *period = sample_u16(rng, &ranges.atr_period),
+        IndicatorExpr::AtrPercentile {
+            atr_period,
+            lookback,
+            ..
+        } => {
+            *atr_period = sample_u16(rng, &ranges.atr_period);
+            *lookback = sample_u16(rng, &ranges.atr_percentile_lookback);
+            if let Some(value) = constant {
+                *value = sample_range(rng, &ranges.atr_percentile_max);
+            }
+        }
+        IndicatorExpr::BodyRangeRatio { .. } => {
+            if let Some(value) = constant {
+                *value = sample_range(rng, &ranges.impulse_body_ratio);
+            }
+        }
+        IndicatorExpr::CloseLocationInBar { .. } => {
+            if let Some(value) = constant {
+                let high = sample_range(rng, &ranges.impulse_close_location);
+                *value = if *value < 0.5 { 1.0 - high } else { high };
+            }
+        }
+        IndicatorExpr::SessionRangeHigh {
+            start_hour,
+            range_bars,
+            ..
+        }
+        | IndicatorExpr::SessionRangeLow {
+            start_hour,
+            range_bars,
+            ..
+        } => {
+            *start_hour = sample_u8(rng, &ranges.session_start_hour);
+            *range_bars = sample_u16(rng, &ranges.session_range_bars);
+        }
+        IndicatorExpr::SwingBaseZoneHigh {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        }
+        | IndicatorExpr::SwingBaseZoneLow {
+            swing_left,
+            swing_right,
+            base_bars,
+            ..
+        } => {
+            let swing = sample_u16(rng, &ranges.swing_bars);
+            *swing_left = swing;
+            *swing_right = swing;
+            *base_bars = sample_u16(rng, &ranges.base_bars);
+        }
+    }
+}
+
+fn sample_range(rng: &mut ChaCha8Rng, range: &SearchRange) -> f64 {
+    let count = ((range.maximum - range.minimum) / range.step)
+        .floor()
+        .max(0.0) as u32;
+    let index = rng.gen_range(0..=count) as f64;
+    (range.minimum + index * range.step).min(range.maximum)
+}
+
+fn sample_u16(rng: &mut ChaCha8Rng, range: &SearchRange) -> u16 {
+    sample_range(rng, range).round().clamp(1.0, u16::MAX as f64) as u16
+}
+fn sample_u8(rng: &mut ChaCha8Rng, range: &SearchRange) -> u8 {
+    sample_range(rng, range).round().clamp(0.0, u8::MAX as f64) as u8
 }
 
 pub(crate) fn build_seed(
@@ -327,10 +554,7 @@ pub(crate) fn entry_atom_count(expression: &BoolExpr) -> usize {
 }
 
 /// (long_condition, short_condition) atoms available inside a family.
-fn family_entry_atoms(
-    family: SearchFamily,
-    rng: &mut ChaCha8Rng,
-) -> Vec<(BoolExpr, BoolExpr)> {
+fn family_entry_atoms(family: SearchFamily, rng: &mut ChaCha8Rng) -> Vec<(BoolExpr, BoolExpr)> {
     match family {
         SearchFamily::TrendPullback => {
             // Slow MA at least one ladder step above the fast period.
@@ -385,6 +609,23 @@ fn family_entry_atoms(
                         NumericExpr::Constant { value: 0.0 },
                     ),
                 ),
+                // +4 ADX regime / directional confirmation
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                ),
+                (
+                    compare(ComparisonOp::GreaterThan, plus_di(14, 1), minus_di(14, 1)),
+                    compare(ComparisonOp::GreaterThan, minus_di(14, 1), plus_di(14, 1)),
+                ),
             ]
         }
         SearchFamily::MomentumBurst => {
@@ -419,9 +660,7 @@ fn family_entry_atoms(
                     compare(
                         ComparisonOp::LessThan,
                         roc(roc_period, 1),
-                        NumericExpr::Constant {
-                            value: -roc_level,
-                        },
+                        NumericExpr::Constant { value: -roc_level },
                     ),
                 ),
                 // +2 RSI side of 50
@@ -439,12 +678,24 @@ fn family_entry_atoms(
                 ),
                 // +3 Close vs SMA momentum
                 (
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
+                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                ),
+                (
                     compare(
                         ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
                     ),
-                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                ),
+                (
+                    compare(ComparisonOp::GreaterThan, plus_di(14, 1), minus_di(14, 1)),
+                    compare(ComparisonOp::GreaterThan, minus_di(14, 1), plus_di(14, 1)),
                 ),
             ]
         }
@@ -460,20 +711,14 @@ fn family_entry_atoms(
                         ComparisonOp::GreaterThan,
                         close(1),
                         NumericExpr::Indicator {
-                            value: IndicatorExpr::DonchianHigh {
-                                period,
-                                shift: 2,
-                            },
+                            value: IndicatorExpr::DonchianHigh { period, shift: 2 },
                         },
                     ),
                     compare(
                         ComparisonOp::LessThan,
                         close(1),
                         NumericExpr::Indicator {
-                            value: IndicatorExpr::DonchianLow {
-                                period,
-                                shift: 2,
-                            },
+                            value: IndicatorExpr::DonchianLow { period, shift: 2 },
                         },
                     ),
                 ),
@@ -504,11 +749,7 @@ fn family_entry_atoms(
                 ),
                 // +2 Close vs SMA confirmation
                 (
-                    compare(
-                        ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
-                    ),
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
                     compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
                 ),
                 // +3 Positive / negative ROC expansion
@@ -523,6 +764,22 @@ fn family_entry_atoms(
                         roc(roc_period, 1),
                         NumericExpr::Constant { value: -0.05 },
                     ),
+                ),
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                ),
+                (
+                    compare(ComparisonOp::GreaterThan, plus_di(14, 1), minus_di(14, 1)),
+                    compare(ComparisonOp::GreaterThan, minus_di(14, 1), plus_di(14, 1)),
                 ),
             ]
         }
@@ -561,11 +818,7 @@ fn family_entry_atoms(
                 ),
                 (
                     compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
-                    compare(
-                        ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
-                    ),
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
                 ),
             ]
         }
@@ -601,11 +854,7 @@ fn family_entry_atoms(
                 ),
                 (
                     compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
-                    compare(
-                        ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
-                    ),
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
                 ),
             ]
         }
@@ -643,12 +892,24 @@ fn family_entry_atoms(
                     },
                 ),
                 (
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
+                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                ),
+                (
                     compare(
                         ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
                     ),
-                    compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                ),
+                (
+                    compare(ComparisonOp::GreaterThan, plus_di(14, 1), minus_di(14, 1)),
+                    compare(ComparisonOp::GreaterThan, minus_di(14, 1), plus_di(14, 1)),
                 ),
             ]
         }
@@ -689,11 +950,7 @@ fn family_entry_atoms(
                     ),
                 ),
                 (
-                    compare(
-                        ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
-                    ),
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
                     compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
                 ),
             ]
@@ -756,6 +1013,22 @@ fn family_entry_atoms(
                         NumericExpr::Constant { value: -0.05 },
                     ),
                 ),
+                (
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                    compare(
+                        ComparisonOp::GreaterThan,
+                        adx(14, 1),
+                        NumericExpr::Constant { value: 25.0 },
+                    ),
+                ),
+                (
+                    compare(ComparisonOp::GreaterThan, plus_di(14, 1), minus_di(14, 1)),
+                    compare(ComparisonOp::GreaterThan, minus_di(14, 1), plus_di(14, 1)),
+                ),
             ]
         }
         SearchFamily::SupplyDemandReclaim => {
@@ -798,21 +1071,14 @@ fn family_entry_atoms(
                         close(1),
                         ema(choose_period(rng), 1),
                     ),
-                    compare(
-                        ComparisonOp::LessThan,
-                        close(1),
-                        ema(choose_period(rng), 1),
-                    ),
+                    compare(ComparisonOp::LessThan, close(1), ema(choose_period(rng), 1)),
                 ),
             ]
         }
         SearchFamily::SweepReclaim => {
             let period = choose_period(rng).max(10);
             let score = NumericExpr::Indicator {
-                value: IndicatorExpr::LiquiditySweepScore {
-                    period,
-                    shift: 1,
-                },
+                value: IndicatorExpr::LiquiditySweepScore { period, shift: 1 },
             };
             let sma_period = choose_period(rng);
             vec![
@@ -841,11 +1107,7 @@ fn family_entry_atoms(
                     ),
                 ),
                 (
-                    compare(
-                        ComparisonOp::GreaterThan,
-                        close(1),
-                        sma(sma_period, 1),
-                    ),
+                    compare(ComparisonOp::GreaterThan, close(1), sma(sma_period, 1)),
                     compare(ComparisonOp::LessThan, close(1), sma(sma_period, 1)),
                 ),
             ]
@@ -907,6 +1169,24 @@ fn rsi(period: u16, shift: u16) -> NumericExpr {
             period,
             shift,
         },
+    }
+}
+
+fn adx(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::Adx { period, shift },
+    }
+}
+
+fn plus_di(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::PlusDi { period, shift },
+    }
+}
+
+fn minus_di(period: u16, shift: u16) -> NumericExpr {
+    NumericExpr::Indicator {
+        value: IndicatorExpr::MinusDi { period, shift },
     }
 }
 
@@ -1051,9 +1331,7 @@ fn random_manage(rng: &mut ChaCha8Rng) -> ManagePolicy {
         }
     });
     ManagePolicy {
-        break_even_at_r: rng
-            .gen_bool(0.3)
-            .then(|| choose_from(rng, &R_ACTIVATE)),
+        break_even_at_r: rng.gen_bool(0.3).then(|| choose_from(rng, &R_ACTIVATE)),
         trailing,
         time_stop_bars: rng.gen_bool(0.45).then(|| rng.gen_range(6..=80)),
         partial_exits,
@@ -1251,6 +1529,9 @@ fn mutate_indicator(indicator: &mut IndicatorExpr, rng: &mut ChaCha8Rng) {
         | IndicatorExpr::Wma { period, .. }
         | IndicatorExpr::Rsi { period, .. }
         | IndicatorExpr::Atr { period, .. }
+        | IndicatorExpr::Adx { period, .. }
+        | IndicatorExpr::PlusDi { period, .. }
+        | IndicatorExpr::MinusDi { period, .. }
         | IndicatorExpr::DonchianHigh { period, .. }
         | IndicatorExpr::DonchianLow { period, .. }
         | IndicatorExpr::Highest { period, .. }
@@ -1583,9 +1864,7 @@ mod tests {
     #[test]
     fn institutional_seeds_are_pending_only_with_frozen_atr() {
         let population: Vec<_> = (0..64)
-            .map(|index| {
-                generate_seed_for_family(91, index, SearchFamily::TrendPullback)
-            })
+            .map(|index| generate_seed_for_family(91, index, SearchFamily::TrendPullback))
             .collect();
         assert!(population.iter().all(|value| {
             matches!(
@@ -1629,10 +1908,7 @@ mod tests {
         let population: Vec<_> = (0..400).map(|index| generate_seed(23, index)).collect();
         for strategy in &population {
             assert!(
-                matches!(
-                    strategy.stops.stop_loss,
-                    StopLossPolicy::AtrMultiple { .. }
-                ),
+                matches!(strategy.stops.stop_loss, StopLossPolicy::AtrMultiple { .. }),
                 "stop_loss must be ATR multiple, got {:?}",
                 strategy.stops.stop_loss
             );
@@ -1670,7 +1946,12 @@ mod tests {
         let mut saw_and = false;
         let mut max_children = 0usize;
         for strategy in &population {
-            let Some(entry) = strategy.entry.long.as_ref().or(strategy.entry.short.as_ref()) else {
+            let Some(entry) = strategy
+                .entry
+                .long
+                .as_ref()
+                .or(strategy.entry.short.as_ref())
+            else {
                 continue;
             };
             match entry {

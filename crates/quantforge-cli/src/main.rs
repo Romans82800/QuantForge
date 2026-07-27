@@ -1391,7 +1391,7 @@ fn family_bakeoff_command(args: FamilyBakeoffArgs) -> Result<(), Box<dyn Error>>
             "  {} retention={:.3} oos1_E={:.4} pass={:.0}% pot={} evals={}",
             row.family.label(),
             row.median_retention,
-            row.median_oos1_expectancy,
+            row.median_oos1_expectancy_r,
             row.pass_rate * 100.0,
             row.pot_elites,
             row.evaluations
@@ -4487,9 +4487,15 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.90),
         },
+        search_ranges: quantforge_discover::SearchRangeProfile::default(),
         oos1_expectancy_retention: 0.7,
         require_m1_precision: false,
         simple_exits: true,
+        allow_break_even: false,
+        allow_trailing_stops: false,
+        allow_partial_exits: false,
+        allow_stop_entries: false,
+        allow_limit_entries: false,
         flatten_at_22: args.flatten_at_22,
         max_one_entry_per_day: true,
         mutate_after_elites: 300,
@@ -4499,7 +4505,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_folds: 3,
         robustness_monte_carlo_trials: 250,
         robustness_neighborhood_samples: 8,
-        calendar_year_folds: true,
+        calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
         scout: ScoutConfig {

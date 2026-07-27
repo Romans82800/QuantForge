@@ -26,6 +26,7 @@ pub use model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError,
     DiscoverRunMode, DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig,
     GateResult, LongShortSkewBucket, NicheKey, PrecisionGateConfig, SearchFamily,
+    SearchRange, SearchRangeProfile,
     SearchFamilySpec, SymbolScreenResult, ThreeLevelBucket, TRIAL_BUDGET_WARNING,
 };
 pub use multi_symbol::{DEFAULT_FX_PACK, DISPLAY_ONLY_SYMBOLS, PackSymbol, screen_multi_symbol};

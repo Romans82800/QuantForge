@@ -17,7 +17,9 @@ pub use indicator::{
     IndicatorParityReport, IndicatorReferenceMetadata, compare_indicator_reference,
 };
 
-pub const PARITY_PROTOCOL_VERSION: &str = "mt5-parity-v1";
+/// v2 binds the tested export's execution inputs as well as its source and IR.
+/// A report from a differently-costed EA is therefore not comparable by mistake.
+pub const PARITY_PROTOCOL_VERSION: &str = "mt5-parity-v2";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mt5TesterMetadata {
@@ -46,6 +48,24 @@ impl Mt5TesterMetadata {
             .parse::<u64>()
             .map_err(|_| ParityError::InvalidInput("terminal_build is not an integer".into()))?;
         self.required("server")?;
+        self.matches_u64("magic", evidence.config.magic)?;
+        self.matches_u64(
+            "deviation_points",
+            u64::from(evidence.config.deviation_points),
+        )?;
+        self.matches_number(
+            "max_spread_points",
+            evidence.config.max_spread_points.unwrap_or(0.0),
+        )?;
+        self.matches_number(
+            "estimated_slippage_points_per_side",
+            evidence.config.estimated_slippage_points_per_side,
+        )?;
+        self.matches_number(
+            "commission_per_lot_round_turn",
+            evidence.config.commission_per_lot_round_turn,
+        )?;
+        self.matches_number("initial_deposit", evidence.config.tester.deposit)?;
         Ok(())
     }
 
@@ -55,6 +75,33 @@ impl Mt5TesterMetadata {
             .map(String::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ParityError::InvalidInput(format!("MT5 metadata is missing {property}")))
+    }
+
+    fn matches_u64(&self, property: &str, expected: u64) -> Result<(), ParityError> {
+        let observed = self.required(property)?.parse::<u64>().map_err(|_| {
+            ParityError::InvalidInput(format!("MT5 metadata {property} is not an integer"))
+        })?;
+        if observed == expected {
+            Ok(())
+        } else {
+            Err(ParityError::InvalidInput(format!(
+                "MT5 metadata {property} does not match export evidence"
+            )))
+        }
+    }
+
+    fn matches_number(&self, property: &str, expected: f64) -> Result<(), ParityError> {
+        let observed = self.required(property)?.parse::<f64>().map_err(|_| {
+            ParityError::InvalidInput(format!("MT5 metadata {property} is not numeric"))
+        })?;
+        let scale = expected.abs().max(1.0);
+        if observed.is_finite() && (observed - expected).abs() <= scale * 1.0e-9 {
+            Ok(())
+        } else {
+            Err(ParityError::InvalidInput(format!(
+                "MT5 metadata {property} does not match export evidence"
+            )))
+        }
     }
 }
 
@@ -634,9 +681,16 @@ fn align_trades(reference: &ParityRun, external: &ParityRun) -> Vec<TradeDiff> {
     diffs
 }
 
+/// Compare the realised balance path, not independently sampled floating P&L.
+///
+/// The M1 judge marks an open position once per minute while the generated EA
+/// records MT5 equity on decision-bar ticks. Those snapshots can differ during
+/// an otherwise identical open trade, especially around a stop. Closed deals
+/// are the common, broker-verifiable equity path and are already checked for
+/// timing and economics by `align_trades`.
 fn equity_divergence(reference: &ParityRun, external: &ParityRun, points: usize) -> f64 {
-    let left = resample_equity(&reference.equity, points);
-    let right = resample_equity(&external.equity, points);
+    let left = resample_balance(&realized_balance_path(reference), points);
+    let right = resample_balance(&realized_balance_path(external), points);
     if left.is_empty() || right.is_empty() {
         return if left.is_empty() && right.is_empty() {
             0.0
@@ -650,18 +704,29 @@ fn equity_divergence(reference: &ParityRun, external: &ParityRun, points: usize)
         .fold(0.0, f64::max)
 }
 
-fn resample_equity(values: &[ParityEquityPoint], points: usize) -> Vec<f64> {
+fn realized_balance_path(run: &ParityRun) -> Vec<f64> {
+    let mut balance = run.metrics.initial_balance;
+    let mut values = Vec::with_capacity(run.trades.len() + 1);
+    values.push(balance);
+    for trade in &run.trades {
+        balance += trade.net_profit;
+        values.push(balance);
+    }
+    values
+}
+
+fn resample_balance(values: &[f64], points: usize) -> Vec<f64> {
     if values.is_empty() {
         return Vec::new();
     }
     let count = values.len().min(points).max(1);
     if count == 1 {
-        return vec![values[0].equity];
+        return vec![values[0]];
     }
     (0..count)
         .map(|index| {
             let source = index * (values.len() - 1) / (count - 1);
-            values[source].equity
+            values[source]
         })
         .collect()
 }
@@ -831,12 +896,27 @@ mod tests {
                 ("timeframe".into(), "PERIOD_M15".into()),
                 ("terminal_build".into(), "5834".into()),
                 ("server".into(), "Fixture-Demo".into()),
+                ("magic".into(), evidence.config.magic.to_string()),
+                (
+                    "deviation_points".into(),
+                    evidence.config.deviation_points.to_string(),
+                ),
+                ("max_spread_points".into(), "0".into()),
+                ("estimated_slippage_points_per_side".into(), "0".into()),
+                ("commission_per_lot_round_turn".into(), "0".into()),
+                ("initial_deposit".into(), "100000".into()),
             ]),
         };
         metadata.validate_evidence(&evidence).unwrap();
 
-        let mut wrong = metadata;
+        let mut wrong = metadata.clone();
         wrong.properties.insert("symbol".into(), "OTHER".into());
         assert!(wrong.validate_evidence(&evidence).is_err());
+
+        let mut wrong_cost = metadata;
+        wrong_cost
+            .properties
+            .insert("commission_per_lot_round_turn".into(), "7".into());
+        assert!(wrong_cost.validate_evidence(&evidence).is_err());
     }
 }
