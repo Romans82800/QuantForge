@@ -25,7 +25,7 @@ pub struct PortfolioConfig {
     pub maximum_pairwise_correlation: f64,
     pub maximum_weight_per_strategy: f64,
     pub maximum_symbol_exposure: f64,
-    pub maximum_family_exposure: f64,
+    pub maximum_cohort_exposure: f64,
     pub maximum_strategies: usize,
     pub minimum_return_percent: f64,
     pub cvar_tail_fraction: f64,
@@ -41,7 +41,7 @@ impl Default for PortfolioConfig {
             maximum_pairwise_correlation: 0.70,
             maximum_weight_per_strategy: 0.25,
             maximum_symbol_exposure: 1.0,
-            maximum_family_exposure: 0.50,
+            maximum_cohort_exposure: 0.50,
             maximum_strategies: 10,
             minimum_return_percent: 0.0,
             cvar_tail_fraction: 0.05,
@@ -67,7 +67,7 @@ impl PortfolioConfig {
                 self.maximum_weight_per_strategy,
             ),
             ("maximum_symbol_exposure", self.maximum_symbol_exposure),
-            ("maximum_family_exposure", self.maximum_family_exposure),
+            ("maximum_cohort_exposure", self.maximum_cohort_exposure),
             ("cvar_tail_fraction", self.cvar_tail_fraction),
         ] {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
@@ -101,7 +101,9 @@ impl PortfolioConfig {
 pub struct PortfolioCandidate {
     pub strategy_fingerprint: ContentHash,
     pub symbol: String,
-    pub family: String,
+    /// Diversification group. Callers pass a behaviour cohort (trade frequency
+    /// and hold time) so the exposure cap limits correlated selections.
+    pub cohort: String,
     pub initial_balance: f64,
     pub return_percent: f64,
     pub maximum_drawdown_percent: f64,
@@ -114,7 +116,7 @@ pub struct PortfolioCandidate {
 pub struct PortfolioAllocation {
     pub strategy_fingerprint: ContentHash,
     pub symbol: String,
-    pub family: String,
+    pub cohort: String,
     pub weight: f64,
     pub source_return_percent: f64,
     pub source_maximum_drawdown_percent: f64,
@@ -160,7 +162,7 @@ pub struct PortfolioReport {
     pub pairwise_correlations: Vec<PairwiseCorrelation>,
     pub maximum_observed_pairwise_correlation: f64,
     pub symbol_exposures: BTreeMap<String, f64>,
-    pub family_exposures: BTreeMap<String, f64>,
+    pub cohort_exposures: BTreeMap<String, f64>,
     pub expected_return_percent: f64,
     pub path_maximum_drawdown_percent: f64,
     pub objective_score: f64,
@@ -255,7 +257,7 @@ fn prepare_candidates(
             )));
         }
         if candidate.symbol.trim().is_empty()
-            || candidate.family.trim().is_empty()
+            || candidate.cohort.trim().is_empty()
             || !candidate.initial_balance.is_finite()
             || candidate.initial_balance <= 0.0
             || !candidate.return_percent.is_finite()
@@ -331,12 +333,12 @@ fn greedy_selection<'a>(
             })
     });
     let maximum_per_symbol = exposure_count(config.maximum_symbol_exposure, target_count);
-    let maximum_per_family = exposure_count(config.maximum_family_exposure, target_count);
-    if maximum_per_symbol == 0 || maximum_per_family == 0 {
+    let maximum_per_cohort = exposure_count(config.maximum_cohort_exposure, target_count);
+    if maximum_per_symbol == 0 || maximum_per_cohort == 0 {
         return Vec::new();
     }
     let mut symbols = BTreeMap::<&str, usize>::new();
-    let mut families = BTreeMap::<&str, usize>::new();
+    let mut cohorts = BTreeMap::<&str, usize>::new();
     let mut selected = Vec::with_capacity(target_count);
     for candidate in ordered {
         if symbols
@@ -344,11 +346,11 @@ fn greedy_selection<'a>(
             .copied()
             .unwrap_or(0)
             >= maximum_per_symbol
-            || families
-                .get(candidate.candidate.family.as_str())
+            || cohorts
+                .get(candidate.candidate.cohort.as_str())
                 .copied()
                 .unwrap_or(0)
-                >= maximum_per_family
+                >= maximum_per_cohort
             || selected.iter().any(|existing: &&PreparedCandidate<'_>| {
                 correlation(&candidate.returns, &existing.returns)
                     > config.maximum_pairwise_correlation
@@ -357,7 +359,7 @@ fn greedy_selection<'a>(
             continue;
         }
         *symbols.entry(&candidate.candidate.symbol).or_default() += 1;
-        *families.entry(&candidate.candidate.family).or_default() += 1;
+        *cohorts.entry(&candidate.candidate.cohort).or_default() += 1;
         selected.push(candidate);
         if selected.len() == target_count {
             break;
@@ -390,7 +392,7 @@ fn build_report(
         .map(|value| PortfolioAllocation {
             strategy_fingerprint: value.candidate.strategy_fingerprint.clone(),
             symbol: value.candidate.symbol.clone(),
-            family: value.candidate.family.clone(),
+            cohort: value.candidate.cohort.clone(),
             weight,
             source_return_percent: value.candidate.return_percent,
             source_maximum_drawdown_percent: value.candidate.maximum_drawdown_percent,
@@ -421,15 +423,15 @@ fn build_report(
         .map(|value| value.correlation)
         .fold(0.0_f64, f64::max);
     let symbol_exposures = exposures(&allocations, |value| value.symbol.as_str());
-    let family_exposures = exposures(&allocations, |value| value.family.as_str());
+    let cohort_exposures = exposures(&allocations, |value| value.cohort.as_str());
     if weight > config.maximum_weight_per_strategy + 1.0e-12
         || maximum_observed_pairwise_correlation > config.maximum_pairwise_correlation + 1.0e-12
         || symbol_exposures
             .values()
             .any(|value| *value > config.maximum_symbol_exposure + 1.0e-12)
-        || family_exposures
+        || cohort_exposures
             .values()
-            .any(|value| *value > config.maximum_family_exposure + 1.0e-12)
+            .any(|value| *value > config.maximum_cohort_exposure + 1.0e-12)
     {
         return Err(PortfolioError::InternalConstraintViolation);
     }
@@ -453,7 +455,7 @@ fn build_report(
         pairwise_correlations,
         maximum_observed_pairwise_correlation,
         symbol_exposures,
-        family_exposures,
+        cohort_exposures,
         expected_return_percent,
         path_maximum_drawdown_percent,
         objective_score,
@@ -636,13 +638,13 @@ mod tests {
     fn candidate(
         label: &str,
         symbol: &str,
-        family: &str,
+        cohort: &str,
         signature: Vec<f64>,
     ) -> PortfolioCandidate {
         PortfolioCandidate {
             strategy_fingerprint: ContentHash::sha256(label),
             symbol: symbol.into(),
-            family: family.into(),
+            cohort: cohort.into(),
             initial_balance: 100_000.0,
             return_percent: 10.0,
             maximum_drawdown_percent: 5.0,
@@ -664,7 +666,7 @@ mod tests {
         let config = PortfolioConfig {
             maximum_pairwise_correlation: 0.1,
             maximum_weight_per_strategy: 0.25,
-            maximum_family_exposure: 0.50,
+            maximum_cohort_exposure: 0.50,
             maximum_strategies: 4,
             stress_trials: 100,
             stress_block_length: 2,
@@ -681,7 +683,7 @@ mod tests {
         assert!(report.selected.iter().all(|value| value.weight == 0.25));
         assert!(
             report
-                .family_exposures
+                .cohort_exposures
                 .values()
                 .all(|exposure| *exposure <= 0.5)
         );
@@ -703,7 +705,7 @@ mod tests {
             PortfolioConfig {
                 maximum_pairwise_correlation: 0.5,
                 maximum_weight_per_strategy: 0.5,
-                maximum_family_exposure: 1.0,
+                maximum_cohort_exposure: 1.0,
                 maximum_strategies: 2,
                 ..PortfolioConfig::default()
             },
@@ -717,7 +719,7 @@ mod tests {
         let config = PortfolioConfig {
             maximum_pairwise_correlation: 0.1,
             maximum_weight_per_strategy: 0.25,
-            maximum_family_exposure: 0.5,
+            maximum_cohort_exposure: 0.5,
             maximum_strategies: 4,
             stress_trials: 50,
             stress_block_length: 2,

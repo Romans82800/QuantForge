@@ -7,7 +7,7 @@ use quantforge_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceField {
     Open,
@@ -16,7 +16,9 @@ pub enum PriceField {
     Close,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Every field is integer-valued, so `Eq`/`Hash` are exact and this type can key
+/// an indicator buffer cache directly instead of via a serialized string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "operator", rename_all = "snake_case")]
 pub enum IndicatorExpr {
     Sma {
@@ -141,10 +143,164 @@ pub enum IndicatorExpr {
         period: u16,
         shift: u16,
     },
+    /// MACD main line: `EMA(fast) - EMA(slow)`.
+    MacdMain {
+        source: PriceField,
+        fast_period: u16,
+        slow_period: u16,
+        shift: u16,
+    },
+    /// MACD signal line: EMA of the main line.
+    MacdSignal {
+        source: PriceField,
+        fast_period: u16,
+        slow_period: u16,
+        signal_period: u16,
+        shift: u16,
+    },
+    /// MACD histogram: `main - signal`.
+    MacdHistogram {
+        source: PriceField,
+        fast_period: u16,
+        slow_period: u16,
+        signal_period: u16,
+        shift: u16,
+    },
+    /// Bollinger middle band (simple moving average).
+    BollingerMid {
+        source: PriceField,
+        period: u16,
+        shift: u16,
+    },
+    /// Bollinger upper band. Deviation is carried in tenths so the IR stays
+    /// integer-valued and fingerprints cannot drift on float formatting.
+    BollingerUpper {
+        source: PriceField,
+        period: u16,
+        deviation_tenths: u16,
+        shift: u16,
+    },
+    /// Bollinger lower band.
+    BollingerLower {
+        source: PriceField,
+        period: u16,
+        deviation_tenths: u16,
+        shift: u16,
+    },
+    /// `(upper - lower) / mid * 100` — squeeze / expansion detector.
+    BollingerBandwidth {
+        source: PriceField,
+        period: u16,
+        deviation_tenths: u16,
+        shift: u16,
+    },
+    /// Ichimoku conversion line: midpoint of the last `period` bars.
+    IchimokuTenkan {
+        period: u16,
+        shift: u16,
+    },
+    /// Ichimoku base line: midpoint of the last `period` bars.
+    IchimokuKijun {
+        period: u16,
+        shift: u16,
+    },
+    /// Ichimoku leading span A, displaced forward by `kijun_period` bars so the
+    /// value read at a bar is the cloud edge visible on that bar.
+    IchimokuSenkouA {
+        tenkan_period: u16,
+        kijun_period: u16,
+        shift: u16,
+    },
+    /// Ichimoku leading span B, displaced forward by `kijun_period` bars.
+    IchimokuSenkouB {
+        period: u16,
+        kijun_period: u16,
+        shift: u16,
+    },
+    /// QQE smoothed RSI line: `EMA(RSI(rsi_period), smoothing_period)`.
+    QqeLine {
+        rsi_period: u16,
+        smoothing_period: u16,
+        shift: u16,
+    },
+    /// QQE trailing level derived from the smoothed RSI's average true range.
+    /// The Wilder factor is carried in tenths (42 = 4.2).
+    QqeTrail {
+        rsi_period: u16,
+        smoothing_period: u16,
+        factor_tenths: u16,
+        shift: u16,
+    },
+    /// Rolling volume-weighted average price over `period` bars.
+    Vwap {
+        period: u16,
+        shift: u16,
+    },
+    /// Commodity Channel Index on typical price.
+    Cci {
+        period: u16,
+        shift: u16,
+    },
 }
 
 impl IndicatorExpr {
-    fn period_and_shift(&self) -> (u16, u16) {
+    /// Mutable access to the bar shift carried by every indicator variant.
+    pub fn shift_mut(&mut self) -> &mut u16 {
+        match self {
+            Self::Sma { shift, .. }
+            | Self::Ema { shift, .. }
+            | Self::Wma { shift, .. }
+            | Self::Rsi { shift, .. }
+            | Self::Atr { shift, .. }
+            | Self::Adx { shift, .. }
+            | Self::PlusDi { shift, .. }
+            | Self::MinusDi { shift, .. }
+            | Self::DonchianHigh { shift, .. }
+            | Self::DonchianLow { shift, .. }
+            | Self::Highest { shift, .. }
+            | Self::Lowest { shift, .. }
+            | Self::StandardDeviation { shift, .. }
+            | Self::ZScore { shift, .. }
+            | Self::PercentileInRange { shift, .. }
+            | Self::RateOfChange { shift, .. }
+            | Self::SessionRangeHigh { shift, .. }
+            | Self::SessionRangeLow { shift, .. }
+            | Self::BodyRangeRatio { shift, .. }
+            | Self::CloseLocationInBar { shift, .. }
+            | Self::AtrPercentile { shift, .. }
+            | Self::SwingBaseZoneHigh { shift, .. }
+            | Self::SwingBaseZoneLow { shift, .. }
+            | Self::LiquiditySweepScore { shift, .. }
+            | Self::MacdMain { shift, .. }
+            | Self::MacdSignal { shift, .. }
+            | Self::MacdHistogram { shift, .. }
+            | Self::BollingerMid { shift, .. }
+            | Self::BollingerUpper { shift, .. }
+            | Self::BollingerLower { shift, .. }
+            | Self::BollingerBandwidth { shift, .. }
+            | Self::IchimokuTenkan { shift, .. }
+            | Self::IchimokuKijun { shift, .. }
+            | Self::IchimokuSenkouA { shift, .. }
+            | Self::IchimokuSenkouB { shift, .. }
+            | Self::QqeLine { shift, .. }
+            | Self::QqeTrail { shift, .. }
+            | Self::Vwap { shift, .. }
+            | Self::Cci { shift, .. } => shift,
+        }
+    }
+
+    /// Cache key for the underlying indicator buffer. Series calculation ignores
+    /// `shift` (it is a lookup offset, in both Scout and MQL5), so two expressions
+    /// differing only in shift must share one buffer.
+    pub fn buffer_key(&self) -> Self {
+        let mut key = self.clone();
+        *key.shift_mut() = 0;
+        key
+    }
+
+    /// Representative lookback and bar shift, used for IR validation and by the
+    /// evaluator to resolve reads against completed bars.
+    pub fn period_and_shift(&self) -> (u16, u16) {
         match *self {
             Self::Sma { period, shift, .. }
             | Self::Ema { period, shift, .. }
@@ -193,6 +349,64 @@ impl IndicatorExpr {
                     .max(2),
                 shift,
             ),
+            Self::MacdMain {
+                fast_period,
+                slow_period,
+                shift,
+                ..
+            } => (fast_period.max(slow_period).max(2), shift),
+            Self::MacdSignal {
+                fast_period,
+                slow_period,
+                signal_period,
+                shift,
+                ..
+            }
+            | Self::MacdHistogram {
+                fast_period,
+                slow_period,
+                signal_period,
+                shift,
+                ..
+            } => (
+                fast_period
+                    .max(slow_period)
+                    .saturating_add(signal_period)
+                    .max(2),
+                shift,
+            ),
+            Self::BollingerMid { period, shift, .. }
+            | Self::BollingerUpper { period, shift, .. }
+            | Self::BollingerLower { period, shift, .. }
+            | Self::BollingerBandwidth { period, shift, .. }
+            | Self::IchimokuTenkan { period, shift }
+            | Self::IchimokuKijun { period, shift }
+            | Self::Vwap { period, shift }
+            | Self::Cci { period, shift } => (period.max(2), shift),
+            Self::IchimokuSenkouA {
+                tenkan_period,
+                kijun_period,
+                shift,
+            } => (
+                tenkan_period.max(kijun_period).saturating_add(kijun_period),
+                shift,
+            ),
+            Self::IchimokuSenkouB {
+                period,
+                kijun_period,
+                shift,
+            } => (period.saturating_add(kijun_period).max(2), shift),
+            Self::QqeLine {
+                rsi_period,
+                smoothing_period,
+                shift,
+            }
+            | Self::QqeTrail {
+                rsi_period,
+                smoothing_period,
+                shift,
+                ..
+            } => (rsi_period.max(smoothing_period).max(2), shift),
         }
     }
 }
@@ -343,13 +557,20 @@ pub struct PartialExit {
     pub fraction: f64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+fn default_end_of_day_hour() -> u8 {
+    23
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagePolicy {
     pub break_even_at_r: Option<f64>,
     pub trailing: Option<TrailingPolicy>,
     pub time_stop_bars: Option<u16>,
     pub partial_exits: Vec<PartialExit>,
     pub flatten_end_of_day: bool,
+    /// Broker-local hour when open positions flatten and pending orders cancel.
+    #[serde(default = "default_end_of_day_hour")]
+    pub end_of_day_hour: u8,
     /// When true, the first fill (market open or pending activation) locks the
     /// broker-local calendar day — no further market entries or pending orders
     /// may be placed that day, even if the first trade closed early. An unfilled
@@ -357,6 +578,20 @@ pub struct ManagePolicy {
     /// Production Discover stamps this from job config; it is not an evolvable gene.
     #[serde(default)]
     pub max_one_entry_per_day: bool,
+}
+
+impl Default for ManagePolicy {
+    fn default() -> Self {
+        Self {
+            break_even_at_r: None,
+            trailing: None,
+            time_stop_bars: None,
+            partial_exits: Vec::new(),
+            flatten_end_of_day: false,
+            end_of_day_hour: default_end_of_day_hour(),
+            max_one_entry_per_day: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,7 +606,13 @@ pub struct StrategyIr {
     pub id: String,
     pub version: u16,
     pub entry: EntrySignals,
+    /// Legacy exit applied to either position side. New strategies should use
+    /// `exit_long` and `exit_short` so mirrored exits cannot close the wrong side.
     pub exit: Option<BoolExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_long: Option<BoolExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_short: Option<BoolExpr>,
     pub filters: Vec<BoolExpr>,
     pub side: Side,
     pub risk: RiskPolicy,
@@ -448,6 +689,12 @@ impl StrategyIr {
         if let Some(exit) = &self.exit {
             validate_bool(exit, "exit", 1, limits)?;
         }
+        if let Some(exit) = &self.exit_long {
+            validate_bool(exit, "exit_long", 1, limits)?;
+        }
+        if let Some(exit) = &self.exit_short {
+            validate_bool(exit, "exit_short", 1, limits)?;
+        }
         for (index, filter) in self.filters.iter().enumerate() {
             validate_bool(filter, &format!("filters[{index}]"), 1, limits)?;
         }
@@ -479,6 +726,12 @@ impl StrategyIr {
         if let Some(exit) = &self.exit {
             complexity += bool_complexity(exit);
         }
+        if let Some(exit) = &self.exit_long {
+            complexity += bool_complexity(exit);
+        }
+        if let Some(exit) = &self.exit_short {
+            complexity += bool_complexity(exit);
+        }
         for filter in &self.filters {
             complexity += bool_complexity(filter);
         }
@@ -499,6 +752,12 @@ impl StrategyIr {
         }
         canonicalize_entry_order(&mut value.entry.order, policy)?;
         if let Some(exit) = &mut value.exit {
+            canonicalize_bool(exit, policy)?;
+        }
+        if let Some(exit) = &mut value.exit_long {
+            canonicalize_bool(exit, policy)?;
+        }
+        if let Some(exit) = &mut value.exit_short {
             canonicalize_bool(exit, policy)?;
         }
         for filter in &mut value.filters {
@@ -525,7 +784,26 @@ impl StrategyIr {
             stops: &canonical.stops,
             manage: &canonical.manage,
         };
-        Ok(stable_json_hash(&material)?)
+        if canonical.exit_long.is_none() && canonical.exit_short.is_none() {
+            // Preserve all pre-side-specific fingerprints byte-for-byte.
+            Ok(stable_json_hash(&material)?)
+        } else {
+            Ok(stable_json_hash(&SideSpecificFingerprintMaterial {
+                legacy: material,
+                exit_long: &canonical.exit_long,
+                exit_short: &canonical.exit_short,
+            })?)
+        }
+    }
+
+    /// Resolve a long-position exit while retaining legacy artifacts.
+    pub fn long_exit(&self) -> Option<&BoolExpr> {
+        self.exit_long.as_ref().or(self.exit.as_ref())
+    }
+
+    /// Resolve a short-position exit while retaining legacy artifacts.
+    pub fn short_exit(&self) -> Option<&BoolExpr> {
+        self.exit_short.as_ref().or(self.exit.as_ref())
     }
 }
 
@@ -610,6 +888,13 @@ struct FingerprintMaterial<'a> {
     risk: &'a RiskPolicy,
     stops: &'a ProtectiveStops,
     manage: &'a ManagePolicy,
+}
+
+#[derive(Serialize)]
+struct SideSpecificFingerprintMaterial<'a> {
+    legacy: FingerprintMaterial<'a>,
+    exit_long: &'a Option<BoolExpr>,
+    exit_short: &'a Option<BoolExpr>,
 }
 
 fn validate_bool(
@@ -780,6 +1065,12 @@ fn validate_stops(stops: &ProtectiveStops, limits: IrLimits) -> Result<(), IrErr
 }
 
 fn validate_manage(manage: &ManagePolicy, limits: IrLimits) -> Result<(), IrError> {
+    if manage.end_of_day_hour > 23 {
+        return Err(IrError::Invalid {
+            path: "manage.end_of_day_hour".into(),
+            reason: "must be between 0 and 23".into(),
+        });
+    }
     if let Some(value) = manage.break_even_at_r {
         require_positive("manage.break_even_at_r", value)?;
     }
@@ -1079,6 +1370,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: vec![],
             side: Side::Both,
             risk: RiskPolicy::FixedCurrency { amount: 1_000.0 },

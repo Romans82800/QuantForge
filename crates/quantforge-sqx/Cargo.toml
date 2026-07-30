@@ -1,0 +1,11 @@
+[package]
+name = "quantforge-sqx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantforge-data.workspace = true
+serde.workspace = true
+quantforge-broker.workspace = true
+chrono.workspace = true

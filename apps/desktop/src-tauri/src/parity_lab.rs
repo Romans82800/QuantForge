@@ -36,6 +36,10 @@ pub struct JudgeRequest {
     fallback_spread_points: Option<f64>,
     max_spread_points: Option<f64>,
     initial_balance: f64,
+    /// Broker-local hour from which entries may be placed (inclusive).
+    entry_window_start_hour: Option<u32>,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    entry_window_end_hour: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -76,6 +80,10 @@ pub struct ExportRequest {
     currency: String,
     leverage: u32,
     tester_model: u8,
+    /// Broker-local hour from which entries may be placed (inclusive).
+    entry_window_start_hour: Option<u32>,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    entry_window_end_hour: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -132,6 +140,12 @@ pub struct ParityView {
     drawdown_delta_relative: f64,
     equity_divergence_percent: f64,
     protective_orders_present: bool,
+    reference_win_rate: f64,
+    external_win_rate: f64,
+    reference_winning_trades: usize,
+    external_winning_trades: usize,
+    reference_profit_factor: Option<f64>,
+    external_profit_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -208,6 +222,11 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
             include_costs_in_risk: true,
         },
         allow_execution_gaps: false,
+        indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+        entry_window: crate::discover::entry_window(
+            request.entry_window_start_hour,
+            request.entry_window_end_hour,
+        ),
     };
     let result = evaluate_strategy_m1(&strategy, &decision_dataset, &m1.dataset, &broker, &config)
         .map_err(|error| error.to_string())?;
@@ -338,8 +357,19 @@ fn export_mql5_sync(request: &ExportRequest) -> Result<ExportView, String> {
     }
     let strategy: StrategyIr = read_json(&request.strategy_path)?;
     let broker = load_bound_broker(&request.broker_path, None)?;
+    let window = crate::discover::entry_window(
+        request.entry_window_start_hour,
+        request.entry_window_end_hour,
+    );
+    // A blank name means "derive one", so exporting several strategies in a row
+    // no longer produces a folder of identically named experts.
+    let expert_name = if request.expert_name.trim().is_empty() {
+        quantforge_export_mql5::suggested_expert_name(&broker.symbol, &strategy.id, request.magic)
+    } else {
+        request.expert_name.trim().to_string()
+    };
     let config = Mql5ExportConfig {
-        expert_name: request.expert_name.clone(),
+        expert_name: expert_name.clone(),
         expert_directory: request.expert_directory.clone(),
         timeframe: request.timeframe.clone(),
         magic: request.magic,
@@ -348,6 +378,9 @@ fn export_mql5_sync(request: &ExportRequest) -> Result<ExportView, String> {
         estimated_slippage_points_per_side: request.slippage_points_per_side,
         commission_per_lot_round_turn: request.commission_per_lot_round_turn,
         allow_live_trading_default: false,
+        export_style: quantforge_export_mql5::ExportStyle::Sqx,
+        entry_window_start_hour: window.start_hour,
+        entry_window_end_hour: window.end_hour,
         tester: TesterConfig {
             from_date: None,
             to_date: None,
@@ -359,14 +392,23 @@ fn export_mql5_sync(request: &ExportRequest) -> Result<ExportView, String> {
     };
     let bundle = generate_bundle(&strategy, &broker, &config).map_err(|error| error.to_string())?;
     fs::create_dir_all(&out).map_err(|error| format!("cannot create export directory: {error}"))?;
-    let source = out.join(format!("{}.mq5", request.expert_name));
-    let settings = out.join(format!("{}.set", request.expert_name));
-    let tester = out.join(format!("{}.tester.ini", request.expert_name));
-    let evidence = out.join(format!("{}.evidence.json", request.expert_name));
+    let source = out.join(format!("{expert_name}.mq5"));
+    let settings = out.join(format!("{expert_name}.set"));
+    let tester = out.join(format!("{expert_name}.tester.ini"));
+    let evidence = out.join(format!("{expert_name}.evidence.json"));
     write_text_new(&source, &bundle.source)?;
     write_text_new(&settings, &bundle.set_file)?;
     write_text_new(&tester, &bundle.tester_ini)?;
     write_json_new(&evidence, &bundle.evidence)?;
+    for support in &bundle.support_files {
+        let path = out.join(&support.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create export support directory: {error}"))?;
+        }
+        write_text_new(&path, &support.contents)
+            .map_err(|error| format!("cannot write export support file: {error}"))?;
+    }
     Ok(ExportView {
         output_directory: display_path(&out),
         source_path: display_path(&source),
@@ -520,6 +562,12 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         drawdown_delta_relative: artifact.report.max_drawdown_delta_relative,
         equity_divergence_percent: artifact.report.max_equity_path_divergence_percent,
         protective_orders_present: artifact.report.protective_orders_present,
+        reference_win_rate: artifact.report.reference_win_rate,
+        external_win_rate: artifact.report.external_win_rate,
+        reference_winning_trades: artifact.report.reference_winning_trades,
+        external_winning_trades: artifact.report.external_winning_trades,
+        reference_profit_factor: artifact.report.reference_profit_factor,
+        external_profit_factor: artifact.report.external_profit_factor,
     })
 }
 

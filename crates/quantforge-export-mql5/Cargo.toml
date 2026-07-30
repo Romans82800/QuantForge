@@ -12,3 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+include_dir = "0.7.4"
+
+[dev-dependencies]
+quantforge-eval.workspace = true

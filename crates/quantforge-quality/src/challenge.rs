@@ -240,10 +240,24 @@ pub struct MonteCarloReport {
     pub seed: u64,
     pub trials: usize,
     pub block_length: usize,
+    /// Fraction of sampled trades deliberately removed from each simulation.
+    /// Zero preserves the historical moving-block bootstrap behaviour.
+    #[serde(default)]
+    pub skip_trade_probability: f64,
+    /// Explicit pass criteria carried with the evidence rather than hidden in
+    /// the caller's configuration.
+    #[serde(default)]
+    pub minimum_p05_net_profit: f64,
+    #[serde(default)]
+    pub maximum_p95_drawdown_percent: f64,
     pub p05_net_profit: f64,
     pub median_net_profit: f64,
     pub p95_drawdown_percent: f64,
     pub worst_drawdown_percent: f64,
+    /// A small deterministic sample of paths for Results. Full trial paths are
+    /// intentionally not archived: they add no evidence beyond the summary.
+    #[serde(default)]
+    pub sample_paths: Vec<Vec<f64>>,
     pub passed: bool,
 }
 
@@ -738,18 +752,55 @@ pub fn monte_carlo_from_trade_profits(
     minimum_p05_net_profit: f64,
     maximum_p95_drawdown_percent: f64,
 ) -> MonteCarloReport {
+    monte_carlo_trade_resampling_with_skip(
+        profits,
+        initial_balance,
+        trials,
+        block_length,
+        0.0,
+        seed,
+        minimum_p05_net_profit,
+        maximum_p95_drawdown_percent,
+    )
+}
+
+/// SQX-style trade Monte Carlo: resample the ordered trade stream in moving
+/// blocks, then randomly remove a proportion of trades from every simulation.
+///
+/// Removing trades is deliberately done after resampling. It asks whether the
+/// edge survives both a different ordering and a realistic proportion of
+/// missed/filtered fills; it never changes the original backtest or searches
+/// for a favourable seed.
+pub fn monte_carlo_trade_resampling_with_skip(
+    profits: &[f64],
+    initial_balance: f64,
+    trials: usize,
+    block_length: usize,
+    skip_trade_probability: f64,
+    seed: u64,
+    minimum_p05_net_profit: f64,
+    maximum_p95_drawdown_percent: f64,
+) -> MonteCarloReport {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xa5a5_01b0_07c5_7a11);
     let mut net_profits = Vec::with_capacity(trials);
     let mut drawdowns = Vec::with_capacity(trials);
+    let mut sample_paths = Vec::with_capacity(trials.min(30));
+    let skip_trade_probability = skip_trade_probability.clamp(0.0, 0.95);
     if profits.is_empty() {
         net_profits.resize(trials, 0.0);
         drawdowns.resize(trials, 0.0);
     } else {
-        for _ in 0..trials {
-            let sampled = moving_block_sample(profits, block_length, &mut rng);
+        for trial in 0..trials {
+            let mut sampled = moving_block_sample(profits, block_length, &mut rng);
+            if skip_trade_probability > 0.0 {
+                sampled.retain(|_| !rng.gen_bool(skip_trade_probability));
+            }
             let (net_profit, drawdown) = profit_path_metrics(initial_balance, &sampled);
             net_profits.push(net_profit);
             drawdowns.push(drawdown);
+            if trial < 30 {
+                sample_paths.push(downsample_profit_path(initial_balance, &sampled, 80));
+            }
         }
     }
     net_profits.sort_by(f64::total_cmp);
@@ -759,14 +810,22 @@ pub fn monte_carlo_from_trade_profits(
     let p95_drawdown_percent = quantile(&drawdowns, 0.95);
     let worst_drawdown_percent = *drawdowns.last().unwrap_or(&0.0);
     MonteCarloReport {
-        method: "moving_block_trade_bootstrap_v1".into(),
+        method: if skip_trade_probability > 0.0 {
+            "moving_block_trade_resampling_with_skip_v1".into()
+        } else {
+            "moving_block_trade_bootstrap_v1".into()
+        },
         seed,
         trials,
         block_length,
+        skip_trade_probability,
+        minimum_p05_net_profit,
+        maximum_p95_drawdown_percent,
         p05_net_profit,
         median_net_profit,
         p95_drawdown_percent,
         worst_drawdown_percent,
+        sample_paths,
         passed: !profits.is_empty()
             && p05_net_profit >= minimum_p05_net_profit
             && p95_drawdown_percent <= maximum_p95_drawdown_percent,
@@ -817,6 +876,23 @@ fn profit_path_metrics(initial_balance: f64, profits: &[f64]) -> (f64, f64) {
         }
     }
     (balance - initial_balance, maximum_drawdown_percent)
+}
+
+fn downsample_profit_path(initial_balance: f64, profits: &[f64], points: usize) -> Vec<f64> {
+    let mut balances = Vec::with_capacity(profits.len() + 1);
+    let mut balance = initial_balance;
+    balances.push(balance);
+    for profit in profits {
+        balance += profit;
+        balances.push(balance);
+    }
+    if balances.len() <= points.max(2) {
+        return balances;
+    }
+    let last = balances.len() - 1;
+    (0..points.max(2))
+        .map(|index| balances[index * last / (points.max(2) - 1)])
+        .collect()
 }
 
 fn run_parameter_neighborhood(
@@ -903,6 +979,12 @@ fn perturb_strategy(
         perturb_bool(entry, fraction, rng);
     }
     if let Some(exit) = &mut neighbor.exit {
+        perturb_bool(exit, fraction, rng);
+    }
+    if let Some(exit) = &mut neighbor.exit_long {
+        perturb_bool(exit, fraction, rng);
+    }
+    if let Some(exit) = &mut neighbor.exit_short {
         perturb_bool(exit, fraction, rng);
     }
     for filter in &mut neighbor.filters {
@@ -1093,6 +1175,90 @@ fn perturb_indicator(indicator: &mut IndicatorExpr, fraction: f64, rng: &mut Cha
             perturb_period(base_bars, fraction, rng);
         }
         IndicatorExpr::BodyRangeRatio { .. } | IndicatorExpr::CloseLocationInBar { .. } => {}
+        IndicatorExpr::MacdMain {
+            fast_period,
+            slow_period,
+            ..
+        } => {
+            perturb_period(fast_period, fraction, rng);
+            perturb_period(slow_period, fraction, rng);
+            *slow_period = (*slow_period).max(*fast_period + 1);
+        }
+        IndicatorExpr::MacdSignal {
+            fast_period,
+            slow_period,
+            signal_period,
+            ..
+        }
+        | IndicatorExpr::MacdHistogram {
+            fast_period,
+            slow_period,
+            signal_period,
+            ..
+        } => {
+            perturb_period(fast_period, fraction, rng);
+            perturb_period(slow_period, fraction, rng);
+            *slow_period = (*slow_period).max(*fast_period + 1);
+            perturb_period(signal_period, fraction, rng);
+        }
+        IndicatorExpr::BollingerMid { period, .. } => perturb_period(period, fraction, rng),
+        IndicatorExpr::BollingerUpper {
+            period,
+            deviation_tenths,
+            ..
+        }
+        | IndicatorExpr::BollingerLower {
+            period,
+            deviation_tenths,
+            ..
+        }
+        | IndicatorExpr::BollingerBandwidth {
+            period,
+            deviation_tenths,
+            ..
+        } => {
+            perturb_period(period, fraction, rng);
+            perturb_period(deviation_tenths, fraction, rng);
+        }
+        IndicatorExpr::IchimokuTenkan { period, .. }
+        | IndicatorExpr::IchimokuKijun { period, .. } => perturb_period(period, fraction, rng),
+        IndicatorExpr::IchimokuSenkouA {
+            tenkan_period,
+            kijun_period,
+            ..
+        } => {
+            perturb_period(tenkan_period, fraction, rng);
+            perturb_period(kijun_period, fraction, rng);
+        }
+        IndicatorExpr::IchimokuSenkouB {
+            period,
+            kijun_period,
+            ..
+        } => {
+            perturb_period(period, fraction, rng);
+            perturb_period(kijun_period, fraction, rng);
+        }
+        IndicatorExpr::QqeLine {
+            rsi_period,
+            smoothing_period,
+            ..
+        } => {
+            perturb_period(rsi_period, fraction, rng);
+            perturb_period(smoothing_period, fraction, rng);
+        }
+        IndicatorExpr::QqeTrail {
+            rsi_period,
+            smoothing_period,
+            factor_tenths,
+            ..
+        } => {
+            perturb_period(rsi_period, fraction, rng);
+            perturb_period(smoothing_period, fraction, rng);
+            perturb_period(factor_tenths, fraction, rng);
+        }
+        IndicatorExpr::Vwap { period, .. } | IndicatorExpr::Cci { period, .. } => {
+            perturb_period(period, fraction, rng)
+        }
     }
 }
 
@@ -1350,6 +1516,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: Vec::new(),
             side: Side::LongOnly,
             risk: RiskPolicy::FixedCurrency { amount: 1.0 },

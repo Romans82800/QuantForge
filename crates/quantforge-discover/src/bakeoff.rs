@@ -1,7 +1,12 @@
-//! Short Fast Scout per Search Family, ranked by OOS1 retention.
+//! Equal-budget Fast Scout per entry-condition count, ranked by OOS1 retention.
+//!
+//! This replaces the old per-family bakeoff. Families said what indicators a
+//! strategy was allowed to use; the question that actually matters is how many
+//! mirrored entry conditions survive out of sample, because every extra
+//! condition is another degree of freedom to overfit.
 
 use crate::engine::{evolve_new_with_pack, passes_oos1_pick};
-use crate::model::{DiscoverConfig, DiscoverError, DiscoverRunMode, SearchFamily};
+use crate::model::{DiscoverConfig, DiscoverError, DiscoverRunMode, UniversalGrammarConfig};
 use crate::multi_symbol::PackSymbol;
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
@@ -9,14 +14,16 @@ use quantforge_eval::evaluate_strategy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FamilyBakeoffConfig {
+#[serde(rename_all = "camelCase")]
+pub struct ConditionBakeoffConfig {
     pub discover: DiscoverConfig,
-    /// Generations of Fast Scout per family (after the initial batch).
+    /// Generations of Fast Scout per condition count (after the initial batch).
     pub generations: u64,
-    pub families: Vec<SearchFamily>,
+    /// Entry-condition counts to compare, each pinned exactly.
+    pub entry_condition_counts: Vec<usize>,
 }
 
-impl Default for FamilyBakeoffConfig {
+impl Default for ConditionBakeoffConfig {
     fn default() -> Self {
         let discover = DiscoverConfig {
             run_mode: DiscoverRunMode::FastScout,
@@ -25,7 +32,7 @@ impl Default for FamilyBakeoffConfig {
             initial_candidates: 60,
             batch_size: 30,
             mutate_after_elites: 12,
-            // A comparison needs the same planned sample for every family.
+            // A comparison needs the same planned sample for every arm.
             // Fast Scout otherwise stops once a pot reaches eight members.
             early_stop_pot_elites: Some(usize::MAX),
             worker_threads: 1,
@@ -34,15 +41,15 @@ impl Default for FamilyBakeoffConfig {
         Self {
             discover,
             generations: 3,
-            families: SearchFamily::ALL.to_vec(),
+            entry_condition_counts: vec![2, 3, 4],
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FamilyBakeoffRow {
-    pub family: SearchFamily,
+pub struct ConditionBakeoffRow {
+    pub entry_conditions: usize,
     /// Expectancy normalized by the fixed $1,000 risk policy.
     pub median_is_expectancy_r: f64,
     /// Expectancy normalized by the fixed $1,000 risk policy.
@@ -58,28 +65,31 @@ pub struct FamilyBakeoffRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FamilyBakeoffReport {
-    pub rows: Vec<FamilyBakeoffRow>,
-    pub recommended: Option<SearchFamily>,
+pub struct ConditionBakeoffReport {
+    pub rows: Vec<ConditionBakeoffRow>,
+    pub recommended: Option<usize>,
 }
 
-/// Run an equal-budget Fast Scout for each family, then independently recheck
-/// every retained pot member on OOS1 before ranking it.
-pub fn run_family_bakeoff(
+/// Run an equal-budget Fast Scout for each entry-condition count, then
+/// independently recheck every retained pot member on OOS1 before ranking it.
+pub fn run_condition_bakeoff(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
-    config: FamilyBakeoffConfig,
-) -> Result<FamilyBakeoffReport, DiscoverError> {
-    let mut rows = Vec::with_capacity(config.families.len());
-    for family in &config.families {
+    config: ConditionBakeoffConfig,
+) -> Result<ConditionBakeoffReport, DiscoverError> {
+    let mut rows = Vec::with_capacity(config.entry_condition_counts.len());
+    for entry_conditions in &config.entry_condition_counts {
+        let entry_conditions =
+            (*entry_conditions).clamp(2, UniversalGrammarConfig::MAX_ENTRY_CONDITIONS);
         let mut discover = config.discover.clone();
-        discover.search_family = *family;
+        discover.universal_grammar.minimum_entry_conditions = entry_conditions;
+        discover.universal_grammar.maximum_entry_conditions = entry_conditions;
         discover.run_mode = DiscoverRunMode::FastScout;
-        // Keep each family on the same planned evaluation budget even when the
+        // Keep each arm on the same planned evaluation budget even when the
         // caller supplied a generic DiscoverConfig rather than this type's
         // default preset.
         discover.early_stop_pot_elites = Some(usize::MAX);
@@ -128,8 +138,8 @@ pub fn run_family_bakeoff(
         } else {
             passes as f64 / oos1_tested as f64
         };
-        rows.push(FamilyBakeoffRow {
-            family: *family,
+        rows.push(ConditionBakeoffRow {
+            entry_conditions,
             median_is_expectancy_r: median(&is_values_r),
             median_oos1_expectancy_r: median(&oos1_values_r),
             median_retention: median(&retentions),
@@ -151,6 +161,8 @@ pub fn run_family_bakeoff(
                     .partial_cmp(&left.median_oos1_expectancy_r)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            // Break remaining ties toward the simpler arm.
+            .then_with(|| left.entry_conditions.cmp(&right.entry_conditions))
     });
     let recommended = rows
         .iter()
@@ -160,8 +172,8 @@ pub fn run_family_bakeoff(
                 && row.median_retention >= 0.70
                 && row.median_oos1_expectancy_r > 0.0
         })
-        .map(|row| row.family);
-    Ok(FamilyBakeoffReport { rows, recommended })
+        .map(|row| row.entry_conditions);
+    Ok(ConditionBakeoffReport { rows, recommended })
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -182,38 +194,37 @@ fn median(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
+    fn row(entry_conditions: usize, retention: f64) -> ConditionBakeoffRow {
+        ConditionBakeoffRow {
+            entry_conditions,
+            median_is_expectancy_r: 0.2,
+            median_oos1_expectancy_r: 0.2,
+            median_retention: retention,
+            pass_rate: 0.5,
+            elites: 1,
+            pot_elites: 1,
+            oos1_tested: 1,
+            evaluations: 10,
+        }
+    }
+
     #[test]
     fn bakeoff_ranks_by_retention() {
-        let mut rows = [
-            FamilyBakeoffRow {
-                family: SearchFamily::TrendPullback,
-                median_is_expectancy_r: 0.2,
-                median_oos1_expectancy_r: 0.2,
-                median_retention: 0.5,
-                pass_rate: 0.2,
-                elites: 0,
-                pot_elites: 1,
-                oos1_tested: 1,
-                evaluations: 10,
-            },
-            FamilyBakeoffRow {
-                family: SearchFamily::MomentumBurst,
-                median_is_expectancy_r: 0.1,
-                median_oos1_expectancy_r: 0.1,
-                median_retention: 0.9,
-                pass_rate: 0.8,
-                elites: 1,
-                pot_elites: 2,
-                oos1_tested: 2,
-                evaluations: 10,
-            },
-        ];
+        let mut rows = [row(4, 0.5), row(2, 0.9)];
         rows.sort_by(|left, right| {
             right
                 .median_retention
                 .partial_cmp(&left.median_retention)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        assert_eq!(rows[0].family, SearchFamily::MomentumBurst);
+        assert_eq!(rows[0].entry_conditions, 2);
+    }
+
+    #[test]
+    fn default_config_compares_two_three_and_four_conditions() {
+        assert_eq!(
+            ConditionBakeoffConfig::default().entry_condition_counts,
+            vec![2, 3, 4]
+        );
     }
 }

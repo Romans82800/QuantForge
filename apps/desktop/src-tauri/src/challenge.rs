@@ -36,6 +36,10 @@ pub struct ChallengeRequest {
     fallback_spread_points: Option<f64>,
     max_spread_points: Option<f64>,
     initial_balance: f64,
+    /// Broker-local hour from which entries may be placed (inclusive).
+    entry_window_start_hour: Option<u32>,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    entry_window_end_hour: Option<u32>,
     folds: usize,
     monte_carlo_trials: usize,
     neighborhood_samples: usize,
@@ -246,6 +250,13 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
             },
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: crate::discover::entry_window(
+                request.entry_window_start_hour,
+                request.entry_window_end_hour,
+            ),
+            // Challenge reports its metrics, so it must always replay in full.
+            abandon_above_drawdown_percent: None,
         },
         folds: request.folds,
         monte_carlo_trials: request.monte_carlo_trials,

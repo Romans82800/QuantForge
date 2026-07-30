@@ -3,7 +3,7 @@ use quantforge_core::{ContentHash, FloatPolicy, STRATEGY_IR_VERSION, stable_json
 use quantforge_data::DataQualityReport;
 use quantforge_discover::{
     BehaviorDescriptor, Databank, DiscoverConfig, DiscoverTelemetry, Elite, EvidenceComponents,
-    FamilyStyle, GateConfig, LongShortSkewBucket, NicheKey, ThreeLevelBucket, niche_label,
+    GateConfig, LongShortSkewBucket, NicheKey, ThreeLevelBucket, niche_label,
 };
 use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
 use quantforge_ir::{
@@ -114,6 +114,8 @@ fn strategy() -> StrategyIr {
             order: Default::default(),
         },
         exit: None,
+        exit_long: None,
+        exit_short: None,
         filters: Vec::new(),
         side: Side::LongOnly,
         risk: RiskPolicy::FixedCurrency {
@@ -171,24 +173,24 @@ fn write_databank(
         tournament_size: 1,
         structural_mutation_probability: 0.1,
         seed: 42,
-        search_family: quantforge_discover::SearchFamily::TrendPullback,
+        universal_grammar: Default::default(),
         run_mode: quantforge_discover::DiscoverRunMode::FullHarvest,
-        allow_cross_family_mutation: false,
         early_stop_pot_elites: None,
+        target_databank_elites: None,
         trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: challenge.baseline.metrics.trade_count,
             maximum_drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
             minimum_return_percent: challenge.baseline.metrics.return_percent - 1.0,
             minimum_profit_factor: 0.0,
-            minimum_return_drawdown: 0.0,
+            minimum_recovery_factor: 0.0,
         },
         deposit_gates: GateConfig {
             minimum_trades: challenge.baseline.metrics.trade_count,
             maximum_drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
             minimum_return_percent: challenge.baseline.metrics.return_percent - 1.0,
             minimum_profit_factor: 0.0,
-            minimum_return_drawdown: 0.0,
+            minimum_recovery_factor: 0.0,
         },
         precision: quantforge_discover::PrecisionGateConfig {
             minimum_return_retention: 0.0,
@@ -197,7 +199,14 @@ fn write_databank(
         oos1_expectancy_retention: 0.0,
         require_m1_precision: false,
         simple_exits: false,
+        allow_break_even: false,
+        allow_trailing_stops: false,
+        allow_partial_exits: false,
+        allow_market_entries: true,
+        allow_stop_entries: false,
+        allow_limit_entries: false,
         flatten_at_22: false,
+        end_of_day_hour: 23,
         max_one_entry_per_day: false,
         mutate_after_elites: 0,
         random_fill_fraction: 0.0,
@@ -206,6 +215,8 @@ fn write_databank(
         robustness_folds: 3,
         robustness_monte_carlo_trials: 50,
         robustness_neighborhood_samples: 2,
+        robustness_perturbation_fraction: 0.20,
+        minimum_neighborhood_survival_fraction: 0.0,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
@@ -221,7 +232,7 @@ fn write_databank(
         }
     };
     let niche = NicheKey {
-        family: FamilyStyle::TrendPullback,
+        entry_conditions: 3,
         trade_frequency: ThreeLevelBucket::High,
         hold_time: ThreeLevelBucket::Low,
         drawdown: bucket(challenge.baseline.metrics.max_drawdown_percent, 5.0, 15.0),
@@ -232,7 +243,8 @@ fn write_databank(
         strategy: strategy.clone(),
         structural_fingerprint: fingerprint.clone(),
         descriptor: BehaviorDescriptor {
-            family: FamilyStyle::TrendPullback,
+            entry_conditions: 3,
+            exit_conditions: 1,
             trades_per_1000_bars: 100.0,
             average_bars_held: 1.0,
             drawdown_percent: challenge.baseline.metrics.max_drawdown_percent,
@@ -259,6 +271,7 @@ fn write_databank(
         deflated_trade_sharpe: None,
         multi_symbol_results: Vec::new(),
         gate_results: Vec::new(),
+        robustness: None,
         equity_signature: Vec::new(),
         discovered_generation: 0,
     };
@@ -311,9 +324,11 @@ fn write_judge(
     challenge: &ChallengeReport,
 ) {
     let config = JudgeConfig {
+        entry_window: quantforge_eval::EntryWindow::default(),
         initial_balance: challenge.config.scout.initial_balance,
         costs: challenge.config.scout.costs.clone(),
         allow_execution_gaps: false,
+        indicator_engine: challenge.config.scout.indicator_engine,
     };
     let m1_hash = ContentHash::sha256("fixture-m1-validation");
     let combined_hash = stable_json_hash(&BTreeMap::from([
@@ -371,6 +386,8 @@ fn write_parity(
     challenge: &ChallengeReport,
 ) {
     let config = Mql5ExportConfig {
+        entry_window_start_hour: 2,
+        entry_window_end_hour: 19,
         expert_name: "AssemblyFixture".into(),
         expert_directory: "QuantForge".into(),
         timeframe: "M15".into(),
@@ -384,6 +401,7 @@ fn write_parity(
             .adverse_slippage_points_per_side,
         commission_per_lot_round_turn: challenge.config.scout.costs.commission_per_lot_round_turn,
         allow_live_trading_default: false,
+        export_style: quantforge_export_mql5::ExportStyle::Sqx,
         tester: TesterConfig {
             from_date: None,
             to_date: None,

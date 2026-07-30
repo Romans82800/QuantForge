@@ -8,10 +8,10 @@ use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecificat
 use quantforge_core::FloatPolicy;
 use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
 use quantforge_eval::{
-    BacktestMetrics, CostModel, EquityPoint, EvalError, ExitReason, FeatureCache, PositionSide,
-    ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio,
-    favorable_r as compute_favorable_r, favorable_sample_from_m1_window, in_mandatory_entry_window,
-    normalize_price, placeable_stop_candidate, price_reaches_from_above, price_reaches_from_below,
+    BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason, FeatureCache,
+    PositionSide, ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio,
+    favorable_r as compute_favorable_r, favorable_sample_from_m1_window, normalize_price,
+    placeable_stop_candidate, price_reaches_from_above, price_reaches_from_below,
     ratchet_favorable_peak, resolve_spread,
 };
 use quantforge_ir::{
@@ -34,6 +34,12 @@ pub struct JudgeConfig {
     /// When true, continue M1 replay across in-bar minute gaps (research default).
     /// Gap events remain in telemetry for audit.
     pub allow_execution_gaps: bool,
+    #[serde(default)]
+    pub indicator_engine: quantforge_eval::IndicatorEngine,
+    /// Broker-local hours in which new entries and pending orders may be placed.
+    /// Must match the scout window, or M1 judgment will disagree by construction.
+    #[serde(default)]
+    pub entry_window: EntryWindow,
 }
 
 impl Default for JudgeConfig {
@@ -42,6 +48,8 @@ impl Default for JudgeConfig {
             initial_balance: 100_000.0,
             costs: CostModel::default(),
             allow_execution_gaps: true,
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: EntryWindow::default(),
         }
     }
 }
@@ -52,6 +60,10 @@ impl JudgeConfig {
             initial_balance: self.initial_balance,
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
             costs: self.costs.clone(),
+            indicator_engine: self.indicator_engine,
+            entry_window: self.entry_window,
+            // The judge always replays in full; its metrics are the promotion evidence.
+            abandon_above_drawdown_percent: None,
         }
         .validate()?;
         Ok(())
@@ -199,10 +211,23 @@ pub fn evaluate_strategy_m1(
     } else {
         0
     };
-    let mut m1_bars_owned = m1_dataset.bars.clone();
-    forward_fill_zero_spreads(&mut m1_bars_owned);
-    let m1_bars = &m1_bars_owned;
-    let mut features = FeatureCache::new(decision_bars, &broker.timezone)?;
+    // The robustness battery calls this once per fold and once per parameter
+    // sample, so an unconditional clone of the execution series dominates
+    // promotion cost. Borrow whenever the data already carries spreads.
+    let m1_bars_owned: std::borrow::Cow<'_, [Bar]> =
+        if quantforge_data::needs_spread_forward_fill(&m1_dataset.bars) {
+            let mut owned = m1_dataset.bars.clone();
+            forward_fill_zero_spreads(&mut owned);
+            std::borrow::Cow::Owned(owned)
+        } else {
+            std::borrow::Cow::Borrowed(&m1_dataset.bars)
+        };
+    let m1_bars: &[Bar] = &m1_bars_owned;
+    let mut features = FeatureCache::with_engine(
+        decision_bars,
+        &broker.timezone,
+        config.indicator_engine,
+    )?;
     let mut balance = config.initial_balance;
     let mut position: Option<OpenPosition> = None;
     let mut pending: Option<PendingOrder> = None;
@@ -270,8 +295,9 @@ pub fn evaluate_strategy_m1(
         // M1 window for the just-completed decision bar (set at end of prior loop).
         let previous_execution_bars = last_execution_bars;
         let current_local = broker_clock.local_datetime(opening_minute.timestamp_ms)?;
-        let in_close_blackout = current_local.hour() >= 22;
-        let in_entry_window = in_mandatory_entry_window(current_local.hour());
+        let in_close_blackout =
+            current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let in_entry_window = config.entry_window.contains(current_local.hour());
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
             active_entry_day = Some(day_key);
@@ -369,7 +395,10 @@ pub fn evaluate_strategy_m1(
                 protective_gap_exit(open, opening_minute, opening_spread_price, broker)
             {
                 Some(event)
-            } else if let Some(exit) = &strategy.exit
+            } else if let Some(exit) = match open.side {
+                PositionSide::Long => strategy.long_exit(),
+                PositionSide::Short => strategy.short_exit(),
+            }
                 && features.evaluate_bool(exit, decision_index)?
             {
                 Some(ExitEvent {
@@ -537,7 +566,7 @@ pub fn evaluate_strategy_m1(
             }
             let spread_price = spread.points * broker.point;
             let minute_local = broker_clock.local_datetime(minute.timestamp_ms)?;
-            let minute_in_entry_window = in_mandatory_entry_window(minute_local.hour());
+            let minute_in_entry_window = config.entry_window.contains(minute_local.hour());
             if !minute_in_entry_window && pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
             }
@@ -1603,6 +1632,7 @@ mod tests {
                 initial_balance: 100.0,
                 same_bar_policy: SameBarPolicy::Conservative,
                 costs: CostModel::default(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1617,6 +1647,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1636,6 +1667,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1658,6 +1690,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1680,6 +1713,7 @@ mod tests {
                     initial_balance: 100.0,
                     costs: CostModel::default(),
                     allow_execution_gaps: false,
+                    ..Default::default()
                 }
             ),
             Err(JudgeError::M1Gap { .. })
@@ -1710,6 +1744,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1756,6 +1791,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1811,6 +1847,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1865,6 +1902,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1885,10 +1923,10 @@ mod tests {
             decision_bars.push(decision);
         }
         let decisions = dataset(decision_bars, b"close-at-22-decisions");
-        let flatten_ms = chrono::DateTime::parse_from_rfc3339("2024-01-01T22:00:00Z")
+        let flatten_ms = chrono::DateTime::parse_from_rfc3339("2024-01-01T23:00:00Z")
             .unwrap()
             .timestamp_millis();
-        let end_ms = chrono::DateTime::parse_from_rfc3339("2024-01-01T23:00:00Z")
+        let end_ms = chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z")
             .unwrap()
             .timestamp_millis();
         let execution = dataset(
@@ -1900,6 +1938,7 @@ mod tests {
         let mut managed = strategy(false);
         managed.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
         managed.manage.flatten_end_of_day = true;
+        managed.manage.end_of_day_hour = 23;
         let result = evaluate_strategy_m1(
             &managed,
             &decisions,
@@ -1909,6 +1948,7 @@ mod tests {
                 initial_balance: 100.0,
                 costs: CostModel::default(),
                 allow_execution_gaps: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1936,6 +1976,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: vec![],
             side: if short {
                 Side::ShortOnly

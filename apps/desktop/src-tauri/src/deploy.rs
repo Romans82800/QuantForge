@@ -242,7 +242,7 @@ fn build_deployment_pack_sync(request: &DeployRequest) -> Result<DeployView, Str
     let mut files = BTreeMap::<PathBuf, Vec<u8>>::from([
         (
             PathBuf::from(format!("{expert_name}.mq5")),
-            generated.source.into_bytes(),
+            generated.source.clone().into_bytes(),
         ),
         (
             PathBuf::from(format!("{expert_name}.set")),
@@ -273,6 +273,12 @@ fn build_deployment_pack_sync(request: &DeployRequest) -> Result<DeployView, Str
             deployment_changelog(&entry, &parity_hash, &generated.evidence).into_bytes(),
         ),
     ]);
+    for support in &generated.support_files {
+        files.insert(
+            PathBuf::from(&support.relative_path),
+            support.contents.clone().into_bytes(),
+        );
+    }
     let file_records: Vec<_> = files
         .iter()
         .map(|(path, bytes)| DeploymentFileRecord {

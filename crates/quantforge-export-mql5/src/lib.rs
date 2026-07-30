@@ -8,8 +8,9 @@ mod runner;
 pub use compiler::compile_with_metaeditor;
 pub use generator::generate_bundle;
 pub use model::{
-    CompileReport, ExportBundle, ExportError, ExportEvidenceCard, MetaEditorConfig,
-    Mql5ExportConfig, TerminalConfig, TesterConfig, TesterRunReport,
+    CompileReport, ExportBundle, ExportError, ExportEvidenceCard, ExportStyle, ExportSupportFile,
+    MetaEditorConfig, Mql5ExportConfig, TerminalConfig, TesterConfig, TesterRunReport,
+    suggested_expert_name,
 };
 pub use runner::run_mt5_tester;
 

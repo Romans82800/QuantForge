@@ -4,6 +4,32 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Mirrors `quantforge_eval::EntryWindow::default()`. The export crate cannot
+/// depend on the engine, so `entry_window_defaults_match_the_engine` pins them.
+pub const MANDATORY_ENTRY_WINDOW_START_HOUR: u32 = 2;
+pub const MANDATORY_ENTRY_WINDOW_END_HOUR: u32 = 19;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportStyle {
+    /// Legacy QuantForge inline-indicator expert.
+    Quantforge,
+    /// StrategyQuant-style shell with Sq* custom indicators.
+    Sqx,
+}
+
+impl Default for ExportStyle {
+    fn default() -> Self {
+        Self::Sqx
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportSupportFile {
+    pub relative_path: String,
+    pub contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Mql5ExportConfig {
@@ -16,6 +42,12 @@ pub struct Mql5ExportConfig {
     pub estimated_slippage_points_per_side: f64,
     pub commission_per_lot_round_turn: f64,
     pub allow_live_trading_default: bool,
+    pub export_style: ExportStyle,
+    /// Broker-local hour from which the expert may place entries (inclusive).
+    /// Must mirror the evaluation window, or the EA cannot reproduce the backtest.
+    pub entry_window_start_hour: u32,
+    /// Broker-local hour from which the expert stops placing entries (exclusive).
+    pub entry_window_end_hour: u32,
     pub tester: TesterConfig,
 }
 
@@ -31,8 +63,44 @@ impl Default for Mql5ExportConfig {
             estimated_slippage_points_per_side: 0.0,
             commission_per_lot_round_turn: 0.0,
             allow_live_trading_default: false,
+            export_style: ExportStyle::Sqx,
+            entry_window_start_hour: MANDATORY_ENTRY_WINDOW_START_HOUR,
+            entry_window_end_hour: MANDATORY_ENTRY_WINDOW_END_HOUR,
             tester: TesterConfig::default(),
         }
+    }
+}
+
+/// Build a collision-resistant expert name from the symbol and the Discover
+/// candidate id (`g898-84`), so a folder of exports never repeats a filename.
+/// `magic` disambiguates the rare case of two banks reusing the same id.
+pub fn suggested_expert_name(symbol: &str, strategy_id: &str, magic: u64) -> String {
+    let token = |value: &str| -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let symbol = token(symbol);
+    let symbol = if symbol.is_empty() { "SYMBOL" } else { &symbol };
+    let identifier = token(strategy_id);
+    let identifier = if identifier.is_empty() {
+        format!("m{magic}")
+    } else {
+        identifier
+    };
+    let name = format!("{symbol}_{identifier}");
+    // MQL5 rejects a leading digit in the compiled program name.
+    if name.starts_with(|character: char| character.is_ascii_digit()) {
+        format!("QF_{name}")
+    } else {
+        name
     }
 }
 
@@ -100,6 +168,16 @@ impl Mql5ExportConfig {
         if self.allow_live_trading_default {
             return Err(ExportError::InvalidConfig(
                 "generated exports must default to live trading disabled".into(),
+            ));
+        }
+        if self.entry_window_start_hour > 23 || self.entry_window_end_hour > 24 {
+            return Err(ExportError::InvalidConfig(
+                "entry window hours must be 0-23 for the start and 0-24 for the end".into(),
+            ));
+        }
+        if self.entry_window_start_hour >= self.entry_window_end_hour {
+            return Err(ExportError::InvalidConfig(
+                "entry window start hour must be earlier than its end hour".into(),
             ));
         }
         self.tester.validate()
@@ -196,6 +274,7 @@ pub struct ExportEvidenceCard {
     pub parity_deals_file: String,
     pub parity_equity_file: String,
     pub parity_metadata_file: String,
+    pub export_style: ExportStyle,
     pub config: Mql5ExportConfig,
 }
 
@@ -205,6 +284,8 @@ pub struct ExportBundle {
     pub set_file: String,
     pub tester_ini: String,
     pub evidence: ExportEvidenceCard,
+    #[serde(default)]
+    pub support_files: Vec<ExportSupportFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

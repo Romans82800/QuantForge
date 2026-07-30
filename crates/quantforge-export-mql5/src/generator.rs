@@ -1,5 +1,8 @@
-use crate::model::{ExportBundle, ExportError, ExportEvidenceCard, Mql5ExportConfig};
+use crate::model::{
+    ExportBundle, ExportError, ExportEvidenceCard, ExportStyle, ExportSupportFile, Mql5ExportConfig,
+};
 use crate::{EXPORT_SCHEMA_VERSION, EXPORT_TARGET};
+use include_dir::{include_dir, Dir};
 use quantforge_broker::{SymbolSpecification, TradeMode};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_ir::{
@@ -9,6 +12,30 @@ use quantforge_ir::{
 };
 
 const TEMPLATE: &str = include_str!("template.mq5");
+const SQX_TEMPLATE: &str = include_str!("sqx_template.mq5");
+const SQX_RUNTIME: &str = include_str!("sqx_runtime.mqh");
+/// MACD, Bollinger, Ichimoku, QQE, VWAP and CCI helpers. Both templates share
+/// one copy so the two export styles cannot drift apart.
+const EXTENDED_INDICATORS: &str = include_str!("extended_indicators.mqh");
+/// `iMACD` needs a signal period even when only the main line is read; the main
+/// buffer does not depend on it.
+const DEFAULT_MACD_SIGNAL_PERIOD: u16 = 9;
+static SQX_INDICATORS: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/../../mql5/QuantForge/Indicators");
+
+fn sqx_runtime_inline() -> String {
+    SQX_RUNTIME
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("#ifndef __QUANTFORGE_SQX_RUNTIME_MQH__")
+                || trimmed.starts_with("#define __QUANTFORGE_SQX_RUNTIME_MQH__")
+                || trimmed == "#endif"
+                || trimmed == "#include <Trade/Trade.mqh>")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 pub fn generate_bundle(
     strategy: &StrategyIr,
@@ -25,9 +52,18 @@ pub fn generate_bundle(
     let broker_spec_hash = broker.content_hash()?;
     let fingerprint_short = &strategy_fingerprint.as_str()[..12];
     let parity_prefix = format!("QuantForge\\QF_{fingerprint_short}");
+    let template = match config.export_style {
+        ExportStyle::Quantforge => TEMPLATE,
+        ExportStyle::Sqx => SQX_TEMPLATE,
+    };
 
-    let mut source = TEMPLATE.to_owned();
+    let mut source = template.to_owned();
+    if matches!(config.export_style, ExportStyle::Sqx) {
+        source = source.replace("@@SQX_RUNTIME@@", &sqx_runtime_inline());
+    }
+    source = source.replace("@@QF_EXTENDED_INDICATORS@@", EXTENDED_INDICATORS);
     for (placeholder, value) in [
+        ("@@EXPERT_NAME@@", config.expert_name.clone()),
         ("@@ALLOW_LIVE@@", "false".into()),
         ("@@MAGIC@@", config.magic.to_string()),
         ("@@DEVIATION@@", config.deviation_points.to_string()),
@@ -42,6 +78,14 @@ pub fn generate_bundle(
         (
             "@@COMMISSION@@",
             mql_double(config.commission_per_lot_round_turn),
+        ),
+        (
+            "@@ENTRY_WINDOW_START@@",
+            config.entry_window_start_hour.to_string(),
+        ),
+        (
+            "@@ENTRY_WINDOW_END@@",
+            config.entry_window_end_hour.to_string(),
         ),
         ("@@PARITY_PREFIX@@", mql_string(&parity_prefix)),
         ("@@STRATEGY_FINGERPRINT@@", strategy_fingerprint.to_string()),
@@ -65,10 +109,16 @@ pub fn generate_bundle(
                 .unwrap_or_else(|| "false".into()),
         ),
         (
-            "@@EXIT_SIGNAL@@",
+            "@@LONG_EXIT_SIGNAL@@",
             strategy
-                .exit
-                .as_ref()
+                .long_exit()
+                .map(|value| bool_expr(value, "extra_shift"))
+                .unwrap_or_else(|| "false".into()),
+        ),
+        (
+            "@@SHORT_EXIT_SIGNAL@@",
+            strategy
+                .short_exit()
                 .map(|value| bool_expr(value, "extra_shift"))
                 .unwrap_or_else(|| "false".into()),
         ),
@@ -89,6 +139,10 @@ pub fn generate_bundle(
         ("@@TRAILING_KIND@@", trailing_kind(&strategy).to_string()),
         ("@@TRAILING_ACTIVATE_R@@", trailing_activate_r(&strategy)),
         ("@@TRAILING_DISTANCE@@", trailing_distance(&strategy)),
+        (
+            "@@EOD_HOUR@@",
+            strategy.manage.end_of_day_hour.to_string(),
+        ),
         (
             "@@FLATTEN_EOD@@",
             if strategy.manage.flatten_end_of_day {
@@ -146,14 +200,48 @@ pub fn generate_bundle(
         parity_deals_file: format!("{parity_prefix}_deals.csv"),
         parity_equity_file: format!("{parity_prefix}_equity.csv"),
         parity_metadata_file: format!("{parity_prefix}_metadata.csv"),
+        export_style: config.export_style,
         config: config.clone(),
+    };
+    let support_files = match config.export_style {
+        ExportStyle::Sqx => sqx_support_files(),
+        ExportStyle::Quantforge => Vec::new(),
     };
     Ok(ExportBundle {
         source,
         set_file,
         tester_ini,
         evidence,
+        support_files,
     })
+}
+
+fn sqx_support_files() -> Vec<ExportSupportFile> {
+    let mut files = vec![ExportSupportFile {
+        relative_path: "sqx_runtime.mqh".into(),
+        contents: SQX_RUNTIME.into(),
+    }];
+    for entry in SQX_INDICATORS.files() {
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "mq5")
+        {
+            let name = entry
+                .path()
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(contents) = entry.contents_utf8() {
+                files.push(ExportSupportFile {
+                    relative_path: format!("Indicators/{name}"),
+                    contents: contents.into(),
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    files
 }
 
 fn validate_trade_mode(
@@ -412,6 +500,146 @@ fn indicator_expr(indicator: &IndicatorExpr, extra_shift: &str) -> String {
             "QFLiquiditySweepScore({},({}+{}))",
             period, shift, extra_shift
         ),
+        IndicatorExpr::MacdMain {
+            source,
+            fast_period,
+            slow_period,
+            shift,
+        } => format!(
+            "QFMacdMain({},{},{},{},({}+{}))",
+            applied_price(source),
+            fast_period,
+            slow_period,
+            DEFAULT_MACD_SIGNAL_PERIOD,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::MacdSignal {
+            source,
+            fast_period,
+            slow_period,
+            signal_period,
+            shift,
+        } => format!(
+            "QFMacdSignal({},{},{},{},({}+{}))",
+            applied_price(source),
+            fast_period,
+            slow_period,
+            signal_period,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::MacdHistogram {
+            source,
+            fast_period,
+            slow_period,
+            signal_period,
+            shift,
+        } => format!(
+            "QFMacdHistogram({},{},{},{},({}+{}))",
+            applied_price(source),
+            fast_period,
+            slow_period,
+            signal_period,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::BollingerMid {
+            source,
+            period,
+            shift,
+        } => format!(
+            "QFBollingerMid({},{},({}+{}))",
+            applied_price(source),
+            period,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::BollingerUpper {
+            source,
+            period,
+            deviation_tenths,
+            shift,
+        } => format!(
+            "QFBollingerUpper({},{},{},({}+{}))",
+            applied_price(source),
+            period,
+            deviation_tenths,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::BollingerLower {
+            source,
+            period,
+            deviation_tenths,
+            shift,
+        } => format!(
+            "QFBollingerLower({},{},{},({}+{}))",
+            applied_price(source),
+            period,
+            deviation_tenths,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::BollingerBandwidth {
+            source,
+            period,
+            deviation_tenths,
+            shift,
+        } => format!(
+            "QFBollingerBandwidth({},{},{},({}+{}))",
+            applied_price(source),
+            period,
+            deviation_tenths,
+            shift,
+            extra_shift
+        ),
+        IndicatorExpr::IchimokuTenkan { period, shift } => format!(
+            "QFIchimokuTenkan({},({}+{}))",
+            period, shift, extra_shift
+        ),
+        IndicatorExpr::IchimokuKijun { period, shift } => {
+            format!("QFIchimokuKijun({},({}+{}))", period, shift, extra_shift)
+        }
+        IndicatorExpr::IchimokuSenkouA {
+            tenkan_period,
+            kijun_period,
+            shift,
+        } => format!(
+            "QFIchimokuSenkouA({},{},({}+{}))",
+            tenkan_period, kijun_period, shift, extra_shift
+        ),
+        IndicatorExpr::IchimokuSenkouB {
+            period,
+            kijun_period,
+            shift,
+        } => format!(
+            "QFIchimokuSenkouB({},{},({}+{}))",
+            period, kijun_period, shift, extra_shift
+        ),
+        IndicatorExpr::QqeLine {
+            rsi_period,
+            smoothing_period,
+            shift,
+        } => format!(
+            "QFQqeLine({},{},({}+{}))",
+            rsi_period, smoothing_period, shift, extra_shift
+        ),
+        IndicatorExpr::QqeTrail {
+            rsi_period,
+            smoothing_period,
+            factor_tenths,
+            shift,
+        } => format!(
+            "QFQqeTrail({},{},{},({}+{}))",
+            rsi_period, smoothing_period, factor_tenths, shift, extra_shift
+        ),
+        IndicatorExpr::Vwap { period, shift } => {
+            format!("QFVwap({},({}+{}))", period, shift, extra_shift)
+        }
+        IndicatorExpr::Cci { period, shift } => {
+            format!("QFCci({},({}+{}))", period, shift, extra_shift)
+        }
     }
 }
 
@@ -590,6 +818,8 @@ fn set_file(config: &Mql5ExportConfig, parity_prefix: &str) -> String {
          InpMaxSpreadPoints={}||{}||1||{}||N\n\
          InpEstimatedSlippagePointsPerSide={}||{}||0.1||{}||N\n\
          InpCommissionPerLotRoundTurn={}||{}||0.1||{}||N\n\
+         InpEntryWindowStartHour={}||{}||1||{}||N\n\
+         InpEntryWindowEndHour={}||{}||1||{}||N\n\
          InpParityPrefix={}\n",
         config.magic,
         config.magic,
@@ -606,6 +836,12 @@ fn set_file(config: &Mql5ExportConfig, parity_prefix: &str) -> String {
         mql_double(config.commission_per_lot_round_turn),
         mql_double(config.commission_per_lot_round_turn),
         mql_double(config.commission_per_lot_round_turn),
+        config.entry_window_start_hour,
+        config.entry_window_start_hour,
+        config.entry_window_start_hour,
+        config.entry_window_end_hour,
+        config.entry_window_end_hour,
+        config.entry_window_end_hour,
         parity_prefix
     )
 }
@@ -745,6 +981,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: Vec::new(),
             side: Side::Both,
             risk: RiskPolicy::FixedCurrency { amount: 100.0 },
@@ -777,11 +1015,106 @@ mod tests {
                 .contains("g_trade.Buy(volume,_Symbol,0.0,stop,target")
         );
         assert!(first.source.contains("QFCrossAbove"));
-        assert!(first.source.contains("iADXWilder"));
+        assert!(first.source.contains("SqATR"));
+        assert!(first.source.contains("checkBarOpen"));
+        assert!(first.source.contains("sqPrice"));
+        assert!(first.source.contains("sqValid"));
+        assert!(!first.source.contains("#include \"sqx_runtime.mqh\""));
+        assert!(first.source.contains("LongEntrySignal"));
         assert!(first.source.contains("g_decision_bars_seen<320"));
         assert!(!first.source.contains("@@"));
         assert!(first.evidence.mandatory_stop_loss);
         assert!(first.evidence.mandatory_take_profit);
+    }
+
+    #[test]
+    fn indicator_handles_are_created_once_and_released_on_deinit() {
+        for style in [ExportStyle::Sqx, ExportStyle::Quantforge] {
+            let bundle = generate_bundle(
+                &strategy(),
+                &broker(),
+                &Mql5ExportConfig {
+                    export_style: style,
+                    ..Mql5ExportConfig::default()
+                },
+            )
+            .unwrap();
+            // Every handle must come from a cache lookup, never from a bare
+            // constructor inside a per-tick accessor.
+            for constructor in ["iCustom(", "iMA(", "iRSI(", "iATR(", "iStdDev(", "iADXWilder("] {
+                let creations = bundle.source.matches(constructor).count();
+                let cache_stores = bundle
+                    .source
+                    .matches(&format!("Remember(key,{constructor}"))
+                    .count();
+                assert_eq!(
+                    creations, cache_stores,
+                    "{style:?} creates {constructor} outside the handle cache"
+                );
+            }
+            assert!(bundle.source.contains("ReleaseHandles"));
+        }
+    }
+
+    #[test]
+    fn suggested_expert_names_are_unique_per_candidate_and_mql_safe() {
+        assert_eq!(
+            crate::suggested_expert_name("EURUSD", "g898-84", 990_001),
+            "EURUSD_g898_84"
+        );
+        assert_eq!(
+            crate::suggested_expert_name("EURUSD", "g12-7", 990_002),
+            "EURUSD_g12_7"
+        );
+        // A missing id still yields a distinct, compilable name.
+        assert_eq!(
+            crate::suggested_expert_name("XAU/USD", "", 42),
+            "XAU_USD_m42"
+        );
+        assert_eq!(crate::suggested_expert_name("30YR", "g1-1", 7), "QF_30YR_g1_1");
+        for name in [
+            crate::suggested_expert_name("EURUSD", "g898-84", 1),
+            crate::suggested_expert_name("", "", 1),
+        ] {
+            assert!(
+                name.chars()
+                    .all(|value| value.is_ascii_alphanumeric() || value == '_')
+            );
+        }
+    }
+
+    #[test]
+    fn side_specific_exits_are_exported_under_the_matching_position_type() {
+        let mut strategy = strategy();
+        strategy.exit_long = Some(BoolExpr::Compare {
+            comparison: ComparisonOp::LessThan,
+            left: NumericExpr::Indicator {
+                value: IndicatorExpr::Rsi {
+                    source: PriceField::Close,
+                    period: 14,
+                    shift: 1,
+                },
+            },
+            right: NumericExpr::Constant { value: 45.0 },
+        });
+        strategy.exit_short = Some(BoolExpr::Compare {
+            comparison: ComparisonOp::GreaterThan,
+            left: NumericExpr::Indicator {
+                value: IndicatorExpr::Rsi {
+                    source: PriceField::Close,
+                    period: 14,
+                    shift: 1,
+                },
+            },
+            right: NumericExpr::Constant { value: 55.0 },
+        });
+        let bundle =
+            generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
+        assert!(bundle.source.contains("position_type == POSITION_TYPE_BUY"));
+        assert!(bundle.source.contains("position_type == POSITION_TYPE_SELL"));
+        assert!(bundle.source.contains("45.000000000000"));
+        assert!(bundle.source.contains("55.000000000000"));
+        assert!(!bundle.source.contains("@@"));
     }
 
     #[test]
@@ -826,6 +1159,7 @@ mod tests {
         assert!(bundle.source.contains("QFBodyRangeRatio"));
         assert!(bundle.source.contains("QFLiquiditySweepScore"));
         assert!(bundle.source.contains("QFSessionRangeHigh"));
+        assert!(!bundle.support_files.is_empty());
         assert!(!bundle.source.contains("@@"));
     }
 
@@ -857,11 +1191,54 @@ mod tests {
         assert!(bundle.source.contains("QFManagePosition"));
         assert!(bundle.source.contains("return true;"));
         assert!(bundle.source.contains("QFInCloseBlackout()"));
-        assert!(bundle.source.contains("current.hour>=22"));
+        assert!(bundle.source.contains("current.hour>=23"));
         assert!(bundle.source.contains("QFMaxOneEntryPerDay"));
         assert!(bundle.source.contains("QFEntryDayExhausted"));
         assert!(bundle.source.contains("QFInMandatoryEntryWindow"));
-        assert!(bundle.source.contains("current.hour>=2 && current.hour<19"));
+        assert!(bundle.source.contains("InpEntryWindowStartHour=2"));
+        assert!(bundle.source.contains("InpEntryWindowEndHour=19"));
+        assert!(
+            bundle
+                .source
+                .contains("current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour")
+        );
         assert!(bundle.source.contains("QFMarkEntrySignalTaken"));
+    }
+
+    #[test]
+    fn a_custom_entry_window_reaches_the_expert_and_its_set_file() {
+        let config = Mql5ExportConfig {
+            entry_window_start_hour: 2,
+            entry_window_end_hour: 23,
+            ..Mql5ExportConfig::default()
+        };
+        let bundle = generate_bundle(&strategy(), &broker(), &config).unwrap();
+        assert!(bundle.source.contains("InpEntryWindowStartHour=2"));
+        assert!(bundle.source.contains("InpEntryWindowEndHour=23"));
+        assert!(bundle.set_file.contains("InpEntryWindowEndHour=23||23||1||23||N"));
+    }
+
+    #[test]
+    fn an_inverted_entry_window_is_rejected() {
+        let config = Mql5ExportConfig {
+            entry_window_start_hour: 22,
+            entry_window_end_hour: 3,
+            ..Mql5ExportConfig::default()
+        };
+        assert!(generate_bundle(&strategy(), &broker(), &config).is_err());
+    }
+
+    /// The export crate cannot depend on the engine, so its mirrored defaults
+    /// are pinned here instead.
+    #[test]
+    fn entry_window_defaults_match_the_engine() {
+        use crate::model::{MANDATORY_ENTRY_WINDOW_END_HOUR, MANDATORY_ENTRY_WINDOW_START_HOUR};
+
+        let engine = quantforge_eval::EntryWindow::default();
+        assert_eq!(engine.start_hour, MANDATORY_ENTRY_WINDOW_START_HOUR);
+        assert_eq!(engine.end_hour, MANDATORY_ENTRY_WINDOW_END_HOUR);
+        let config = Mql5ExportConfig::default();
+        assert_eq!(config.entry_window_start_hour, engine.start_hour);
+        assert_eq!(config.entry_window_end_hour, engine.end_hour);
     }
 }

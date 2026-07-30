@@ -1,0 +1,23 @@
+---
+description: Rebuild and reinstall QuantForge.app after desktop/backend edits
+alwaysApply: true
+---
+
+# Rebuild QuantForge after edits
+
+After any change that affects the desktop app (Rust crates, `apps/desktop`, Tauri commands, UI), **rebuild and reinstall** before telling the user the app is ready:
+
+```bash
+cd apps/desktop
+pnpm tauri build
+
+osascript -e 'quit app "QuantForge"' 2>/dev/null || true
+killall QuantForge 2>/dev/null || true
+rm -rf /Applications/QuantForge.app
+cp -R ../../target/release/bundle/macos/QuantForge.app /Applications/QuantForge.app
+# Bundle path is workspace target/: QuantForge/target/release/bundle/macos/QuantForge.app
+open -a QuantForge
+```
+
+- Prefer **release** builds (`pnpm tauri build`, no `--debug`) so Discover/eval run ~10× faster than debug.
+- Do this at the end of every edit turn that changes the app; do not leave a stale `/Applications/QuantForge.app`.

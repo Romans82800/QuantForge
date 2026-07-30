@@ -3,7 +3,7 @@ use crate::workflow::{
     EvolveArtifact, ensure_new, manifest, read_json_hashed, recipe_path, write_json_new,
 };
 use quantforge_data::QualityGrade;
-use quantforge_discover::FamilyStyle;
+use quantforge_discover::Elite;
 use quantforge_portfolio::{
     PortfolioCandidate, PortfolioConfig, PortfolioObjective, PortfolioReport, pack_portfolio,
 };
@@ -22,7 +22,7 @@ pub struct PortfolioRequest {
     maximum_pairwise_correlation: f64,
     maximum_weight_per_strategy: f64,
     maximum_symbol_exposure: f64,
-    maximum_family_exposure: f64,
+    maximum_cohort_exposure: f64,
     maximum_strategies: usize,
     minimum_return_percent: f64,
     cvar_tail_fraction: f64,
@@ -51,7 +51,7 @@ pub struct PortfolioView {
 #[serde(rename_all = "camelCase")]
 struct AllocationView {
     fingerprint: String,
-    family: String,
+    cohort: String,
     symbol: String,
     weight: f64,
     return_percent: f64,
@@ -89,7 +89,7 @@ fn build_portfolio_sync(request: &PortfolioRequest) -> Result<PortfolioView, Str
         .map(|elite| PortfolioCandidate {
             strategy_fingerprint: elite.structural_fingerprint.clone(),
             symbol: broker.symbol.clone(),
-            family: family_name(elite.descriptor.family).into(),
+            cohort: behavior_cohort(elite),
             initial_balance: artifact.databank.config.scout.initial_balance,
             return_percent: elite.metrics.return_percent,
             maximum_drawdown_percent: elite.metrics.max_drawdown_percent,
@@ -107,7 +107,7 @@ fn build_portfolio_sync(request: &PortfolioRequest) -> Result<PortfolioView, Str
         maximum_pairwise_correlation: request.maximum_pairwise_correlation,
         maximum_weight_per_strategy: request.maximum_weight_per_strategy,
         maximum_symbol_exposure: request.maximum_symbol_exposure,
-        maximum_family_exposure: request.maximum_family_exposure,
+        maximum_cohort_exposure: request.maximum_cohort_exposure,
         maximum_strategies: request.maximum_strategies,
         minimum_return_percent: request.minimum_return_percent,
         cvar_tail_fraction: request.cvar_tail_fraction,
@@ -202,19 +202,15 @@ fn verify_databank(
     Ok(())
 }
 
-fn family_name(family: FamilyStyle) -> &'static str {
-    match family {
-        FamilyStyle::TrendPullback => "trend_pullback",
-        FamilyStyle::MomentumBurst => "momentum_burst",
-        FamilyStyle::DonchianBreakout => "donchian_breakout",
-        FamilyStyle::MeanReversionBand => "mean_reversion_band",
-        FamilyStyle::ZScoreReversion => "zscore_reversion",
-        FamilyStyle::SessionOrb => "session_orb",
-        FamilyStyle::ImpulseCandle => "impulse_candle",
-        FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
-        FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
-        FamilyStyle::SweepReclaim => "sweep_reclaim",
-    }
+/// Diversification group for the exposure cap. Entry-condition count plus the
+/// trade-frequency and hold-time buckets is a better correlation proxy than the
+/// old family label, which said nothing about how a strategy actually behaved.
+fn behavior_cohort(elite: &Elite) -> String {
+    format!(
+        "e{}/{:?}/{:?}",
+        elite.niche.entry_conditions, elite.niche.trade_frequency, elite.niche.hold_time
+    )
+    .to_ascii_lowercase()
 }
 
 fn view(artifact: &PortfolioArtifact, path: &Path) -> PortfolioView {
@@ -235,7 +231,7 @@ fn view(artifact: &PortfolioArtifact, path: &Path) -> PortfolioView {
             .iter()
             .map(|allocation| AllocationView {
                 fingerprint: allocation.strategy_fingerprint.as_str().into(),
-                family: allocation.family.clone(),
+                cohort: allocation.cohort.clone(),
                 symbol: allocation.symbol.clone(),
                 weight: allocation.weight,
                 return_percent: allocation.source_return_percent,

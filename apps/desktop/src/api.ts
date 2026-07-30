@@ -17,8 +17,8 @@ import type {
   DiscoverJobView,
   DiscoverRequest,
   EliteDetail,
-  FamilyBakeoffReport,
-  FamilyBakeoffRequest,
+  ConditionBakeoffReport,
+  ConditionBakeoffRequest,
   ExportRequest,
   ExportView,
   FidelityDemoRequest,
@@ -41,6 +41,8 @@ import type {
   AssetProfile,
   SymbolPack,
   PartitionEquityView,
+  ResultsRobustnessRequest,
+  ResultsRobustnessView,
   SavedDiscoverProfile,
   SavedSearchRangeProfile,
 } from "./types";
@@ -171,8 +173,17 @@ export function startDiscover(request: DiscoverRequest): Promise<DiscoverJobView
   return invoke<DiscoverJobView>("start_discover", { request });
 }
 
-export function runFamilyBakeoff(request: FamilyBakeoffRequest): Promise<FamilyBakeoffReport> {
-  return invoke<FamilyBakeoffReport>("run_family_bakeoff", { request });
+export function runConditionBakeoff(
+  request: ConditionBakeoffRequest,
+): Promise<ConditionBakeoffReport> {
+  return invoke<ConditionBakeoffReport>("run_condition_bakeoff", { request });
+}
+
+export async function promoteEliteToVault(fingerprint: string): Promise<string | null> {
+  const vaultDirectory = await chooseDirectory("Choose Vault directory for candidate staging");
+  return vaultDirectory
+    ? invoke<string>("promote_elite_to_vault", { fingerprint, vaultDirectory })
+    : null;
 }
 
 export function getDiscoverJob(): Promise<DiscoverJobView> {
@@ -281,6 +292,12 @@ export function deleteDiscoverProfile(id: string): Promise<SavedDiscoverProfile[
 
 export function getElitePartitionEquity(fingerprint: string): Promise<PartitionEquityView> {
   return invoke<PartitionEquityView>("get_elite_partition_equity", { fingerprint });
+}
+
+export function runEliteRobustness(
+  request: ResultsRobustnessRequest,
+): Promise<ResultsRobustnessView> {
+  return invoke<ResultsRobustnessView>("run_elite_robustness", { request });
 }
 
 export function upsertAsset(asset: AssetProfile): Promise<AssetProfile[]> {

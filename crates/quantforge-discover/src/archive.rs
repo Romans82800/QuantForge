@@ -1,7 +1,8 @@
-use crate::grammar::classify_family;
+use crate::grammar::{entry_condition_count, exit_condition_count};
 use crate::model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, Elite, EvidenceComponents,
-    GateResult, LongShortSkewBucket, NicheKey, ThreeLevelBucket, return_drawdown_ratio,
+    GateResult, LongShortSkewBucket, NicheKey, RobustnessEvidence, ThreeLevelBucket,
+    recovery_factor,
 };
 use quantforge_core::{FloatPolicy, quantize};
 use quantforge_eval::{PositionSide, ScoutResult};
@@ -20,6 +21,8 @@ pub(crate) struct CandidateEvaluation {
     pub deflated_trade_sharpe: Option<f64>,
     pub multi_symbol_results: Vec<crate::model::SymbolScreenResult>,
     pub gate_results: Vec<GateResult>,
+    /// Present only on the databank path, where the M1 robustness battery ran.
+    pub robustness: Option<RobustnessEvidence>,
 }
 
 pub(crate) fn deposit_to_accepted_pool(
@@ -110,6 +113,7 @@ fn deposit_into_breeding_pool(
             deflated_trade_sharpe: candidate.deflated_trade_sharpe,
             multi_symbol_results: candidate.multi_symbol_results,
             gate_results: candidate.gate_results,
+            robustness: candidate.robustness,
             equity_signature: signature,
             discovered_generation: candidate.generation,
         };
@@ -138,6 +142,7 @@ fn deposit_into_breeding_pool(
         deflated_trade_sharpe: candidate.deflated_trade_sharpe,
         multi_symbol_results: candidate.multi_symbol_results,
         gate_results: candidate.gate_results,
+        robustness: candidate.robustness,
         equity_signature: signature,
         discovered_generation: candidate.generation,
     });
@@ -201,6 +206,7 @@ fn deposit_into_map_elites(
         deflated_trade_sharpe: candidate.deflated_trade_sharpe,
         multi_symbol_results: candidate.multi_symbol_results,
         gate_results: candidate.gate_results,
+        robustness: candidate.robustness,
         equity_signature: signature,
         discovered_generation: candidate.generation,
     };
@@ -261,7 +267,7 @@ pub(crate) fn passes_gate_config(result: &ScoutResult, gates: &crate::model::Gat
         && metrics.max_drawdown_percent <= gates.maximum_drawdown_percent
         && metrics.return_percent > gates.minimum_return_percent
         && effective_profit_factor >= gates.minimum_profit_factor
-        && return_drawdown_ratio(metrics) >= gates.minimum_return_drawdown
+        && recovery_factor(metrics) >= gates.minimum_recovery_factor
 }
 
 fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor {
@@ -274,7 +280,8 @@ fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor
         .count();
     let short_count = trade_count.saturating_sub(long_count);
     BehaviorDescriptor {
-        family: classify_family(strategy),
+        entry_conditions: entry_condition_count(strategy),
+        exit_conditions: exit_condition_count(strategy),
         trades_per_1000_bars: quantized(trade_count as f64 / bar_count as f64 * 1_000.0),
         average_bars_held: if trade_count == 0 {
             0.0
@@ -300,7 +307,7 @@ fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor
 
 pub(crate) fn niche_key(value: &BehaviorDescriptor) -> NicheKey {
     NicheKey {
-        family: value.family,
+        entry_conditions: value.entry_conditions,
         trade_frequency: three_level(value.trades_per_1000_bars, 5.0, 20.0),
         hold_time: three_level(value.average_bars_held, 4.0, 24.0),
         drawdown: three_level(value.drawdown_percent, 5.0, 15.0),
@@ -458,8 +465,8 @@ fn refresh_fingerprint_coverage_map(
 
 pub fn niche_label(niche: &NicheKey) -> String {
     format!(
-        "{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
-        niche.family,
+        "entry{}/{:?}/{:?}/{:?}/{:?}/{:?}",
+        niche.entry_conditions,
         niche.trade_frequency,
         niche.hold_time,
         niche.drawdown,
@@ -496,14 +503,14 @@ mod tests {
                     maximum_drawdown_percent: 100.0,
                     minimum_return_percent: -100.0,
                     minimum_profit_factor: 0.0,
-                    minimum_return_drawdown: 0.0,
+                    minimum_recovery_factor: 0.0,
                 },
                 deposit_gates: GateConfig {
                     minimum_trades: 0,
                     maximum_drawdown_percent: 100.0,
                     minimum_return_percent: -100.0,
                     minimum_profit_factor: 0.0,
-                    minimum_return_drawdown: 0.0,
+                    minimum_recovery_factor: 0.0,
                 },
                 scout: ScoutConfig::default(),
                 ..DiscoverConfig::default()
@@ -565,19 +572,19 @@ mod tests {
     }
 
     #[test]
-    fn default_grid_contains_2430_possible_niches() {
-        assert_eq!(10 * 3usize.pow(5), 2430);
+    fn default_grid_includes_named_and_universal_grammar_niches() {
+        assert_eq!(crate::model::FamilyStyle::ALL.len() * 3usize.pow(5), 2673);
     }
 
     #[test]
-    fn return_drawdown_gate_rejects_weak_efficiency() {
+    fn recovery_factor_gate_rejects_weak_efficiency() {
         let mut result = profitable_result();
         result.metrics.max_drawdown_percent = 2.0;
         result.metrics.max_drawdown = 2_000.0;
         let mut config = bank(0.88).config;
-        config.gates.minimum_return_drawdown = 1.01;
+        config.gates.minimum_recovery_factor = 1.01;
         assert!(!passes_gates(&result, &config));
-        config.gates.minimum_return_drawdown = 1.0;
+        config.gates.minimum_recovery_factor = 1.0;
         assert!(passes_gates(&result, &config));
     }
 
@@ -599,6 +606,7 @@ mod tests {
                 deflated_trade_sharpe: None,
                 multi_symbol_results: Vec::new(),
                 gate_results: Vec::new(),
+                robustness: None,
             },
         )
         .unwrap();
@@ -618,6 +626,7 @@ mod tests {
                 deflated_trade_sharpe: None,
                 multi_symbol_results: Vec::new(),
                 gate_results: Vec::new(),
+                robustness: None,
             },
         )
         .unwrap();
@@ -637,6 +646,7 @@ mod tests {
                 deflated_trade_sharpe: None,
                 multi_symbol_results: Vec::new(),
                 gate_results: Vec::new(),
+                robustness: None,
             },
         )
         .unwrap();
@@ -660,6 +670,7 @@ mod tests {
                 deflated_trade_sharpe: None,
                 multi_symbol_results: Vec::new(),
                 gate_results: Vec::new(),
+                robustness: None,
             },
         )
         .unwrap();
@@ -685,6 +696,7 @@ mod tests {
                 deflated_trade_sharpe: None,
                 multi_symbol_results: Vec::new(),
                 gate_results: Vec::new(),
+                robustness: None,
             },
         )
         .unwrap();

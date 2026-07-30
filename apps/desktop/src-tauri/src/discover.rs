@@ -4,10 +4,9 @@ use quantforge_data::{
     bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms, BarDataset,
 };
 use quantforge_discover::{
-    continue_evolution_with_pack, evolve_new_with_pack,
-    run_family_bakeoff as evolve_family_bakeoff, Databank, DiscoverConfig, DiscoverRunMode,
-    FamilyBakeoffConfig, FamilyBakeoffReport, GateConfig, PackSymbol, SearchFamily,
-    SearchRangeProfile, DEFAULT_FX_PACK,
+    evolve_new_with_pack, run_condition_bakeoff as evolve_condition_bakeoff, ConditionBakeoffConfig,
+    ConditionBakeoffReport, Databank, DiscoverConfig, DiscoverRunMode, GateConfig, PackSymbol,
+    SearchRangeProfile, UniversalGrammarConfig, DEFAULT_FX_PACK,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{write_json_new, write_json_versioned, RunManifest, RunRecipe};
@@ -16,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -91,9 +90,16 @@ pub struct DiscoverRequest {
     allow_break_even: Option<bool>,
     allow_trailing_stops: Option<bool>,
     allow_partial_exits: Option<bool>,
+    /// Entry order kinds the search may sample. At least one must stay enabled.
+    allow_market_entries: Option<bool>,
     allow_stop_entries: Option<bool>,
     allow_limit_entries: Option<bool>,
     flatten_at_22: Option<bool>,
+    end_of_day_hour: Option<u8>,
+    /// Broker-local hour from which entries may be placed (inclusive).
+    entry_window_start_hour: Option<u32>,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    entry_window_end_hour: Option<u32>,
     /// Cap to one filled entry per broker-local day (default true).
     max_one_entry_per_day: Option<bool>,
     mutate_after_elites: Option<usize>,
@@ -103,6 +109,10 @@ pub struct DiscoverRequest {
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_neighborhood_samples: Option<usize>,
+    /// Size of the ±% jitter applied to every numeric gene (default 0.20).
+    robustness_perturbation_fraction: Option<f64>,
+    /// Fraction of ±param neighbors that must survive (default 0.7; Quota uses 0.5).
+    minimum_neighborhood_survival_fraction: Option<f64>,
     /// Broker-local calendar-year folds; every year must pass (strict opt-in).
     calendar_year_folds: Option<bool>,
     /// Hard deflated-Sharpe floor; omit for report-only.
@@ -111,12 +121,15 @@ pub struct DiscoverRequest {
     multi_symbol_minimum_pass: Option<usize>,
     /// Directory of pack H1 TSV + broker JSON files for the multi-symbol screen.
     pack_data_dir: Option<String>,
-    /// Locked Search Family (`trend_pullback`, `momentum_burst`, …).
-    search_family: Option<String>,
-    /// `fast_scout` or `full_harvest`.
+    /// Family-free entry/exit cardinality and completed-bar shift bounds
+    /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
+    universal_grammar: Option<UniversalGrammarConfig>,
+    /// `fast_scout`, `full_harvest`, or `quota_harvest`.
     run_mode: Option<String>,
-    /// Early-stop when accepted pot reaches this size (Fast Scout).
+    /// Early-stop when accepted pot reaches this size (Fast Scout / Quota).
     early_stop_pot_elites: Option<usize>,
+    /// Early-stop when databank reaches this many elites (Quota Harvest default 20).
+    target_databank_elites: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
@@ -152,6 +165,7 @@ pub struct DiscoverJobView {
     pot_elites: usize,
     pot_new_niches: u64,
     databank_elites: usize,
+    target_databank_elites: Option<usize>,
     mutate_after_elites: usize,
     breeding_active: bool,
     worker_threads: usize,
@@ -232,6 +246,7 @@ impl DiscoverJobView {
             pot_elites: 0,
             pot_new_niches: 0,
             databank_elites: 0,
+            target_databank_elites: None,
             mutate_after_elites: 300,
             breeding_active: false,
             worker_threads: 0,
@@ -268,7 +283,7 @@ impl DiscoverJobView {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FamilyBakeoffRequest {
+pub struct ConditionBakeoffRequest {
     data_path: String,
     metadata_path: Option<String>,
     source_timezone: Option<String>,
@@ -283,14 +298,16 @@ pub struct FamilyBakeoffRequest {
     slippage_points_per_side: f64,
     fallback_spread_points: Option<f64>,
     validation_fraction: f64,
-    /// Search families to compare (`trend_pullback`, …). Must be non-empty.
+    /// Entry-condition counts to compare on equal budget. Defaults to 2, 3, 4.
     #[serde(default)]
-    families: Vec<String>,
+    entry_condition_counts: Vec<usize>,
 }
 
 #[tauri::command]
-pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoffReport, String> {
-    let families = parse_bakeoff_families(&request.families)?;
+pub fn run_condition_bakeoff(
+    request: ConditionBakeoffRequest,
+) -> Result<ConditionBakeoffReport, String> {
+    let entry_condition_counts = parse_entry_condition_counts(&request.entry_condition_counts)?;
     let loaded = load_data_source(
         &request.data_path,
         request.metadata_path.as_deref(),
@@ -323,12 +340,12 @@ pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoff
     discover.scout.costs.commission_per_lot_round_turn = request.commission_per_lot_round_turn;
     discover.scout.costs.adverse_slippage_points_per_side = request.slippage_points_per_side;
     discover.scout.costs.fallback_spread_points = request.fallback_spread_points;
-    let config = FamilyBakeoffConfig {
+    let config = ConditionBakeoffConfig {
         discover,
         generations: request.generations.max(1),
-        families,
+        entry_condition_counts,
     };
-    evolve_family_bakeoff(
+    evolve_condition_bakeoff(
         &search_h1,
         Some(&oos1),
         &m1_is,
@@ -342,9 +359,12 @@ pub fn run_family_bakeoff(request: FamilyBakeoffRequest) -> Result<FamilyBakeoff
 
 #[tauri::command]
 pub fn start_discover(
-    request: DiscoverRequest,
+    mut request: DiscoverRequest,
     state: State<'_, DiscoverState>,
 ) -> Result<DiscoverJobView, String> {
+    if request.mode == DiscoverMode::New && request.databank_path.trim().is_empty() {
+        request.databank_path = automatic_databank_path(&request)?;
+    }
     validate_request(&request)?;
     {
         let current = state
@@ -378,6 +398,7 @@ pub fn start_discover(
         pot_elites: 0,
         pot_new_niches: 0,
         databank_elites: 0,
+        target_databank_elites: request.target_databank_elites,
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
         breeding_active: false,
         worker_threads: request.worker_threads.unwrap_or(0),
@@ -427,6 +448,48 @@ pub fn start_discover(
         }
     });
     Ok(started)
+}
+
+/// New discovery archives must never overwrite a previous run. The UI may
+/// leave this blank; in that case derive a human-readable, collision-proof
+/// archive path beside the QuantForge workspace instead of opening a save
+/// dialog for every run.
+fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> {
+    let source = Path::new(&request.data_path);
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "cannot derive an archive name from decision OHLC path".to_owned())?;
+    let symbol = stem
+        .split(['_', '-'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("strategy")
+        .to_ascii_uppercase();
+    let timeframe = match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
+        DecisionTimeframe::H1 => "H1",
+        DecisionTimeframe::M15 => "M15",
+    };
+    let root = source
+        .ancestors()
+        .find(|candidate| candidate.file_name().and_then(|name| name.to_str()) == Some("QuantForge"))
+        .map(Path::to_path_buf)
+        .or_else(|| source.parent().map(Path::to_path_buf))
+        .ok_or_else(|| "cannot derive an archive directory from decision OHLC path".to_owned())?;
+    let directory = root.join("runs").join(&symbol).join("Databank");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    let base = format!("{symbol}_{timeframe}_databank_{now_ms}");
+    let mut candidate = directory.join(format!("{base}.json"));
+    let mut suffix = 2usize;
+    while candidate.exists() {
+        candidate = directory.join(format!("{base}_{suffix}.json"));
+        suffix += 1;
+    }
+    Ok(candidate.display().to_string())
 }
 
 #[tauri::command]
@@ -497,19 +560,13 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         return Err("data, broker and databank paths are required".into());
     }
     if request.mode == DiscoverMode::New {
-        let family = request
-            .search_family
-            .as_deref()
-            .ok_or("search family is required for a new Discover run")?;
-        if parse_search_family(family).is_none() {
-            return Err(format!(
-                "unknown search family '{family}' (use trend_pullback, momentum_burst, donchian_breakout, mean_reversion_band)"
-            ));
+        if let Some(grammar) = request.universal_grammar.as_ref() {
+            validate_universal_grammar(grammar)?;
         }
         if let Some(mode) = request.run_mode.as_deref() {
             if parse_run_mode(mode).is_none() {
                 return Err(format!(
-                    "unknown run mode '{mode}' (use fast_scout or full_harvest)"
+                    "unknown run mode '{mode}' (use fast_scout, full_harvest, or quota_harvest)"
                 ));
             }
         }
@@ -535,7 +592,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.correlation_threshold.is_some(),
             request.novelty_weight.is_some(),
             request.seed.is_some(),
-            request.search_family.is_some(),
+            request.universal_grammar.is_some(),
             request.run_mode.is_some(),
             request.early_stop_pot_elites.is_some(),
             request.minimum_trades.is_some(),
@@ -554,9 +611,12 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.allow_break_even.is_some(),
             request.allow_trailing_stops.is_some(),
             request.allow_partial_exits.is_some(),
+            request.allow_market_entries.is_some(),
             request.allow_stop_entries.is_some(),
             request.allow_limit_entries.is_some(),
             request.flatten_at_22.is_some(),
+            request.entry_window_start_hour.is_some(),
+            request.entry_window_end_hour.is_some(),
             request.max_one_entry_per_day.is_some(),
             request.mutate_after_elites.is_some(),
             request.random_fill_fraction.is_some(),
@@ -565,6 +625,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.robustness_folds.is_some(),
             request.robustness_monte_carlo_trials.is_some(),
             request.robustness_neighborhood_samples.is_some(),
+            request.robustness_perturbation_fraction.is_some(),
             request.commission_per_lot_round_turn.is_some(),
             request.slippage_points_per_side.is_some(),
             request.fallback_spread_points.is_some(),
@@ -591,7 +652,7 @@ fn run_discovery(
     paused: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let started = Instant::now();
+    let clock = ActiveClock::new();
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
@@ -698,7 +759,7 @@ fn run_discovery(
                 0,
             )
             .map_err(|error| error.to_string())?;
-            update_bank(job, &bank, 0, soft_budget, run_until_stopped, started)?;
+            update_bank(job, &bank, 0, soft_budget, run_until_stopped, &clock)?;
             (bank, None, 0u64)
         }
         DiscoverMode::Continue => {
@@ -714,7 +775,7 @@ fn run_discovery(
                 0,
                 soft_budget,
                 run_until_stopped,
-                started,
+                &clock,
             )?;
             (
                 artifact.databank,
@@ -753,9 +814,45 @@ fn run_discovery(
         wrote_checkpoint = true;
     }
 
+    let quota_met = |bank: &Databank| -> bool {
+        bank.config
+            .target_databank_elites
+            .is_some_and(|target| bank.elites.len() >= target)
+    };
+
+    // Dataset selection is fixed for the run: `validate_resume` requires the
+    // bank's hashes to keep matching whatever it is advanced against. Resolving
+    // it once lets a single session own the indicator cache for every
+    // generation, instead of rebuilding the cache on each one-generation call.
+    let evaluation_dataset = if bank.data_hash == search_decision.data_hash {
+        &search_decision
+    } else {
+        development_dataset.as_ref().ok_or_else(|| {
+            "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
+        })?
+    };
+    let evaluation_oos1 = if bank.data_hash == search_decision.data_hash {
+        None
+    } else {
+        oos1_ref
+    };
+    let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
+        &m1.dataset
+    } else {
+        m1_eval
+    };
+    let session = quantforge_discover::EvolutionSession::new(
+        bank.config.worker_threads,
+        evaluation_dataset.bars.len(),
+    )
+    .map_err(|error| error.to_string())?;
+
     loop {
-        wait_if_paused(job, paused, stop)?;
+        wait_if_paused(job, paused, stop, &clock)?;
         if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if quota_met(&bank) {
             break;
         }
         if !run_until_stopped && completed_now >= soft_budget {
@@ -777,37 +874,21 @@ fn run_discovery(
         update_phase(
             job,
             &phase_label,
-            "Candidates are bred on IS, precision-checked on M1, then picked only if OOS1 expectancy ≥ 0.7× IS.",
+            "Candidates enter the pot on Selected-TF IS evidence. M1 precision, robustness and OOS1 (≥0.7× IS) then gate databank promotion only.",
         )?;
 
-        let evaluation_dataset = if bank.data_hash == search_decision.data_hash {
-            &search_decision
-        } else {
-            development_dataset.as_ref().ok_or_else(|| {
-                "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
-            })?
-        };
-        let evaluation_oos1 = if bank.data_hash == search_decision.data_hash {
-            None
-        } else {
-            oos1_ref
-        };
-        let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
-            &m1.dataset
-        } else {
-            m1_eval
-        };
-        bank = continue_evolution_with_pack(
-            bank,
-            evaluation_dataset,
-            evaluation_oos1,
-            evaluation_m1,
-            &broker,
-            &pack,
-            &broker.symbol,
-            1,
-        )
-        .map_err(|error| error.to_string())?;
+        bank = session
+            .advance(
+                bank,
+                evaluation_dataset,
+                evaluation_oos1,
+                evaluation_m1,
+                &broker,
+                &pack,
+                &broker.symbol,
+                1,
+            )
+            .map_err(|error| error.to_string())?;
         completed_now += 1;
         update_bank(
             job,
@@ -815,7 +896,7 @@ fn run_discovery(
             completed_now,
             soft_budget,
             run_until_stopped,
-            started,
+            &clock,
         )?;
 
         if bank.coverage() > 0 {
@@ -851,6 +932,11 @@ fn run_discovery(
                 );
             }
         }
+
+        // Quota Harvest (and any run with a databank target): stop when filled.
+        if quota_met(&bank) {
+            break;
+        }
     }
 
     finish_discovery(
@@ -869,7 +955,7 @@ fn run_discovery(
         soft_budget,
         run_until_stopped,
         wrote_checkpoint,
-        started,
+        &clock,
     )
 }
 
@@ -890,7 +976,7 @@ fn finish_discovery(
     soft_budget: u64,
     run_until_stopped: bool,
     wrote_checkpoint: bool,
-    started: Instant,
+    clock: &ActiveClock,
 ) -> Result<(), String> {
     update_bank(
         job,
@@ -898,7 +984,7 @@ fn finish_discovery(
         completed_now,
         soft_budget,
         run_until_stopped,
-        started,
+        clock,
     )?;
 
     if bank.elites.is_empty() {
@@ -954,16 +1040,34 @@ fn finish_discovery(
         .write()
         .map_err(|_| "discover job state is unavailable".to_owned())?;
     view.status = "completed";
-    view.phase = if stop_was_early(completed_now, soft_budget, run_until_stopped) {
+    let quota_complete = bank
+        .config
+        .target_databank_elites
+        .is_some_and(|target| bank.elites.len() >= target);
+    view.phase = if quota_complete {
+        format!(
+            "Quota complete · {} databank elites",
+            bank.elites.len()
+        )
+    } else if stop_was_early(completed_now, soft_budget, run_until_stopped) {
         "Stopped and checkpointed".into()
     } else {
         "Discovery checkpoint complete".into()
     };
     view.output_path = Some(display_path(Path::new(&request.databank_path)));
-    view.message = format!(
-        "Saved {} niches after {} evaluations.",
-        view.coverage, view.evaluation_count
-    );
+    view.message = if quota_complete {
+        format!(
+            "Reached databank quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
+            bank.elites.len(),
+            bank.config.target_databank_elites.unwrap_or(0),
+            view.evaluation_count
+        )
+    } else {
+        format!(
+            "Saved {} niches after {} evaluations.",
+            view.coverage, view.evaluation_count
+        )
+    };
     Ok(())
 }
 
@@ -1218,6 +1322,16 @@ fn decision_timeframe_label(dataset: &BarDataset) -> Result<String, String> {
     })
 }
 
+/// Threads Rayon will actually use. `0` is the "global pool" sentinel.
+fn effective_worker_threads(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+}
+
 fn development_partition(
     dataset: &BarDataset,
     validation_fraction: f64,
@@ -1302,53 +1416,49 @@ fn clip_dataset_to_window(dataset: &BarDataset, window: &BarDataset) -> Result<B
     })
 }
 
-fn parse_search_family(value: &str) -> Option<quantforge_discover::SearchFamily> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "trend_pullback" | "trendpullback" | "trend" => {
-            Some(quantforge_discover::SearchFamily::TrendPullback)
-        }
-        "momentum_burst" | "momentumburst" | "momentum" => {
-            Some(quantforge_discover::SearchFamily::MomentumBurst)
-        }
-        "donchian_breakout" | "donchianbreakout" | "breakout" => {
-            Some(quantforge_discover::SearchFamily::DonchianBreakout)
-        }
-        "mean_reversion_band" | "meanreversionband" | "mean_reversion" => {
-            Some(quantforge_discover::SearchFamily::MeanReversionBand)
-        }
-        "zscore_reversion" | "z_score_reversion" | "zscore" => {
-            Some(quantforge_discover::SearchFamily::ZScoreReversion)
-        }
-        "session_orb" | "sessionorb" | "orb" => Some(quantforge_discover::SearchFamily::SessionOrb),
-        "impulse_candle" | "impulsecandle" | "impulse" => {
-            Some(quantforge_discover::SearchFamily::ImpulseCandle)
-        }
-        "vol_squeeze_break" | "volsqueezebreak" | "vol_squeeze" => {
-            Some(quantforge_discover::SearchFamily::VolSqueezeBreak)
-        }
-        "supply_demand_reclaim" | "supplydemandreclaim" | "supply_demand" => {
-            Some(quantforge_discover::SearchFamily::SupplyDemandReclaim)
-        }
-        "sweep_reclaim" | "sweepreclaim" | "sweep" => {
-            Some(quantforge_discover::SearchFamily::SweepReclaim)
-        }
-        _ => None,
+const MAX_ENTRY_CONDITIONS: usize = UniversalGrammarConfig::MAX_ENTRY_CONDITIONS;
+const MAX_EXIT_CONDITIONS: usize = 3;
+
+fn validate_universal_grammar(grammar: &UniversalGrammarConfig) -> Result<(), String> {
+    if grammar.minimum_entry_conditions < 2
+        || grammar.maximum_entry_conditions > MAX_ENTRY_CONDITIONS
+        || grammar.minimum_entry_conditions > grammar.maximum_entry_conditions
+    {
+        return Err(format!(
+            "entry conditions must be an ordered range within 2..={MAX_ENTRY_CONDITIONS}"
+        ));
     }
+    if grammar.minimum_exit_conditions == 0
+        || grammar.maximum_exit_conditions > MAX_EXIT_CONDITIONS
+        || grammar.minimum_exit_conditions > grammar.maximum_exit_conditions
+    {
+        return Err(format!(
+            "exit conditions must be an ordered range within 1..={MAX_EXIT_CONDITIONS}"
+        ));
+    }
+    if grammar.minimum_shift == 0 || grammar.minimum_shift > grammar.maximum_shift {
+        return Err("completed-bar shifts must be an ordered range starting at 1".into());
+    }
+    Ok(())
 }
 
-fn parse_bakeoff_families(values: &[String]) -> Result<Vec<SearchFamily>, String> {
+/// Entry-condition counts for the condition tester. Empty means the 2/3/4 default.
+fn parse_entry_condition_counts(values: &[usize]) -> Result<Vec<usize>, String> {
     if values.is_empty() {
-        return Err("select at least one search family for the family tester".into());
+        return Ok(ConditionBakeoffConfig::default().entry_condition_counts);
     }
-    let mut families = Vec::with_capacity(values.len());
+    let mut counts = Vec::with_capacity(values.len());
     for value in values {
-        let family =
-            parse_search_family(value).ok_or_else(|| format!("unknown search family '{value}'"))?;
-        if !families.contains(&family) {
-            families.push(family);
+        if !(2..=MAX_ENTRY_CONDITIONS).contains(value) {
+            return Err(format!(
+                "entry-condition counts must be within 2..={MAX_ENTRY_CONDITIONS}: got {value}"
+            ));
+        }
+        if !counts.contains(value) {
+            counts.push(*value);
         }
     }
-    Ok(families)
+    Ok(counts)
 }
 
 fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
@@ -1358,6 +1468,9 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
         }
         "full_harvest" | "fullharvest" | "harvest" => {
             Some(quantforge_discover::DiscoverRunMode::FullHarvest)
+        }
+        "quota_harvest" | "quotaharvest" | "quota" => {
+            Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
         }
         _ => None,
     }
@@ -1375,35 +1488,31 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         tournament_size: 4,
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
-        search_family: request
-            .search_family
-            .as_deref()
-            .and_then(parse_search_family)
-            .unwrap_or_default(),
+        universal_grammar: request.universal_grammar.clone().unwrap_or_default(),
         run_mode: request
             .run_mode
             .as_deref()
             .and_then(parse_run_mode)
             .unwrap_or(quantforge_discover::DiscoverRunMode::FullHarvest),
-        allow_cross_family_mutation: false,
         early_stop_pot_elites: request.early_stop_pot_elites,
+        target_databank_elites: request.target_databank_elites,
         trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: request.minimum_trades.unwrap_or(10),
             maximum_drawdown_percent: request.maximum_drawdown_percent.unwrap_or(40.0),
             minimum_return_percent: request.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: request.minimum_profit_factor.unwrap_or(1.0),
-            minimum_return_drawdown: request.minimum_return_drawdown.unwrap_or(0.0),
+            minimum_recovery_factor: request.minimum_return_drawdown.unwrap_or(0.0),
         },
         deposit_gates: GateConfig {
             minimum_trades: request.deposit_minimum_trades.unwrap_or(20),
             maximum_drawdown_percent: request.deposit_maximum_drawdown_percent.unwrap_or(30.0),
             minimum_return_percent: request.deposit_minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: request.deposit_minimum_profit_factor.unwrap_or(1.0),
-            minimum_return_drawdown: request.deposit_minimum_return_drawdown.unwrap_or(0.0),
+            minimum_recovery_factor: request.deposit_minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
-            minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.90),
+            minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
@@ -1412,9 +1521,11 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
         allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
+        allow_market_entries: request.allow_market_entries.unwrap_or(true),
         allow_stop_entries: request.allow_stop_entries.unwrap_or(false),
         allow_limit_entries: request.allow_limit_entries.unwrap_or(false),
         flatten_at_22: request.flatten_at_22.unwrap_or(false),
+        end_of_day_hour: request.end_of_day_hour.unwrap_or(23),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
         random_fill_fraction: request.random_fill_fraction.unwrap_or(0.4),
@@ -1427,6 +1538,12 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
         robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(8),
+        robustness_perturbation_fraction: request
+            .robustness_perturbation_fraction
+            .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        minimum_neighborhood_survival_fraction: request
+            .minimum_neighborhood_survival_fraction
+            .unwrap_or(0.7),
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
@@ -1440,17 +1557,74 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
             },
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: entry_window(
+                request.entry_window_start_hour,
+                request.entry_window_end_hour,
+            ),
+            // Search sets this per batch from the drawdown gate.
+            abandon_above_drawdown_percent: None,
         },
     })
+}
+
+/// Falls back to the engine default so a request that omits the window keeps the
+/// session every stored databank was built with.
+pub(crate) fn entry_window(
+    start_hour: Option<u32>,
+    end_hour: Option<u32>,
+) -> quantforge_eval::EntryWindow {
+    let default = quantforge_eval::EntryWindow::default();
+    quantforge_eval::EntryWindow::new(
+        start_hour.unwrap_or(default.start_hour),
+        end_hour.unwrap_or(default.end_hour),
+    )
+}
+
+/// Run timer that measures working time, not elapsed time.
+///
+/// Throughput is reported as a per-hour rate, so counting the minutes a job sat
+/// paused would make every resumed run look permanently slower than it is.
+#[derive(Clone)]
+struct ActiveClock {
+    started: Instant,
+    paused_millis: Arc<AtomicU64>,
+}
+
+impl ActiveClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            paused_millis: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn add_paused(&self, span: Duration) {
+        self.paused_millis
+            .fetch_add(span.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn active_hours(&self) -> f64 {
+        let paused = self.paused_millis.load(Ordering::SeqCst) as f64 / 1_000.0;
+        let active = (self.started.elapsed().as_secs_f64() - paused).max(1.0);
+        active / 3600.0
+    }
 }
 
 fn wait_if_paused(
     job: &Arc<RwLock<DiscoverJobView>>,
     paused: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
+    clock: &ActiveClock,
 ) -> Result<(), String> {
+    let pause_started = Instant::now();
+    let mut was_paused = false;
     while paused.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        was_paused = true;
         thread::sleep(Duration::from_millis(100));
+    }
+    if was_paused {
+        clock.add_paused(pause_started.elapsed());
     }
     if !stop.load(Ordering::SeqCst) {
         let mut view = job
@@ -1485,7 +1659,7 @@ fn update_bank(
     completed_now: u64,
     requested: u64,
     run_until_stopped: bool,
-    started: Instant,
+    clock: &ActiveClock,
 ) -> Result<(), String> {
     let telemetry = &bank.telemetry;
     let accepted_total = telemetry.pot_accepted
@@ -1507,7 +1681,7 @@ fn update_bank(
         + telemetry.rejected_multi_symbol
         + telemetry.rejected_deflated_sharpe
         + telemetry.rejected_evaluation;
-    let hours = started.elapsed().as_secs_f64().max(1.0) / 3600.0;
+    let hours = clock.active_hours();
     let risk = quantforge_discover::FIXED_RISK_PER_TRADE;
     let best_is = bank
         .elites
@@ -1539,8 +1713,13 @@ fn update_bank(
     let mutate_after = bank.config.mutate_after_elites;
     let pot_elites = bank.pot_size();
     let databank_elites = bank.coverage();
+    let target_databank = bank.config.target_databank_elites;
     let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
-    let phase = if breeding_active {
+    let phase = if let Some(target) = target_databank {
+        format!(
+            "Quota · databank {databank_elites}/{target} · pot {pot_elites} · gen {completed_now}"
+        )
+    } else if breeding_active {
         format!(
             "Breeding from pot · pot {pot_elites} · databank {databank_elites} · gen {completed_now}"
         )
@@ -1549,18 +1728,25 @@ fn update_bank(
             "Filling initial pot · {pot_elites}/{mutate_after} · databank {databank_elites} · gen {completed_now}"
         )
     };
-    let pot_message = format!(
-        "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} (M1+WFO+MC only). {} · {}",
-        if breeding_active {
-            "Breeding unlocked; random fill continues".to_owned()
-        } else {
-            format!(
-                "{} more pot elites until breeding",
-                mutate_after.saturating_sub(pot_elites)
-            )
-        },
-        funnel_summary(bank)
-    );
+    let pot_message = if let Some(target) = target_databank {
+        format!(
+            "Quota Harvest: databank {databank_elites}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
+            funnel_summary(bank)
+        )
+    } else {
+        format!(
+            "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} (M1+WFO+MC only). {} · {}",
+            if breeding_active {
+                "Breeding unlocked; random fill continues".to_owned()
+            } else {
+                format!(
+                    "{} more pot elites until breeding",
+                    mutate_after.saturating_sub(pot_elites)
+                )
+            },
+            funnel_summary(bank)
+        )
+    };
 
     let mut view = job
         .write()
@@ -1578,9 +1764,12 @@ fn update_bank(
     view.pot_elites = pot_elites;
     view.pot_new_niches = telemetry.pot_accepted;
     view.databank_elites = databank_elites;
+    view.target_databank_elites = target_databank;
     view.mutate_after_elites = mutate_after;
     view.breeding_active = breeding_active;
-    view.worker_threads = bank.config.worker_threads;
+    // `0` means "Rayon global pool", which is every logical CPU. Report the
+    // threads that actually run, not the sentinel.
+    view.worker_threads = effective_worker_threads(bank.config.worker_threads);
     view.coverage = databank_elites;
     view.qd_score = bank.qd_score();
     view.rejected_gate = telemetry.rejected_gate;
@@ -1657,9 +1846,13 @@ mod tests {
             allow_break_even: Some(false),
             allow_trailing_stops: Some(false),
             allow_partial_exits: Some(false),
+            allow_market_entries: Some(true),
             allow_stop_entries: Some(false),
             allow_limit_entries: Some(false),
             flatten_at_22: Some(false),
+            end_of_day_hour: Some(23),
+            entry_window_start_hour: None,
+            entry_window_end_hour: None,
             max_one_entry_per_day: Some(true),
             mutate_after_elites: Some(0),
             random_fill_fraction: Some(0.0),
@@ -1668,13 +1861,16 @@ mod tests {
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),
             robustness_neighborhood_samples: Some(2),
+            robustness_perturbation_fraction: Some(0.20),
+            minimum_neighborhood_survival_fraction: Some(0.0),
             calendar_year_folds: Some(false),
             minimum_deflated_trade_sharpe: None,
             multi_symbol_minimum_pass: Some(0),
             pack_data_dir: None,
-            search_family: Some("trend_pullback".into()),
+            universal_grammar: None,
             run_mode: Some("full_harvest".into()),
             early_stop_pot_elites: None,
+            target_databank_elites: None,
             search_ranges: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
@@ -1696,6 +1892,44 @@ mod tests {
         request.mode = DiscoverMode::Continue;
         let error = validate_request(&request).expect_err("override must fail");
         assert!(error.contains("immutable configuration"));
+    }
+
+    #[test]
+    fn new_runs_need_no_family_and_reject_an_impossible_entry_range() {
+        let directory = tempdir().expect("temp directory");
+        let mut request = request(
+            directory
+                .path()
+                .join("fresh-bank.json")
+                .display()
+                .to_string(),
+        );
+        validate_request(&request).expect("universal grammar defaults are enough");
+        request.universal_grammar = Some(UniversalGrammarConfig {
+            minimum_entry_conditions: 4,
+            maximum_entry_conditions: 2,
+            ..UniversalGrammarConfig::default()
+        });
+        let error = validate_request(&request).expect_err("inverted range must fail");
+        assert!(error.contains("entry conditions"));
+    }
+
+    #[test]
+    fn throughput_excludes_time_spent_paused() {
+        let clock = ActiveClock::new();
+        let before = clock.active_hours();
+        clock.add_paused(Duration::from_secs(7_200));
+        // A two-hour pause must not become two hours of "working" time, which
+        // would otherwise halve the reported evaluations per hour.
+        assert!(clock.active_hours() <= before);
+        assert!(clock.active_hours() > 0.0);
+    }
+
+    #[test]
+    fn condition_bakeoff_defaults_to_two_three_and_four() {
+        assert_eq!(parse_entry_condition_counts(&[]), Ok(vec![2, 3, 4]));
+        assert_eq!(parse_entry_condition_counts(&[3, 3, 2]), Ok(vec![3, 2]));
+        assert!(parse_entry_condition_counts(&[5]).is_err());
     }
 
     #[test]

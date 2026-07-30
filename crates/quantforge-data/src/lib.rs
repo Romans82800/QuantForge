@@ -576,6 +576,23 @@ fn timeframe_seconds(value: &str) -> Option<u64> {
 ///
 /// Returns how many bars were rewritten. Leading zeros/missing stay unchanged
 /// until the first positive value appears.
+/// Whether [`forward_fill_zero_spreads`] would change this slice.
+///
+/// Lets a caller skip cloning a large execution series just to fill nothing. The
+/// scan mirrors the fill rule exactly: a bar is only rewritten once some earlier
+/// bar carried a positive spread.
+pub fn needs_spread_forward_fill(bars: &[Bar]) -> bool {
+    let mut seen_positive = false;
+    for bar in bars {
+        match bar.spread_points {
+            Some(points) if points > 0 => seen_positive = true,
+            _ if seen_positive => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 pub fn forward_fill_zero_spreads(bars: &mut [Bar]) -> usize {
     let mut last_positive = None;
     let mut filled = 0;

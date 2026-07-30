@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         bank.elites.len()
     );
     println!(
-        "id\tfamily\tis_exp\toos1_exp\toos1x\toos2_exp\tis_ret%\toos1_ret%\toos2_ret%\tgate"
+        "id\tconditions\tis_exp\toos1_exp\toos1x\toos2_exp\tis_ret%\toos1_ret%\toos2_ret%\tgate"
     );
 
     let mut rows = Vec::new();
@@ -76,10 +76,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         };
         let pass = is_exp > 0.0 && oos1_exp > 0.0 && oos1_exp >= 0.7 * is_exp;
-        let family = format!("{:?}", elite.niche.family).to_ascii_lowercase();
+        let conditions = format!("entry{}", elite.niche.entry_conditions);
         rows.push((
             elite.strategy.id.clone(),
-            family,
+            conditions,
             is_exp,
             oos1_exp,
             ratio,

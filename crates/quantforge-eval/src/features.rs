@@ -1,9 +1,90 @@
-use crate::model::EvalError;
+use crate::model::{EvalError, IndicatorEngine};
 use chrono::{Datelike, NaiveDate, Timelike};
 use quantforge_broker::BrokerClock;
 use quantforge_data::Bar;
 use quantforge_ir::{BoolExpr, ComparisonOp, ContextValue, IndicatorExpr, NumericExpr, PriceField};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Default ceiling for one shared indicator cache. At 40k bars a buffer costs
+/// ~320 KB, so this holds roughly 800 distinct indicator/period combinations.
+pub const DEFAULT_INDICATOR_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Indicator buffers for ONE bar series, reusable across candidates and threads.
+///
+/// A search population is bred from shared parents, so the same `ATR(14)` or
+/// `Ema(close, 20)` buffer is otherwise recomputed once per candidate. Buffers are
+/// immutable once built, so they are handed out as `Arc` and never copied.
+///
+/// Each instance belongs to exactly one bar series — see [`FeatureCache::with_shared_cache`].
+pub struct IndicatorBufferCache {
+    maximum_buffers: usize,
+    state: std::sync::RwLock<IndicatorCacheState>,
+}
+
+type BufferKey = (IndicatorEngine, IndicatorExpr);
+
+#[derive(Default)]
+struct IndicatorCacheState {
+    buffers: HashMap<BufferKey, Arc<Vec<f64>>>,
+    /// Insertion order, used to evict the oldest buffers once the budget is hit.
+    order: std::collections::VecDeque<BufferKey>,
+}
+
+impl IndicatorBufferCache {
+    pub fn new(bar_count: usize) -> Self {
+        Self::with_budget(bar_count, DEFAULT_INDICATOR_CACHE_BYTES)
+    }
+
+    pub fn with_budget(bar_count: usize, budget_bytes: usize) -> Self {
+        let bytes_per_buffer = bar_count.max(1) * std::mem::size_of::<f64>();
+        Self {
+            maximum_buffers: (budget_bytes / bytes_per_buffer).max(1),
+            state: std::sync::RwLock::new(IndicatorCacheState::default()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.read().map(|state| state.buffers.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `compute` runs outside the lock, so a race can compute the same buffer twice.
+    /// That is cheaper than serializing every miss behind a write lock, and the
+    /// result is identical either way.
+    fn get_or_compute(
+        &self,
+        key: &IndicatorExpr,
+        engine: IndicatorEngine,
+        compute: impl FnOnce() -> Vec<f64>,
+    ) -> Arc<Vec<f64>> {
+        let lookup = (engine, key.clone());
+        if let Ok(state) = self.state.read() {
+            if let Some(buffer) = state.buffers.get(&lookup) {
+                return Arc::clone(buffer);
+            }
+        }
+        let buffer = Arc::new(compute());
+        let Ok(mut state) = self.state.write() else {
+            return buffer;
+        };
+        if let Some(existing) = state.buffers.get(&lookup) {
+            return Arc::clone(existing);
+        }
+        state.buffers.insert(lookup.clone(), Arc::clone(&buffer));
+        state.order.push_back(lookup);
+        while state.buffers.len() > self.maximum_buffers {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            state.buffers.remove(&oldest);
+        }
+        buffer
+    }
+}
 
 /// Cached Strategy IR feature evaluator shared by Scout and the M1 judge.
 ///
@@ -12,17 +93,43 @@ use std::collections::BTreeMap;
 pub struct FeatureCache<'a> {
     bars: &'a [Bar],
     broker_clock: BrokerClock,
-    indicators: BTreeMap<String, Vec<f64>>,
+    indicator_engine: IndicatorEngine,
+    /// Lock-free per-evaluation tier. Every per-bar read resolves here.
+    indicators: HashMap<IndicatorExpr, Arc<Vec<f64>>>,
+    /// Optional cross-candidate tier for the same bars. Consulted once per
+    /// distinct indicator, never inside the per-bar path.
+    shared: Option<&'a IndicatorBufferCache>,
 }
 
 impl<'a> FeatureCache<'a> {
     pub fn new(bars: &'a [Bar], timezone: &str) -> Result<Self, EvalError> {
+        Self::with_engine(bars, timezone, IndicatorEngine::Sqx)
+    }
+
+    pub fn with_engine(
+        bars: &'a [Bar],
+        timezone: &str,
+        indicator_engine: IndicatorEngine,
+    ) -> Result<Self, EvalError> {
+        Self::with_shared_cache(bars, timezone, indicator_engine, None)
+    }
+
+    /// `shared` MUST have been created for exactly these `bars`; buffers are keyed
+    /// by indicator only, so mixing datasets would return values from the wrong series.
+    pub fn with_shared_cache(
+        bars: &'a [Bar],
+        timezone: &str,
+        indicator_engine: IndicatorEngine,
+        shared: Option<&'a IndicatorBufferCache>,
+    ) -> Result<Self, EvalError> {
         let broker_clock = BrokerClock::parse(timezone)
             .map_err(|_| EvalError::InvalidBrokerTimezone(timezone.into()))?;
         Ok(Self {
             bars,
             broker_clock,
-            indicators: BTreeMap::new(),
+            indicator_engine,
+            indicators: HashMap::new(),
+            shared,
         })
     }
 
@@ -169,19 +276,31 @@ impl<'a> FeatureCache<'a> {
         let Some(index) = shifted_index(decision_index, shift, extra_shift) else {
             return Ok(None);
         };
-        let key = serde_json::to_string(indicator)?;
-        if !self.indicators.contains_key(&key) {
-            let values = calculate_indicator_series_with_clock(
+        let key = indicator.buffer_key();
+        let buffer = match self.indicators.get(&key) {
+            Some(buffer) => buffer,
+            None => {
+                let buffer = self.load_buffer(&key);
+                self.indicators.entry(key).or_insert(buffer)
+            }
+        };
+        Ok(buffer.get(index).copied().filter(|value| value.is_finite()))
+    }
+
+    /// Resolves a buffer from the shared tier when present, otherwise computes it.
+    fn load_buffer(&self, key: &IndicatorExpr) -> Arc<Vec<f64>> {
+        let compute = || {
+            calculate_indicator_series_with_clock(
                 self.bars,
-                indicator,
+                key,
                 Some(&self.broker_clock),
-            );
-            self.indicators.insert(key.clone(), values);
+                self.indicator_engine,
+            )
+        };
+        match self.shared {
+            Some(shared) => shared.get_or_compute(key, self.indicator_engine, compute),
+            None => Arc::new(compute()),
         }
-        Ok(self.indicators[&key]
-            .get(index)
-            .copied()
-            .filter(|value| value.is_finite()))
     }
 }
 
@@ -191,56 +310,7 @@ trait IndicatorEvalFields {
 
 impl IndicatorEvalFields for IndicatorExpr {
     fn period_and_shift_for_eval(&self) -> (u16, u16) {
-        // Mirror IndicatorExpr::period_and_shift validation ladder.
-        match *self {
-            Self::Sma { period, shift, .. }
-            | Self::Ema { period, shift, .. }
-            | Self::Wma { period, shift, .. }
-            | Self::Rsi { period, shift, .. }
-            | Self::Atr { period, shift }
-            | Self::Adx { period, shift }
-            | Self::PlusDi { period, shift }
-            | Self::MinusDi { period, shift }
-            | Self::DonchianHigh { period, shift }
-            | Self::DonchianLow { period, shift }
-            | Self::Highest { period, shift, .. }
-            | Self::Lowest { period, shift, .. }
-            | Self::StandardDeviation { period, shift, .. }
-            | Self::ZScore { period, shift, .. }
-            | Self::PercentileInRange { period, shift, .. }
-            | Self::RateOfChange { period, shift, .. }
-            | Self::LiquiditySweepScore { period, shift } => (period, shift),
-            Self::SessionRangeHigh {
-                range_bars, shift, ..
-            }
-            | Self::SessionRangeLow {
-                range_bars, shift, ..
-            } => (range_bars.max(2), shift),
-            Self::BodyRangeRatio { shift } | Self::CloseLocationInBar { shift } => (2, shift),
-            Self::AtrPercentile {
-                atr_period,
-                lookback,
-                shift,
-            } => (atr_period.max(lookback).max(2), shift),
-            Self::SwingBaseZoneHigh {
-                swing_left,
-                swing_right,
-                base_bars,
-                shift,
-            }
-            | Self::SwingBaseZoneLow {
-                swing_left,
-                swing_right,
-                base_bars,
-                shift,
-            } => (
-                swing_left
-                    .saturating_add(swing_right)
-                    .saturating_add(base_bars)
-                    .max(2),
-                shift,
-            ),
-        }
+        self.period_and_shift()
     }
 }
 
@@ -270,13 +340,14 @@ fn source_series(bars: &[Bar], field: PriceField) -> Vec<f64> {
 ///
 /// Session-range indicators require a broker clock; without one they return NaN.
 pub fn calculate_indicator_series(bars: &[Bar], indicator: &IndicatorExpr) -> Vec<f64> {
-    calculate_indicator_series_with_clock(bars, indicator, None)
+    calculate_indicator_series_with_clock(bars, indicator, None, IndicatorEngine::Sqx)
 }
 
 pub fn calculate_indicator_series_with_clock(
     bars: &[Bar],
     indicator: &IndicatorExpr,
     clock: Option<&BrokerClock>,
+    engine: IndicatorEngine,
 ) -> Vec<f64> {
     match *indicator {
         IndicatorExpr::Sma { source, period, .. } => {
@@ -288,13 +359,28 @@ pub fn calculate_indicator_series_with_clock(
         IndicatorExpr::Wma { source, period, .. } => {
             wma(&source_series(bars, source), period as usize)
         }
-        IndicatorExpr::Rsi { source, period, .. } => {
-            rsi(&source_series(bars, source), period as usize)
-        }
-        IndicatorExpr::Atr { period, .. } => atr(bars, period as usize),
-        IndicatorExpr::Adx { period, .. } => directional_index(bars, period as usize).0,
-        IndicatorExpr::PlusDi { period, .. } => directional_index(bars, period as usize).1,
-        IndicatorExpr::MinusDi { period, .. } => directional_index(bars, period as usize).2,
+        IndicatorExpr::Rsi { source, period, .. } => match engine {
+            IndicatorEngine::Sqx => {
+                quantforge_sqx::rsi_series(&source_series(bars, source), period as usize)
+            }
+            IndicatorEngine::Mt5 => rsi(&source_series(bars, source), period as usize),
+        },
+        IndicatorExpr::Atr { period, .. } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::atr_series(bars, period as usize),
+            IndicatorEngine::Mt5 => atr(bars, period as usize),
+        },
+        IndicatorExpr::Adx { period, .. } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::directional_index(bars, period as usize).0,
+            IndicatorEngine::Mt5 => directional_index(bars, period as usize).0,
+        },
+        IndicatorExpr::PlusDi { period, .. } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::directional_index(bars, period as usize).1,
+            IndicatorEngine::Mt5 => directional_index(bars, period as usize).1,
+        },
+        IndicatorExpr::MinusDi { period, .. } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::directional_index(bars, period as usize).2,
+            IndicatorEngine::Mt5 => directional_index(bars, period as usize).2,
+        },
         IndicatorExpr::DonchianHigh { period, .. } => rolling_extreme(
             &source_series(bars, PriceField::High),
             period as usize,
@@ -306,30 +392,47 @@ pub fn calculate_indicator_series_with_clock(
             false,
         ),
         IndicatorExpr::Highest { source, period, .. } => {
-            rolling_extreme(&source_series(bars, source), period as usize, true)
+            let values = source_series(bars, source);
+            match engine {
+                IndicatorEngine::Sqx => quantforge_sqx::highest_series(&values, period as usize),
+                IndicatorEngine::Mt5 => {
+                    rolling_extreme(&values, period as usize, true)
+                }
+            }
         }
         IndicatorExpr::Lowest { source, period, .. } => {
-            rolling_extreme(&source_series(bars, source), period as usize, false)
+            let values = source_series(bars, source);
+            match engine {
+                IndicatorEngine::Sqx => quantforge_sqx::lowest_series(&values, period as usize),
+                IndicatorEngine::Mt5 => {
+                    rolling_extreme(&values, period as usize, false)
+                }
+            }
         }
         IndicatorExpr::StandardDeviation { source, period, .. } => {
             rolling_standard_deviation(&source_series(bars, source), period as usize)
         }
-        IndicatorExpr::ZScore { source, period, .. } => {
-            let values = source_series(bars, source);
-            let means = rolling_mean(&values, period as usize);
-            let deviations = rolling_standard_deviation(&values, period as usize);
-            values
-                .iter()
-                .zip(means.iter().zip(deviations.iter()))
-                .map(|(value, (mean, deviation))| {
-                    if deviation.is_finite() && *deviation > 0.0 {
-                        (value - mean) / deviation
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect()
-        }
+        IndicatorExpr::ZScore { source, period, .. } => match engine {
+            IndicatorEngine::Sqx => {
+                quantforge_sqx::zscore_series(&source_series(bars, source), period as usize)
+            }
+            IndicatorEngine::Mt5 => {
+                let values = source_series(bars, source);
+                let means = rolling_mean(&values, period as usize);
+                let deviations = rolling_standard_deviation(&values, period as usize);
+                values
+                    .iter()
+                    .zip(means.iter().zip(deviations.iter()))
+                    .map(|(value, (mean, deviation))| {
+                        if deviation.is_finite() && *deviation > 0.0 {
+                            (value - mean) / deviation
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect()
+            }
+        },
         IndicatorExpr::PercentileInRange { source, period, .. } => {
             let values = source_series(bars, source);
             let lows = rolling_extreme(&values, period as usize, false);
@@ -348,25 +451,50 @@ pub fn calculate_indicator_series_with_clock(
         }
         IndicatorExpr::RateOfChange { source, period, .. } => {
             let values = source_series(bars, source);
-            let mut output = vec![f64::NAN; values.len()];
-            for index in period as usize..values.len() {
-                let previous = values[index - period as usize];
-                if previous != 0.0 {
-                    output[index] = (values[index] / previous - 1.0) * 100.0;
+            match engine {
+                IndicatorEngine::Sqx => {
+                    quantforge_sqx::rate_of_change_series(&values, period as usize)
+                }
+                IndicatorEngine::Mt5 => {
+                    let mut output = vec![f64::NAN; values.len()];
+                    for index in period as usize..values.len() {
+                        let previous = values[index - period as usize];
+                        if previous != 0.0 {
+                            output[index] = (values[index] / previous - 1.0) * 100.0;
+                        }
+                    }
+                    output
                 }
             }
-            output
         }
         IndicatorExpr::SessionRangeHigh {
             start_hour,
             range_bars,
             ..
-        } => session_range_series(bars, clock, start_hour, range_bars as usize, true),
+        } => match (engine, clock) {
+            (IndicatorEngine::Sqx, Some(clock)) => quantforge_sqx::session_range_series(
+                bars,
+                clock,
+                start_hour,
+                range_bars as usize,
+                true,
+            ),
+            _ => session_range_series(bars, clock, start_hour, range_bars as usize, true),
+        },
         IndicatorExpr::SessionRangeLow {
             start_hour,
             range_bars,
             ..
-        } => session_range_series(bars, clock, start_hour, range_bars as usize, false),
+        } => match (engine, clock) {
+            (IndicatorEngine::Sqx, Some(clock)) => quantforge_sqx::session_range_series(
+                bars,
+                clock,
+                start_hour,
+                range_bars as usize,
+                false,
+            ),
+            _ => session_range_series(bars, clock, start_hour, range_bars as usize, false),
+        },
         IndicatorExpr::BodyRangeRatio { .. } => bars
             .iter()
             .map(|bar| {
@@ -393,35 +521,404 @@ pub fn calculate_indicator_series_with_clock(
             atr_period,
             lookback,
             ..
-        } => atr_percentile_series(bars, atr_period as usize, lookback as usize),
+        } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::atr_percentile_series(
+                bars,
+                atr_period as usize,
+                lookback as usize,
+            ),
+            IndicatorEngine::Mt5 => {
+                atr_percentile_series(bars, atr_period as usize, lookback as usize, engine)
+            }
+        },
         IndicatorExpr::SwingBaseZoneHigh {
             swing_left,
             swing_right,
             base_bars,
             ..
-        } => swing_base_zone_series(
-            bars,
-            swing_left as usize,
-            swing_right as usize,
-            base_bars as usize,
-            true,
-        ),
+        } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::swing_base_zone_series(
+                bars,
+                swing_left as usize,
+                swing_right as usize,
+                base_bars as usize,
+                true,
+            ),
+            IndicatorEngine::Mt5 => swing_base_zone_series(
+                bars,
+                swing_left as usize,
+                swing_right as usize,
+                base_bars as usize,
+                true,
+            ),
+        },
         IndicatorExpr::SwingBaseZoneLow {
             swing_left,
             swing_right,
             base_bars,
             ..
-        } => swing_base_zone_series(
-            bars,
-            swing_left as usize,
-            swing_right as usize,
-            base_bars as usize,
+        } => match engine {
+            IndicatorEngine::Sqx => quantforge_sqx::swing_base_zone_series(
+                bars,
+                swing_left as usize,
+                swing_right as usize,
+                base_bars as usize,
+                false,
+            ),
+            IndicatorEngine::Mt5 => swing_base_zone_series(
+                bars,
+                swing_left as usize,
+                swing_right as usize,
+                base_bars as usize,
+                false,
+            ),
+        },
+        IndicatorExpr::LiquiditySweepScore { period, .. } => match engine {
+            IndicatorEngine::Sqx => {
+                quantforge_sqx::liquidity_sweep_score_series(bars, period as usize)
+            }
+            IndicatorEngine::Mt5 => liquidity_sweep_score_series(bars, period as usize),
+        },
+        IndicatorExpr::MacdMain {
+            source,
+            fast_period,
+            slow_period,
+            ..
+        } => macd_main_series(
+            &source_series(bars, source),
+            fast_period as usize,
+            slow_period as usize,
+        ),
+        IndicatorExpr::MacdSignal {
+            source,
+            fast_period,
+            slow_period,
+            signal_period,
+            ..
+        } => {
+            let main = macd_main_series(
+                &source_series(bars, source),
+                fast_period as usize,
+                slow_period as usize,
+            );
+            ema_sparse(&main, signal_period as usize)
+        }
+        IndicatorExpr::MacdHistogram {
+            source,
+            fast_period,
+            slow_period,
+            signal_period,
+            ..
+        } => {
+            let main = macd_main_series(
+                &source_series(bars, source),
+                fast_period as usize,
+                slow_period as usize,
+            );
+            let signal = ema_sparse(&main, signal_period as usize);
+            combine(&main, &signal, |main, signal| main - signal)
+        }
+        IndicatorExpr::BollingerMid { source, period, .. } => {
+            rolling_mean(&source_series(bars, source), period as usize)
+        }
+        IndicatorExpr::BollingerUpper {
+            source,
+            period,
+            deviation_tenths,
+            ..
+        } => bollinger_band(
+            &source_series(bars, source),
+            period as usize,
+            tenths(deviation_tenths),
+            true,
+        ),
+        IndicatorExpr::BollingerLower {
+            source,
+            period,
+            deviation_tenths,
+            ..
+        } => bollinger_band(
+            &source_series(bars, source),
+            period as usize,
+            tenths(deviation_tenths),
             false,
         ),
-        IndicatorExpr::LiquiditySweepScore { period, .. } => {
-            liquidity_sweep_score_series(bars, period as usize)
+        IndicatorExpr::BollingerBandwidth {
+            source,
+            period,
+            deviation_tenths,
+            ..
+        } => {
+            let values = source_series(bars, source);
+            let mid = rolling_mean(&values, period as usize);
+            let deviation = rolling_standard_deviation(&values, period as usize);
+            let multiplier = tenths(deviation_tenths);
+            mid.iter()
+                .zip(deviation.iter())
+                .map(|(mid, deviation)| {
+                    if mid.is_finite() && deviation.is_finite() && *mid != 0.0 {
+                        2.0 * multiplier * deviation / mid * 100.0
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        }
+        IndicatorExpr::IchimokuTenkan { period, .. }
+        | IndicatorExpr::IchimokuKijun { period, .. } => midpoint_series(bars, period as usize),
+        IndicatorExpr::IchimokuSenkouA {
+            tenkan_period,
+            kijun_period,
+            ..
+        } => {
+            let tenkan = midpoint_series(bars, tenkan_period as usize);
+            let kijun = midpoint_series(bars, kijun_period as usize);
+            let span = combine(&tenkan, &kijun, |tenkan, kijun| (tenkan + kijun) / 2.0);
+            displace_forward(&span, kijun_period as usize)
+        }
+        IndicatorExpr::IchimokuSenkouB {
+            period,
+            kijun_period,
+            ..
+        } => {
+            let span = midpoint_series(bars, period as usize);
+            displace_forward(&span, kijun_period as usize)
+        }
+        IndicatorExpr::QqeLine {
+            rsi_period,
+            smoothing_period,
+            ..
+        } => ema_sparse(
+            &qqe_rsi(bars, rsi_period as usize),
+            smoothing_period as usize,
+        ),
+        IndicatorExpr::QqeTrail {
+            rsi_period,
+            smoothing_period,
+            factor_tenths,
+            ..
+        } => qqe_trail_series(
+            bars,
+            rsi_period as usize,
+            smoothing_period as usize,
+            tenths(factor_tenths),
+        ),
+        IndicatorExpr::Vwap { period, .. } => vwap_series(bars, period as usize),
+        IndicatorExpr::Cci { period, .. } => cci_series(bars, period as usize),
+    }
+}
+
+fn tenths(value: u16) -> f64 {
+    value as f64 / 10.0
+}
+
+/// QQE is defined on Wilder RSI in both export styles. Routing it through the
+/// engine switch would make the smoothed line disagree with the generated EA,
+/// and MT5 is the environment that ultimately trades.
+fn qqe_rsi(bars: &[Bar], period: usize) -> Vec<f64> {
+    rsi(&source_series(bars, PriceField::Close), period)
+}
+
+fn combine(left: &[f64], right: &[f64], operation: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| {
+            if left.is_finite() && right.is_finite() {
+                operation(*left, *right)
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+fn macd_main_series(values: &[f64], fast_period: usize, slow_period: usize) -> Vec<f64> {
+    let fast = ema(values, fast_period);
+    let slow = ema(values, slow_period);
+    combine(&fast, &slow, |fast, slow| fast - slow)
+}
+
+fn bollinger_band(values: &[f64], period: usize, multiplier: f64, upper: bool) -> Vec<f64> {
+    let mid = rolling_mean(values, period);
+    let deviation = rolling_standard_deviation(values, period);
+    combine(&mid, &deviation, |mid, deviation| {
+        if upper {
+            mid + multiplier * deviation
+        } else {
+            mid - multiplier * deviation
+        }
+    })
+}
+
+/// EMA over a buffer that may carry a `NaN` warm-up prefix. The average is
+/// seeded from the first `period` finite values so a derived series (MACD main,
+/// smoothed RSI) starts where its input becomes valid.
+fn ema_sparse(values: &[f64], period: usize) -> Vec<f64> {
+    let mut output = vec![f64::NAN; values.len()];
+    if period == 0 {
+        return output;
+    }
+    let Some(first) = values.iter().position(|value| value.is_finite()) else {
+        return output;
+    };
+    if first + period > values.len() {
+        return output;
+    }
+    let seed = values[first..first + period].iter().sum::<f64>() / period as f64;
+    if !seed.is_finite() {
+        return output;
+    }
+    let mut previous = seed;
+    output[first + period - 1] = seed;
+    let alpha = 2.0 / (period as f64 + 1.0);
+    for index in first + period..values.len() {
+        if !values[index].is_finite() {
+            continue;
+        }
+        previous = alpha * values[index] + (1.0 - alpha) * previous;
+        output[index] = previous;
+    }
+    output
+}
+
+/// Midpoint of the highest high and lowest low over `period` bars — the shared
+/// shape of Ichimoku's Tenkan, Kijun and Senkou B lines.
+fn midpoint_series(bars: &[Bar], period: usize) -> Vec<f64> {
+    let highs = rolling_extreme(&source_series(bars, PriceField::High), period, true);
+    let lows = rolling_extreme(&source_series(bars, PriceField::Low), period, false);
+    combine(&highs, &lows, |high, low| (high + low) / 2.0)
+}
+
+/// Shift a buffer forward so the value read at bar `i` was computed from bar
+/// `i - offset`, matching how MT5 plots the Ichimoku cloud ahead of price.
+fn displace_forward(values: &[f64], offset: usize) -> Vec<f64> {
+    let mut output = vec![f64::NAN; values.len()];
+    for index in offset..values.len() {
+        output[index] = values[index - offset];
+    }
+    output
+}
+
+fn qqe_trail_series(
+    bars: &[Bar],
+    rsi_period: usize,
+    smoothing_period: usize,
+    factor: f64,
+) -> Vec<f64> {
+    let length = bars.len();
+    let mut output = vec![f64::NAN; length];
+    if rsi_period == 0 || smoothing_period == 0 {
+        return output;
+    }
+    let smoothed = ema_sparse(&qqe_rsi(bars, rsi_period), smoothing_period);
+    let wilder = rsi_period.saturating_mul(2).saturating_sub(1).max(1);
+
+    let mut absolute = vec![f64::NAN; length];
+    for index in 1..length {
+        if smoothed[index].is_finite() && smoothed[index - 1].is_finite() {
+            absolute[index] = (smoothed[index - 1] - smoothed[index]).abs();
         }
     }
+    let smoothed_absolute = ema_sparse(&absolute, wilder);
+    let deviation = ema_sparse(&smoothed_absolute, wilder);
+
+    let mut long_band = f64::NAN;
+    let mut short_band = f64::NAN;
+    let mut trend_up = true;
+    for index in 1..length {
+        let (Some(current), Some(previous), Some(band)) = (
+            finite(smoothed[index]),
+            finite(smoothed[index - 1]),
+            finite(deviation[index]),
+        ) else {
+            continue;
+        };
+        let room = band * factor;
+        let new_long = current - room;
+        let new_short = current + room;
+
+        long_band = if long_band.is_finite() && previous > long_band && current > long_band {
+            long_band.max(new_long)
+        } else {
+            new_long
+        };
+        short_band = if short_band.is_finite() && previous < short_band && current < short_band {
+            short_band.min(new_short)
+        } else {
+            new_short
+        };
+
+        if current > short_band {
+            trend_up = true;
+        } else if current < long_band {
+            trend_up = false;
+        }
+        output[index] = if trend_up { long_band } else { short_band };
+    }
+    output
+}
+
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn typical_price_series(bars: &[Bar]) -> Vec<f64> {
+    bars.iter()
+        .map(|bar| (bar.high + bar.low + bar.close) / 3.0)
+        .collect()
+}
+
+/// Rolling volume-weighted average price. Tick volume is the weight; feeds
+/// without volume fall back to an equally weighted typical price so the buffer
+/// stays defined instead of collapsing to NaN.
+fn vwap_series(bars: &[Bar], period: usize) -> Vec<f64> {
+    let mut output = vec![f64::NAN; bars.len()];
+    if period == 0 || bars.len() < period {
+        return output;
+    }
+    let typical = typical_price_series(bars);
+    for index in period - 1..bars.len() {
+        let start = index + 1 - period;
+        let mut weighted = 0.0;
+        let mut total = 0.0;
+        for offset in start..=index {
+            let weight = if bars[offset].tick_volume > 0 {
+                bars[offset].tick_volume as f64
+            } else {
+                1.0
+            };
+            weighted += typical[offset] * weight;
+            total += weight;
+        }
+        if total > 0.0 {
+            output[index] = weighted / total;
+        }
+    }
+    output
+}
+
+fn cci_series(bars: &[Bar], period: usize) -> Vec<f64> {
+    let mut output = vec![f64::NAN; bars.len()];
+    if period == 0 || bars.len() < period {
+        return output;
+    }
+    let typical = typical_price_series(bars);
+    let means = rolling_mean(&typical, period);
+    for index in period - 1..bars.len() {
+        let mean = means[index];
+        if !mean.is_finite() {
+            continue;
+        }
+        let deviation = typical[index + 1 - period..=index]
+            .iter()
+            .map(|value| (value - mean).abs())
+            .sum::<f64>()
+            / period as f64;
+        if deviation > 0.0 {
+            output[index] = (typical[index] - mean) / (0.015 * deviation);
+        }
+    }
+    output
 }
 
 fn session_range_series(
@@ -486,8 +983,16 @@ fn session_range_series(
     output
 }
 
-fn atr_percentile_series(bars: &[Bar], atr_period: usize, lookback: usize) -> Vec<f64> {
-    let atr_values = atr(bars, atr_period);
+fn atr_percentile_series(
+    bars: &[Bar],
+    atr_period: usize,
+    lookback: usize,
+    engine: IndicatorEngine,
+) -> Vec<f64> {
+    let atr_values = match engine {
+        IndicatorEngine::Sqx => quantforge_sqx::atr_series(bars, atr_period),
+        IndicatorEngine::Mt5 => atr(bars, atr_period),
+    };
     let mut output = vec![f64::NAN; bars.len()];
     if lookback == 0 {
         return output;
@@ -525,11 +1030,12 @@ fn swing_base_zone_series(
     if swing_left == 0 || swing_right == 0 || base_bars == 0 {
         return output;
     }
+    let ready_delay = swing_right.max(base_bars);
     let mut last_zone = f64::NAN;
     for (index, output_value) in output.iter_mut().enumerate() {
-        // Pivot at p is confirmed once we have `swing_right` bars after it.
-        if index >= swing_right {
-            let pivot = index - swing_right;
+        // Pivot is ready once swing-right and the post-pivot base both exist.
+        if index >= ready_delay {
+            let pivot = index - ready_delay;
             if pivot >= swing_left {
                 let is_swing_low = (1..=swing_left)
                     .all(|offset| bars[pivot].low <= bars[pivot - offset].low)
@@ -646,18 +1152,9 @@ fn wma(values: &[f64], period: usize) -> Vec<f64> {
 }
 
 fn rolling_extreme(values: &[f64], period: usize, maximum: bool) -> Vec<f64> {
+    // NaN warm-up here, unlike the SQX engine's zero warm-up.
     let mut output = vec![f64::NAN; values.len()];
-    if period == 0 || values.len() < period {
-        return output;
-    }
-    for index in period - 1..values.len() {
-        let window = &values[index + 1 - period..=index];
-        output[index] = if maximum {
-            window.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-        } else {
-            window.iter().copied().fold(f64::INFINITY, f64::min)
-        };
-    }
+    quantforge_sqx::rolling_extreme_into(values, period, maximum, &mut output);
     output
 }
 
@@ -853,16 +1350,53 @@ mod tests {
                 spread_points: Some(0),
             },
         ];
-        let values = calculate_indicator_series(
+        let values = calculate_indicator_series_with_clock(
             &bars,
             &IndicatorExpr::Atr {
                 period: 2,
                 shift: 0,
             },
+            None,
+            IndicatorEngine::Mt5,
         );
         assert!(values[0].is_nan());
         assert_eq!(values[1], 2.5);
         assert_eq!(values[2], 2.0);
+    }
+
+    #[test]
+    fn sqx_atr_uses_expanding_then_fixed_window() {
+        let bars = vec![
+            Bar {
+                timestamp_ms: 0,
+                open: 10.0,
+                high: 11.0,
+                low: 9.0,
+                close: 10.0,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 60_000,
+                open: 9.0,
+                high: 12.0,
+                low: 9.0,
+                close: 11.0,
+                tick_volume: 0,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+        ];
+        let values = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::Atr {
+                period: 14,
+                shift: 0,
+            },
+        );
+        assert_eq!(values[0], 2.0);
+        assert!((values[1] - 2.5).abs() < 1e-9);
     }
 
     #[test]
@@ -946,16 +1480,216 @@ mod tests {
                 spread_points: Some(0),
             },
         ];
-        let scores = calculate_indicator_series(
+        let indicator = IndicatorExpr::LiquiditySweepScore {
+            period: 2,
+            shift: 1,
+        };
+        let legacy = calculate_indicator_series_with_clock(
             &bars,
-            &IndicatorExpr::LiquiditySweepScore {
-                period: 2,
+            &indicator,
+            None,
+            IndicatorEngine::Mt5,
+        );
+        assert_eq!(legacy[0], 0.0);
+        assert_eq!(legacy[1], 0.0);
+        assert_eq!(legacy[2], 1.0);
+
+        let sqx = calculate_indicator_series_with_clock(
+            &bars,
+            &indicator,
+            None,
+            IndicatorEngine::Sqx,
+        );
+        assert!(sqx.iter().all(|value| *value == 0.0 || *value == 1.0 || *value == -1.0));
+    }
+
+    fn trending_bars(count: usize) -> Vec<Bar> {
+        (0..count)
+            .map(|index| {
+                let base = 100.0 + index as f64 * 0.3 + ((index % 7) as f64) * 0.1;
+                Bar {
+                    timestamp_ms: index as i64 * 3_600_000,
+                    open: base,
+                    high: base + 0.6,
+                    low: base - 0.4,
+                    close: base + 0.2,
+                    tick_volume: 10 + (index % 5) as u64,
+                    real_volume: 0,
+                    spread_points: Some(0),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macd_histogram_is_main_minus_signal() {
+        let bars = trending_bars(200);
+        let main = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::MacdMain {
+                source: PriceField::Close,
+                fast_period: 12,
+                slow_period: 26,
                 shift: 1,
             },
         );
-        assert_eq!(scores[0], 0.0);
-        assert_eq!(scores[1], 0.0);
-        assert_eq!(scores[2], 1.0);
+        let signal = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::MacdSignal {
+                source: PriceField::Close,
+                fast_period: 12,
+                slow_period: 26,
+                signal_period: 9,
+                shift: 1,
+            },
+        );
+        let histogram = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::MacdHistogram {
+                source: PriceField::Close,
+                fast_period: 12,
+                slow_period: 26,
+                signal_period: 9,
+                shift: 1,
+            },
+        );
+        let index = bars.len() - 1;
+        assert!(main[index].is_finite());
+        assert!(signal[index].is_finite());
+        assert!((histogram[index] - (main[index] - signal[index])).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bollinger_bands_straddle_the_middle_band() {
+        let bars = trending_bars(120);
+        let period = 20;
+        let mid = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::BollingerMid {
+                source: PriceField::Close,
+                period,
+                shift: 1,
+            },
+        );
+        let upper = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::BollingerUpper {
+                source: PriceField::Close,
+                period,
+                deviation_tenths: 20,
+                shift: 1,
+            },
+        );
+        let lower = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::BollingerLower {
+                source: PriceField::Close,
+                period,
+                deviation_tenths: 20,
+                shift: 1,
+            },
+        );
+        let bandwidth = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::BollingerBandwidth {
+                source: PriceField::Close,
+                period,
+                deviation_tenths: 20,
+                shift: 1,
+            },
+        );
+        let index = bars.len() - 1;
+        assert!(upper[index] > mid[index] && mid[index] > lower[index]);
+        assert!(((upper[index] + lower[index]) / 2.0 - mid[index]).abs() < 1e-9);
+        let expected = (upper[index] - lower[index]) / mid[index] * 100.0;
+        assert!((bandwidth[index] - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ichimoku_spans_are_displaced_by_the_base_period() {
+        let bars = trending_bars(200);
+        let tenkan_period = 9;
+        let kijun_period = 26;
+        let tenkan = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::IchimokuTenkan {
+                period: tenkan_period,
+                shift: 1,
+            },
+        );
+        let kijun = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::IchimokuKijun {
+                period: kijun_period,
+                shift: 1,
+            },
+        );
+        let senkou_a = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::IchimokuSenkouA {
+                tenkan_period,
+                kijun_period,
+                shift: 1,
+            },
+        );
+        let index = bars.len() - 1;
+        let source = index - kijun_period as usize;
+        let expected = (tenkan[source] + kijun[source]) / 2.0;
+        assert!((senkou_a[index] - expected).abs() < 1e-12);
+        // Tenkan tracks a shorter window, so it leads Kijun in an uptrend.
+        assert!(tenkan[index] > kijun[index]);
+    }
+
+    #[test]
+    fn vwap_collapses_to_typical_price_mean_with_flat_volume() {
+        let mut bars = trending_bars(60);
+        for bar in &mut bars {
+            bar.tick_volume = 5;
+        }
+        let period = 10;
+        let vwap = calculate_indicator_series(&bars, &IndicatorExpr::Vwap { period, shift: 1 });
+        let index = bars.len() - 1;
+        let expected = bars[index + 1 - period as usize..=index]
+            .iter()
+            .map(|bar| (bar.high + bar.low + bar.close) / 3.0)
+            .sum::<f64>()
+            / period as f64;
+        assert!((vwap[index] - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cci_is_positive_while_price_trends_up() {
+        let bars = trending_bars(120);
+        let cci = calculate_indicator_series(&bars, &IndicatorExpr::Cci { period: 20, shift: 1 });
+        let index = bars.len() - 1;
+        assert!(cci[index].is_finite());
+        assert!(cci[index] > 0.0);
+    }
+
+    #[test]
+    fn qqe_trail_sits_below_the_line_in_an_uptrend() {
+        let bars = trending_bars(400);
+        let line = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::QqeLine {
+                rsi_period: 14,
+                smoothing_period: 5,
+                shift: 1,
+            },
+        );
+        let trail = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::QqeTrail {
+                rsi_period: 14,
+                smoothing_period: 5,
+                factor_tenths: 42,
+                shift: 1,
+            },
+        );
+        let index = bars.len() - 1;
+        assert!(line[index].is_finite());
+        assert!(trail[index].is_finite());
+        assert!(trail[index] < line[index]);
     }
 
     #[test]
@@ -1005,6 +1739,7 @@ mod tests {
                 shift: 1,
             },
             Some(&clock),
+            IndicatorEngine::Sqx,
         );
         assert!(highs[0].is_nan());
         assert_eq!(highs[1], 3.0);

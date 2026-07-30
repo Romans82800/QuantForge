@@ -6,14 +6,14 @@ use quantforge_data::{
     bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
 use quantforge_discover::{
-    Databank, DiscoverConfig, DiscoverRunMode, FamilyBakeoffConfig, GateConfig,
-    MethodologyGridConfig, PermutationNullConfig, SearchFamily, continue_evolution, evolve_new,
-    run_family_bakeoff, run_methodology_grid, run_permutation_null,
+    ConditionBakeoffConfig, Databank, DiscoverConfig, DiscoverRunMode, GateConfig,
+    MethodologyGridConfig, PermutationNullConfig, UniversalGrammarConfig, continue_evolution,
+    evolve_new, run_condition_bakeoff, run_methodology_grid, run_permutation_null,
 };
 use quantforge_eval::{CostModel, ScoutConfig, ScoutResult, evaluate_strategy};
 use quantforge_export_mql5::{
-    ExportEvidenceCard, MetaEditorConfig, Mql5ExportConfig, TerminalConfig, TesterConfig,
-    TesterRunReport, compile_with_metaeditor, generate_bundle, run_mt5_tester,
+    ExportEvidenceCard, ExportStyle, MetaEditorConfig, Mql5ExportConfig, TerminalConfig,
+    TesterConfig, TesterRunReport, compile_with_metaeditor, generate_bundle, run_mt5_tester,
 };
 use quantforge_ir::StrategyIr;
 use quantforge_parity::{
@@ -93,6 +93,12 @@ enum Command {
         max_spread_points: Option<f64>,
         #[arg(long, default_value_t = 100_000.0)]
         initial_balance: f64,
+        /// Broker-local hour from which entries may be placed (inclusive).
+        #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+        entry_window_start_hour: u32,
+        /// Broker-local hour from which entries stop being placed (exclusive).
+        #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+        entry_window_end_hour: u32,
         /// Allow a data-quality Fail and record the override in the manifest.
         #[arg(long)]
         allow_failed_data: bool,
@@ -134,9 +140,9 @@ enum Command {
     SealedFinal(SealedFinalArgs),
     /// Stationary-bootstrap noise floor for Discover gate calibration.
     PermutationNull(PermutationNullArgs),
-    /// Short Fast Scout per Search Family, ranked by OOS1 retention.
-    FamilyBakeoff(FamilyBakeoffArgs),
-    /// Factor grid across families: atoms × entry/exit recipes → OOS1 retention.
+    /// Short Fast Scout per entry-condition count, ranked by OOS1 retention.
+    ConditionBakeoff(ConditionBakeoffArgs),
+    /// Factor grid across entry/exit condition counts × recipes → OOS1 retention.
     MethodologyResearch(MethodologyResearchArgs),
 }
 
@@ -170,7 +176,7 @@ struct PermutationNullArgs {
 }
 
 #[derive(Debug, Args)]
-struct FamilyBakeoffArgs {
+struct ConditionBakeoffArgs {
     #[command(flatten)]
     source: DataSourceArgs,
     #[arg(long)]
@@ -197,6 +203,9 @@ struct FamilyBakeoffArgs {
     initial_candidates: usize,
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Entry-condition counts to compare (each pinned exactly). Default 2,3,4.
+    #[arg(long, value_delimiter = ',', default_value = "2,3,4")]
+    entry_condition_counts: Vec<usize>,
     #[arg(long)]
     commission_per_lot_round_turn: f64,
     #[arg(long, default_value_t = 0.0)]
@@ -271,6 +280,12 @@ struct DataSourceArgs {
 
 #[derive(Debug, Args)]
 struct EvolveArgs {
+    /// Broker-local hour from which entries may be placed (inclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+    entry_window_start_hour: u32,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+    entry_window_end_hour: u32,
     #[command(flatten)]
     source: DataSourceArgs,
     /// M1 execution CSV/TSV used for mandatory higher-precision acceptance.
@@ -316,9 +331,18 @@ struct EvolveArgs {
     structural_mutation_probability: Option<f64>,
     #[arg(long)]
     seed: Option<u64>,
-    /// Locked Search Family id (trend_pullback, session_orb, sweep_reclaim, …)
-    #[arg(long, default_value = "trend_pullback")]
-    search_family: String,
+    /// Minimum mirrored entry conditions (2..=4). Default 2.
+    #[arg(long)]
+    minimum_entry_conditions: Option<usize>,
+    /// Maximum mirrored entry conditions (2..=4). Default 4.
+    #[arg(long)]
+    maximum_entry_conditions: Option<usize>,
+    /// Minimum exit conditions (1..=3). Default 1.
+    #[arg(long)]
+    minimum_exit_conditions: Option<usize>,
+    /// Maximum exit conditions (1..=3). Default 3.
+    #[arg(long)]
+    maximum_exit_conditions: Option<usize>,
     /// fast_scout | full_harvest
     #[arg(long, default_value = "full_harvest")]
     run_mode: String,
@@ -330,14 +354,21 @@ struct EvolveArgs {
     minimum_return_percent: Option<f64>,
     #[arg(long)]
     minimum_profit_factor: Option<f64>,
-    #[arg(long)]
+    #[arg(long, alias = "minimum-recovery-factor")]
     minimum_return_drawdown: Option<f64>,
     #[arg(long)]
     minimum_m1_return_retention: Option<f64>,
-    /// Close positions, cancel pending orders and block entries from 22:00
+    /// Size of the ±% jitter applied to every numeric gene when probing the
+    /// local plateau, as a fraction (SQX default 0.20).
+    #[arg(long)]
+    robustness_perturbation_fraction: Option<f64>,
+    /// Close positions, cancel pending orders and block entries from end-of-day
     /// until the next broker day.
     #[arg(long)]
     flatten_at_22: bool,
+    /// Broker-local hour (0–23) for end-of-day flatten when `--flatten-at-22` is set (default 23).
+    #[arg(long, default_value_t = 23)]
+    end_of_day_hour: u8,
     /// Required for a new databank; a continuation uses the stored assumption.
     #[arg(long)]
     commission_per_lot_round_turn: Option<f64>,
@@ -364,6 +395,12 @@ struct EvolveArgs {
 
 #[derive(Debug, Args)]
 struct JudgeArgs {
+    /// Broker-local hour from which entries may be placed (inclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+    entry_window_start_hour: u32,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+    entry_window_end_hour: u32,
     #[command(flatten)]
     decision: DataSourceArgs,
     /// M1 execution CSV/TSV covering every decision bar.
@@ -411,6 +448,12 @@ struct JudgeArgs {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
+    /// Broker-local hour from which entries may be placed (inclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+    entry_window_start_hour: u32,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+    entry_window_end_hour: u32,
     /// Strategy IR JSON.
     #[arg(long)]
     strategy: PathBuf,
@@ -654,8 +697,9 @@ struct PortfolioArgs {
     maximum_weight_per_strategy: f64,
     #[arg(long, default_value_t = 1.0)]
     maximum_symbol_exposure: f64,
-    #[arg(long, default_value_t = 0.50)]
-    maximum_family_exposure: f64,
+    /// Cap on exposure to any one strategy cohort (family).
+    #[arg(long, alias = "maximum-family-exposure", default_value_t = 0.50)]
+    maximum_cohort_exposure: f64,
     #[arg(long, default_value_t = 10)]
     maximum_strategies: usize,
     #[arg(long, default_value_t = 0.0)]
@@ -736,6 +780,12 @@ struct IncubationFinalizeArgs {
 
 #[derive(Debug, Args)]
 struct ChallengeArgs {
+    /// Broker-local hour from which entries may be placed (inclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+    entry_window_start_hour: u32,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+    entry_window_end_hour: u32,
     #[command(flatten)]
     source: DataSourceArgs,
     #[arg(long)]
@@ -811,6 +861,12 @@ struct ChallengeArgs {
 
 #[derive(Debug, Args)]
 struct SealedFinalArgs {
+    /// Broker-local hour from which entries may be placed (inclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
+    entry_window_start_hour: u32,
+    /// Broker-local hour from which entries stop being placed (exclusive).
+    #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
+    entry_window_end_hour: u32,
     #[command(flatten)]
     source: DataSourceArgs,
     #[arg(long)]
@@ -1205,6 +1261,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             fallback_spread_points,
             max_spread_points,
             initial_balance,
+            entry_window_start_hour,
+            entry_window_end_hour,
             allow_failed_data,
             out,
         } => {
@@ -1233,6 +1291,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     max_spread_points,
                     include_costs_in_risk: true,
                 },
+                indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+                entry_window: quantforge_eval::EntryWindow::new(
+                    entry_window_start_hour,
+                    entry_window_end_hour,
+                ),
+                abandon_above_drawdown_percent: None,
             };
             let result = evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?;
 
@@ -1301,43 +1365,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
-        Command::FamilyBakeoff(args) => family_bakeoff_command(args)?,
+        Command::ConditionBakeoff(args) => condition_bakeoff_command(args)?,
         Command::MethodologyResearch(args) => methodology_research_command(args)?,
     }
     Ok(())
-}
-
-fn parse_cli_search_family(value: &str) -> Result<SearchFamily, Box<dyn Error>> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "trend_pullback" | "trend" => Ok(SearchFamily::TrendPullback),
-        "momentum_burst" | "momentum" => Ok(SearchFamily::MomentumBurst),
-        "donchian_breakout" | "breakout" => Ok(SearchFamily::DonchianBreakout),
-        "mean_reversion_band" | "mean_reversion" => Ok(SearchFamily::MeanReversionBand),
-        "zscore_reversion" | "zscore" => Ok(SearchFamily::ZScoreReversion),
-        "session_orb" | "orb" => Ok(SearchFamily::SessionOrb),
-        "impulse_candle" | "impulse" => Ok(SearchFamily::ImpulseCandle),
-        "vol_squeeze_break" | "vol_squeeze" => Ok(SearchFamily::VolSqueezeBreak),
-        "supply_demand_reclaim" | "supply_demand" => Ok(SearchFamily::SupplyDemandReclaim),
-        "sweep_reclaim" | "sweep" => Ok(SearchFamily::SweepReclaim),
-        other => Err(format!("unknown search family: {other}").into()),
-    }
 }
 
 fn parse_cli_run_mode(value: &str) -> Result<DiscoverRunMode, Box<dyn Error>> {
     match value.trim().to_ascii_lowercase().as_str() {
         "fast_scout" | "scout" => Ok(DiscoverRunMode::FastScout),
         "full_harvest" | "harvest" => Ok(DiscoverRunMode::FullHarvest),
+        "quota_harvest" | "quota" => Ok(DiscoverRunMode::QuotaHarvest),
         other => Err(format!("unknown run mode: {other}").into()),
     }
 }
 
-fn family_bakeoff_command(args: FamilyBakeoffArgs) -> Result<(), Box<dyn Error>> {
+fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn Error>> {
     if args.out.exists() {
         return Err(format!(
-            "family-bakeoff artifact already exists and will not be replaced: {}",
+            "condition-bakeoff artifact already exists and will not be replaced: {}",
             args.out.display()
         )
         .into());
+    }
+    if args.entry_condition_counts.is_empty() {
+        return Err("entry-condition-counts must include at least one count".into());
+    }
+    for count in &args.entry_condition_counts {
+        if !(2..=UniversalGrammarConfig::MAX_ENTRY_CONDITIONS).contains(count) {
+            return Err(format!(
+                "entry-condition-counts must be within 2..={}: got {count}",
+                UniversalGrammarConfig::MAX_ENTRY_CONDITIONS
+            )
+            .into());
+        }
     }
     let (dataset, _) = load_source(&args.source)?;
     let m1_source = DataSourceArgs {
@@ -1363,12 +1424,12 @@ fn family_bakeoff_command(args: FamilyBakeoffArgs) -> Result<(), Box<dyn Error>>
     discover.scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
     discover.scout.costs.adverse_slippage_points_per_side = args.slippage_points_per_side;
     discover.scout.costs.fallback_spread_points = args.fallback_spread_points;
-    let config = FamilyBakeoffConfig {
+    let config = ConditionBakeoffConfig {
         discover,
         generations: args.generations,
-        families: SearchFamily::ALL.to_vec(),
+        entry_condition_counts: args.entry_condition_counts,
     };
-    let report = run_family_bakeoff(
+    let report = run_condition_bakeoff(
         &search_dataset,
         Some(&oos1),
         &m1,
@@ -1382,14 +1443,14 @@ fn family_bakeoff_command(args: FamilyBakeoffArgs) -> Result<(), Box<dyn Error>>
     }
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
     println!(
-        "family-bakeoff wrote {} (recommended={:?})",
+        "condition-bakeoff wrote {} (recommended={:?})",
         args.out.display(),
-        report.recommended.map(|family| family.label())
+        report.recommended
     );
     for row in &report.rows {
         println!(
-            "  {} retention={:.3} oos1_E={:.4} pass={:.0}% pot={} evals={}",
-            row.family.label(),
+            "  entry_conditions={} retention={:.3} oos1_E={:.4} pass={:.0}% pot={} evals={}",
+            row.entry_conditions,
             row.median_retention,
             row.median_oos1_expectancy_r,
             row.pass_rate * 100.0,
@@ -1445,10 +1506,10 @@ fn methodology_research_command(args: MethodologyResearchArgs) -> Result<(), Box
     println!("Top cells:");
     for cell in report.cells.iter().take(12) {
         println!(
-            "  {} {} atoms={} screened={} oos_pass={:.0}% ret={}",
-            cell.family.label(),
+            "  entry={} exit={} {} screened={} oos_pass={:.0}% ret={}",
+            cell.entry_conditions,
+            cell.exit_conditions,
             cell.recipe.label(),
-            cell.atom_count,
             cell.screened,
             cell.oos1_pass_rate * 100.0,
             cell.median_retention
@@ -1658,6 +1719,12 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: quantforge_eval::EntryWindow::new(
+                args.entry_window_start_hour,
+                args.entry_window_end_hour,
+            ),
+            abandon_above_drawdown_percent: None,
         },
         folds: args.folds,
         purge_bars: args.purge_bars,
@@ -1851,6 +1918,12 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: quantforge_eval::EntryWindow::new(
+                args.entry_window_start_hour,
+                args.entry_window_end_hour,
+            ),
+            abandon_above_drawdown_percent: None,
         },
         minimum_trades: args.minimum_trades,
         minimum_return_percent: args.minimum_return_percent,
@@ -3279,6 +3352,11 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
             include_costs_in_risk: true,
         },
         allow_execution_gaps: args.allow_execution_gaps,
+        indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+        entry_window: quantforge_eval::EntryWindow::new(
+            args.entry_window_start_hour,
+            args.entry_window_end_hour,
+        ),
     };
     let result = evaluate_strategy_m1(&strategy, &decision_dataset, &m1_dataset, &broker, &config)?;
     let combined_data_hash = quantforge_core::stable_json_hash(&BTreeMap::from([
@@ -3422,6 +3500,9 @@ fn export_command(args: ExportArgs) -> Result<(), Box<dyn Error>> {
         estimated_slippage_points_per_side: args.slippage_points_per_side,
         commission_per_lot_round_turn: args.commission_per_lot_round_turn,
         allow_live_trading_default: false,
+        export_style: ExportStyle::Sqx,
+        entry_window_start_hour: args.entry_window_start_hour,
+        entry_window_end_hour: args.entry_window_end_hour,
         tester: TesterConfig {
             from_date: args.from_date,
             to_date: args.to_date,
@@ -3453,6 +3534,13 @@ fn export_command(args: ExportArgs) -> Result<(), Box<dyn Error>> {
     write_text_new(&set_path, &bundle.set_file)?;
     write_text_new(&tester_path, &bundle.tester_ini)?;
     write_json_new(&evidence_path, &bundle.evidence)?;
+    for support in &bundle.support_files {
+        let path = args.out.join(&support.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_text_new(&path, &support.contents)?;
+    }
     println!("wrote guarded export to {}", args.out.display());
 
     if args.compile {
@@ -3980,7 +4068,7 @@ fn portfolio_command(args: PortfolioArgs) -> Result<(), Box<dyn Error>> {
         .map(|elite| PortfolioCandidate {
             strategy_fingerprint: elite.structural_fingerprint.clone(),
             symbol: broker.symbol.clone(),
-            family: family_name(elite.descriptor.family).into(),
+            cohort: behavior_cohort(elite),
             initial_balance: artifact.databank.config.scout.initial_balance,
             return_percent: elite.metrics.return_percent,
             maximum_drawdown_percent: elite.metrics.max_drawdown_percent,
@@ -3992,7 +4080,7 @@ fn portfolio_command(args: PortfolioArgs) -> Result<(), Box<dyn Error>> {
         maximum_pairwise_correlation: args.maximum_pairwise_correlation,
         maximum_weight_per_strategy: args.maximum_weight_per_strategy,
         maximum_symbol_exposure: args.maximum_symbol_exposure,
-        maximum_family_exposure: args.maximum_family_exposure,
+        maximum_cohort_exposure: args.maximum_cohort_exposure,
         maximum_strategies: args.maximum_strategies,
         minimum_return_percent: args.minimum_return_percent,
         cvar_tail_fraction: args.cvar_tail_fraction,
@@ -4081,19 +4169,14 @@ fn verify_portfolio_databank(
     Ok(())
 }
 
-fn family_name(family: quantforge_discover::FamilyStyle) -> &'static str {
-    match family {
-        quantforge_discover::FamilyStyle::TrendPullback => "trend_pullback",
-        quantforge_discover::FamilyStyle::MomentumBurst => "momentum_burst",
-        quantforge_discover::FamilyStyle::DonchianBreakout => "donchian_breakout",
-        quantforge_discover::FamilyStyle::MeanReversionBand => "mean_reversion_band",
-        quantforge_discover::FamilyStyle::ZScoreReversion => "zscore_reversion",
-        quantforge_discover::FamilyStyle::SessionOrb => "session_orb",
-        quantforge_discover::FamilyStyle::ImpulseCandle => "impulse_candle",
-        quantforge_discover::FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
-        quantforge_discover::FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
-        quantforge_discover::FamilyStyle::SweepReclaim => "sweep_reclaim",
-    }
+/// Diversification group for the portfolio exposure cap: entry-condition count
+/// plus the trade-frequency and hold-time buckets.
+fn behavior_cohort(elite: &quantforge_discover::Elite) -> String {
+    format!(
+        "e{}/{:?}/{:?}",
+        elite.niche.entry_conditions, elite.niche.trade_frequency, elite.niche.hold_time
+    )
+    .to_ascii_lowercase()
 }
 
 #[derive(Serialize)]
@@ -4457,6 +4540,23 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
     let commission = args
         .commission_per_lot_round_turn
         .ok_or("--commission-per-lot-round-turn is required when creating a new databank")?;
+    let defaults = UniversalGrammarConfig::default();
+    let universal_grammar = UniversalGrammarConfig {
+        minimum_entry_conditions: args
+            .minimum_entry_conditions
+            .unwrap_or(defaults.minimum_entry_conditions),
+        maximum_entry_conditions: args
+            .maximum_entry_conditions
+            .unwrap_or(defaults.maximum_entry_conditions),
+        minimum_exit_conditions: args
+            .minimum_exit_conditions
+            .unwrap_or(defaults.minimum_exit_conditions),
+        maximum_exit_conditions: args
+            .maximum_exit_conditions
+            .unwrap_or(defaults.maximum_exit_conditions),
+        minimum_shift: defaults.minimum_shift,
+        maximum_shift: defaults.maximum_shift,
+    };
     Ok(DiscoverConfig {
         initial_candidates: args.initial.unwrap_or(500),
         batch_size: args.batch.unwrap_or(200),
@@ -4465,27 +4565,27 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         tournament_size: args.tournament_size.unwrap_or(4),
         structural_mutation_probability: args.structural_mutation_probability.unwrap_or(0.18),
         seed: args.seed.unwrap_or(42),
-        search_family: parse_cli_search_family(&args.search_family)?,
+        universal_grammar,
         run_mode: parse_cli_run_mode(&args.run_mode)?,
-        allow_cross_family_mutation: false,
         early_stop_pot_elites: None,
+        target_databank_elites: None,
         trial_budget_warning: quantforge_discover::TRIAL_BUDGET_WARNING,
         gates: GateConfig {
             minimum_trades: args.minimum_trades.unwrap_or(10),
             maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(40.0),
             minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: args.minimum_profit_factor.unwrap_or(1.0),
-            minimum_return_drawdown: args.minimum_return_drawdown.unwrap_or(0.0),
+            minimum_recovery_factor: args.minimum_return_drawdown.unwrap_or(0.0),
         },
         deposit_gates: GateConfig {
             minimum_trades: args.minimum_trades.unwrap_or(20),
             maximum_drawdown_percent: args.maximum_drawdown_percent.unwrap_or(30.0),
             minimum_return_percent: args.minimum_return_percent.unwrap_or(0.0),
             minimum_profit_factor: args.minimum_profit_factor.unwrap_or(1.0),
-            minimum_return_drawdown: args.minimum_return_drawdown.unwrap_or(0.0),
+            minimum_recovery_factor: args.minimum_return_drawdown.unwrap_or(0.0),
         },
         precision: quantforge_discover::PrecisionGateConfig {
-            minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.90),
+            minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: quantforge_discover::SearchRangeProfile::default(),
         oos1_expectancy_retention: 0.7,
@@ -4494,9 +4594,11 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         allow_break_even: false,
         allow_trailing_stops: false,
         allow_partial_exits: false,
+        allow_market_entries: true,
         allow_stop_entries: false,
         allow_limit_entries: false,
         flatten_at_22: args.flatten_at_22,
+        end_of_day_hour: args.end_of_day_hour,
         max_one_entry_per_day: true,
         mutate_after_elites: 300,
         random_fill_fraction: 0.4,
@@ -4505,6 +4607,10 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_folds: 3,
         robustness_monte_carlo_trials: 250,
         robustness_neighborhood_samples: 8,
+        robustness_perturbation_fraction: args
+            .robustness_perturbation_fraction
+            .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        minimum_neighborhood_survival_fraction: 0.7,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
@@ -4518,6 +4624,13 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
+            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            entry_window: quantforge_eval::EntryWindow::new(
+                args.entry_window_start_hour,
+                args.entry_window_end_hour,
+            ),
+            // Search overrides this per batch; the CLI default keeps full metrics.
+            abandon_above_drawdown_percent: None,
         },
     })
 }

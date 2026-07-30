@@ -1,4 +1,4 @@
-use crate::features::FeatureCache;
+use crate::features::{FeatureCache, IndicatorBufferCache};
 use crate::management::{
     favorable_r as compute_favorable_r, favorable_sample_from_decision_bar, normalize_price,
     placeable_stop_candidate, price_reaches_from_above, price_reaches_from_below,
@@ -6,7 +6,7 @@ use crate::management::{
 };
 use crate::model::{
     BacktestMetrics, EquityPoint, EvalError, ExitReason, PositionSide, ScoutConfig, ScoutResult,
-    ScoutTelemetry, Trade, in_mandatory_entry_window,
+    ScoutTelemetry, Trade,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
 use chrono::Timelike;
@@ -78,7 +78,22 @@ pub fn evaluate_strategy(
     broker: &SymbolSpecification,
     config: &ScoutConfig,
 ) -> Result<ScoutResult, EvalError> {
-    evaluate_strategy_inner(strategy, dataset, broker, config, None)
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, None)
+}
+
+/// Same as [`evaluate_strategy`], reusing indicator buffers across candidates.
+///
+/// `cache` must belong to `dataset`: buffers are keyed by indicator and engine
+/// only, so a cache shared between different bar series would return values from
+/// the wrong data. Build one per dataset and pass it for every candidate.
+pub fn evaluate_strategy_cached(
+    strategy: &StrategyIr,
+    dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &ScoutConfig,
+    cache: &IndicatorBufferCache,
+) -> Result<ScoutResult, EvalError> {
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, Some(cache))
 }
 
 /// Evaluates a strategy with all earlier bars available as indicator warm-up,
@@ -108,6 +123,7 @@ pub fn evaluate_strategy_from(
         broker,
         config,
         Some(entry_start_timestamp_ms),
+        None,
     )
 }
 
@@ -117,6 +133,7 @@ fn evaluate_strategy_inner(
     broker: &SymbolSpecification,
     config: &ScoutConfig,
     entry_start_timestamp_ms: Option<i64>,
+    indicator_cache: Option<&IndicatorBufferCache>,
 ) -> Result<ScoutResult, EvalError> {
     if dataset.bars.len() < 2 {
         return Err(EvalError::InsufficientBars);
@@ -152,13 +169,19 @@ fn evaluate_strategy_inner(
     } else {
         0
     };
-    let mut features = FeatureCache::new(bars, &broker.timezone)?;
+    let mut features = FeatureCache::with_shared_cache(
+        bars,
+        &broker.timezone,
+        config.indicator_engine,
+        indicator_cache,
+    )?;
     let mut balance = config.initial_balance;
     let mut position: Option<OpenPosition> = None;
     let mut pending: Option<PendingOrder> = None;
     let mut trades = Vec::new();
     let mut equity = Vec::with_capacity(bars.len() - 1);
     let mut telemetry = ScoutTelemetry::default();
+    let mut equity_peak = config.initial_balance;
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
@@ -176,8 +199,9 @@ fn evaluate_strategy_inner(
         let previous_spread_price =
             resolve_spread(previous_bar, broker, &config.costs)?.points * broker.point;
         let current_local = broker_clock.local_datetime(bar.timestamp_ms)?;
-        let in_close_blackout = current_local.hour() >= 22;
-        let in_entry_window = in_mandatory_entry_window(current_local.hour());
+        let in_close_blackout =
+            current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let in_entry_window = config.entry_window.contains(current_local.hour());
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
             active_entry_day = Some(day_key);
@@ -185,7 +209,6 @@ fn evaluate_strategy_inner(
         }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
-        let mut opened_from_pending = false;
 
         if strategy.manage.flatten_end_of_day && in_close_blackout {
             // The 22:00 broker-time bar is reserved for flatten/cancellation.
@@ -273,7 +296,10 @@ fn evaluate_strategy_inner(
             let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker)
             {
                 Some(event)
-            } else if let Some(exit) = &strategy.exit
+            } else if let Some(exit) = match open.side {
+                PositionSide::Long => strategy.long_exit(),
+                PositionSide::Short => strategy.short_exit(),
+            }
                 && features.evaluate_bool(exit, index)?
             {
                 Some(ExitEvent {
@@ -324,13 +350,13 @@ fn evaluate_strategy_inner(
             && index >= signal_warmup_bars
             && entry_start_timestamp_ms.is_none_or(|start| bar.timestamp_ms >= start)
         {
-            let filters_pass = strategy
-                .filters
-                .iter()
-                .map(|filter| features.evaluate_bool(filter, index))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .all(|value| value);
+            let mut filters_pass = true;
+            for filter in &strategy.filters {
+                if !features.evaluate_bool(filter, index)? {
+                    filters_pass = false;
+                    break;
+                }
+            }
             if filters_pass {
                 let long_signal = strategy
                     .entry
@@ -435,14 +461,16 @@ fn evaluate_strategy_inner(
             position = Some(open);
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
-            opened_from_pending = true;
             signal_taken_today = true;
         }
 
-        // Market: allow same-bar SL/TP. Pending fill: defer protective exits to the
-        // next bar (SQX stockpicker rule) — same-bar path after a stop/limit fill is
-        // unknowable on Selected TF and was the main H1↔M1 divergence source.
-        if opened_this_bar && !opened_from_pending {
+        // MetaTrader 5 hedged model: an attached stop/target is live from the fill,
+        // including on the fill bar itself, for market and pending entries alike.
+        // The intrabar path is unknowable on Selected TF, so `SameBarPolicy::Conservative`
+        // resolves it against the full bar range and lets the stop win a collision.
+        // These trades open and close on one bar, so `ambiguous_trade_fraction` counts
+        // them and dismisses strategies that lean on the assumption.
+        if opened_this_bar {
             let event = position
                 .as_ref()
                 .and_then(|open| protective_intrabar_exit(open, bar, spread_price, broker));
@@ -469,10 +497,20 @@ fn evaluate_strategy_inner(
             balance,
             equity: marked_equity,
         });
+
+        if let Some(ceiling) = config.abandon_above_drawdown_percent {
+            equity_peak = equity_peak.max(marked_equity);
+            if equity_peak > 0.0 && (equity_peak - marked_equity) / equity_peak * 100.0 > ceiling {
+                telemetry.abandoned_above_drawdown = true;
+                break;
+            }
+        }
     }
 
     if let Some(open) = position.take() {
-        let final_index = bars.len() - 1;
+        // Equity gains one point per replayed bar starting at index 1, so this is
+        // the last bar reached — the final bar normally, earlier when abandoned.
+        let final_index = equity.len().min(bars.len() - 1);
         let bar = &bars[final_index];
         let spread_price = resolve_spread(bar, broker, &config.costs)?.points * broker.point;
         let event = ExitEvent {
@@ -1247,6 +1285,12 @@ fn calculate_metrics(
     }
 }
 
+/// Per-bar equity Sharpe, scaled by the square root of the sample count.
+///
+/// This is a comparison score between QuantForge candidates, not an MT5 figure:
+/// MT5 normalizes to one year, so its Sharpe is on a different scale and the two
+/// numbers are not expected to agree. Changing the scaling would move every
+/// stored deflated-Sharpe gate, so it stays as-is deliberately.
 pub fn equity_sharpe_ratio(initial_balance: f64, equity: &[EquityPoint]) -> Option<f64> {
     if equity.len() < 2 || initial_balance <= 0.0 {
         return None;
@@ -1276,6 +1320,7 @@ pub fn equity_sharpe_ratio(initial_balance: f64, equity: &[EquityPoint]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::EntryWindow;
     use quantforge_broker::{DayOfWeek, FillingMode, SwapMode, TradeMode};
     use quantforge_core::{ContentHash, STRATEGY_IR_VERSION};
     use quantforge_ir::{
@@ -1355,6 +1400,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: vec![],
             side: Side::LongOnly,
             risk: RiskPolicy::FixedCurrency { amount: 10.0 },
@@ -1369,6 +1416,166 @@ mod tests {
                 export_safe: true,
             },
         }
+    }
+
+    /// Long entry driven by indicators, so evaluation actually builds buffers.
+    fn indicator_strategy(period: u16) -> StrategyIr {
+        let mut strategy = strategy();
+        strategy.id = format!("indicator-fixture-{period}");
+        strategy.entry.long = Some(BoolExpr::And {
+            children: vec![
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Price {
+                        field: PriceField::Close,
+                        shift: 1,
+                    },
+                    right: NumericExpr::Indicator {
+                        value: IndicatorExpr::Ema {
+                            source: PriceField::Close,
+                            period,
+                            shift: 1,
+                        },
+                    },
+                },
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Indicator {
+                        value: IndicatorExpr::Rsi {
+                            source: PriceField::Close,
+                            period: 14,
+                            shift: 1,
+                        },
+                    },
+                    right: NumericExpr::Constant { value: 40.0 },
+                },
+                // Same EMA at a different shift: one buffer must serve both.
+                BoolExpr::Compare {
+                    comparison: ComparisonOp::GreaterThan,
+                    left: NumericExpr::Indicator {
+                        value: IndicatorExpr::Ema {
+                            source: PriceField::Close,
+                            period,
+                            shift: 2,
+                        },
+                    },
+                    right: NumericExpr::Constant { value: 0.0 },
+                },
+            ],
+        });
+        strategy
+    }
+
+    fn oscillating_bars(count: usize) -> Vec<Bar> {
+        (0..count)
+            .map(|index| {
+                let base = 100.0 + (index as f64 * 0.23).sin() * 3.0 + index as f64 * 0.01;
+                bar(
+                    index as i64 * 60_000,
+                    base,
+                    base + 0.6,
+                    base - 0.6,
+                    base + if index % 2 == 0 { 0.2 } else { -0.15 },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shared_indicator_cache_does_not_change_results() {
+        let dataset = dataset_with_bars(oscillating_bars(400));
+        let broker = broker();
+        let config = ScoutConfig::default();
+        let cache = IndicatorBufferCache::new(dataset.bars.len());
+
+        for period in [10, 20, 10] {
+            let strategy = indicator_strategy(period);
+            let uncached = evaluate_strategy(&strategy, &dataset, &broker, &config).unwrap();
+            let cached =
+                evaluate_strategy_cached(&strategy, &dataset, &broker, &config, &cache).unwrap();
+            assert_eq!(
+                cached.metrics.trade_count, uncached.metrics.trade_count,
+                "trade count diverged at period {period}"
+            );
+            assert_eq!(
+                cached.metrics.net_profit.to_bits(),
+                uncached.metrics.net_profit.to_bits(),
+                "net profit diverged at period {period}"
+            );
+            assert_eq!(cached.trades.len(), uncached.trades.len());
+            for (left, right) in cached.trades.iter().zip(uncached.trades.iter()) {
+                assert_eq!(left.entry_price.to_bits(), right.entry_price.to_bits());
+                assert_eq!(left.exit_price.to_bits(), right.exit_price.to_bits());
+                assert_eq!(left.exit_reason, right.exit_reason);
+            }
+        }
+        // Two EMA periods plus one RSI. The repeated period and the second EMA
+        // shift must not add buffers.
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn the_cache_budget_bounds_retained_buffers() {
+        let dataset = dataset_with_bars(oscillating_bars(400));
+        let broker = broker();
+        let config = ScoutConfig::default();
+        let bytes_for_two = 2 * dataset.bars.len() * std::mem::size_of::<f64>();
+        let cache = IndicatorBufferCache::with_budget(dataset.bars.len(), bytes_for_two);
+        for period in [8, 12, 16, 24, 32] {
+            evaluate_strategy_cached(&indicator_strategy(period), &dataset, &broker, &config, &cache)
+                .unwrap();
+        }
+        assert!(
+            cache.len() <= 2,
+            "cache grew past its budget: {}",
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn abandoning_above_the_drawdown_ceiling_still_reports_a_breach() {
+        let dataset = dataset_with_bars(oscillating_bars(400));
+        let broker = broker();
+        let strategy = indicator_strategy(10);
+        let full = evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
+
+        let ceiling = 0.0;
+        let abandoning = ScoutConfig {
+            abandon_above_drawdown_percent: Some(ceiling),
+            ..ScoutConfig::default()
+        };
+        let stopped = evaluate_strategy(&strategy, &dataset, &broker, &abandoning).unwrap();
+        if full.metrics.max_drawdown_percent > ceiling {
+            assert!(stopped.telemetry.abandoned_above_drawdown);
+            // The reported drawdown must still exceed the ceiling, otherwise a
+            // doomed candidate could slip through the gate it was abandoned for.
+            assert!(stopped.metrics.max_drawdown_percent > ceiling);
+            assert!(stopped.equity.len() < full.equity.len());
+        }
+    }
+
+    #[test]
+    fn a_generous_drawdown_ceiling_leaves_results_untouched() {
+        let dataset = dataset_with_bars(oscillating_bars(400));
+        let broker = broker();
+        let strategy = indicator_strategy(10);
+        let full = evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
+        let guarded = evaluate_strategy(
+            &strategy,
+            &dataset,
+            &broker,
+            &ScoutConfig {
+                abandon_above_drawdown_percent: Some(100.0),
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(!guarded.telemetry.abandoned_above_drawdown);
+        assert_eq!(guarded.equity.len(), full.equity.len());
+        assert_eq!(
+            guarded.metrics.net_profit.to_bits(),
+            full.metrics.net_profit.to_bits()
+        );
     }
 
     fn short_strategy() -> StrategyIr {
@@ -1618,8 +1825,8 @@ mod tests {
                     expiry_bars: 2,
                 },
                 98.0,
-                // Pending fill defers same-bar SL/TP (SQX Selected-TF rule).
-                ExitReason::EndOfData,
+                // MT5 hedged model: the attached target is live on the fill bar.
+                ExitReason::TakeProfit,
             ),
         ] {
             let mut strategy = strategy();
@@ -1647,10 +1854,11 @@ mod tests {
     }
 
     #[test]
-    fn end_of_day_flatten_closes_at_22_and_blocks_later_entries() {
+    fn end_of_day_flatten_closes_at_configured_hour_and_blocks_later_entries() {
         let mut strategy = strategy();
         strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 10.0 };
         strategy.manage.flatten_end_of_day = true;
+        strategy.manage.end_of_day_hour = 23;
         let data = dataset_with_bars(vec![
             timed_bar("2024-01-01T17:00:00Z"),
             timed_bar("2024-01-01T18:00:00Z"),
@@ -1664,7 +1872,7 @@ mod tests {
         assert_eq!(result.trades.len(), 1);
         assert_eq!(
             result.trades[0].exit_timestamp_ms,
-            timed_bar("2024-01-01T22:00:00Z").timestamp_ms
+            timed_bar("2024-01-01T23:00:00Z").timestamp_ms
         );
     }
 
@@ -1747,6 +1955,53 @@ mod tests {
             result.trades[0].entry_timestamp_ms,
             timed_bar("2024-01-01T10:00:00Z").timestamp_ms
         );
+    }
+
+    #[test]
+    fn a_widened_entry_window_admits_evening_entries() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.manage.time_stop_bars = Some(1);
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-01T01:00:00Z"),
+            timed_bar("2024-01-01T01:30:00Z"),
+            timed_bar("2024-01-01T10:00:00Z"),
+            timed_bar("2024-01-01T11:00:00Z"),
+            timed_bar("2024-01-01T19:00:00Z"),
+            timed_bar("2024-01-01T20:00:00Z"),
+        ]);
+        let evening = timed_bar("2024-01-01T19:00:00Z").timestamp_ms;
+        let config = ScoutConfig {
+            entry_window: EntryWindow::new(2, 23),
+            ..ScoutConfig::default()
+        };
+        let widened = evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
+        assert!(
+            widened
+                .trades
+                .iter()
+                .any(|trade| trade.entry_timestamp_ms == evening)
+        );
+        let default =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert!(
+            !default
+                .trades
+                .iter()
+                .any(|trade| trade.entry_timestamp_ms == evening)
+        );
+        // 01:00 stays outside either window, so widening the end never opens the start.
+        assert!(widened.telemetry.skipped_outside_entry_window > 0);
+    }
+
+    #[test]
+    fn an_inverted_entry_window_is_rejected() {
+        let config = ScoutConfig {
+            entry_window: EntryWindow::new(22, 3),
+            ..ScoutConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

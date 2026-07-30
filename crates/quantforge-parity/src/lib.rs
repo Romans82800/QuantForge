@@ -138,6 +138,46 @@ pub struct ParityMetrics {
     pub trade_count: usize,
     pub max_drawdown: f64,
     pub max_drawdown_percent: f64,
+    /// Always recounted from the parity trade list rather than copied from an
+    /// engine, so both sides are classified by one rule and any gap is real.
+    #[serde(default)]
+    pub winning_trades: usize,
+    #[serde(default)]
+    pub losing_trades: usize,
+    #[serde(default)]
+    pub win_rate: f64,
+    #[serde(default)]
+    pub profit_factor: Option<f64>,
+}
+
+/// MT5 counts a closing deal as a profit trade when its net profit is strictly
+/// above zero, so a break-even exit is neither a win nor a loss.
+fn classify_trades(trades: &[ParityTrade]) -> (usize, usize, f64, Option<f64>) {
+    let winning = trades
+        .iter()
+        .filter(|trade| trade.net_profit > 0.0)
+        .count();
+    let losing = trades
+        .iter()
+        .filter(|trade| trade.net_profit < 0.0)
+        .count();
+    let win_rate = if trades.is_empty() {
+        0.0
+    } else {
+        winning as f64 / trades.len() as f64 * 100.0
+    };
+    let gross_wins = trades
+        .iter()
+        .filter(|trade| trade.net_profit > 0.0)
+        .map(|trade| trade.net_profit)
+        .sum::<f64>();
+    let gross_losses = -trades
+        .iter()
+        .filter(|trade| trade.net_profit < 0.0)
+        .map(|trade| trade.net_profit)
+        .sum::<f64>();
+    let profit_factor = (gross_losses > 0.0).then_some(gross_wins / gross_losses);
+    (winning, losing, win_rate, profit_factor)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,8 +224,22 @@ impl ParityRun {
                 trade_count: result.metrics.trade_count,
                 max_drawdown: result.metrics.max_drawdown,
                 max_drawdown_percent: result.metrics.max_drawdown_percent,
+                winning_trades: 0,
+                losing_trades: 0,
+                win_rate: 0.0,
+                profit_factor: None,
             },
         }
+        .with_recounted_classification()
+    }
+
+    fn with_recounted_classification(mut self) -> Self {
+        let (winning, losing, win_rate, profit_factor) = classify_trades(&self.trades);
+        self.metrics.winning_trades = winning;
+        self.metrics.losing_trades = losing;
+        self.metrics.win_rate = win_rate;
+        self.metrics.profit_factor = profit_factor;
+        self
     }
 
     pub fn from_judge(result: &JudgeResult) -> Self {
@@ -261,6 +315,20 @@ pub struct DiffReport {
     pub aligned_trade_count: usize,
     pub required_aligned_trade_count: usize,
     pub trade_alignment_passed: bool,
+    /// Diagnostic: always recounted from each side's trade list so a win-rate
+    /// split with equal trade counts cannot hide. Not a hard gate.
+    #[serde(default)]
+    pub reference_win_rate: f64,
+    #[serde(default)]
+    pub external_win_rate: f64,
+    #[serde(default)]
+    pub reference_winning_trades: usize,
+    #[serde(default)]
+    pub external_winning_trades: usize,
+    #[serde(default)]
+    pub reference_profit_factor: Option<f64>,
+    #[serde(default)]
+    pub external_profit_factor: Option<f64>,
     pub trade_diffs: Vec<TradeDiff>,
     pub tolerances: ParityTolerances,
 }
@@ -345,6 +413,12 @@ pub fn compare_runs(
         aligned_trade_count,
         required_aligned_trade_count,
         trade_alignment_passed,
+        reference_win_rate: reference.metrics.win_rate,
+        external_win_rate: external.metrics.win_rate,
+        reference_winning_trades: reference.metrics.winning_trades,
+        external_winning_trades: external.metrics.winning_trades,
+        reference_profit_factor: reference.metrics.profit_factor,
+        external_profit_factor: external.metrics.profit_factor,
         trade_diffs,
         tolerances,
     })
@@ -543,14 +617,15 @@ fn pair_deals(rows: Vec<DealRow>) -> Result<Vec<ParityTrade>, ParityError> {
     }
 
     let mut trades = Vec::new();
-    for (position_id, position) in positions {
+    for (_position_id, position) in positions {
         let Some(side) = position.side else {
             continue;
         };
+        // Tester ToDate can leave a live position with no exit deal. Scout/Judge
+        // force-close at EndOfData; skip incomplete rows so trade-count compare
+        // still works (delta of 0–1 is expected until EA end-of-test flatten).
         if position.entry_volume <= 0.0 || position.exit_volume <= 0.0 {
-            return Err(ParityError::InvalidInput(format!(
-                "position {position_id} does not have both entry and exit deals"
-            )));
+            continue;
         }
         trades.push(ParityTrade {
             side,
@@ -587,6 +662,7 @@ fn calculate_metrics(
             max_drawdown_percent = max_drawdown_percent.max(drawdown / peak * 100.0);
         }
     }
+    let (winning_trades, losing_trades, win_rate, profit_factor) = classify_trades(trades);
     ParityMetrics {
         initial_balance,
         ending_balance,
@@ -594,6 +670,10 @@ fn calculate_metrics(
         trade_count: trades.len(),
         max_drawdown,
         max_drawdown_percent,
+        winning_trades,
+        losing_trades,
+        win_rate,
+        profit_factor,
     }
 }
 
@@ -802,6 +882,7 @@ mod tests {
             parity_deals_file: "deals.csv".into(),
             parity_equity_file: "equity.csv".into(),
             parity_metadata_file: "metadata.csv".into(),
+            export_style: quantforge_export_mql5::ExportStyle::Sqx,
             config: Mql5ExportConfig {
                 tester: TesterConfig::default(),
                 ..Mql5ExportConfig::default()
@@ -840,8 +921,13 @@ mod tests {
                 trade_count: 1,
                 max_drawdown: 0.0,
                 max_drawdown_percent: 0.0,
+                winning_trades: 0,
+                losing_trades: 0,
+                win_rate: 0.0,
+                profit_factor: None,
             },
         }
+        .with_recounted_classification()
     }
 
     #[test]

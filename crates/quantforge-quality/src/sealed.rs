@@ -407,6 +407,8 @@ mod tests {
                 order: Default::default(),
             },
             exit: None,
+            exit_long: None,
+            exit_short: None,
             filters: Vec::new(),
             side: Side::LongOnly,
             risk: RiskPolicy::FixedCurrency { amount: 1.0 },

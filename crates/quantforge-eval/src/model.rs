@@ -35,11 +35,35 @@ impl Default for CostModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndicatorEngine {
+    /// MT5 built-in semantics (rolling-mean ATR, standard iADX).
+    Mt5,
+    /// StrategyQuant Sq* indicator math (default for parity).
+    #[default]
+    Sqx,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoutConfig {
     pub initial_balance: f64,
     pub same_bar_policy: SameBarPolicy,
     pub costs: CostModel,
+    #[serde(default)]
+    pub indicator_engine: IndicatorEngine,
+    /// Broker-local hours in which new entries and pending orders may be placed.
+    #[serde(default)]
+    pub entry_window: EntryWindow,
+    /// Stop replaying once equity drawdown passes this percentage.
+    ///
+    /// Drawdown never recovers downward, so a run past the ceiling can no longer
+    /// satisfy a gate that caps drawdown at or below it. Search sets this to its
+    /// drawdown gate to skip the remainder of a doomed backtest; the returned
+    /// metrics are then truncated and only valid for rejecting the candidate.
+    /// Leave `None` whenever the metrics themselves are the output.
+    #[serde(default)]
+    pub abandon_above_drawdown_percent: Option<f64>,
 }
 
 impl Default for ScoutConfig {
@@ -48,6 +72,9 @@ impl Default for ScoutConfig {
             initial_balance: 100_000.0,
             same_bar_policy: SameBarPolicy::Conservative,
             costs: CostModel::default(),
+            indicator_engine: IndicatorEngine::Sqx,
+            entry_window: EntryWindow::default(),
+            abandon_above_drawdown_percent: None,
         }
     }
 }
@@ -85,6 +112,7 @@ impl ScoutConfig {
                 )));
             }
         }
+        self.entry_window.validate()?;
         Ok(())
     }
 }
@@ -154,15 +182,82 @@ pub struct BacktestMetrics {
     pub expectancy: f64,
 }
 
+impl BacktestMetrics {
+    /// MT5 Recovery Factor: net profit ÷ absolute equity max drawdown.
+    ///
+    /// Matches MetaTrader 5's "Recovery Factor" (Total Net Profit / Equity
+    /// Drawdown Maximal in account currency). Returns +∞ when there is profit
+    /// and no drawdown, and the raw net profit when both are non-positive.
+    pub fn recovery_factor(&self) -> f64 {
+        if self.max_drawdown > 1.0e-12 {
+            self.net_profit / self.max_drawdown
+        } else if self.net_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            self.net_profit
+        }
+    }
+}
+
 /// Broker-local hour when new entries/pending may first be placed (inclusive).
 pub const MANDATORY_ENTRY_WINDOW_START_HOUR: u32 = 2;
 /// Broker-local hour when the entry window ends (exclusive). 19 = 7pm: no new
 /// entries or pending from 19:00 onward.
 pub const MANDATORY_ENTRY_WINDOW_END_HOUR: u32 = 19;
 
-/// Hard-coded QuantForge entry session: `[02:00, 19:00)` broker local time.
+/// Broker-local hours during which new entries and pending orders may be placed.
+///
+/// Both bounds are broker local time, resolved through the symbol profile's
+/// timezone, so a window survives a broker whose server day starts at a
+/// different UTC offset. `start_hour` is inclusive and `end_hour` exclusive, so
+/// `[2, 19)` admits 02:00 through 18:59 and rejects 19:00 onward. Brokers that
+/// only accept orders a few minutes after the hour should widen the start hour
+/// rather than rely on the minute-level session gate in the broker profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryWindow {
+    pub start_hour: u32,
+    pub end_hour: u32,
+}
+
+impl Default for EntryWindow {
+    fn default() -> Self {
+        Self {
+            start_hour: MANDATORY_ENTRY_WINDOW_START_HOUR,
+            end_hour: MANDATORY_ENTRY_WINDOW_END_HOUR,
+        }
+    }
+}
+
+impl EntryWindow {
+    pub fn new(start_hour: u32, end_hour: u32) -> Self {
+        Self {
+            start_hour,
+            end_hour,
+        }
+    }
+
+    pub fn contains(&self, hour: u32) -> bool {
+        (self.start_hour..self.end_hour).contains(&hour)
+    }
+
+    pub fn validate(&self) -> Result<(), EvalError> {
+        if self.start_hour > 23 || self.end_hour > 24 {
+            return Err(EvalError::InvalidConfig(
+                "entry window hours must be 0-23 for the start and 0-24 for the end".into(),
+            ));
+        }
+        if self.start_hour >= self.end_hour {
+            return Err(EvalError::InvalidConfig(
+                "entry window start hour must be earlier than its end hour".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Default QuantForge entry session: `[02:00, 19:00)` broker local time.
 pub fn in_mandatory_entry_window(hour: u32) -> bool {
-    (MANDATORY_ENTRY_WINDOW_START_HOUR..MANDATORY_ENTRY_WINDOW_END_HOUR).contains(&hour)
+    EntryWindow::default().contains(hour)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +282,11 @@ pub struct ScoutTelemetry {
     pub fallback_spread_bars: usize,
     pub swap_rollover_events: usize,
     pub swap_effective_days: u32,
+    /// Replay stopped early because drawdown passed
+    /// [`ScoutConfig::abandon_above_drawdown_percent`]. The accompanying metrics
+    /// cover only the bars replayed and are valid solely for rejection.
+    #[serde(default)]
+    pub abandoned_above_drawdown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,4 +317,34 @@ pub enum EvalError {
     Broker(#[from] BrokerSpecError),
     #[error(transparent)]
     Ir(#[from] IrError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BacktestMetrics;
+
+    fn metrics(net_profit: f64, max_drawdown: f64) -> BacktestMetrics {
+        BacktestMetrics {
+            initial_balance: 100_000.0,
+            ending_balance: 100_000.0 + net_profit,
+            net_profit,
+            return_percent: net_profit / 100_000.0 * 100.0,
+            trade_count: 1,
+            winning_trades: 1,
+            losing_trades: 0,
+            win_rate: 100.0,
+            profit_factor: None,
+            max_drawdown,
+            max_drawdown_percent: max_drawdown / 100_000.0 * 100.0,
+            sharpe_ratio: None,
+            expectancy: net_profit,
+        }
+    }
+
+    #[test]
+    fn recovery_factor_matches_mt5_definition() {
+        // MT5: Total Net Profit / Equity Drawdown Maximal
+        let value = metrics(29_706.01, 8_593.20).recovery_factor();
+        assert!((value - 3.46).abs() < 0.005);
+    }
 }

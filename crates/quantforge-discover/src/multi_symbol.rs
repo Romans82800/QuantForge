@@ -17,8 +17,7 @@ pub struct PackSymbol {
 
 /// FX majors/crosses used for the default multi-symbol gate.
 pub const DEFAULT_FX_PACK: &[&str] = &[
-    "AUDUSD", "EURGBP", "EURJPY", "EURNZD", "GBPJPY", "GBPUSD", "NZDUSD", "USDCHF",
-    "USDJPY",
+    "AUDUSD", "EURGBP", "EURJPY", "EURNZD", "GBPJPY", "GBPUSD", "NZDUSD", "USDCHF", "USDJPY",
 ];
 
 /// Non-gating asset classes that may be reported as out-of-universe evidence.

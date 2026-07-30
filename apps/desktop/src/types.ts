@@ -82,6 +82,26 @@ export interface PartitionEquityView {
   isTrades: number;
   oos1Trades: number;
   oos2Trades: number;
+  fullRunTrades: number;
+  fullRunReturnPercent: number;
+  fullRunNetProfit: number;
+  fullRunMaxDrawdown: number;
+  fullRunMaxDrawdownPercent: number;
+  fullRunProfitFactor: number | null;
+  fullRunWinRate: number;
+  fullRunSharpeRatio: number | null;
+  fullRunRecoveryFactor: number | null;
+  trades: TradeRowView[];
+}
+
+export interface TradeRowView {
+  side: string;
+  entryTimestampMs: number;
+  exitTimestampMs: number;
+  entryPrice: number;
+  exitPrice: number;
+  netProfit: number;
+  exitReason: string;
 }
 
 export interface CoverageCell {
@@ -92,8 +112,9 @@ export interface CoverageCell {
   intensity: number;
 }
 
-export interface FamilyCoverage {
-  family: string;
+export interface ConditionCoverage {
+  entryConditions: number;
+  label: string;
   occupied: number;
   total: number;
   cells: CoverageCell[];
@@ -102,13 +123,14 @@ export interface FamilyCoverage {
 export interface EliteRow {
   fingerprint: string;
   strategyId: string;
-  family: string;
+  entryConditions: number;
+  exitConditions: number;
   evidence: number;
   novelty: number;
   trades: number;
   returnPercent: number;
   drawdownPercent: number;
-  returnDrawdown: number | null;
+  recoveryFactor: number | null;
   profitFactor: number | null;
   sharpeRatio: number | null;
   isExpectancy: number;
@@ -137,6 +159,7 @@ export interface DatabankWorkspace {
   dataHash: string;
   brokerSpecHash: string;
   grammarVersion: string;
+  legacyReadOnly: boolean;
   qualityGrade: string;
   qualityScore: number;
   coverage: number;
@@ -152,10 +175,11 @@ export interface DatabankWorkspace {
   allowBreakEven: boolean;
   allowTrailingStops: boolean;
   allowPartialExits: boolean;
+  allowMarketEntries: boolean;
   allowStopEntries: boolean;
   allowLimitEntries: boolean;
   maxOneEntryPerDay: boolean;
-  families: FamilyCoverage[];
+  conditionGroups: ConditionCoverage[];
   elites: EliteRow[];
 }
 
@@ -181,11 +205,113 @@ export interface BatchEaExportView {
   evidencePaths: string[];
 }
 
+export interface WalkForwardFold {
+  fold: number;
+  start_timestamp_ms: number;
+  end_timestamp_ms: number;
+  decision_bars: number;
+  trades_in_fold: number;
+  metrics: Record<string, number | null>;
+  passed: boolean;
+}
+
+/**
+ * Serialized `quantforge_discover::RobustnessEvidence`. These keys stay
+ * snake_case because the databank record is embedded verbatim.
+ */
+export interface RobustnessEvidence {
+  m1_retention: {
+    selected_timeframe_metrics: Record<string, number | null>;
+    minimum_return_retention: number;
+    return_retention?: number | null;
+    trade_retention?: number | null;
+    drawdown_expansion?: number | null;
+  };
+  walk_forward: {
+    fold_scheme: string;
+    total_folds: number;
+    passing_folds: number;
+    passing_fraction: number;
+    required_passing_fraction: number;
+    folds?: WalkForwardFold[];
+  };
+  monte_carlo: {
+    method: string;
+    seed: number;
+    trials: number;
+    block_length: number;
+    skip_trade_probability?: number;
+    minimum_p05_net_profit?: number;
+    maximum_p95_drawdown_percent?: number;
+    p05_net_profit: number;
+    median_net_profit: number;
+    p95_drawdown_percent: number;
+    worst_drawdown_percent: number;
+    sample_paths?: number[][];
+    passed: boolean;
+  };
+  parameter_neighborhood: {
+    perturbation_fraction: number;
+    samples_requested: number;
+    samples_evaluated: number;
+    surviving_samples: number;
+    survival_fraction: number;
+    required_survival_fraction: number;
+    plateau_neighbors: number;
+    plateau_surviving: number;
+    plateau_survival_fraction?: number | null;
+    original_metrics?: Record<string, number | null> | null;
+    samples?: ParameterNeighborhoodSample[];
+  };
+}
+
+export interface ParameterNeighborhoodSample {
+  sample_index: number;
+  net_profit: number;
+  return_percent: number;
+  max_drawdown_percent: number;
+  trade_count: number;
+  profit_factor?: number | null;
+  sharpe_ratio?: number | null;
+  survived: boolean;
+}
+
+export type ResultsRobustnessMode = "standard" | "deep";
+
+export interface ResultsRobustnessRequest {
+  fingerprint: string;
+  mode: ResultsRobustnessMode;
+}
+
+export interface ResultsRobustnessView {
+  fingerprint: string;
+  strategyId: string;
+  mode: ResultsRobustnessMode;
+  passed: boolean;
+  blocker: string | null;
+  message: string;
+  artifactPath: string;
+  folds: number;
+  monteCarloTrials: number;
+  neighborhoodSamples: number;
+  evidence: RobustnessEvidence | null;
+}
+
+export interface EliteRobustnessView {
+  monteCarlo?: string | null;
+  walkForward?: string | null;
+  paramPermutation?: string | null;
+  summary?: string | null;
+  /** Full battery record; absent for elites deposited before it was persisted. */
+  evidence?: RobustnessEvidence | null;
+}
+
 export interface EliteDetail {
   fingerprint: string;
   strategyId: string;
   thesis: string;
-  family: string;
+  entryConditions: number;
+  exitConditions: number;
   niche: string;
   grade: string;
   parity: string;
@@ -194,6 +320,8 @@ export interface EliteDetail {
   metrics: Record<string, number | null>;
   strategyIr: unknown;
   equitySignature: number[];
+  /** Present when Discover persisted robustness gate detail; otherwise UI shows "not recorded". */
+  robustness?: EliteRobustnessView | null;
 }
 
 export type EliteSort =
@@ -201,9 +329,9 @@ export type EliteSort =
   | "novelty"
   | "trades"
   | "drawdown"
-  | "returnDrawdown"
+  | "recoveryFactor"
   | "sharpe"
-  | "family"
+  | "entryConditions"
   | "grade";
 
 export interface DataLabRequest {
@@ -258,22 +386,19 @@ export type DiscoverJobStatus =
   | "completed"
   | "failed";
 
-export type SearchFamilyId =
-  | "trend_pullback"
-  | "momentum_burst"
-  | "donchian_breakout"
-  | "mean_reversion_band"
-  | "zscore_reversion"
-  | "session_orb"
-  | "impulse_candle"
-  | "vol_squeeze_break"
-  | "supply_demand_reclaim"
-  | "sweep_reclaim";
+export interface UniversalGrammarConfig {
+  minimumEntryConditions: number;
+  maximumEntryConditions: number;
+  minimumExitConditions: number;
+  maximumExitConditions: number;
+  minimumShift: number;
+  maximumShift: number;
+}
 
-export type DiscoverRunModeId = "fast_scout" | "full_harvest";
+export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest";
 
-export interface FamilyBakeoffRow {
-  family: SearchFamilyId;
+export interface ConditionBakeoffRow {
+  entryConditions: number;
   medianIsExpectancyR: number;
   medianOos1ExpectancyR: number;
   medianRetention: number;
@@ -284,12 +409,12 @@ export interface FamilyBakeoffRow {
   evaluations: number;
 }
 
-export interface FamilyBakeoffReport {
-  rows: FamilyBakeoffRow[];
-  recommended: SearchFamilyId | null;
+export interface ConditionBakeoffReport {
+  rows: ConditionBakeoffRow[];
+  recommended: number | null;
 }
 
-export interface FamilyBakeoffRequest {
+export interface ConditionBakeoffRequest {
   dataPath: string;
   metadataPath: string | null;
   sourceTimezone: string | null;
@@ -304,8 +429,8 @@ export interface FamilyBakeoffRequest {
   slippagePointsPerSide: number;
   fallbackSpreadPoints: number | null;
   validationFraction: number;
-  /** Families to test; empty is rejected by the backend. */
-  families: SearchFamilyId[];
+  /** Entry-condition counts to compare; empty defaults to 2, 3, 4 on the backend. */
+  entryConditionCounts: number[];
 }
 
 export interface DiscoverRequest {
@@ -326,9 +451,10 @@ export interface DiscoverRequest {
   correlationThreshold: number | null;
   noveltyWeight: number | null;
   seed: number | null;
-  searchFamily: SearchFamilyId | null;
+  universalGrammar: UniversalGrammarConfig | null;
   runMode: DiscoverRunModeId | null;
   earlyStopPotElites: number | null;
+  targetDatabankElites: number | null;
   searchRanges: SearchRangeProfile | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
@@ -347,9 +473,13 @@ export interface DiscoverRequest {
   allowBreakEven: boolean | null;
   allowTrailingStops: boolean | null;
   allowPartialExits: boolean | null;
+  allowMarketEntries: boolean | null;
   allowStopEntries: boolean | null;
   allowLimitEntries: boolean | null;
   flattenAt22: boolean | null;
+  endOfDayHour: number | null;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
   maxOneEntryPerDay: boolean | null;
   mutateAfterElites: number | null;
   randomFillFraction: number | null;
@@ -358,6 +488,8 @@ export interface DiscoverRequest {
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
   robustnessNeighborhoodSamples: number | null;
+  robustnessPerturbationFraction: number | null;
+  minimumNeighborhoodSurvivalFraction: number | null;
   calendarYearFolds: boolean | null;
   minimumDeflatedTradeSharpe: number | null;
   multiSymbolMinimumPass: number | null;
@@ -471,6 +603,7 @@ export interface DiscoverJobView {
   potElites: number;
   potNewNiches: number;
   databankElites: number;
+  targetDatabankElites?: number | null;
   mutateAfterElites: number;
   breedingActive: boolean;
   workerThreads: number;
@@ -519,6 +652,8 @@ export interface ChallengeRequest {
   fallbackSpreadPoints: number | null;
   maxSpreadPoints: number | null;
   initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
   folds: number;
   monteCarloTrials: number;
   neighborhoodSamples: number;
@@ -671,6 +806,8 @@ export interface JudgeRequest {
   fallbackSpreadPoints: number | null;
   maxSpreadPoints: number | null;
   initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
 }
 
 export interface JudgeView {
@@ -707,6 +844,8 @@ export interface ExportRequest {
   currency: string;
   leverage: number;
   testerModel: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
 }
 
 export interface ExportView {
@@ -754,6 +893,12 @@ export interface ParityView {
   drawdownDeltaRelative: number;
   equityDivergencePercent: number;
   protectiveOrdersPresent: boolean;
+  referenceWinRate: number;
+  externalWinRate: number;
+  referenceWinningTrades: number;
+  externalWinningTrades: number;
+  referenceProfitFactor: number | null;
+  externalProfitFactor: number | null;
 }
 
 export interface IndicatorParityRequest {
@@ -788,7 +933,7 @@ export interface PortfolioRequest {
   maximumPairwiseCorrelation: number;
   maximumWeightPerStrategy: number;
   maximumSymbolExposure: number;
-  maximumFamilyExposure: number;
+  maximumCohortExposure: number;
   maximumStrategies: number;
   minimumReturnPercent: number;
   cvarTailFraction: number;
@@ -799,7 +944,7 @@ export interface PortfolioRequest {
 
 export interface PortfolioAllocationView {
   fingerprint: string;
-  family: string;
+  cohort: string;
   symbol: string;
   weight: number;
   returnPercent: number;

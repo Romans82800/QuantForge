@@ -10,6 +10,8 @@ input int    InpDeviationPoints=@@DEVIATION@@;
 input double InpMaxSpreadPoints=@@MAX_SPREAD@@;
 input double InpEstimatedSlippagePointsPerSide=@@SLIPPAGE@@;
 input double InpCommissionPerLotRoundTurn=@@COMMISSION@@;
+input int    InpEntryWindowStartHour=@@ENTRY_WINDOW_START@@;
+input int    InpEntryWindowEndHour=@@ENTRY_WINDOW_END@@;
 input string InpParityPrefix="@@PARITY_PREFIX@@";
 
 CTrade g_trade;
@@ -44,13 +46,94 @@ double QFPrice(const int field,const int shift)
    return iClose(_Symbol,_Period,shift);
 }
 
+// Handles live for the whole run. Creating and releasing one per condition atom
+// makes MT5 rebuild the indicator's history on every evaluation, which is by far
+// the largest cost of a generated expert in the Strategy Tester.
+#define QFH_MAX_HANDLES 48
+
+string g_qfh_keys[QFH_MAX_HANDLES];
+int    g_qfh_values[QFH_MAX_HANDLES];
+int    g_qfh_count=0;
+
+int QFHCached(const string key)
+{
+   for(int index=0;index<g_qfh_count;index++)
+      if(g_qfh_keys[index]==key)
+         return g_qfh_values[index];
+   return -2;
+}
+
+int QFHRemember(const string key,const int handle)
+{
+   if(g_qfh_count<QFH_MAX_HANDLES)
+   {
+      g_qfh_keys[g_qfh_count]=key;
+      g_qfh_values[g_qfh_count]=handle;
+      g_qfh_count++;
+   }
+   return handle;
+}
+
+void QFHReleaseHandles()
+{
+   for(int index=0;index<g_qfh_count;index++)
+      if(g_qfh_values[index]!=INVALID_HANDLE)
+         IndicatorRelease(g_qfh_values[index]);
+   g_qfh_count=0;
+}
+
+int QFHMa(const ENUM_MA_METHOD method,const ENUM_APPLIED_PRICE source,const int period)
+{
+   const string key="MA|"+IntegerToString(period)+"|"+IntegerToString((int)method)
+                    +"|"+IntegerToString((int)source);
+   const int cached=QFHCached(key);
+   if(cached!=-2)
+      return cached;
+   return QFHRemember(key,iMA(_Symbol,_Period,period,0,method,source));
+}
+
+int QFHRsi(const ENUM_APPLIED_PRICE source,const int period)
+{
+   const string key="RSI|"+IntegerToString(period)+"|"+IntegerToString((int)source);
+   const int cached=QFHCached(key);
+   if(cached!=-2)
+      return cached;
+   return QFHRemember(key,iRSI(_Symbol,_Period,period,source));
+}
+
+int QFHAtr(const int period)
+{
+   const string key="ATR|"+IntegerToString(period);
+   const int cached=QFHCached(key);
+   if(cached!=-2)
+      return cached;
+   return QFHRemember(key,iATR(_Symbol,_Period,period));
+}
+
+int QFHAdx(const int period)
+{
+   const string key="ADXW|"+IntegerToString(period);
+   const int cached=QFHCached(key);
+   if(cached!=-2)
+      return cached;
+   return QFHRemember(key,iADXWilder(_Symbol,_Period,period));
+}
+
+int QFHStdDev(const ENUM_APPLIED_PRICE source,const int period)
+{
+   const string key="STDDEV|"+IntegerToString(period)+"|"+IntegerToString((int)source);
+   const int cached=QFHCached(key);
+   if(cached!=-2)
+      return cached;
+   return QFHRemember(key,iStdDev(_Symbol,_Period,period,0,MODE_SMA,source));
+}
+
 double QFBufferValue(const int handle,const int shift)
 {
    if(handle==INVALID_HANDLE || shift<0)
       return EMPTY_VALUE;
    double values[1];
    const int copied=CopyBuffer(handle,0,shift,1,values);
-   IndicatorRelease(handle);
    if(copied!=1)
       return EMPTY_VALUE;
    return values[0];
@@ -62,7 +145,6 @@ double QFBufferValueAt(const int handle,const int buffer,const int shift)
       return EMPTY_VALUE;
    double values[1];
    const int copied=CopyBuffer(handle,buffer,shift,1,values);
-   IndicatorRelease(handle);
    if(copied!=1)
       return EMPTY_VALUE;
    return values[0];
@@ -71,41 +153,39 @@ double QFBufferValueAt(const int handle,const int buffer,const int shift)
 double QFMA(const ENUM_MA_METHOD method,const ENUM_APPLIED_PRICE source,
             const int period,const int shift)
 {
-   return QFBufferValue(iMA(_Symbol,_Period,period,0,method,source),shift);
+   return QFBufferValue(QFHMa(method,source,period),shift);
 }
 
 double QFRSI(const ENUM_APPLIED_PRICE source,const int period,const int shift)
 {
-   return QFBufferValue(iRSI(_Symbol,_Period,period,source),shift);
+   return QFBufferValue(QFHRsi(source,period),shift);
 }
 
 double QFATR(const int period,const int shift)
 {
-   return QFBufferValue(iATR(_Symbol,_Period,period),shift);
+   return QFBufferValue(QFHAtr(period),shift);
 }
 
 double QFADX(const int period,const int shift)
 {
    // QuantForge's typed ADX/+DI/-DI implementation uses Welles Wilder
    // smoothing. MT5 exposes that exact buffer family separately from iADX.
-   return QFBufferValue(iADXWilder(_Symbol,_Period,period),shift);
+   return QFBufferValue(QFHAdx(period),shift);
 }
 
 double QFPlusDI(const int period,const int shift)
 {
-   const int handle=iADXWilder(_Symbol,_Period,period);
-   return QFBufferValueAt(handle,1,shift);
+   return QFBufferValueAt(QFHAdx(period),1,shift);
 }
 
 double QFMinusDI(const int period,const int shift)
 {
-   const int handle=iADXWilder(_Symbol,_Period,period);
-   return QFBufferValueAt(handle,2,shift);
+   return QFBufferValueAt(QFHAdx(period),2,shift);
 }
 
 double QFStdDev(const ENUM_APPLIED_PRICE source,const int period,const int shift)
 {
-   return QFBufferValue(iStdDev(_Symbol,_Period,period,0,MODE_SMA,source),shift);
+   return QFBufferValue(QFHStdDev(source,period),shift);
 }
 
 double QFExtreme(const ENUM_SERIESMODE mode,const int field,const int period,const int shift,
@@ -179,15 +259,21 @@ double QFCloseLocationInBar(const int shift)
 
 double QFAtrPercentile(const int atr_period,const int lookback,const int shift)
 {
-   if(atr_period<1 || lookback<1 || Bars(_Symbol,_Period)<shift+lookback)
+   if(atr_period<1 || lookback<1 || shift<0 || Bars(_Symbol,_Period)<shift+lookback)
+      return EMPTY_VALUE;
+   // One bulk copy instead of `lookback` single-value reads. CopyBuffer returns
+   // oldest-first, so index `copied-1-offset` is the bar at `shift+offset`.
+   double window[];
+   const int copied=CopyBuffer(QFHAtr(atr_period),0,shift,lookback,window);
+   if(copied<1)
       return EMPTY_VALUE;
    double values[];
-   ArrayResize(values,lookback);
+   ArrayResize(values,copied);
    int finite=0;
    double current=EMPTY_VALUE;
-   for(int offset=0;offset<lookback;offset++)
+   for(int offset=0;offset<copied;offset++)
    {
-      const double value=QFATR(atr_period,shift+offset);
+      const double value=window[copied-1-offset];
       if(!QFValid(value))
          continue;
       values[finite++]=value;
@@ -214,7 +300,8 @@ bool QFSameBrokerDay(const datetime left,const datetime right)
 double QFSessionRangeExtreme(const int start_hour,const int range_bars,const int shift,
                              const bool want_high)
 {
-   if(range_bars<1 || Bars(_Symbol,_Period)<=shift)
+   // Mirror quantforge_sqx::session_range_series (see sqx_template.mq5).
+   if(range_bars<1 || shift<0 || Bars(_Symbol,_Period)<=shift)
       return EMPTY_VALUE;
    const datetime anchor=iTime(_Symbol,_Period,shift);
    if(anchor<=0)
@@ -222,7 +309,8 @@ double QFSessionRangeExtreme(const int start_hour,const int range_bars,const int
    MqlDateTime parts;
    if(!TimeToStruct(anchor,parts))
       return EMPTY_VALUE;
-   int start_shift=-1;
+
+   int window_start=-1;
    for(int index=Bars(_Symbol,_Period)-1;index>=shift;index--)
    {
       const datetime bar_time=iTime(_Symbol,_Period,index);
@@ -233,42 +321,34 @@ double QFSessionRangeExtreme(const int start_hour,const int range_bars,const int
          continue;
       if(bar_parts.hour>=start_hour)
       {
-         start_shift=index;
+         window_start=index;
          break;
       }
    }
-   if(start_shift<0 || start_shift+1<range_bars)
+   if(window_start<0)
       return EMPTY_VALUE;
-   // Window is the earliest `range_bars` bars from session start (lower shift = newer).
-   // Walk forward in time: start_shift is oldest candidate; find contiguous range.
-   int oldest=start_shift;
-   for(int index=start_shift;index>=shift;index--)
+
+   const int window_end=window_start-(range_bars-1);
+   if(window_end<shift)
+      return EMPTY_VALUE;
+
+   double extreme=want_high ? -DBL_MAX : DBL_MAX;
+   int collected=0;
+   for(int index=window_start;index>=window_end;index--)
    {
       const datetime bar_time=iTime(_Symbol,_Period,index);
       if(bar_time<=0 || !QFSameBrokerDay(bar_time,anchor))
-         break;
+         return EMPTY_VALUE;
       MqlDateTime bar_parts;
       if(!TimeToStruct(bar_time,bar_parts) || bar_parts.hour<start_hour)
-         continue;
-      oldest=index;
-   }
-   // Collect `range_bars` bars starting at oldest toward present.
-   int collected=0;
-   double extreme=want_high ? -DBL_MAX : DBL_MAX;
-   for(int index=oldest;index>=shift && collected<range_bars;index--)
-   {
-      const datetime bar_time=iTime(_Symbol,_Period,index);
-      if(bar_time<=0 || !QFSameBrokerDay(bar_time,anchor))
-         break;
-      const double high=iHigh(_Symbol,_Period,index);
-      const double low=iLow(_Symbol,_Period,index);
+         return EMPTY_VALUE;
       if(want_high)
-         extreme=MathMax(extreme,high);
+         extreme=MathMax(extreme,iHigh(_Symbol,_Period,index));
       else
-         extreme=MathMin(extreme,low);
+         extreme=MathMin(extreme,iLow(_Symbol,_Period,index));
       collected++;
    }
-   if(collected<range_bars)
+   if(collected!=range_bars)
       return EMPTY_VALUE;
    return extreme;
 }
@@ -286,52 +366,57 @@ double QFSessionRangeLow(const int start_hour,const int range_bars,const int shi
 double QFSwingBaseZoneExtreme(const int swing_left,const int swing_right,const int base_bars,
                               const int shift,const bool zone_high)
 {
-   // MT5 shift: larger = older. Pivot confirmed at shift `confirm` where
-   // pivot = confirm + swing_right (older by swing_right bars).
+   // Match Rust `swing_base_zone_series`: forward carry of the most recent
+   // confirmed pivot zone up to the evaluation bar (no future pivots).
+   // Ready delay is max(swing_right, base_bars) so base_bars > swing_right
+   // still forms a zone (required for short-side reclaim genes).
    if(swing_left<1 || swing_right<1 || base_bars<1)
       return EMPTY_VALUE;
    const int total=Bars(_Symbol,_Period);
-   if(total<=shift+swing_right+base_bars+swing_left)
+   const int ready_delay=(swing_right>base_bars ? swing_right : base_bars);
+   if(total<=shift+ready_delay+swing_left)
       return EMPTY_VALUE;
+   const int target_ri=total-1-shift;
    double last_zone=EMPTY_VALUE;
-   for(int confirm=total-1-swing_right;confirm>=shift;confirm--)
+   for(int ri=0;ri<=target_ri;ri++)
    {
-      const int pivot=confirm+swing_right;
-      if(pivot+swing_left>=total || pivot-swing_right<0)
+      if(ri<ready_delay)
          continue;
+      const int pivot_ri=ri-ready_delay;
+      if(pivot_ri<swing_left)
+         continue;
+      const int pivot_shift=total-1-pivot_ri;
       bool is_swing_low=true;
       bool is_swing_high=true;
       for(int offset=1;offset<=swing_left;offset++)
       {
-         // Older bars: pivot+offset
-         if(iLow(_Symbol,_Period,pivot)>iLow(_Symbol,_Period,pivot+offset))
+         if(iLow(_Symbol,_Period,pivot_shift)>iLow(_Symbol,_Period,pivot_shift+offset))
             is_swing_low=false;
-         if(iHigh(_Symbol,_Period,pivot)<iHigh(_Symbol,_Period,pivot+offset))
+         if(iHigh(_Symbol,_Period,pivot_shift)<iHigh(_Symbol,_Period,pivot_shift+offset))
             is_swing_high=false;
       }
       for(int offset=1;offset<=swing_right;offset++)
       {
-         // Newer bars: pivot-offset
-         if(iLow(_Symbol,_Period,pivot)>=iLow(_Symbol,_Period,pivot-offset))
+         if(iLow(_Symbol,_Period,pivot_shift)>=iLow(_Symbol,_Period,pivot_shift-offset))
             is_swing_low=false;
-         if(iHigh(_Symbol,_Period,pivot)<=iHigh(_Symbol,_Period,pivot-offset))
+         if(iHigh(_Symbol,_Period,pivot_shift)<=iHigh(_Symbol,_Period,pivot_shift-offset))
             is_swing_high=false;
       }
       const bool use_pivot=zone_high ? is_swing_low : is_swing_high;
       if(!use_pivot)
          continue;
-      // Base is `base_bars` bars after the pivot (newer).
-      const int base_oldest=pivot-1;
-      if(base_oldest-(base_bars-1)<0)
+      const int base_start_ri=pivot_ri+1;
+      const int base_end_ri=base_start_ri+base_bars-1;
+      if(base_end_ri>ri)
          continue;
       double extreme=zone_high ? -DBL_MAX : DBL_MAX;
-      for(int offset=0;offset<base_bars;offset++)
+      for(int bi=base_start_ri;bi<=base_end_ri;bi++)
       {
-         const int index=base_oldest-offset;
+         const int bar_shift=total-1-bi;
          if(zone_high)
-            extreme=MathMax(extreme,iHigh(_Symbol,_Period,index));
+            extreme=MathMax(extreme,iHigh(_Symbol,_Period,bar_shift));
          else
-            extreme=MathMin(extreme,iLow(_Symbol,_Period,index));
+            extreme=MathMin(extreme,iLow(_Symbol,_Period,bar_shift));
       }
       last_zone=extreme;
    }
@@ -392,6 +477,8 @@ double QFContext(const int field,const int shift)
    return field==0 ? (double)parts.hour : (double)parts.day_of_week;
 }
 
+@@QF_EXTENDED_INDICATORS@@
+
 bool QFGreater(const double left,const double right)
 {
    return QFValid(left) && QFValid(right) && left>right;
@@ -436,7 +523,14 @@ bool QFShortSignal(const int extra_shift)
 
 bool QFExitSignal(const int extra_shift)
 {
-   return @@EXIT_SIGNAL@@;
+   if(!QFOwnPosition())
+      return false;
+   const long position_type = PositionGetInteger(POSITION_TYPE);
+   if(position_type == POSITION_TYPE_BUY)
+      return @@LONG_EXIT_SIGNAL@@;
+   if(position_type == POSITION_TYPE_SELL)
+      return @@SHORT_EXIT_SIGNAL@@;
+   return false;
 }
 
 bool QFFilters(const int extra_shift)
@@ -513,10 +607,11 @@ int QFBrokerDayKey(const datetime bar_time)
 
 bool QFInMandatoryEntryWindow(const datetime bar_time)
 {
-   // Hard-coded QuantForge session: [02:00, 19:00) broker/chart local time.
+   // QuantForge entry session, start inclusive and end exclusive, in
+   // broker/chart local time. Must match the window the backtest was run with.
    MqlDateTime current;
    TimeToStruct(bar_time,current);
-   return current.hour>=2 && current.hour<19;
+   return current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour;
 }
 
 void QFSyncEntryDay(const datetime bar_time)
@@ -797,7 +892,7 @@ bool QFInCloseBlackout()
    MqlDateTime current;
    if(!TimeToStruct(iTime(_Symbol,_Period,0),current))
       return false;
-   return current.hour>=22;
+   return current.hour>=@@EOD_HOUR@@;
 }
 
 bool QFStopWouldTriggerAtOpen(const bool buy,const double candidate,
@@ -914,10 +1009,11 @@ void QFRecordEquity(const datetime bar_time)
 {
    if(g_equity_file==INVALID_HANDLE)
       return;
+   // OnDeinit flushes and closes, so per-record flushing only bought crash
+   // resilience at the cost of a synchronous disk write per sample.
    FileWrite(g_equity_file,(long)bar_time*1000,
              AccountInfoDouble(ACCOUNT_BALANCE),
              AccountInfoDouble(ACCOUNT_EQUITY));
-   FileFlush(g_equity_file);
 }
 
 int OnInit()
@@ -986,6 +1082,8 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   QFHReleaseHandles();
+   QFXReleaseHandles();
    if(g_deals_file!=INVALID_HANDLE)
    {
       FileFlush(g_deals_file);

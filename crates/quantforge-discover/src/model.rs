@@ -3,6 +3,7 @@ use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_eval::{BacktestMetrics, EvalError, ScoutConfig};
 use quantforge_ir::{IrError, StrategyIr};
+use quantforge_quality::MonteCarloReport;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -14,8 +15,15 @@ pub struct GateConfig {
     pub maximum_drawdown_percent: f64,
     pub minimum_return_percent: f64,
     pub minimum_profit_factor: f64,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub minimum_return_drawdown: f64,
+    /// Floor on MT5-style recovery factor (`net_profit / absolute equity DD`).
+    /// Serialized as `minimum_return_drawdown` for databank JSON compatibility.
+    #[serde(
+        default,
+        rename = "minimum_return_drawdown",
+        alias = "minimum_recovery_factor",
+        skip_serializing_if = "is_zero"
+    )]
+    pub minimum_recovery_factor: f64,
 }
 
 impl Default for GateConfig {
@@ -26,7 +34,7 @@ impl Default for GateConfig {
             maximum_drawdown_percent: 40.0,
             minimum_return_percent: 0.0,
             minimum_profit_factor: 1.0,
-            minimum_return_drawdown: 0.0,
+            minimum_recovery_factor: 0.0,
         }
     }
 }
@@ -39,7 +47,7 @@ impl GateConfig {
             maximum_drawdown_percent: 30.0,
             minimum_return_percent: 0.0,
             minimum_profit_factor: 1.0,
-            minimum_return_drawdown: 0.0,
+            minimum_recovery_factor: 0.0,
         }
     }
 }
@@ -241,7 +249,7 @@ mod search_range_profile_tests {
 impl Default for PrecisionGateConfig {
     fn default() -> Self {
         Self {
-            minimum_return_retention: 0.90,
+            minimum_return_retention: 0.80,
         }
     }
 }
@@ -263,10 +271,12 @@ pub enum SearchFamily {
     VolSqueezeBreak,
     SupplyDemandReclaim,
     SweepReclaim,
+    /// Family-free typed block search across the full condition library.
+    Universal,
 }
 
 impl SearchFamily {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::TrendPullback,
         Self::MomentumBurst,
         Self::DonchianBreakout,
@@ -277,6 +287,7 @@ impl SearchFamily {
         Self::VolSqueezeBreak,
         Self::SupplyDemandReclaim,
         Self::SweepReclaim,
+        Self::Universal,
     ];
 
     pub fn label(self) -> &'static str {
@@ -291,40 +302,44 @@ impl SearchFamily {
             Self::VolSqueezeBreak => "VolSqueezeBreak",
             Self::SupplyDemandReclaim => "SupplyDemandReclaim",
             Self::SweepReclaim => "SweepReclaim",
+            Self::Universal => "UniversalGrammar",
         }
     }
 
     pub fn recipe_summary(self) -> &'static str {
         match self {
             Self::TrendPullback => {
-                "EMA/SMA structure + optional ROC · max 3 atoms · ATR14 · stop/limit · mirror"
+                "EMA/SMA structure + optional ROC · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::MomentumBurst => {
-                "RSI/ROC thrust atoms · max 3 atoms · ATR14 · stop/limit · mirror"
+                "RSI/ROC thrust atoms · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::DonchianBreakout => {
-                "Donchian/HH-LL + optional SMA · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Donchian/HH-LL + optional SMA · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::MeanReversionBand => {
-                "RSI + percentile fades · max 3 atoms · ATR14 · stop/limit · mirror"
+                "RSI + percentile fades · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::ZScoreReversion => {
-                "Close z-score extremes · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Close z-score extremes · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::SessionOrb => {
-                "Broker-local opening-range breakout · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Broker-local opening-range breakout · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::ImpulseCandle => {
-                "Body/range + close-in-bar thrust · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Body/range + close-in-bar thrust · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::VolSqueezeBreak => {
-                "ATR-percentile squeeze then break · max 3 atoms · ATR14 · stop/limit · mirror"
+                "ATR-percentile squeeze then break · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::SupplyDemandReclaim => {
-                "Swing-base zone reclaim · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Swing-base zone reclaim · max 3 atoms · ATR14 · next-open market · mirror"
             }
             Self::SweepReclaim => {
-                "Liquidity sweep then reclaim · max 3 atoms · ATR14 · stop/limit · mirror"
+                "Liquidity sweep then reclaim · max 3 atoms · ATR14 · next-open market · mirror"
+            }
+            Self::Universal => {
+                "Any typed factors · 2–3 mirrored entry conditions · 1–3 side-specific exits · closed-bar shifts"
             }
         }
     }
@@ -341,6 +356,7 @@ impl SearchFamily {
             Self::VolSqueezeBreak => FamilyStyle::VolSqueezeBreak,
             Self::SupplyDemandReclaim => FamilyStyle::SupplyDemandReclaim,
             Self::SweepReclaim => FamilyStyle::SweepReclaim,
+            Self::Universal => FamilyStyle::Universal,
         }
     }
 
@@ -356,6 +372,7 @@ impl SearchFamily {
             FamilyStyle::VolSqueezeBreak => Self::VolSqueezeBreak,
             FamilyStyle::SupplyDemandReclaim => Self::SupplyDemandReclaim,
             FamilyStyle::SweepReclaim => Self::SweepReclaim,
+            FamilyStyle::Universal => Self::Universal,
         }
     }
 
@@ -373,6 +390,66 @@ impl SearchFamily {
     }
 }
 
+/// Immutable family-free grammar bounds sealed into a databank.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UniversalGrammarConfig {
+    pub minimum_entry_conditions: usize,
+    pub maximum_entry_conditions: usize,
+    pub minimum_exit_conditions: usize,
+    pub maximum_exit_conditions: usize,
+    /// Oldest/youngest completed decision-bar shifts. Shift zero is forbidden.
+    pub minimum_shift: u16,
+    pub maximum_shift: u16,
+}
+
+impl Default for UniversalGrammarConfig {
+    fn default() -> Self {
+        Self {
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 4,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 3,
+            minimum_shift: 1,
+            maximum_shift: 3,
+        }
+    }
+}
+
+impl UniversalGrammarConfig {
+    /// Widest entry-condition count the grammar will build. Four is the ceiling
+    /// because each extra mirrored block is another degree of freedom to overfit.
+    pub const MAX_ENTRY_CONDITIONS: usize = 4;
+
+    fn validate(&self) -> Result<(), DiscoverError> {
+        if self.minimum_entry_conditions < 2
+            || self.maximum_entry_conditions > Self::MAX_ENTRY_CONDITIONS
+            || self.minimum_entry_conditions > self.maximum_entry_conditions
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "universal entry conditions must be an ordered range within 2..=4".into(),
+            ));
+        }
+        if self.minimum_exit_conditions == 0
+            || self.maximum_exit_conditions > 3
+            || self.minimum_exit_conditions > self.maximum_exit_conditions
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "universal exit conditions must be an ordered range within 1..=3".into(),
+            ));
+        }
+        if self.minimum_shift == 0
+            || self.minimum_shift > self.maximum_shift
+            || self.maximum_shift > 50
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "universal shifts must be an ordered closed-bar range within 1..=50".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchFamilySpec {
     pub family: SearchFamily,
@@ -387,13 +464,16 @@ pub struct SearchFamilySpec {
     pub complexity_penalty_weight: f64,
 }
 
-/// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates.
+/// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates;
+/// Quota Harvest = ~20 databank elites per family without chasing pot 300.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverRunMode {
     FastScout,
     #[default]
     FullHarvest,
+    /// Seed-heavy, softer param neighborhood, stop when databank hits quota.
+    QuotaHarvest,
 }
 
 /// Named gate outcome persisted on elites for evidence-first promotion.
@@ -417,18 +497,19 @@ pub struct DiscoverConfig {
     pub tournament_size: usize,
     pub structural_mutation_probability: f64,
     pub seed: u64,
-    /// Locked Search Family for this databank (immutable on continue).
+    /// Immutable grammar bounds sealed into the databank: how many mirrored
+    /// entry conditions, how many exit conditions, and the closed-bar shifts.
     #[serde(default)]
-    pub search_family: SearchFamily,
+    pub universal_grammar: UniversalGrammarConfig,
     /// Fast Scout vs Full Harvest knobs applied at start.
     #[serde(default)]
     pub run_mode: DiscoverRunMode,
-    /// When false (default), structural mutation cannot jump families.
-    #[serde(default)]
-    pub allow_cross_family_mutation: bool,
     /// Stop evolving once the accepted pot reaches this size (`None` = no early stop).
     #[serde(default)]
     pub early_stop_pot_elites: Option<usize>,
+    /// Stop evolving once the databank reaches this many elites (`None` = no early stop).
+    #[serde(default)]
+    pub target_databank_elites: Option<usize>,
     /// Soft warning threshold for planned trial budget (UI).
     #[serde(default = "default_trial_budget_warning")]
     pub trial_budget_warning: u64,
@@ -461,14 +542,20 @@ pub struct DiscoverConfig {
     pub allow_trailing_stops: bool,
     #[serde(default)]
     pub allow_partial_exits: bool,
+    /// Entry order kinds the search may sample. At least one must stay enabled;
+    /// disabling market makes the run pending-only (stop-only or limit-only).
+    #[serde(default = "default_allow_market_entries")]
+    pub allow_market_entries: bool,
     #[serde(default)]
     pub allow_stop_entries: bool,
     #[serde(default)]
     pub allow_limit_entries: bool,
     /// Mandatory portfolio protection applied to every generated strategy.
-    /// When enabled, exposure is flattened and entries are blocked from 22:00
-    /// until the next broker day.
+    /// When enabled, exposure is flattened at `end_of_day_hour` broker time.
     pub flatten_at_22: bool,
+    /// Broker-local hour for end-of-day flatten (SQX default 23:00).
+    #[serde(default = "default_end_of_day_hour")]
+    pub end_of_day_hour: u8,
     /// Cap each strategy to one filled entry per broker-local calendar day.
     /// Improves H1↔M1 agreement and keeps trade counts in a swing-friendly band.
     #[serde(default = "default_max_one_entry_per_day")]
@@ -488,7 +575,7 @@ pub struct DiscoverConfig {
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
     /// After IS scout + OOS1 pass, require M1 walk-forward / Monte Carlo /
-    /// ±param neighborhood before a candidate may enter the pot.
+    /// ±param neighborhood before a candidate may enter the databank (not the pot).
     #[serde(default = "default_require_m1_robustness")]
     pub require_m1_robustness: bool,
     #[serde(default = "default_robustness_folds")]
@@ -497,6 +584,13 @@ pub struct DiscoverConfig {
     pub robustness_monte_carlo_trials: usize,
     #[serde(default = "default_robustness_neighborhood_samples")]
     pub robustness_neighborhood_samples: usize,
+    /// Size of the ±% jitter applied to every numeric gene when probing the
+    /// local plateau. `0.20` matches the SQX parameter-sensitivity default.
+    #[serde(default = "default_robustness_perturbation_fraction")]
+    pub robustness_perturbation_fraction: f64,
+    /// Fraction of ±param neighbors that must survive for databank promotion.
+    #[serde(default = "default_minimum_neighborhood_survival_fraction")]
+    pub minimum_neighborhood_survival_fraction: f64,
     /// Use broker-local calendar-year folds (every year must pass) instead of
     /// contiguous index slices.
     #[serde(default = "default_calendar_year_folds")]
@@ -533,6 +627,10 @@ fn default_max_one_entry_per_day() -> bool {
     true
 }
 
+fn default_end_of_day_hour() -> u8 {
+    23
+}
+
 fn default_mutate_after_elites() -> usize {
     300
 }
@@ -563,6 +661,18 @@ fn default_robustness_neighborhood_samples() -> usize {
     8
 }
 
+fn default_allow_market_entries() -> bool {
+    true
+}
+
+fn default_robustness_perturbation_fraction() -> f64 {
+    crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION
+}
+
+fn default_minimum_neighborhood_survival_fraction() -> f64 {
+    0.7
+}
+
 fn default_calendar_year_folds() -> bool {
     false
 }
@@ -586,10 +696,10 @@ impl Default for DiscoverConfig {
             tournament_size: 4,
             structural_mutation_probability: 0.18,
             seed: 42,
-            search_family: SearchFamily::default(),
+            universal_grammar: UniversalGrammarConfig::default(),
             run_mode: DiscoverRunMode::FullHarvest,
-            allow_cross_family_mutation: false,
             early_stop_pot_elites: None,
+            target_databank_elites: None,
             trial_budget_warning: default_trial_budget_warning(),
             gates: GateConfig::default(),
             deposit_gates: GateConfig::deposit_defaults(),
@@ -601,9 +711,11 @@ impl Default for DiscoverConfig {
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
+            allow_market_entries: default_allow_market_entries(),
             allow_stop_entries: false,
             allow_limit_entries: false,
             flatten_at_22: false,
+            end_of_day_hour: default_end_of_day_hour(),
             max_one_entry_per_day: default_max_one_entry_per_day(),
             mutate_after_elites: default_mutate_after_elites(),
             random_fill_fraction: default_random_fill_fraction(),
@@ -612,6 +724,9 @@ impl Default for DiscoverConfig {
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
             robustness_neighborhood_samples: default_robustness_neighborhood_samples(),
+            robustness_perturbation_fraction: default_robustness_perturbation_fraction(),
+            minimum_neighborhood_survival_fraction: default_minimum_neighborhood_survival_fraction(
+            ),
             calendar_year_folds: default_calendar_year_folds(),
             minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
             multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
@@ -621,7 +736,7 @@ impl Default for DiscoverConfig {
 }
 
 impl DiscoverConfig {
-    /// Apply Fast Scout or Full Harvest presets (family stays as configured).
+    /// Apply Fast Scout, Full Harvest, or Quota Harvest presets.
     pub fn apply_run_mode(&mut self) {
         match self.run_mode {
             DiscoverRunMode::FastScout => {
@@ -630,7 +745,6 @@ impl DiscoverConfig {
                 self.require_m1_precision = false;
                 self.require_m1_robustness = false;
                 self.simple_exits = !self.has_complex_execution();
-                self.allow_cross_family_mutation = false;
                 if self.early_stop_pot_elites.is_none() {
                     self.early_stop_pot_elites = Some(8);
                 }
@@ -644,7 +758,31 @@ impl DiscoverConfig {
                 } else {
                     self.simple_exits = false;
                 }
-                self.allow_cross_family_mutation = false;
+            }
+            DiscoverRunMode::QuotaHarvest => {
+                // ~20 databank elites: seed-heavy, softer param neighborhood,
+                // stop on databank quota — not pot 300.
+                if !self.has_complex_execution() {
+                    self.simple_exits = true;
+                } else {
+                    self.simple_exits = false;
+                }
+                self.require_m1_precision = false;
+                self.require_m1_robustness = true;
+                self.initial_candidates = self.initial_candidates.max(1000);
+                self.batch_size = self.batch_size.max(300);
+                self.random_fill_fraction = self.random_fill_fraction.max(0.75);
+                self.mutate_after_elites = self.mutate_after_elites.min(25);
+                // Do not early-stop on pot size — that freezes before databank fills.
+                // Only the databank quota stops the run.
+                self.early_stop_pot_elites = None;
+                if self.target_databank_elites.is_none() {
+                    self.target_databank_elites = Some(20);
+                }
+                self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.min(80);
+                self.robustness_neighborhood_samples = self.robustness_neighborhood_samples.min(5);
+                self.minimum_neighborhood_survival_fraction =
+                    self.minimum_neighborhood_survival_fraction.min(0.5);
             }
         }
     }
@@ -655,6 +793,13 @@ impl DiscoverConfig {
             || self.allow_partial_exits
             || self.allow_stop_entries
             || self.allow_limit_entries
+            || !self.allow_market_entries
+    }
+
+    /// True when the search may only ever place market orders, so seeding never
+    /// samples pending distances that `enforce_execution_feature_flags` discards.
+    pub const fn market_entries_only(&self) -> bool {
+        self.simple_exits || !(self.allow_stop_entries || self.allow_limit_entries)
     }
 
     /// Planned evaluations for honesty UI: initial + batch × generations.
@@ -668,6 +813,11 @@ impl DiscoverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
+        if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
+            return Err(DiscoverError::InvalidConfig(
+                "enable at least one entry order kind: market, stop or limit".into(),
+            ));
+        }
         if self.has_complex_execution() && !self.require_m1_precision {
             return Err(DiscoverError::InvalidConfig(
                 "break-even, trailing, partial and pending-entry genes require M1 precision".into(),
@@ -676,11 +826,6 @@ impl DiscoverConfig {
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
-            ));
-        }
-        if self.search_family.spec().max_atoms == 0 {
-            return Err(DiscoverError::InvalidConfig(
-                "search family max_atoms must be positive".into(),
             ));
         }
         if self.batch_size == 0 {
@@ -731,15 +876,15 @@ impl DiscoverConfig {
             || !self.gates.minimum_return_percent.is_finite()
             || !self.gates.minimum_profit_factor.is_finite()
             || self.gates.minimum_profit_factor < 0.0
-            || !self.gates.minimum_return_drawdown.is_finite()
-            || self.gates.minimum_return_drawdown < 0.0
+            || !self.gates.minimum_recovery_factor.is_finite()
+            || self.gates.minimum_recovery_factor < 0.0
             || !self.deposit_gates.maximum_drawdown_percent.is_finite()
             || self.deposit_gates.maximum_drawdown_percent < 0.0
             || !self.deposit_gates.minimum_return_percent.is_finite()
             || !self.deposit_gates.minimum_profit_factor.is_finite()
             || self.deposit_gates.minimum_profit_factor < 0.0
-            || !self.deposit_gates.minimum_return_drawdown.is_finite()
-            || self.deposit_gates.minimum_return_drawdown < 0.0
+            || !self.deposit_gates.minimum_recovery_factor.is_finite()
+            || self.deposit_gates.minimum_recovery_factor < 0.0
         {
             return Err(DiscoverError::InvalidConfig(
                 "gate thresholds must be finite and non-negative where applicable".into(),
@@ -765,8 +910,24 @@ impl DiscoverConfig {
                         .into(),
                 ));
             }
+            if !self.minimum_neighborhood_survival_fraction.is_finite()
+                || !(0.0..=1.0).contains(&self.minimum_neighborhood_survival_fraction)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "minimum_neighborhood_survival_fraction must be finite and between 0 and 1"
+                        .into(),
+                ));
+            }
+            if !self.robustness_perturbation_fraction.is_finite()
+                || !(0.01..=1.0).contains(&self.robustness_perturbation_fraction)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_perturbation_fraction must be finite and between 0.01 and 1".into(),
+                ));
+            }
         }
         self.search_ranges.validate()?;
+        self.universal_grammar.validate()?;
         self.scout.validate()?;
         Ok(())
     }
@@ -785,10 +946,11 @@ pub enum FamilyStyle {
     VolSqueezeBreak,
     SupplyDemandReclaim,
     SweepReclaim,
+    Universal,
 }
 
 impl FamilyStyle {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::TrendPullback,
         Self::MomentumBurst,
         Self::DonchianBreakout,
@@ -799,6 +961,7 @@ impl FamilyStyle {
         Self::VolSqueezeBreak,
         Self::SupplyDemandReclaim,
         Self::SweepReclaim,
+        Self::Universal,
     ];
 }
 
@@ -819,8 +982,12 @@ pub enum LongShortSkewBucket {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BehaviorDescriptor {
-    pub family: FamilyStyle,
+    /// Count of mirrored entry condition blocks (2, 3 or 4).
+    pub entry_conditions: usize,
+    /// Count of exit condition blocks OR'd together.
+    pub exit_conditions: usize,
     pub trades_per_1000_bars: f64,
     pub average_bars_held: f64,
     pub drawdown_percent: f64,
@@ -829,9 +996,13 @@ pub struct BehaviorDescriptor {
     pub long_short_skew: f64,
 }
 
+/// MAP-Elites cell. The first axis is the entry-condition count so the archive
+/// keeps the best 2-, 3- and 4-condition strategy for every behaviour cell
+/// instead of letting one complexity level crowd the others out.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NicheKey {
-    pub family: FamilyStyle,
+    pub entry_conditions: usize,
     pub trade_frequency: ThreeLevelBucket,
     pub hold_time: ThreeLevelBucket,
     pub drawdown: ThreeLevelBucket,
@@ -847,6 +1018,98 @@ pub struct EvidenceComponents {
     pub drawdown_penalty: f64,
     pub complexity_penalty: f64,
     pub total: f64,
+}
+
+/// SQX RetestWithHigherPrecision retention observed when the M1 replay was
+/// compared against the Selected-TF scout that proposed the candidate.
+///
+/// The M1 metrics themselves are `Elite::metrics`; only the scout side and the
+/// derived retention ratios are recorded here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct M1RetentionEvidence {
+    pub selected_timeframe_metrics: BacktestMetrics,
+    pub minimum_return_retention: f64,
+    pub return_retention: Option<f64>,
+    pub trade_retention: Option<f64>,
+    pub drawdown_expansion: Option<f64>,
+}
+
+/// One walk-forward fold of the M1 robustness battery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WalkForwardFold {
+    pub fold: usize,
+    /// Open of the first decision bar inside the fold.
+    pub start_timestamp_ms: i64,
+    /// Open of the last decision bar inside the fold.
+    pub end_timestamp_ms: i64,
+    pub decision_bars: usize,
+    /// Trades whose entry fell inside the fold window.
+    pub trades_in_fold: usize,
+    /// Metrics of the fold replay, which is warmed up on a lookback prefix and
+    /// can therefore contain trades that opened before `start_timestamp_ms`.
+    pub metrics: BacktestMetrics,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WalkForwardEvidence {
+    /// `calendar_year` folds require every fold to pass; `contiguous` folds use
+    /// `required_passing_fraction`.
+    pub fold_scheme: String,
+    pub total_folds: usize,
+    pub passing_folds: usize,
+    pub passing_fraction: f64,
+    pub required_passing_fraction: f64,
+    /// Evaluated folds only. Degenerate ranges still count in `total_folds`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folds: Vec<WalkForwardFold>,
+}
+
+/// One evaluated ±parameter neighbour retained for SQX-style distribution UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParameterNeighborhoodSample {
+    pub sample_index: usize,
+    pub net_profit: f64,
+    pub return_percent: f64,
+    pub max_drawdown_percent: f64,
+    pub trade_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profit_factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharpe_ratio: Option<f64>,
+    pub survived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParameterNeighborhoodEvidence {
+    pub perturbation_fraction: f64,
+    pub samples_requested: usize,
+    /// Samples that produced a canonical, evaluable neighbour.
+    pub samples_evaluated: usize,
+    pub surviving_samples: usize,
+    pub survival_fraction: f64,
+    pub required_survival_fraction: f64,
+    /// Dedicated ADX plateau neighbours; zero when the strategy has no ADX.
+    pub plateau_neighbors: usize,
+    pub plateau_surviving: usize,
+    pub plateau_survival_fraction: Option<f64>,
+    /// Original (unperturbed) M1 baseline metrics for Orig. reference markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_metrics: Option<BacktestMetrics>,
+    /// Per-neighbour metrics for distribution charts. Older elites omit this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<ParameterNeighborhoodSample>,
+}
+
+/// Structured record of everything the M1 pre-deposit robustness battery
+/// measured, retained so a promoted elite carries its own audit trail instead of
+/// only a gate pass/fail flag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobustnessEvidence {
+    pub m1_retention: M1RetentionEvidence,
+    pub walk_forward: WalkForwardEvidence,
+    pub monte_carlo: MonteCarloReport,
+    pub parameter_neighborhood: ParameterNeighborhoodEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -883,6 +1146,11 @@ pub struct Elite {
     /// Named gate outcomes at deposit (evidence strip).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_results: Vec<GateResult>,
+    /// Full M1 robustness battery record when the battery ran at deposit.
+    /// Absent on databanks written before the field existed and on
+    /// research-only runs that skipped the battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robustness: Option<RobustnessEvidence>,
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
@@ -1140,7 +1408,7 @@ fn validate_archive_entries(
             || elite.metrics.trade_count < config.deposit_gates.minimum_trades
             || elite.metrics.return_percent <= config.deposit_gates.minimum_return_percent
             || effective_profit_factor < config.deposit_gates.minimum_profit_factor
-            || return_drawdown_ratio(&elite.metrics) < config.deposit_gates.minimum_return_drawdown
+            || recovery_factor(&elite.metrics) < config.deposit_gates.minimum_recovery_factor
             || elite.metrics.max_drawdown_percent > config.deposit_gates.maximum_drawdown_percent
             || elite.discovered_generation > completed_generations
             || !elite.evidence.total.is_finite()
@@ -1154,14 +1422,9 @@ fn validate_archive_entries(
     Ok(())
 }
 
-pub(crate) fn return_drawdown_ratio(metrics: &BacktestMetrics) -> f64 {
-    if metrics.max_drawdown_percent > 1.0e-12 {
-        metrics.return_percent / metrics.max_drawdown_percent
-    } else if metrics.return_percent > 0.0 {
-        f64::INFINITY
-    } else {
-        metrics.return_percent
-    }
+/// MT5-style recovery factor: net profit ÷ absolute equity max drawdown.
+pub(crate) fn recovery_factor(metrics: &BacktestMetrics) -> f64 {
+    metrics.recovery_factor()
 }
 
 fn is_zero(value: &f64) -> bool {

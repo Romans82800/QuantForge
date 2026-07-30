@@ -5,6 +5,7 @@ members = [
     "crates/quantforge-broker",
     "crates/quantforge-ir",
     "crates/quantforge-eval",
+    "crates/quantforge-sqx",
     "crates/quantforge-tick",
     "crates/quantforge-quality",
     "crates/quantforge-discover",
@@ -42,6 +43,7 @@ quantforge-data = { path = "crates/quantforge-data" }
 quantforge-broker = { path = "crates/quantforge-broker" }
 quantforge-ir = { path = "crates/quantforge-ir" }
 quantforge-eval = { path = "crates/quantforge-eval" }
+quantforge-sqx = { path = "crates/quantforge-sqx" }
 quantforge-tick = { path = "crates/quantforge-tick" }
 quantforge-quality = { path = "crates/quantforge-quality" }
 quantforge-discover = { path = "crates/quantforge-discover" }

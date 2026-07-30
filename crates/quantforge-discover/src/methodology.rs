@@ -1,22 +1,20 @@
-//! Offline methodology factor grid: what keeps OOS1 expectancy across families.
+//! Offline methodology factor grid: what keeps OOS1 expectancy across grammar sizes.
 
-use crate::grammar::{family_entries_with_count, rng_for};
-use crate::model::{DiscoverError, SearchFamily};
+use crate::grammar::{build_seed, rng_for};
+use crate::model::{DiscoverError, SearchFamily, UniversalGrammarConfig};
 use crate::{FIXED_RISK_PER_TRADE, FROZEN_ATR_PERIOD, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
-use quantforge_core::STRATEGY_IR_VERSION;
 use quantforge_data::BarDataset;
 use quantforge_eval::{BacktestMetrics, ScoutConfig, evaluate_strategy};
 use quantforge_ir::{
-    EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy, PartialExit,
-    ProtectiveStops, RiskPolicy, Side, StopLossPolicy, StrategyIr, StrategyMeta,
-    TakeProfitPolicy, TrailingPolicy,
+    EntryDistancePolicy, EntryOrderPolicy, ManagePolicy, PartialExit, ProtectiveStops,
+    StopLossPolicy, StrategyIr, TakeProfitPolicy, TrailingPolicy,
 };
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Exit / entry-order recipe under test (orthogonal to Search Family).
+/// Exit / entry-order recipe under test (orthogonal to grammar condition counts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactorRecipe {
@@ -61,8 +59,8 @@ impl FactorRecipe {
 pub struct MethodologyGridConfig {
     pub seed: u64,
     pub draws_per_cell: usize,
-    pub atom_counts: Vec<usize>,
-    pub families: Vec<SearchFamily>,
+    pub entry_condition_counts: Vec<usize>,
+    pub exit_condition_counts: Vec<usize>,
     pub recipes: Vec<FactorRecipe>,
     pub scout: ScoutConfig,
     /// Soft IS screen before counting a draw toward OOS stats.
@@ -78,8 +76,8 @@ impl Default for MethodologyGridConfig {
         Self {
             seed: 42,
             draws_per_cell: 40,
-            atom_counts: vec![1, 2, 3],
-            families: SearchFamily::ALL.to_vec(),
+            entry_condition_counts: vec![2, 3, 4],
+            exit_condition_counts: vec![1, 2, 3],
             recipes: FactorRecipe::ALL.to_vec(),
             scout: ScoutConfig::default(),
             minimum_trades: 10,
@@ -94,9 +92,9 @@ impl Default for MethodologyGridConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactorDraw {
-    pub family: SearchFamily,
+    pub entry_conditions: usize,
+    pub exit_conditions: usize,
     pub recipe: FactorRecipe,
-    pub atom_count: usize,
     pub entry_kind: String,
     pub complexity: usize,
     pub is_expectancy: f64,
@@ -110,9 +108,9 @@ pub struct FactorDraw {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactorCellSummary {
-    pub family: SearchFamily,
+    pub entry_conditions: usize,
+    pub exit_conditions: usize,
     pub recipe: FactorRecipe,
-    pub atom_count: usize,
     pub draws: usize,
     pub screened: usize,
     pub oos1_pass_rate: f64,
@@ -163,18 +161,39 @@ pub fn run_methodology_grid(
             "draws_per_cell must be > 0".into(),
         ));
     }
-    if config.atom_counts.is_empty() || config.families.is_empty() || config.recipes.is_empty() {
+    if config.entry_condition_counts.is_empty()
+        || config.exit_condition_counts.is_empty()
+        || config.recipes.is_empty()
+    {
         return Err(DiscoverError::InvalidConfig(
-            "methodology grid needs families, atom counts, and recipes".into(),
+            "methodology grid needs entry counts, exit counts, and recipes".into(),
+        ));
+    }
+    if config
+        .entry_condition_counts
+        .iter()
+        .any(|count| !(2..=UniversalGrammarConfig::MAX_ENTRY_CONDITIONS).contains(count))
+    {
+        return Err(DiscoverError::InvalidConfig(
+            "methodology entry condition counts must be within 2..=4".into(),
+        ));
+    }
+    if config
+        .exit_condition_counts
+        .iter()
+        .any(|count| !(1..=3).contains(count))
+    {
+        return Err(DiscoverError::InvalidConfig(
+            "methodology exit condition counts must be within 1..=3".into(),
         ));
     }
 
     let mut jobs = Vec::new();
-    for family in &config.families {
-        for &atom_count in &config.atom_counts {
+    for &entry_conditions in &config.entry_condition_counts {
+        for &exit_conditions in &config.exit_condition_counts {
             for recipe in &config.recipes {
                 for draw in 0..config.draws_per_cell {
-                    jobs.push((*family, atom_count, *recipe, draw as u64));
+                    jobs.push((entry_conditions, exit_conditions, *recipe, draw as u64));
                 }
             }
         }
@@ -184,9 +203,10 @@ pub fn run_methodology_grid(
     let seed = config.seed;
     let draws: Vec<FactorDraw> = jobs
         .into_par_iter()
-        .map(|(family, atom_count, recipe, draw)| {
-            let sequence = mix_sequence(family, atom_count, recipe, draw);
-            let strategy = build_factor_strategy(family, seed, sequence, atom_count, recipe);
+        .map(|(entry_conditions, exit_conditions, recipe, draw)| {
+            let sequence = mix_sequence(entry_conditions, exit_conditions, recipe, draw);
+            let strategy =
+                build_factor_strategy(seed, sequence, entry_conditions, exit_conditions, recipe);
             let entry_kind = entry_kind_label(&strategy.entry.order);
             let complexity = strategy.complexity().score;
             let is_result = evaluate_strategy(&strategy, is_dataset, broker, &scout);
@@ -209,9 +229,9 @@ pub fn run_methodology_grid(
                         && oos_e > 0.0
                         && retention.is_some_and(|value| value >= config.oos1_retention);
                     FactorDraw {
-                        family,
+                        entry_conditions,
+                        exit_conditions,
                         recipe,
-                        atom_count,
                         entry_kind,
                         complexity,
                         is_expectancy: is_e,
@@ -223,9 +243,9 @@ pub fn run_methodology_grid(
                     }
                 }
                 _ => FactorDraw {
-                    family,
+                    entry_conditions,
+                    exit_conditions,
                     recipe,
-                    atom_count,
                     entry_kind,
                     complexity,
                     is_expectancy: f64::NAN,
@@ -256,31 +276,52 @@ pub fn run_methodology_grid(
     })
 }
 
-fn mix_sequence(family: SearchFamily, atom_count: usize, recipe: FactorRecipe, draw: u64) -> u64 {
-    let family_i = SearchFamily::ALL
-        .iter()
-        .position(|value| *value == family)
-        .unwrap_or(0) as u64;
+fn mix_sequence(
+    entry_conditions: usize,
+    exit_conditions: usize,
+    recipe: FactorRecipe,
+    draw: u64,
+) -> u64 {
     let recipe_i = FactorRecipe::ALL
         .iter()
         .position(|value| *value == recipe)
         .unwrap_or(0) as u64;
-    family_i
+    (entry_conditions as u64)
         .wrapping_mul(1_000_003)
-        .wrapping_add((atom_count as u64).wrapping_mul(10_007))
+        .wrapping_add((exit_conditions as u64).wrapping_mul(10_007))
         .wrapping_add(recipe_i.wrapping_mul(97))
         .wrapping_add(draw)
 }
 
 fn build_factor_strategy(
-    family: SearchFamily,
     seed: u64,
     sequence: u64,
-    atom_count: usize,
+    entry_conditions: usize,
+    exit_conditions: usize,
     recipe: FactorRecipe,
 ) -> StrategyIr {
     let mut rng = rng_for(seed, 17, sequence);
-    let (long, short) = family_entries_with_count(family, &mut rng, atom_count);
+    let universal = UniversalGrammarConfig {
+        minimum_entry_conditions: entry_conditions,
+        maximum_entry_conditions: entry_conditions,
+        minimum_exit_conditions: exit_conditions,
+        maximum_exit_conditions: exit_conditions,
+        ..UniversalGrammarConfig::default()
+    };
+    let mut strategy = build_seed(
+        SearchFamily::Universal,
+        &mut rng,
+        format!(
+            "method-e{}-x{}-{}-{sequence}",
+            entry_conditions,
+            exit_conditions,
+            recipe.label()
+        ),
+        entry_conditions,
+        true,
+        true,
+        &universal,
+    );
     let order = match recipe {
         FactorRecipe::SimpleMarket
         | FactorRecipe::BreakEven
@@ -306,14 +347,17 @@ fn build_factor_strategy(
         }
     };
     let manage = match recipe {
-        FactorRecipe::SimpleMarket | FactorRecipe::StopEntry | FactorRecipe::LimitEntry => ManagePolicy {
-            time_stop_bars: Some(rng.gen_range(4..=16)),
-            break_even_at_r: None,
-            trailing: None,
-            partial_exits: Vec::new(),
-            flatten_end_of_day: false,
-            max_one_entry_per_day: true,
-        },
+        FactorRecipe::SimpleMarket | FactorRecipe::StopEntry | FactorRecipe::LimitEntry => {
+            ManagePolicy {
+                time_stop_bars: Some(rng.gen_range(4..=16)),
+                break_even_at_r: None,
+                trailing: None,
+                partial_exits: Vec::new(),
+                flatten_end_of_day: false,
+                max_one_entry_per_day: true,
+                ..Default::default()
+            }
+        }
         FactorRecipe::BreakEven => ManagePolicy {
             time_stop_bars: Some(rng.gen_range(4..=16)),
             break_even_at_r: Some(1.0),
@@ -321,61 +365,49 @@ fn build_factor_strategy(
             partial_exits: Vec::new(),
             flatten_end_of_day: false,
             max_one_entry_per_day: true,
+            ..Default::default()
         },
         FactorRecipe::TrailingStop => ManagePolicy {
             time_stop_bars: Some(rng.gen_range(4..=16)),
             break_even_at_r: None,
-            trailing: Some(TrailingPolicy::RiskMultiple { activate_at_r: 1.5, distance_r: 1.0 }),
+            trailing: Some(TrailingPolicy::RiskMultiple {
+                activate_at_r: 1.5,
+                distance_r: 1.0,
+            }),
             partial_exits: Vec::new(),
             flatten_end_of_day: false,
             max_one_entry_per_day: true,
+            ..Default::default()
         },
         FactorRecipe::PartialExit => ManagePolicy {
             time_stop_bars: Some(rng.gen_range(4..=16)),
             break_even_at_r: None,
             trailing: None,
-            partial_exits: vec![PartialExit { at_r: 1.0, fraction: 0.5 }],
+            partial_exits: vec![PartialExit {
+                at_r: 1.0,
+                fraction: 0.5,
+            }],
             flatten_end_of_day: false,
             max_one_entry_per_day: true,
+            ..Default::default()
         },
     };
     let atr_stop = 1.0 + (rng.gen_range(0..9) as f64) * 0.25;
     let risk_tp = 1.0 + (rng.gen_range(0..9) as f64) * 0.25;
-    let mut strategy = StrategyIr {
-        id: format!(
-            "method-{}-a{}-{}-{sequence}",
-            family.label(),
-            atom_count,
-            recipe.label()
-        ),
-        version: STRATEGY_IR_VERSION,
-        entry: EntrySignals {
-            long: Some(long),
-            short: Some(short),
-            order,
+    strategy.entry.order = order;
+    strategy.risk = quantforge_ir::RiskPolicy::FixedCurrency {
+        amount: FIXED_RISK_PER_TRADE,
+    };
+    strategy.stops = ProtectiveStops {
+        stop_loss: StopLossPolicy::AtrMultiple {
+            period: FROZEN_ATR_PERIOD,
+            multiplier: atr_stop.clamp(1.0, 4.0),
         },
-        exit: None,
-        filters: Vec::new(),
-        side: Side::Both,
-        risk: RiskPolicy::FixedCurrency {
-            amount: FIXED_RISK_PER_TRADE,
-        },
-        stops: ProtectiveStops {
-            stop_loss: StopLossPolicy::AtrMultiple {
-                period: FROZEN_ATR_PERIOD,
-                multiplier: atr_stop.clamp(1.0, 4.0),
-            },
-            take_profit: TakeProfitPolicy::RiskMultiple {
-                multiple: risk_tp.clamp(1.0, 4.0),
-            },
-        },
-        manage,
-        meta: StrategyMeta {
-            thesis_hint: family.label().into(),
-            complexity: 0,
-            export_safe: true,
+        take_profit: TakeProfitPolicy::RiskMultiple {
+            multiple: risk_tp.clamp(1.0, 4.0),
         },
     };
+    strategy.manage = manage;
     strategy.meta.complexity = strategy.complexity().score.min(u16::MAX as usize) as u16;
     strategy
 }
@@ -387,11 +419,13 @@ fn passes_screen(
     minimum_profit_factor: f64,
     maximum_drawdown_percent: f64,
 ) -> bool {
-    let pf = metrics.profit_factor.unwrap_or(if metrics.net_profit > 0.0 {
-        f64::INFINITY
-    } else {
-        0.0
-    });
+    let pf = metrics
+        .profit_factor
+        .unwrap_or(if metrics.net_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        });
     metrics.trade_count >= minimum_trades
         && metrics.return_percent > minimum_return_percent
         && pf >= minimum_profit_factor
@@ -400,15 +434,15 @@ fn passes_screen(
 
 fn summarize_cells(draws: &[FactorDraw], config: &MethodologyGridConfig) -> Vec<FactorCellSummary> {
     let mut cells = Vec::new();
-    for family in &config.families {
-        for &atom_count in &config.atom_counts {
+    for &entry_conditions in &config.entry_condition_counts {
+        for &exit_conditions in &config.exit_condition_counts {
             for recipe in &config.recipes {
                 let group: Vec<&FactorDraw> = draws
                     .iter()
                     .filter(|draw| {
-                        draw.family == *family
+                        draw.entry_conditions == entry_conditions
+                            && draw.exit_conditions == exit_conditions
                             && draw.recipe == *recipe
-                            && draw.atom_count == atom_count
                     })
                     .collect();
                 let screened: Vec<&FactorDraw> = group
@@ -416,7 +450,8 @@ fn summarize_cells(draws: &[FactorDraw], config: &MethodologyGridConfig) -> Vec<
                     .copied()
                     .filter(|draw| draw.passed_is_screen)
                     .collect();
-                let retentions: Vec<f64> = screened.iter().filter_map(|draw| draw.retention).collect();
+                let retentions: Vec<f64> =
+                    screened.iter().filter_map(|draw| draw.retention).collect();
                 let oos_values: Vec<f64> = screened
                     .iter()
                     .map(|draw| draw.oos1_expectancy)
@@ -431,9 +466,9 @@ fn summarize_cells(draws: &[FactorDraw], config: &MethodologyGridConfig) -> Vec<
                         / screened.len() as f64
                 };
                 cells.push(FactorCellSummary {
-                    family: *family,
+                    entry_conditions,
+                    exit_conditions,
                     recipe: *recipe,
-                    atom_count,
                     draws: group.len(),
                     screened: screened.len(),
                     oos1_pass_rate: oos_pass,
@@ -465,7 +500,7 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
         .collect();
     let mut contrasts = Vec::new();
 
-    // Recipe vs simple_market (pooled across families/atoms).
+    // Recipe vs simple_market (pooled across condition counts).
     let baseline: Vec<f64> = screened
         .iter()
         .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket)
@@ -504,35 +539,76 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
         ));
     }
 
-    // Atom count 2/3 vs 1 on simple_market only (clean complexity signal).
-    let atom1: Vec<f64> = screened
+    // Entry-condition count 3/4 vs 2 on simple_market only.
+    let entry2: Vec<f64> = screened
         .iter()
-        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == 1)
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.entry_conditions == 2)
         .filter_map(|draw| draw.retention)
         .collect();
-    let atom1_rows: Vec<&FactorDraw> = screened
+    let entry2_rows: Vec<&FactorDraw> = screened
         .iter()
         .copied()
-        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == 1)
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.entry_conditions == 2)
         .collect();
-    for atoms in [2usize, 3] {
+    for count in [3usize, 4] {
         let treatment: Vec<f64> = screened
             .iter()
-            .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == atoms)
+            .filter(|draw| {
+                draw.recipe == FactorRecipe::SimpleMarket && draw.entry_conditions == count
+            })
             .filter_map(|draw| draw.retention)
             .collect();
         let treatment_rows: Vec<&FactorDraw> = screened
             .iter()
             .copied()
-            .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.atom_count == atoms)
+            .filter(|draw| {
+                draw.recipe == FactorRecipe::SimpleMarket && draw.entry_conditions == count
+            })
             .collect();
         contrasts.push(contrast(
-            format!("atoms:{atoms} vs 1 (simple_market)"),
-            "atoms=1",
-            &format!("atoms={atoms}"),
-            &atom1,
+            format!("entry_conditions:{count} vs 2 (simple_market)"),
+            "entry_conditions=2",
+            &format!("entry_conditions={count}"),
+            &entry2,
             &treatment,
-            pass_rate(&atom1_rows),
+            pass_rate(&entry2_rows),
+            pass_rate(&treatment_rows),
+        ));
+    }
+
+    // Exit-condition count 2/3 vs 1 on simple_market only.
+    let exit1: Vec<f64> = screened
+        .iter()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.exit_conditions == 1)
+        .filter_map(|draw| draw.retention)
+        .collect();
+    let exit1_rows: Vec<&FactorDraw> = screened
+        .iter()
+        .copied()
+        .filter(|draw| draw.recipe == FactorRecipe::SimpleMarket && draw.exit_conditions == 1)
+        .collect();
+    for count in [2usize, 3] {
+        let treatment: Vec<f64> = screened
+            .iter()
+            .filter(|draw| {
+                draw.recipe == FactorRecipe::SimpleMarket && draw.exit_conditions == count
+            })
+            .filter_map(|draw| draw.retention)
+            .collect();
+        let treatment_rows: Vec<&FactorDraw> = screened
+            .iter()
+            .copied()
+            .filter(|draw| {
+                draw.recipe == FactorRecipe::SimpleMarket && draw.exit_conditions == count
+            })
+            .collect();
+        contrasts.push(contrast(
+            format!("exit_conditions:{count} vs 1 (simple_market)"),
+            "exit_conditions=1",
+            &format!("exit_conditions={count}"),
+            &exit1,
+            &treatment,
+            pass_rate(&exit1_rows),
             pass_rate(&treatment_rows),
         ));
     }
@@ -564,31 +640,23 @@ fn build_contrasts(draws: &[FactorDraw]) -> Vec<FactorContrast> {
     // Pending stop vs limit: isolated entry-order contrast.
     let stop: Vec<f64> = screened
         .iter()
-        .filter(|draw| {
-            draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry
-        })
+        .filter(|draw| draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry)
         .filter_map(|draw| draw.retention)
         .collect();
     let stop_rows: Vec<&FactorDraw> = screened
         .iter()
         .copied()
-        .filter(|draw| {
-            draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry
-        })
+        .filter(|draw| draw.entry_kind == "stop" && draw.recipe == FactorRecipe::StopEntry)
         .collect();
     let limit: Vec<f64> = screened
         .iter()
-        .filter(|draw| {
-            draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry
-        })
+        .filter(|draw| draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry)
         .filter_map(|draw| draw.retention)
         .collect();
     let limit_rows: Vec<&FactorDraw> = screened
         .iter()
         .copied()
-        .filter(|draw| {
-            draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry
-        })
+        .filter(|draw| draw.entry_kind == "limit" && draw.recipe == FactorRecipe::LimitEntry)
         .collect();
     contrasts.push(contrast(
         "pending:stop vs limit".into(),
@@ -656,17 +724,20 @@ fn recommend(cells: &[FactorCellSummary], contrasts: &[FactorContrast]) -> Vec<S
     let mut lines = Vec::new();
     if let Some(best) = cells.iter().find(|cell| cell.screened >= 5) {
         lines.push(format!(
-            "Best cell: {} · {} · atoms={} · OOS1 pass {:.0}% · median retention {}",
-            best.family.label(),
+            "Best cell: entries={} · exits={} · {} · OOS1 pass {:.0}% · median retention {}",
+            best.entry_conditions,
+            best.exit_conditions,
             best.recipe.label(),
-            best.atom_count,
             best.oos1_pass_rate * 100.0,
             best.median_retention
                 .map(|value| format!("{value:.3}"))
                 .unwrap_or_else(|| "n/a".into())
         ));
     }
-    for contrast in contrasts.iter().filter(|contrast| contrast.significant_fdr_10) {
+    for contrast in contrasts
+        .iter()
+        .filter(|contrast| contrast.significant_fdr_10)
+    {
         lines.push(format!(
             "FDR≤10%: {} (retention lift {:+.3}, pass lift {:+.1}pp, q={:.3})",
             contrast.name,
@@ -677,43 +748,11 @@ fn recommend(cells: &[FactorCellSummary], contrasts: &[FactorContrast]) -> Vec<S
     }
     if !contrasts.iter().any(|contrast| contrast.significant_fdr_10) {
         lines.push(
-            "No factor contrast survived FDR 10% — prefer simplest production recipe (simple_market) unless a family cell clearly dominates."
+            "No factor contrast survived FDR 10% — prefer the simplest condition counts and production recipe (simple_market)."
                 .into(),
         );
     }
-    let family_ranks = rank_families(cells);
-    if !family_ranks.is_empty() {
-        lines.push(format!(
-            "Family ranking by mean OOS1 pass (screened cells): {}",
-            family_ranks.join(" > ")
-        ));
-    }
     lines
-}
-
-fn rank_families(cells: &[FactorCellSummary]) -> Vec<String> {
-    let mut scores: Vec<(SearchFamily, f64, usize)> = SearchFamily::ALL
-        .iter()
-        .map(|family| {
-            let rows: Vec<&FactorCellSummary> = cells
-                .iter()
-                .filter(|cell| cell.family == *family && cell.screened > 0)
-                .collect();
-            let mean = if rows.is_empty() {
-                0.0
-            } else {
-                rows.iter().map(|cell| cell.oos1_pass_rate).sum::<f64>() / rows.len() as f64
-            };
-            (*family, mean, rows.iter().map(|cell| cell.screened).sum())
-        })
-        .collect();
-    scores.sort_by(|left, right| right.1.total_cmp(&left.1));
-    scores
-        .into_iter()
-        .filter(|(_, _, screened)| *screened > 0)
-        .take(5)
-        .map(|(family, mean, _)| format!("{} ({:.0}%)", family.label(), mean * 100.0))
-        .collect()
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -764,8 +803,7 @@ fn norm_sf(z: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.3275911 * x.abs());
     let poly = t
         * (0.254829592
-            + t * (-0.284496736
-                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
     let erfc = poly * (-x * x).exp();
     (erfc / 2.0).clamp(0.0, 1.0)
 }

@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
-  <title id="title">QuantForge</title>
+  <title id="title">QuantForge QF</title>
   <rect width="512" height="512" rx="104" fill="#0b1118"/>
-  <path d="M108 142h296v228H108z" fill="none" stroke="#263746" stroke-width="12"/>
-  <path d="M148 318l72-88 58 48 86-112" fill="none" stroke="#5bd7cc" stroke-width="28" stroke-linecap="square" stroke-linejoin="miter"/>
-  <path d="M324 166h40v40" fill="none" stroke="#5bd7cc" stroke-width="28"/>
-  <circle cx="220" cy="230" r="14" fill="#e7b65c"/>
-  <circle cx="278" cy="278" r="14" fill="#e7b65c"/>
-  <path d="M146 370h220" stroke="#3f5668" stroke-width="12"/>
+  <path
+    fill="#5bd7cc"
+    fill-rule="evenodd"
+    d="M142 126h92c29 0 52 23 52 52v112c0 20-11 38-28 47l43 49h-62l-39-44h-58c-29 0-52-23-52-52V178c0-29 23-52 52-52Zm10 50c-7 0-12 5-12 12v92c0 7 5 12 12 12h82c2 0 4 0 5-1l-30-34h61l-34-38v-31c0-7-5-12-12-12h-72Z"
+  />
+  <path fill="#5bd7cc" d="M318 126h116v50h-62v48h54v50h-54v112h-54V126Z"/>
 </svg>

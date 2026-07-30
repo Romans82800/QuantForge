@@ -1,22 +1,32 @@
-use quantforge_core::ContentHash;
-use quantforge_data::{DataQualityReport, QualityGrade};
+use quantforge_core::{ContentHash, FloatPolicy};
+use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
 use quantforge_discover::{
-    Databank, Elite, FamilyStyle, LongShortSkewBucket, NicheKey, ThreeLevelBucket, niche_label,
+    Databank, DiscoverConfig, Elite, LongShortSkewBucket, NicheKey, RobustnessConfig,
+    RobustnessEvidence, RobustnessReject, ThreeLevelBucket, niche_label,
+    run_m1_predeposit_robustness,
 };
-use crate::data_lab::load_bound_broker;
+use crate::data_lab::{build_decision_from_m1, load_bound_broker};
+use quantforge_eval::evaluate_strategy;
 use quantforge_export_mql5::{generate_bundle, Mql5ExportConfig, TesterConfig};
-use quantforge_storage::{write_text_new, RunManifest};
+use quantforge_quality::DataSplitPlan;
+use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_text_new};
+use quantforge_ir::{BoolExpr, RiskPolicy, StrategyIr};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use tauri::State;
 use thiserror::Error;
 
-const TOTAL_NICHES: usize = 10 * 3usize.pow(5);
+/// Entry-condition counts the grammar can emit; the first MAP-Elites axis.
+const ENTRY_CONDITION_COUNTS: [usize; 3] = [2, 3, 4];
+const TOTAL_NICHES: usize = ENTRY_CONDITION_COUNTS.len() * 3usize.pow(5);
+const LEGACY_TOTAL_NICHES: usize = 10 * 3usize.pow(5);
 const SELECTION_BIAS_WARNING_THRESHOLD: u64 = 1_500;
+const LEGACY_DATABANK_SCHEMA_VERSION: u16 = 5;
+const LEGACY_GRAMMAR_VERSION: &str = "search-families-v5-selected-tf-parity";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EvolveArtifact {
@@ -33,11 +43,32 @@ pub(crate) struct EvolveArtifact {
 #[derive(Debug)]
 struct LoadedDatabank {
     bank: Databank,
+    legacy_read_only: bool,
+    databank_path: String,
     source: String,
     broker: String,
     metadata_path: Option<String>,
     m1_source: Option<String>,
     m1_metadata_path: Option<String>,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RobustnessSnapshot {
+    elite: Elite,
+    databank_path: String,
+    source: String,
+    broker: String,
+    metadata_path: Option<String>,
+    m1_source: String,
+    m1_metadata_path: Option<String>,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    data_hash: ContentHash,
+    broker_spec_hash: ContentHash,
+    grammar_version: String,
+    config: DiscoverConfig,
 }
 
 #[derive(Default)]
@@ -63,6 +94,7 @@ pub struct DatabankWorkspace {
     data_hash: String,
     broker_spec_hash: String,
     grammar_version: String,
+    legacy_read_only: bool,
     quality_grade: String,
     quality_score: u8,
     coverage: usize,
@@ -78,10 +110,11 @@ pub struct DatabankWorkspace {
     allow_break_even: bool,
     allow_trailing_stops: bool,
     allow_partial_exits: bool,
+    allow_market_entries: bool,
     allow_stop_entries: bool,
     allow_limit_entries: bool,
     max_one_entry_per_day: bool,
-    families: Vec<FamilyCoverage>,
+    condition_groups: Vec<ConditionCoverage>,
     elites: Vec<EliteRow>,
 }
 
@@ -144,8 +177,9 @@ struct RejectionTelemetry {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FamilyCoverage {
-    family: String,
+struct ConditionCoverage {
+    entry_conditions: usize,
+    label: String,
     occupied: usize,
     total: usize,
     cells: Vec<CoverageCell>,
@@ -166,13 +200,15 @@ struct CoverageCell {
 struct EliteRow {
     fingerprint: String,
     strategy_id: String,
-    family: String,
+    entry_conditions: usize,
+    exit_conditions: usize,
     evidence: f64,
     novelty: f64,
     trades: usize,
     return_percent: f64,
     drawdown_percent: f64,
-    return_drawdown: Option<f64>,
+    /// MT5-style recovery factor (net profit / absolute equity DD).
+    recovery_factor: Option<f64>,
     profit_factor: Option<f64>,
     sharpe_ratio: Option<f64>,
     is_expectancy: f64,
@@ -187,11 +223,31 @@ struct EliteRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EliteRobustnessView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monte_carlo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    walk_forward: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param_permutation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    /// Serialized `quantforge_discover::RobustnessEvidence`: walk-forward fold
+    /// rows, Monte Carlo percentiles and parameter-neighborhood survival as
+    /// recorded when the M1 battery ran. Absent for elites deposited before the
+    /// evidence field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EliteDetail {
     fingerprint: String,
     strategy_id: String,
     thesis: String,
-    family: String,
+    entry_conditions: usize,
+    exit_conditions: usize,
     niche: String,
     grade: &'static str,
     parity: &'static str,
@@ -200,6 +256,8 @@ pub struct EliteDetail {
     metrics: Value,
     strategy_ir: Value,
     equity_signature: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    robustness: Option<EliteRobustnessView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -233,6 +291,78 @@ pub struct PartitionEquityView {
     is_trades: usize,
     oos1_trades: usize,
     oos2_trades: usize,
+    /// Full-run M1 replay metrics — same decision bars and judge config as Parity Lab.
+    full_run_trades: usize,
+    full_run_return_percent: f64,
+    full_run_net_profit: f64,
+    full_run_max_drawdown: f64,
+    full_run_max_drawdown_percent: f64,
+    full_run_profit_factor: Option<f64>,
+    full_run_win_rate: f64,
+    full_run_sharpe_ratio: Option<f64>,
+    full_run_recovery_factor: Option<f64>,
+    trades: Vec<TradeRowView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultsRobustnessMode {
+    Standard,
+    Deep,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultsRobustnessRequest {
+    fingerprint: String,
+    mode: ResultsRobustnessMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultsRobustnessView {
+    fingerprint: String,
+    strategy_id: String,
+    mode: ResultsRobustnessMode,
+    passed: bool,
+    blocker: Option<String>,
+    message: String,
+    artifact_path: String,
+    folds: usize,
+    monte_carlo_trials: usize,
+    neighborhood_samples: usize,
+    evidence: Option<RobustnessEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ResultsRobustnessArtifact {
+    schema_version: u16,
+    manifest: RunManifest,
+    databank_source: String,
+    decision_source: String,
+    m1_source: String,
+    broker_source: String,
+    strategy_id: String,
+    strategy_fingerprint: ContentHash,
+    mode: ResultsRobustnessMode,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    selected_timeframe_metrics: quantforge_eval::BacktestMetrics,
+    passed: bool,
+    blocker: Option<String>,
+    evidence: Option<RobustnessEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TradeRowView {
+    side: String,
+    entry_timestamp_ms: i64,
+    exit_timestamp_ms: i64,
+    entry_price: f64,
+    exit_price: f64,
+    net_profit: f64,
+    exit_reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -267,8 +397,7 @@ fn load_databank_path(
 ) -> Result<DatabankWorkspace, DesktopError> {
     let bytes = fs::read(path)?;
     let artifact_hash = ContentHash::sha256(&bytes);
-    let artifact: EvolveArtifact = serde_json::from_slice(&bytes)?;
-    verify_artifact(&artifact)?;
+    let (artifact, legacy_read_only) = parse_evolve_artifact(&bytes)?;
     let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
     let metadata_path = companion_metadata_path(&artifact.source);
@@ -276,18 +405,240 @@ fn load_databank_path(
     let m1_metadata_path = m1_source
         .as_deref()
         .and_then(companion_metadata_path);
+    let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
+    let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
     *state
         .loaded
         .write()
         .map_err(|_| DesktopError::StateUnavailable)? = Some(LoadedDatabank {
         bank: artifact.databank,
+        legacy_read_only,
+        databank_path: source_path.display().to_string(),
         source: artifact.source,
         broker: artifact.broker,
         metadata_path,
         m1_source,
         m1_metadata_path,
+        validation_fraction,
+        sealed_fraction,
     });
     Ok(workspace)
+}
+
+/// Open current archives with the full v6 verifier. Schema-v5 archives use a
+/// frozen, read-only adapter: their original family grammar, raw config,
+/// coverage identities and fingerprints remain validated, while the three
+/// condition-count fields needed by the current Results UI are derived in
+/// memory from each stored strategy. The source file is never rewritten or
+/// relabelled as v6.
+fn parse_evolve_artifact(bytes: &[u8]) -> Result<(EvolveArtifact, bool), DesktopError> {
+    let mut raw: Value = serde_json::from_slice(bytes)?;
+    let schema_version = raw
+        .pointer("/databank/schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    let grammar_version = raw
+        .pointer("/databank/grammar_version")
+        .and_then(Value::as_str);
+    let legacy = schema_version == Some(LEGACY_DATABANK_SCHEMA_VERSION)
+        && grammar_version == Some(LEGACY_GRAMMAR_VERSION);
+
+    if !legacy {
+        let artifact: EvolveArtifact = serde_json::from_value(raw)?;
+        verify_artifact(&artifact)?;
+        return Ok((artifact, false));
+    }
+
+    verify_legacy_raw_bindings(&raw)?;
+    adapt_legacy_archive_axes(&mut raw)?;
+    let mut artifact: EvolveArtifact = serde_json::from_value(raw)?;
+    verify_legacy_artifact(&artifact)?;
+
+    // Current coverage cards key on condition count rather than v5 family.
+    // This is a display-only index over the already-verified elite identities.
+    artifact.databank.coverage_map = artifact
+        .databank
+        .elites
+        .iter()
+        .map(|elite| {
+            (
+                niche_label(&elite.niche),
+                elite.structural_fingerprint.clone(),
+            )
+        })
+        .collect();
+    Ok((artifact, true))
+}
+
+fn verify_legacy_raw_bindings(raw: &Value) -> Result<(), DesktopError> {
+    let manifest_config = raw.pointer("/manifest/recipe/config/discover_config");
+    let databank_config = raw.pointer("/databank/config");
+    if manifest_config.is_none() || manifest_config != databank_config {
+        return Err(DesktopError::InvalidArtifact(
+            "legacy manifest and databank configs do not match".into(),
+        ));
+    }
+
+    verify_legacy_raw_coverage(raw, "elites", "coverage_map", true)?;
+    verify_legacy_raw_coverage(
+        raw,
+        "accepted_pool",
+        "accepted_coverage_map",
+        false,
+    )
+}
+
+fn verify_legacy_raw_coverage(
+    raw: &Value,
+    entries_key: &str,
+    coverage_key: &str,
+    niche_keyed: bool,
+) -> Result<(), DesktopError> {
+    let entries = raw
+        .pointer(&format!("/databank/{entries_key}"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DesktopError::InvalidArtifact(format!(
+                "legacy databank is missing {entries_key}"
+            ))
+        })?;
+    let coverage = raw
+        .pointer(&format!("/databank/{coverage_key}"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            DesktopError::InvalidArtifact(format!(
+                "legacy databank is missing {coverage_key}"
+            ))
+        })?;
+    if entries.len() != coverage.len() {
+        return Err(DesktopError::InvalidArtifact(format!(
+            "legacy {entries_key} and {coverage_key} sizes differ"
+        )));
+    }
+
+    let mut fingerprints = BTreeSet::new();
+    for entry in entries {
+        let fingerprint = entry
+            .get("structural_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DesktopError::InvalidArtifact(format!(
+                    "legacy {entries_key} contains an entry without a fingerprint"
+                ))
+            })?;
+        if !fingerprints.insert(fingerprint) {
+            return Err(DesktopError::InvalidArtifact(format!(
+                "legacy {entries_key} contains a duplicate fingerprint"
+            )));
+        }
+        let key = if niche_keyed {
+            legacy_niche_label(
+                entry.get("niche").ok_or_else(|| {
+                    DesktopError::InvalidArtifact(format!(
+                        "legacy {entries_key} contains an entry without a niche"
+                    ))
+                })?,
+            )?
+        } else {
+            fingerprint.to_owned()
+        };
+        if coverage.get(&key).and_then(Value::as_str) != Some(fingerprint) {
+            return Err(DesktopError::InvalidArtifact(format!(
+                "legacy {coverage_key} does not bind {fingerprint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_niche_label(niche: &Value) -> Result<String, DesktopError> {
+    let field = |name: &str| {
+        niche
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|value| value.replace('_', ""))
+            .ok_or_else(|| {
+                DesktopError::InvalidArtifact(format!(
+                    "legacy niche is missing {name}"
+                ))
+            })
+    };
+    Ok([
+        field("family")?,
+        field("trade_frequency")?,
+        field("hold_time")?,
+        field("drawdown")?,
+        field("win_rate")?,
+        field("long_short_skew")?,
+    ]
+    .join("/"))
+}
+
+fn adapt_legacy_archive_axes(raw: &mut Value) -> Result<(), DesktopError> {
+    for entries_key in ["accepted_pool", "elites"] {
+        let entries = raw
+            .pointer_mut(&format!("/databank/{entries_key}"))
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                DesktopError::InvalidArtifact(format!(
+                    "legacy databank is missing {entries_key}"
+                ))
+            })?;
+        for entry in entries {
+            let strategy: StrategyIr = serde_json::from_value(
+                entry
+                    .get("strategy")
+                    .cloned()
+                    .ok_or_else(|| {
+                        DesktopError::InvalidArtifact(format!(
+                            "legacy {entries_key} contains an entry without a strategy"
+                        ))
+                    })?,
+            )?;
+            let entry_conditions = strategy_entry_condition_count(&strategy);
+            let exit_conditions = strategy_exit_condition_count(&strategy);
+            let descriptor = entry
+                .get_mut("descriptor")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    DesktopError::InvalidArtifact(format!(
+                        "legacy {entries_key} contains an invalid descriptor"
+                    ))
+                })?;
+            rename_legacy_field(descriptor, "trades_per_1000_bars", "tradesPer1000Bars");
+            rename_legacy_field(descriptor, "average_bars_held", "averageBarsHeld");
+            rename_legacy_field(descriptor, "drawdown_percent", "drawdownPercent");
+            rename_legacy_field(descriptor, "win_rate_percent", "winRatePercent");
+            rename_legacy_field(descriptor, "long_short_skew", "longShortSkew");
+            descriptor.insert("entryConditions".into(), json!(entry_conditions));
+            descriptor.insert("exitConditions".into(), json!(exit_conditions));
+
+            let niche = entry
+                .get_mut("niche")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    DesktopError::InvalidArtifact(format!(
+                        "legacy {entries_key} contains an invalid niche"
+                    ))
+                })?;
+            rename_legacy_field(niche, "trade_frequency", "tradeFrequency");
+            rename_legacy_field(niche, "hold_time", "holdTime");
+            rename_legacy_field(niche, "win_rate", "winRate");
+            rename_legacy_field(niche, "long_short_skew", "longShortSkew");
+            niche.insert("entryConditions".into(), json!(entry_conditions));
+        }
+    }
+    Ok(())
+}
+
+fn rename_legacy_field(
+    object: &mut serde_json::Map<String, Value>,
+    legacy: &str,
+    current: &str,
+) {
+    if let Some(value) = object.remove(legacy) {
+        object.insert(current.into(), value);
+    }
 }
 
 #[tauri::command]
@@ -344,6 +695,303 @@ pub async fn get_elite_partition_equity(
     .map_err(|error| format!("partition equity task failed: {error}"))?
 }
 
+#[tauri::command]
+pub async fn run_elite_robustness(
+    request: ResultsRobustnessRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ResultsRobustnessView, String> {
+    let snapshot = {
+        let loaded = state
+            .loaded
+            .read()
+            .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+        let loaded = loaded
+            .as_ref()
+            .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
+        let elite = loaded
+            .bank
+            .elites
+            .iter()
+            .find(|elite| elite.structural_fingerprint.as_str() == request.fingerprint)
+            .ok_or_else(|| DesktopError::MissingElite(request.fingerprint.clone()).to_string())?
+            .clone();
+        RobustnessSnapshot {
+            elite,
+            databank_path: loaded.databank_path.clone(),
+            source: loaded.source.clone(),
+            broker: loaded.broker.clone(),
+            metadata_path: loaded.metadata_path.clone(),
+            m1_source: loaded.m1_source.clone().ok_or_else(|| {
+                "This legacy databank does not bind its M1 source. Run a new M1-verified Discover search before launching Results robustness.".to_owned()
+            })?,
+            m1_metadata_path: loaded.m1_metadata_path.clone(),
+            validation_fraction: loaded.validation_fraction,
+            sealed_fraction: loaded.sealed_fraction,
+            data_hash: loaded.bank.data_hash.clone(),
+            broker_spec_hash: loaded.bank.broker_spec_hash.clone(),
+            grammar_version: loaded.bank.grammar_version.clone(),
+            config: loaded.bank.config.clone(),
+        }
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        run_elite_robustness_sync(&request, &snapshot)
+    })
+    .await
+    .map_err(|error| format!("Results robustness task failed: {error}"))?
+}
+
+fn run_elite_robustness_sync(
+    request: &ResultsRobustnessRequest,
+    snapshot: &RobustnessSnapshot,
+) -> Result<ResultsRobustnessView, String> {
+    let decision_source = crate::data_lab::load_data_source(
+        &snapshot.source,
+        snapshot.metadata_path.as_deref(),
+        None,
+    )?;
+    let m1_source = crate::data_lab::load_data_source(
+        &snapshot.m1_source,
+        snapshot.m1_metadata_path.as_deref(),
+        None,
+    )?;
+    let broker = load_bound_broker(&snapshot.broker, decision_source.metadata.as_ref())?;
+    load_bound_broker(&snapshot.broker, m1_source.metadata.as_ref())?;
+
+    // Reconstruct the exact Selected-TF candles from M1, then recover the same
+    // IS partition that Discover hashed into the databank. This prevents a
+    // Results retest from silently drifting onto full history or OOS1/OOS2.
+    let full_decision =
+        build_decision_from_m1(&m1_source.dataset, Some(&decision_source.dataset))?;
+    let is_decision = databank_decision_partition(
+        &full_decision,
+        &snapshot.data_hash,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )?;
+    let selected_timeframe = evaluate_strategy(
+        &snapshot.elite.strategy,
+        &is_decision,
+        &broker,
+        &snapshot.config.scout,
+    )
+    .map_err(|error| format!("Selected-timeframe IS replay failed: {error}"))?;
+
+    let (folds, monte_carlo_trials, neighborhood_samples) =
+        robustness_depth(&snapshot.config, request.mode);
+    let search = &snapshot.config.search_ranges;
+    let config = RobustnessConfig {
+        folds,
+        monte_carlo_trials,
+        neighborhood_samples,
+        seed: snapshot.config.seed,
+        initial_balance: snapshot.config.scout.initial_balance,
+        costs: snapshot.config.scout.costs.clone(),
+        entry_window: snapshot.config.scout.entry_window,
+        minimum_return_retention: snapshot.config.precision.minimum_return_retention,
+        minimum_fold_trades: snapshot.config.deposit_gates.minimum_trades.clamp(1, 2),
+        minimum_return_percent: snapshot.config.deposit_gates.minimum_return_percent,
+        minimum_profit_factor: snapshot.config.deposit_gates.minimum_profit_factor.min(1.0),
+        maximum_drawdown_percent: snapshot
+            .config
+            .deposit_gates
+            .maximum_drawdown_percent
+            .max(30.0),
+        minimum_passing_fold_fraction: 0.6,
+        minimum_neighborhood_survival_fraction: snapshot
+            .config
+            .minimum_neighborhood_survival_fraction
+            .clamp(0.25, 1.0),
+        parameter_perturbation_fraction: snapshot.config.robustness_perturbation_fraction,
+        adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
+        adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
+        adx_period_step: search.indicator_period.step.round().max(1.0) as u16,
+        adx_threshold_min: search.adx_threshold.minimum,
+        adx_threshold_max: search.adx_threshold.maximum,
+        adx_threshold_step: search.adx_threshold.step,
+        indicator_engine: snapshot.config.scout.indicator_engine,
+        calendar_year_folds: snapshot.config.calendar_year_folds,
+    };
+    let outcome = run_m1_predeposit_robustness(
+        &snapshot.elite.strategy,
+        &is_decision,
+        &m1_source.dataset,
+        &broker,
+        &config,
+        &selected_timeframe.metrics,
+    );
+    let (passed, blocker, message, evidence) = match outcome {
+        Ok(outcome) => (
+            true,
+            None,
+            "Passed M1 retention, walk-forward, Monte Carlo and parameter-neighborhood gates."
+                .to_owned(),
+            outcome.evidence,
+        ),
+        Err(reject) => {
+            let (blocker, message) = robustness_reject_detail(reject);
+            (false, Some(blocker.to_owned()), message.to_owned(), None)
+        }
+    };
+
+    let manifest = RunManifest::new(
+        "elite-robustness",
+        RunRecipe {
+            data_hash: Some(snapshot.data_hash.clone()),
+            broker_spec_hash: Some(snapshot.broker_spec_hash.clone()),
+            grammar_version: Some(snapshot.grammar_version.clone()),
+            seed: Some(snapshot.config.seed),
+            config: BTreeMap::from([
+                ("databank_source".into(), json!(&snapshot.databank_path)),
+                ("decision_source".into(), json!(&snapshot.source)),
+                ("m1_source".into(), json!(&snapshot.m1_source)),
+                ("strategy_fingerprint".into(), json!(&request.fingerprint)),
+                ("mode".into(), json!(request.mode)),
+                ("folds".into(), json!(folds)),
+                ("monte_carlo_trials".into(), json!(monte_carlo_trials)),
+                (
+                    "monte_carlo_skip_trade_probability".into(),
+                    json!(quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY),
+                ),
+                ("neighborhood_samples".into(), json!(neighborhood_samples)),
+                (
+                    "parameter_perturbation_fraction".into(),
+                    json!(config.parameter_perturbation_fraction),
+                ),
+                (
+                    "minimum_return_retention".into(),
+                    json!(config.minimum_return_retention),
+                ),
+                (
+                    "minimum_neighborhood_survival_fraction".into(),
+                    json!(config.minimum_neighborhood_survival_fraction),
+                ),
+                ("passed".into(), json!(passed)),
+                ("blocker".into(), json!(&blocker)),
+            ]),
+            override_flags: Vec::new(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let report_directory = Path::new(&snapshot.databank_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("Robustness");
+    fs::create_dir_all(&report_directory)
+        .map_err(|error| format!("cannot create Results robustness directory: {error}"))?;
+    let short_fingerprint = request.fingerprint.chars().take(12).collect::<String>();
+    let artifact_path = report_directory.join(format!(
+        "{}-{}-{}.robustness.json",
+        safe_file_stem(&snapshot.elite.strategy.id),
+        short_fingerprint,
+        manifest.run_id
+    ));
+    let artifact = ResultsRobustnessArtifact {
+        schema_version: 1,
+        manifest,
+        databank_source: snapshot.databank_path.clone(),
+        decision_source: snapshot.source.clone(),
+        m1_source: snapshot.m1_source.clone(),
+        broker_source: snapshot.broker.clone(),
+        strategy_id: snapshot.elite.strategy.id.clone(),
+        strategy_fingerprint: snapshot.elite.structural_fingerprint.clone(),
+        mode: request.mode,
+        validation_fraction: snapshot.validation_fraction,
+        sealed_fraction: snapshot.sealed_fraction,
+        selected_timeframe_metrics: selected_timeframe.metrics,
+        passed,
+        blocker: blocker.clone(),
+        evidence: evidence.clone(),
+    };
+    write_json_new(&artifact_path, &artifact).map_err(|error| error.to_string())?;
+
+    Ok(ResultsRobustnessView {
+        fingerprint: request.fingerprint.clone(),
+        strategy_id: snapshot.elite.strategy.id.clone(),
+        mode: request.mode,
+        passed,
+        blocker,
+        message,
+        artifact_path: canonical_display(&artifact_path),
+        folds,
+        monte_carlo_trials,
+        neighborhood_samples,
+        evidence,
+    })
+}
+
+fn databank_decision_partition(
+    full_decision: &BarDataset,
+    expected_hash: &ContentHash,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, String> {
+    if &full_decision.data_hash == expected_hash {
+        return Ok(full_decision.clone());
+    }
+    let split = DataSplitPlan::chronological(
+        full_decision,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let bars = full_decision.bars[..split.development.bar_count].to_vec();
+    let development = BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: full_decision.delimiter,
+        source_timezone: full_decision.source_timezone.clone(),
+        bars,
+    };
+    if &development.data_hash != expected_hash {
+        return Err(
+            "The bound decision/M1 files no longer reproduce this databank's IS hash; robustness refuses to test a different sample."
+                .into(),
+        );
+    }
+    Ok(development)
+}
+
+fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static str) {
+    match reject {
+        RobustnessReject::M1Fidelity => (
+            "m1_fidelity",
+            "Failed Selected-TF to M1 return, trade-count or drawdown retention.",
+        ),
+        RobustnessReject::WalkForward => (
+            "walk_forward",
+            "Failed the M1 walk-forward stability requirement.",
+        ),
+        RobustnessReject::MonteCarlo => (
+            "monte_carlo",
+            "Failed the block-bootstrap Monte Carlo requirement.",
+        ),
+        RobustnessReject::ParamNeighborhood => (
+            "parameter_neighborhood",
+            "Failed the ±20% parameter-neighborhood or ADX plateau requirement.",
+        ),
+    }
+}
+
+fn robustness_depth(
+    config: &DiscoverConfig,
+    mode: ResultsRobustnessMode,
+) -> (usize, usize, usize) {
+    match mode {
+        ResultsRobustnessMode::Standard => (
+            config.robustness_folds,
+            config.robustness_monte_carlo_trials,
+            config.robustness_neighborhood_samples,
+        ),
+        ResultsRobustnessMode::Deep => (
+            config.robustness_folds.max(5),
+            config.robustness_monte_carlo_trials.max(1_000),
+            config.robustness_neighborhood_samples.max(20),
+        ),
+    }
+}
+
 fn partition_equity_for_elite(
     elite: &Elite,
     source: &str,
@@ -362,17 +1010,22 @@ fn partition_equity_for_elite(
     })?;
     let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
     crate::data_lab::load_bound_broker(broker_path, m1.metadata.as_ref())?;
-    let plan = quantforge_quality::DataSplitPlan::chronological(&loaded.dataset, 0.2, 0.2)
+    // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
+    // align with the exported EA and external MT5 backtests.
+    let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
+    let plan = quantforge_quality::DataSplitPlan::chronological(&decision_dataset, 0.2, 0.2)
         .map_err(|error| error.to_string())?;
     let result = quantforge_tick::evaluate_strategy_m1(
         &elite.strategy,
-        &loaded.dataset,
+        &decision_dataset,
         &m1.dataset,
         &broker,
         &quantforge_tick::JudgeConfig {
             initial_balance: scout.initial_balance,
             costs: scout.costs.clone(),
             allow_execution_gaps: false,
+            indicator_engine: scout.indicator_engine,
+            entry_window: scout.entry_window,
         },
     )
     .map_err(|error| format!("M1 full-run replay failed: {error}"))?;
@@ -406,6 +1059,22 @@ fn partition_equity_for_elite(
         .then_some(oos1_expectancy / is_expectancy);
 
     let points = downsample_equity(&result.equity, 480, is_end, oos1_end);
+    let trades: Vec<TradeRowView> = result
+        .trades
+        .iter()
+        .take(2_000)
+        .map(|trade| TradeRowView {
+            side: format!("{:?}", trade.side).to_ascii_lowercase(),
+            entry_timestamp_ms: trade.entry_timestamp_ms,
+            exit_timestamp_ms: trade.exit_timestamp_ms,
+            entry_price: trade.entry_price,
+            exit_price: trade.exit_price,
+            net_profit: trade.net_profit,
+            exit_reason: format!("{:?}", trade.exit_reason)
+                .replace('_', " ")
+                .to_ascii_lowercase(),
+        })
+        .collect();
 
     Ok(PartitionEquityView {
         fingerprint: elite.structural_fingerprint.as_str().into(),
@@ -439,6 +1108,16 @@ fn partition_equity_for_elite(
         is_trades: is_trades.len(),
         oos1_trades: oos1_trades.len(),
         oos2_trades: oos2_trades.len(),
+        full_run_trades: result.metrics.trade_count,
+        full_run_return_percent: result.metrics.return_percent,
+        full_run_net_profit: result.metrics.net_profit,
+        full_run_max_drawdown: result.metrics.max_drawdown,
+        full_run_max_drawdown_percent: result.metrics.max_drawdown_percent,
+        full_run_profit_factor: result.metrics.profit_factor,
+        full_run_win_rate: result.metrics.win_rate,
+        full_run_sharpe_ratio: result.metrics.sharpe_ratio,
+        full_run_recovery_factor: finite_recovery_factor(&result.metrics),
+        trades,
     })
 }
 
@@ -540,9 +1219,10 @@ pub fn export_elite_strategy(
         .loaded
         .read()
         .map_err(|_| DesktopError::StateUnavailable.to_string())?;
-    let elite = loaded
+    let loaded = loaded
         .as_ref()
-        .ok_or_else(|| DesktopError::NoDatabank.to_string())?
+        .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
+    let elite = loaded
         .bank
         .elites
         .iter()
@@ -574,6 +1254,55 @@ pub fn export_elite_eas(
 ) -> Result<BatchEaExportView, String> {
     export_elite_eas_to(&request, Path::new(&request.directory), &state)
         .map_err(|error| error.to_string())
+}
+
+/// Stage an elite strategy IR into a Vault `candidates/` folder.
+/// This is not Certified admission — full certify_to_vault still requires the evidence chain.
+#[tauri::command]
+pub fn promote_elite_to_vault(
+    fingerprint: String,
+    vault_directory: String,
+    state: State<'_, DesktopState>,
+) -> Result<String, String> {
+    let loaded = state
+        .loaded
+        .read()
+        .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+    let loaded = loaded
+        .as_ref()
+        .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
+    if loaded.legacy_read_only {
+        return Err(
+            "Schema-v5 databanks are read-only in QuantForge v6. Results retests are allowed, but staging/certification requires a fresh v6 Discover archive."
+                .into(),
+        );
+    }
+    let elite = loaded
+        .bank
+        .elites
+        .iter()
+        .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+        .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?;
+    let root = PathBuf::from(&vault_directory);
+    let candidates = root.join("candidates");
+    fs::create_dir_all(&candidates).map_err(|error| error.to_string())?;
+    let safe_name = fingerprint
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let path = candidates.join(format!("{safe_name}.ir.json"));
+    if path.exists() {
+        return Err(format!(
+            "candidate already staged at {}; remove it before promoting again",
+            path.display()
+        ));
+    }
+    quantforge_storage::write_json_new(&path, &elite.strategy).map_err(|error| error.to_string())?;
+    Ok(path
+        .canonicalize()
+        .unwrap_or(path)
+        .display()
+        .to_string())
 }
 
 fn export_elite_eas_to(
@@ -632,9 +1361,9 @@ fn export_elite_eas_to(
         .map_err(|_| DesktopError::StateUnavailable)?;
     let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
     let broker = load_bound_broker(&loaded.broker, None).map_err(DesktopError::InvalidExport)?;
-    let symbol_stem = safe_file_stem(&broker.symbol);
     let costs = &loaded.bank.config.scout.costs;
     let mut exports = Vec::with_capacity(request.fingerprints.len());
+    let mut used_names = std::collections::BTreeSet::new();
     for (offset, fingerprint) in request.fingerprints.iter().enumerate() {
         let elite = loaded
             .bank
@@ -643,12 +1372,20 @@ fn export_elite_eas_to(
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()))?;
         let unique_number = request.base_magic + offset as u64;
-        let expert_name = format!(
-            "{}_{}_{}",
-            symbol_stem,
-            family_name(elite.niche.family),
-            unique_number
+        // Name each expert after its own generation and candidate index so a
+        // folder of exports is identifiable in the MT5 navigator.
+        let preferred = quantforge_export_mql5::suggested_expert_name(
+            &broker.symbol,
+            &elite.strategy.id,
+            unique_number,
         );
+        let expert_name = if used_names.insert(preferred.clone()) {
+            preferred
+        } else {
+            let fallback = format!("{preferred}_{unique_number}");
+            used_names.insert(fallback.clone());
+            fallback
+        };
         let config = Mql5ExportConfig {
             expert_name: expert_name.clone(),
             expert_directory: "QuantForge".into(),
@@ -659,9 +1396,16 @@ fn export_elite_eas_to(
             estimated_slippage_points_per_side: costs.adverse_slippage_points_per_side,
             commission_per_lot_round_turn: costs.commission_per_lot_round_turn,
             allow_live_trading_default: false,
+            export_style: quantforge_export_mql5::ExportStyle::Sqx,
+            entry_window_start_hour: loaded.bank.config.scout.entry_window.start_hour,
+            entry_window_end_hour: loaded.bank.config.scout.entry_window.end_hour,
             tester: TesterConfig {
                 deposit: loaded.bank.config.scout.initial_balance,
-                model: 4,
+                // Model 1 is M1 OHLC, which is the resolution the M1 judge
+                // already uses. Real ticks (model 4) multiply tester runtime by
+                // orders of magnitude without changing a bar-close decision, so
+                // it belongs to the final parity run rather than batch review.
+                model: 1,
                 ..TesterConfig::default()
             },
         };
@@ -697,6 +1441,15 @@ fn export_elite_eas_to(
             .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
         write_text_new(source, &bundle.source)
             .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        for support in &bundle.support_files {
+            let path = directory.join(&support.relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+            }
+            write_text_new(&path, &support.contents)
+                .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        }
         write_text_new(settings, &bundle.set_file)
             .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
         write_text_new(tester, &bundle.tester_ini)
@@ -713,11 +1466,12 @@ fn export_elite_eas_to(
         "execution_data_hash": loaded.bank.execution_data_hash,
         "broker_spec_hash": loaded.bank.broker_spec_hash,
         "timeframe": request.timeframe,
-        "tester_model": "every tick based on real ticks",
+        "tester_model": "1 minute OHLC",
         "strategies": exports.iter().map(|(elite, expert_name, magic, _, strategy, source, settings, tester, evidence)| serde_json::json!({
             "fingerprint": elite.structural_fingerprint,
             "strategy_id": elite.strategy.id,
-            "family": family_name(elite.niche.family),
+            "entry_conditions": elite.niche.entry_conditions,
+            "exit_conditions": elite.descriptor.exit_conditions,
             "grade": "illuminated",
             "magic": magic,
             "expert_name": expert_name,
@@ -822,12 +1576,10 @@ fn export_elite_strategies_to(
         "strategies": exports.iter().map(|(elite, path)| serde_json::json!({
             "fingerprint": elite.structural_fingerprint,
             "strategy_id": elite.strategy.id,
-            "family": family_name(elite.niche.family),
+            "entry_conditions": elite.niche.entry_conditions,
+            "exit_conditions": elite.descriptor.exit_conditions,
             "return_percent": elite.metrics.return_percent,
-            "return_drawdown": finite_return_drawdown(
-                elite.metrics.return_percent,
-                elite.metrics.max_drawdown_percent,
-            ),
+            "recovery_factor": finite_recovery_factor(&elite.metrics),
             "profit_factor": elite.metrics.profit_factor,
             "sharpe_ratio": effective_sharpe(elite),
             "maximum_drawdown_percent": elite.metrics.max_drawdown_percent,
@@ -895,6 +1647,147 @@ pub(crate) fn verify_artifact(artifact: &EvolveArtifact) -> Result<(), DesktopEr
     Ok(())
 }
 
+fn verify_legacy_artifact(artifact: &EvolveArtifact) -> Result<(), DesktopError> {
+    artifact
+        .manifest
+        .validate()
+        .map_err(|error| DesktopError::InvalidArtifact(error.to_string()))?;
+    let bank = &artifact.databank;
+    if artifact.manifest.command != "evolve"
+        || bank.schema_version != LEGACY_DATABANK_SCHEMA_VERSION
+        || bank.grammar_version != LEGACY_GRAMMAR_VERSION
+        || artifact.manifest.recipe.data_hash.as_ref() != Some(&bank.data_hash)
+        || artifact.manifest.recipe.broker_spec_hash.as_ref() != Some(&bank.broker_spec_hash)
+        || artifact.manifest.recipe.grammar_version.as_deref() != Some(LEGACY_GRAMMAR_VERSION)
+        || !artifact.manifest.recipe.override_flags.is_empty()
+        || artifact.data_quality.grade == QualityGrade::Fail
+        || artifact.coverage != bank.coverage()
+        || (artifact.qd_score - bank.qd_score()).abs() > 1.0e-9
+        || bank.evaluation_count == 0
+        || (bank.elites.is_empty() && bank.accepted_pool.is_empty())
+    {
+        return Err(DesktopError::InvalidArtifact(
+            "legacy manifest, quality, coverage or QD score does not match the persisted archive"
+                .into(),
+        ));
+    }
+    verify_legacy_entries(
+        &bank.elites,
+        &bank.config,
+        bank.completed_generations,
+    )?;
+    verify_legacy_entries(
+        &bank.accepted_pool,
+        &bank.config,
+        bank.completed_generations,
+    )
+}
+
+fn verify_legacy_entries(
+    entries: &[Elite],
+    config: &DiscoverConfig,
+    completed_generations: u64,
+) -> Result<(), DesktopError> {
+    for elite in entries {
+        let fingerprint = elite
+            .strategy
+            .structural_fingerprint(FloatPolicy::default())
+            .map_err(|error| DesktopError::InvalidArtifact(error.to_string()))?;
+        let effective_profit_factor = elite.metrics.profit_factor.unwrap_or({
+            if elite.metrics.net_profit > 0.0 && elite.metrics.winning_trades > 0 {
+                f64::MAX
+            } else {
+                0.0
+            }
+        });
+        let fixed_risk = matches!(
+            elite.strategy.risk,
+            RiskPolicy::FixedCurrency { amount }
+                if (amount - quantforge_discover::FIXED_RISK_PER_TRADE).abs() <= 1.0e-9
+        );
+        let recovery = elite.metrics.recovery_factor();
+        if fingerprint != elite.structural_fingerprint
+            || strategy_entry_condition_count(&elite.strategy)
+                != elite.descriptor.entry_conditions
+            || strategy_exit_condition_count(&elite.strategy)
+                != elite.descriptor.exit_conditions
+            || niche_from_descriptor(&elite.descriptor) != elite.niche
+            || elite.strategy.manage.flatten_end_of_day != config.flatten_at_22
+            || elite.strategy.manage.max_one_entry_per_day != config.max_one_entry_per_day
+            || !fixed_risk
+            || elite.metrics.trade_count < config.deposit_gates.minimum_trades
+            || elite.metrics.return_percent <= config.deposit_gates.minimum_return_percent
+            || effective_profit_factor < config.deposit_gates.minimum_profit_factor
+            || recovery < config.deposit_gates.minimum_recovery_factor
+            || elite.metrics.max_drawdown_percent > config.deposit_gates.maximum_drawdown_percent
+            || elite.discovered_generation > completed_generations
+            || !elite.evidence.total.is_finite()
+            || !elite.novelty.is_finite()
+        {
+            return Err(DesktopError::InvalidArtifact(
+                "a legacy elite is structurally invalid or no longer passes its stored gates"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strategy_entry_condition_count(strategy: &StrategyIr) -> usize {
+    strategy
+        .entry
+        .long
+        .as_ref()
+        .or(strategy.entry.short.as_ref())
+        .map(|expression| match expression {
+            BoolExpr::And { children } => children.len(),
+            _ => 1,
+        })
+        .unwrap_or(0)
+}
+
+fn strategy_exit_condition_count(strategy: &StrategyIr) -> usize {
+    strategy
+        .exit_long
+        .as_ref()
+        .or(strategy.exit_short.as_ref())
+        .or(strategy.exit.as_ref())
+        .map(|expression| match expression {
+            BoolExpr::Or { children } => children.len(),
+            _ => 1,
+        })
+        .unwrap_or(0)
+}
+
+fn niche_from_descriptor(
+    descriptor: &quantforge_discover::BehaviorDescriptor,
+) -> NicheKey {
+    NicheKey {
+        entry_conditions: descriptor.entry_conditions,
+        trade_frequency: three_level_bucket(descriptor.trades_per_1000_bars, 5.0, 20.0),
+        hold_time: three_level_bucket(descriptor.average_bars_held, 4.0, 24.0),
+        drawdown: three_level_bucket(descriptor.drawdown_percent, 5.0, 15.0),
+        win_rate: three_level_bucket(descriptor.win_rate_percent, 35.0, 55.0),
+        long_short_skew: if descriptor.long_short_skew < -0.25 {
+            LongShortSkewBucket::ShortHeavy
+        } else if descriptor.long_short_skew > 0.25 {
+            LongShortSkewBucket::LongHeavy
+        } else {
+            LongShortSkewBucket::Balanced
+        },
+    }
+}
+
+fn three_level_bucket(value: f64, first: f64, second: f64) -> ThreeLevelBucket {
+    if value < first {
+        ThreeLevelBucket::Low
+    } else if value < second {
+        ThreeLevelBucket::Medium
+    } else {
+        ThreeLevelBucket::High
+    }
+}
+
 fn workspace_view(
     artifact: &EvolveArtifact,
     source_path: &Path,
@@ -932,10 +1825,15 @@ fn workspace_view(
         data_hash: bank.data_hash.as_str().into(),
         broker_spec_hash: bank.broker_spec_hash.as_str().into(),
         grammar_version: bank.grammar_version.clone(),
+        legacy_read_only: bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION,
         quality_grade: format!("{:?}", artifact.data_quality.grade).to_ascii_lowercase(),
         quality_score: artifact.data_quality.score,
         coverage: bank.coverage(),
-        total_niches: TOTAL_NICHES,
+        total_niches: if bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION {
+            LEGACY_TOTAL_NICHES
+        } else {
+            TOTAL_NICHES
+        },
         qd_score: bank.qd_score(),
         completed_generations: bank.completed_generations,
         selection_bias: selection_bias(bank.evaluation_count),
@@ -958,10 +1856,11 @@ fn workspace_view(
         allow_break_even: bank.config.allow_break_even,
         allow_trailing_stops: bank.config.allow_trailing_stops,
         allow_partial_exits: bank.config.allow_partial_exits,
+        allow_market_entries: bank.config.allow_market_entries,
         allow_stop_entries: bank.config.allow_stop_entries,
         allow_limit_entries: bank.config.allow_limit_entries,
         max_one_entry_per_day: bank.config.max_one_entry_per_day,
-        families: coverage_families(bank),
+        condition_groups: coverage_condition_groups(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
     }
 }
@@ -994,6 +1893,17 @@ fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
         .get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
+    artifact
+        .manifest
+        .recipe
+        .config
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..1.0).contains(value))
+        .unwrap_or(fallback)
 }
 
 fn companion_metadata_path(data_path: &str) -> Option<String> {
@@ -1030,12 +1940,12 @@ fn selection_bias(evaluation_count: u64) -> SelectionBiasView {
     let (level, message) = if evaluation_count > 10_000 {
         (
             "high",
-            "This is not a data failure: more than 10,000 candidate results were compared, so the winner is highly exposed to multiple-testing luck. Require the full Challenge, sealed-final and external-parity chain.",
+            "More than 10,000 candidate results were compared, so the winner is highly exposed to multiple-testing luck. Require the full Challenge, sealed-final and external-parity chain.",
         )
     } else if evaluation_count > SELECTION_BIAS_WARNING_THRESHOLD {
         (
             "elevated",
-            "This is not a data failure: more than 1,500 candidate results were compared, increasing the chance that a winner benefited from luck. Promotion must retain deflated metrics and robustness evidence.",
+            "More than 1,500 candidate results were compared, increasing the chance that a winner benefited from luck. Promotion must retain deflated metrics and robustness evidence.",
         )
     } else {
         (
@@ -1054,16 +1964,14 @@ fn elite_row(elite: &Elite) -> EliteRow {
     EliteRow {
         fingerprint: elite.structural_fingerprint.as_str().into(),
         strategy_id: elite.strategy.id.clone(),
-        family: family_name(elite.niche.family).into(),
+        entry_conditions: elite.niche.entry_conditions,
+        exit_conditions: elite.descriptor.exit_conditions,
         evidence: elite.evidence.total,
         novelty: elite.novelty,
         trades: elite.metrics.trade_count,
         return_percent: elite.metrics.return_percent,
         drawdown_percent: elite.metrics.max_drawdown_percent,
-        return_drawdown: finite_return_drawdown(
-            elite.metrics.return_percent,
-            elite.metrics.max_drawdown_percent,
-        ),
+        recovery_factor: finite_recovery_factor(&elite.metrics),
         profit_factor: elite.metrics.profit_factor,
         sharpe_ratio: effective_sharpe(elite),
         is_expectancy: elite.is_expectancy,
@@ -1077,10 +1985,9 @@ fn elite_row(elite: &Elite) -> EliteRow {
     }
 }
 
-fn finite_return_drawdown(return_percent: f64, drawdown_percent: f64) -> Option<f64> {
-    (drawdown_percent > 1.0e-12)
-        .then_some(return_percent / drawdown_percent)
-        .filter(|value| value.is_finite())
+fn finite_recovery_factor(metrics: &quantforge_eval::BacktestMetrics) -> Option<f64> {
+    let value = metrics.recovery_factor();
+    value.is_finite().then_some(value)
 }
 
 fn effective_sharpe(elite: &Elite) -> Option<f64> {
@@ -1112,7 +2019,8 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         fingerprint: elite.structural_fingerprint.as_str().into(),
         strategy_id: elite.strategy.id.clone(),
         thesis: elite.strategy.meta.thesis_hint.clone(),
-        family: family_name(elite.niche.family).into(),
+        entry_conditions: elite.niche.entry_conditions,
+        exit_conditions: elite.descriptor.exit_conditions,
         niche: niche_label(&elite.niche),
         grade: "illuminated",
         parity: "unknown",
@@ -1121,10 +2029,61 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         metrics: serde_json::to_value(&elite.metrics)?,
         strategy_ir: serde_json::to_value(&elite.strategy)?,
         equity_signature: elite.equity_signature.clone(),
+        robustness: elite_robustness(elite)?,
     })
 }
 
-fn coverage_families(bank: &Databank) -> Vec<FamilyCoverage> {
+fn elite_robustness(elite: &Elite) -> Result<Option<EliteRobustnessView>, serde_json::Error> {
+    let evidence = elite
+        .robustness
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    if elite.gate_results.is_empty() {
+        return Ok(evidence.map(|evidence| EliteRobustnessView {
+            monte_carlo: None,
+            walk_forward: None,
+            param_permutation: None,
+            summary: None,
+            evidence: Some(evidence),
+        }));
+    }
+    let find = |names: &[&str]| {
+        elite.gate_results.iter().find_map(|gate| {
+            names
+                .iter()
+                .any(|name| gate.name.eq_ignore_ascii_case(name))
+                .then(|| {
+                    format!(
+                        "{} — {}",
+                        if gate.passed { "passed" } else { "failed" },
+                        gate.detail
+                    )
+                })
+        })
+    };
+    let monte_carlo = find(&["monte_carlo", "mc"]);
+    let walk_forward = find(&["walk_forward", "wfo"]);
+    let param_permutation = find(&["param_neighborhood", "param_permutation", "neighborhood"]);
+    let summary = find(&["m1_robustness", "robustness"]);
+    if monte_carlo.is_none()
+        && walk_forward.is_none()
+        && param_permutation.is_none()
+        && summary.is_none()
+        && evidence.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(EliteRobustnessView {
+        monte_carlo,
+        walk_forward,
+        param_permutation,
+        summary,
+        evidence,
+    }))
+}
+
+fn coverage_condition_groups(bank: &Databank) -> Vec<ConditionCoverage> {
     let elites: BTreeMap<_, _> = bank
         .elites
         .iter()
@@ -1140,9 +2099,9 @@ fn coverage_families(bank: &Databank) -> Vec<FamilyCoverage> {
         .iter()
         .map(|elite| elite.evidence.total)
         .fold(f64::NEG_INFINITY, f64::max);
-    FamilyStyle::ALL
+    ENTRY_CONDITION_COUNTS
         .into_iter()
-        .map(|family| {
+        .map(|entry_conditions| {
         let mut cells = Vec::with_capacity(3usize.pow(5));
         for win_rate in three_levels() {
             for skew in skew_levels() {
@@ -1150,7 +2109,7 @@ fn coverage_families(bank: &Databank) -> Vec<FamilyCoverage> {
                     for hold_time in three_levels() {
                         for drawdown in three_levels() {
                             let niche = NicheKey {
-                                family,
+                                entry_conditions,
                                 trade_frequency,
                                 hold_time,
                                 drawdown,
@@ -1179,8 +2138,9 @@ fn coverage_families(bank: &Databank) -> Vec<FamilyCoverage> {
                 }
             }
         }
-        FamilyCoverage {
-            family: family_name(family).into(),
+        ConditionCoverage {
+            entry_conditions,
+            label: format!("{entry_conditions} entry conditions"),
             occupied: cells.iter().filter(|cell| cell.occupied).count(),
             total: cells.len(),
             cells,
@@ -1194,21 +2154,6 @@ fn evidence_intensity(value: f64, minimum: f64, maximum: f64) -> f64 {
         1.0
     } else {
         (0.2 + 0.8 * ((value - minimum) / (maximum - minimum))).clamp(0.2, 1.0)
-    }
-}
-
-fn family_name(family: FamilyStyle) -> &'static str {
-    match family {
-        FamilyStyle::TrendPullback => "trend_pullback",
-        FamilyStyle::MomentumBurst => "momentum_burst",
-        FamilyStyle::DonchianBreakout => "donchian_breakout",
-        FamilyStyle::MeanReversionBand => "mean_reversion_band",
-        FamilyStyle::ZScoreReversion => "zscore_reversion",
-        FamilyStyle::SessionOrb => "session_orb",
-        FamilyStyle::ImpulseCandle => "impulse_candle",
-        FamilyStyle::VolSqueezeBreak => "vol_squeeze_break",
-        FamilyStyle::SupplyDemandReclaim => "supply_demand_reclaim",
-        FamilyStyle::SweepReclaim => "sweep_reclaim",
     }
 }
 
@@ -1249,13 +2194,13 @@ mod tests {
             accepted_coverage_map: BTreeMap::new(),
             telemetry: Default::default(),
         };
-        let families = coverage_families(&bank);
-        assert_eq!(families.len(), 10);
+        let groups = coverage_condition_groups(&bank);
+        assert_eq!(groups.len(), ENTRY_CONDITION_COUNTS.len());
         assert_eq!(
-            families.iter().map(|family| family.total).sum::<usize>(),
+            groups.iter().map(|group| group.total).sum::<usize>(),
             TOTAL_NICHES
         );
-        assert!(families.iter().all(|family| family.occupied == 0));
+        assert!(groups.iter().all(|group| group.occupied == 0));
     }
 
     #[test]
@@ -1264,6 +2209,59 @@ mod tests {
         assert_eq!(selection_bias(1_501).level, "elevated");
         assert_eq!(selection_bias(10_001).level, "high");
         assert_eq!(selection_bias(10_001).evaluation_count, 10_001);
+    }
+
+    #[test]
+    fn robustness_depth_preserves_standard_and_only_raises_deep_compute() {
+        let config = DiscoverConfig {
+            robustness_folds: 3,
+            robustness_monte_carlo_trials: 250,
+            robustness_neighborhood_samples: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            robustness_depth(&config, ResultsRobustnessMode::Standard),
+            (3, 250, 8)
+        );
+        assert_eq!(
+            robustness_depth(&config, ResultsRobustnessMode::Deep),
+            (5, 1_000, 20)
+        );
+    }
+
+    #[test]
+    fn results_robustness_recovers_only_the_hash_bound_is_partition() {
+        let bars: Vec<_> = (0..20)
+            .map(|index| quantforge_data::Bar {
+                timestamp_ms: index * 3_600_000,
+                open: 1.0,
+                high: 1.1,
+                low: 0.9,
+                close: 1.0,
+                tick_volume: 60,
+                real_volume: 0,
+                spread_points: Some(10),
+            })
+            .collect();
+        let full = BarDataset {
+            data_hash: bar_content_hash(&bars),
+            source_rows: bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: b'\t' as char,
+            source_timezone: "Etc/UTC".into(),
+            bars,
+        };
+        let split = DataSplitPlan::chronological(&full, 0.2, 0.2).expect("split");
+        let expected = bar_content_hash(&full.bars[..split.development.bar_count]);
+        let recovered =
+            databank_decision_partition(&full, &expected, 0.2, 0.2).expect("matching IS");
+        assert_eq!(recovered.data_hash, expected);
+        assert_eq!(recovered.bars.len(), split.development.bar_count);
+        assert!(
+            databank_decision_partition(&full, &ContentHash::sha256("other"), 0.2, 0.2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1403,7 +2401,9 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     let judge = JudgeConfig {
         initial_balance: scout.initial_balance,
         costs: scout.costs.clone(),
-        allow_execution_gaps: true,
+        allow_execution_gaps: false,
+        indicator_engine: scout.indicator_engine,
+        entry_window: scout.entry_window,
     };
 
     let mut results = Vec::new();

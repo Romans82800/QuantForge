@@ -9,6 +9,7 @@ pub use challenge::{
     ChallengeReport, CostShockPoint, CostShockReport, MonteCarloReport, MultipleTestingReport,
     ParameterNeighbor, ParameterNeighborhoodReport, PurgedFoldReport, SelectionBiasLevel,
     deflated_trade_sharpe, expected_max_lucky_sharpe, monte_carlo_from_trade_profits,
+    monte_carlo_trade_resampling_with_skip,
     perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
 };
 pub use incubation::{

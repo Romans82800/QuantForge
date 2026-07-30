@@ -38,8 +38,10 @@ import {
   pauseDiscover,
   recordIncubation,
   resumeDiscover,
-  runFamilyBakeoff,
+  runConditionBakeoff,
+  promoteEliteToVault,
   runFidelityDemo,
+  runEliteRobustness,
   runM1Judge,
   runSealedFinal,
   startIncubation,
@@ -63,8 +65,8 @@ import type {
   ExportRequest,
   ExportView,
   EvidenceView,
-  FamilyBakeoffReport,
-  FamilyCoverage,
+  ConditionBakeoffReport,
+  ConditionCoverage,
   JudgeRequest,
   JudgeView,
   IncubationStartRequest,
@@ -74,9 +76,12 @@ import type {
   ParityRequest,
   ParityView,
   PartitionEquityView,
+  RobustnessEvidence,
+  ResultsRobustnessMode,
+  ResultsRobustnessView,
+  TradeRowView,
   PortfolioRequest,
   PortfolioView,
-  SearchFamilyId,
   SearchRange,
   SearchRangeProfile,
   SavedDiscoverProfile,
@@ -89,24 +94,48 @@ import type {
 } from "./types";
 import {
   bindDiscoverTimezone,
+  cagrPercent,
+  describeStrategyConditions,
   discoverProgress,
   discoverProgressLabel,
   filterAndSortElites,
+  formatDateRange,
+  conditionLabel,
   formatNumber,
+  entryOrderError,
+  entryOrderSummary,
+  entryWindowError,
+  entryWindowSummary,
+  perturbationError,
+  perturbationPercent,
   selectionBiasTone,
+  symbolFromDataPath,
+  timeframeFromDataPath,
   visibleEliteFingerprint,
 } from "./view";
 
-const workspaces: { name: WorkspaceName; enabled: boolean }[] = [
-  { name: "Home", enabled: true },
-  { name: "Databank", enabled: true },
-  { name: "Discover", enabled: true },
-  { name: "Search Settings", enabled: true },
-  { name: "Vault", enabled: true },
-  { name: "Data Lab", enabled: true },
-  { name: "Parity Lab", enabled: true },
-  { name: "Portfolio", enabled: true },
-  { name: "Deploy", enabled: true },
+type NavIcon =
+  | "overview"
+  | "discover"
+  | "databank"
+  | "retester"
+  | "data"
+  | "portfolio"
+  | "settings";
+
+/**
+ * Visible navigation rail. Vault and Deploy are intentionally absent: Vault is
+ * now the Databank "Certified" tab and Deploy stays code-only, so no backend
+ * command or workspace component is removed.
+ */
+const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
+  { name: "Home", label: "Overview", icon: "overview" },
+  { name: "Discover", label: "Discover", icon: "discover" },
+  { name: "Databank", label: "Databank", icon: "databank" },
+  { name: "Parity Lab", label: "Retester", icon: "retester" },
+  { name: "Data Lab", label: "Data Manager", icon: "data" },
+  { name: "Portfolio", label: "Portfolio", icon: "portfolio" },
+  { name: "Search Settings", label: "Settings", icon: "settings" },
 ];
 
 const DEFAULT_SEARCH_RANGES: SearchRangeProfile = {
@@ -141,88 +170,48 @@ function normalizeSearchRanges(value: SearchRangeProfile | Record<string, unknow
 }
 
 const workspaceTitles: Record<WorkspaceName, string> = {
-  Home: "Research cockpit",
-  Databank: "IS / OOS1 / OOS2 strategy lab",
-  Discover: "Deterministic strategy discovery",
-  "Search Settings": "Search range profiles",
-  Vault: "Certified strategy vault",
-  "Data Lab": "MT5 data diagnostics",
-  "Parity Lab": "External execution parity",
-  Portfolio: "Portfolio construction",
-  Deploy: "Deployment controls",
+  Home: "Overview",
+  Databank: "Databank",
+  Discover: "Discover",
+  "Search Settings": "Settings",
+  Vault: "Certified",
+  "Data Lab": "Data Manager",
+  "Parity Lab": "Retester",
+  Portfolio: "Portfolio",
+  Deploy: "Deployment",
 };
 
-const gradeLegend = [
-  "Scouted",
-  "Accepted",
-  "Illuminated",
-  "Challenged",
-  "Parity-Passed",
-  "Certified",
-  "Deployed",
-];
-
-const SEARCH_FAMILIES: { id: SearchFamilyId; label: string; recipe: string }[] = [
-  {
-    id: "trend_pullback",
-    label: "TrendPullback",
-    recipe: "EMA/SMA structure + optional ROC · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "momentum_burst",
-    label: "MomentumBurst",
-    recipe: "RSI/ROC thrust atoms · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "donchian_breakout",
-    label: "DonchianBreakout",
-    recipe: "Donchian/HH-LL + optional SMA · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "mean_reversion_band",
-    label: "MeanReversionBand",
-    recipe: "RSI + percentile fades · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "zscore_reversion",
-    label: "ZScoreReversion",
-    recipe: "Close z-score extremes · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "session_orb",
-    label: "SessionOrb",
-    recipe: "Broker-local opening-range breakout · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "impulse_candle",
-    label: "ImpulseCandle",
-    recipe: "Body/range + close-in-bar thrust · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "vol_squeeze_break",
-    label: "VolSqueezeBreak",
-    recipe: "ATR-percentile squeeze then break · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "supply_demand_reclaim",
-    label: "SupplyDemandReclaim",
-    recipe: "Swing-base zone reclaim · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-  {
-    id: "sweep_reclaim",
-    label: "SweepReclaim",
-    recipe: "Liquidity sweep then reclaim · max 3 atoms · ATR14 · next-open market · mirror",
-  },
-];
-
-function familyLabel(id: SearchFamilyId): string {
-  return SEARCH_FAMILIES.find((family) => family.id === id)?.label ?? id;
+function navLabel(name: WorkspaceName): string {
+  return navigation.find((item) => item.name === name)?.label ?? workspaceTitles[name];
 }
 
-function familyRecipe(id: SearchFamilyId | null): string {
-  if (!id) return "Choose a Search Family to lock the grammar before harvest.";
-  return SEARCH_FAMILIES.find((family) => family.id === id)?.recipe ?? id;
+const NAV_GLYPHS: Record<NavIcon, string> = {
+  overview: "M4 11.5 12 4.5l8 7M6 10.5V19h12v-8.5",
+  discover: "M10.5 4.5a6 6 0 1 0 0 12 6 6 0 0 0 0-12ZM15 15l4.5 4.5",
+  databank: "M4.5 6.5h15M4.5 12h15M4.5 17.5h15M9 4v16",
+  retester: "M5 19V9m4.7 10V5m4.6 14v-7m4.7 7V8",
+  data: "M12 4c4 0 7 1.2 7 2.7S16 9.4 12 9.4 5 8.2 5 6.7 8 4 12 4Zm7 5v8.3c0 1.5-3 2.7-7 2.7s-7-1.2-7-2.7V9",
+  portfolio: "M4.5 8.5h15v11h-15zM9 8.5V6a3 3 0 0 1 6 0v2.5",
+  settings:
+    "M12 9.2a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6ZM12 3.5v2.2M12 18.3v2.2M5.5 12H3.3m17.4 0h-2.2M7.4 7.4 5.9 5.9m12.2 12.2-1.5-1.5M16.6 7.4l1.5-1.5M5.9 18.1l1.5-1.5",
+};
+
+function NavGlyph({ icon }: { icon: NavIcon }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="nav-glyph">
+      <path d={NAV_GLYPHS[icon]} />
+    </svg>
+  );
 }
+
+const DEFAULT_UNIVERSAL_GRAMMAR = {
+  minimumEntryConditions: 2,
+  maximumEntryConditions: 4,
+  minimumExitConditions: 1,
+  maximumExitConditions: 3,
+  minimumShift: 1,
+  maximumShift: 3,
+};
 
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceName>("Home");
@@ -232,7 +221,7 @@ function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [family, setFamily] = useState("all");
+  const [entryFilter, setEntryFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
   const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
@@ -244,6 +233,12 @@ function App() {
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchEaTimeframe, setBatchEaTimeframe] = useState("H1");
   const [batchEaMagic, setBatchEaMagic] = useState(42_424_242);
+  const [eliteModalOpen, setEliteModalOpen] = useState(false);
+  const [resultsDetailFp, setResultsDetailFp] = useState<string | null>(null);
+  const [resultsOrigin, setResultsOrigin] = useState<WorkspaceName>("Databank");
+  const [databankTab, setDatabankTab] = useState<"research" | "certified">("research");
+  const [discoverResultsOpen, setDiscoverResultsOpen] = useState(false);
+  const [stripMessage, setStripMessage] = useState<string | null>(null);
   const detailRequest = useRef(0);
 
   async function selectElite(fingerprint: string) {
@@ -258,6 +253,12 @@ function App() {
     } finally {
       if (request === detailRequest.current) setDetailLoading(false);
     }
+  }
+
+  async function openEliteModal(fingerprint: string) {
+    setDetailTab("overview");
+    setEliteModalOpen(true);
+    await selectElite(fingerprint);
   }
 
   async function openDatabank() {
@@ -399,12 +400,60 @@ function App() {
     }
   }
 
+
+  async function exportIr(fingerprint: string) {
+    setStripMessage(null);
+    setError(null);
+    try {
+      const path = await exportEliteStrategy(fingerprint);
+      if (path) setStripMessage(`Exported IR → ${path}`);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function exportMq5(fingerprint: string) {
+    setStripMessage(null);
+    setError(null);
+    setBatchBusy(true);
+    try {
+      const result = await exportEliteEas([fingerprint], batchEaTimeframe, batchEaMagic);
+      if (result) setStripMessage(`Exported MQ5 pack → ${result.directory}`);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function stageForCertification(fingerprint: string) {
+    setStripMessage(null);
+    setError(null);
+    try {
+      const path = await promoteEliteToVault(fingerprint);
+      if (path) setStripMessage(`Staged for certification → ${path}`);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  /**
+   * Opens the Results detail page without moving the user to another workspace,
+   * so Back returns to wherever the row was clicked (Databank, Discover, …).
+   */
+  async function openResultsDetail(fingerprint: string, origin?: WorkspaceName) {
+    setResultsOrigin(origin ?? activeWorkspace);
+    setResultsDetailFp(fingerprint);
+    setError(null);
+    await selectElite(fingerprint);
+  }
+
   const filtered = useMemo(
     () =>
       workspace
-        ? filterAndSortElites(workspace.elites, query, family, sort)
+        ? filterAndSortElites(workspace.elites, query, entryFilter, sort)
         : [],
-    [workspace, query, family, sort],
+    [workspace, query, entryFilter, sort],
   );
 
   useEffect(() => {
@@ -425,58 +474,85 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">QF</span>
-          <div>
-            <strong>QuantForge</strong>
-            <small>Research cockpit</small>
-          </div>
+      <aside className="rail" aria-label="QuantForge">
+        <div className="rail-brand" title="QuantForge">
+          <span className="rail-monogram" aria-hidden="true">QF</span>
+          <span className="rail-brand-label">QuantForge</span>
         </div>
-        <nav aria-label="Workspaces">
-          {workspaces.map(({ name, enabled }) => (
+        <nav className="rail-nav" aria-label="Workspaces">
+          {navigation.map(({ name, label, icon }) => (
             <button
-              className={name === activeWorkspace ? "nav-item active" : "nav-item"}
-              disabled={!enabled}
+              aria-current={name === activeWorkspace ? "page" : undefined}
+              className={name === activeWorkspace ? "rail-item active" : "rail-item"}
               key={name}
               onClick={() => {
                 setError(null);
+                setResultsDetailFp(null);
                 setActiveWorkspace(name);
               }}
-              title={enabled ? undefined : "Workspace UI is not wired yet"}
+              title={label}
+              type="button"
             >
-              <span className="nav-dot" />
-              {name}
-              {!enabled && <small>soon</small>}
+              <NavGlyph icon={icon} />
+              <span>{label}</span>
             </button>
           ))}
         </nav>
-        <div className="grade-legend">
-          <p>Strategy grades</p>
-          {gradeLegend.map((grade) => (
-            <div key={grade}>
-              <span className={`grade-dot grade-${grade.toLowerCase()}`} />
-              {grade}
-            </div>
-          ))}
-        </div>
-        <div className="engine-status">
+        <div className="rail-foot" title="Rust engine runs locally">
           <span className="status-light" />
-          Rust engine local
+          <span>Local</span>
         </div>
       </aside>
 
+      <div className="app-main-column">
+        <div className="app-main-scroll">
       <main>
         <header className="topbar">
-          <div>
-            <p className="eyebrow">Workspace / {activeWorkspace}</p>
-            <h1>{workspaceTitles[activeWorkspace]}</h1>
+          <nav className="crumbs" aria-label="Breadcrumb">
+            <span>Strategies</span>
+            <i aria-hidden="true" />
+            {resultsDetailFp ? (
+              <>
+                <button type="button" className="crumb-link" onClick={() => setResultsDetailFp(null)}>
+                  {navLabel(resultsOrigin)}
+                </button>
+                <i aria-hidden="true" />
+                <strong>Results detail</strong>
+              </>
+            ) : (
+              <strong>{workspaceTitles[activeWorkspace]}</strong>
+            )}
+          </nav>
+          <div className="topbar-actions">
+            {workspace && (
+              <span className="topbar-chip" title={workspace.sourcePath}>
+                {formatNumber(workspace.elites.length)} elites · {workspace.sourcePath.split("/").at(-1)}
+              </span>
+            )}
+            {activeWorkspace === "Databank" && (
+              <button className="primary" onClick={openDatabank} disabled={loading}>
+                {loading ? "Validating…" : workspace ? "Open another" : "Open databank"}
+              </button>
+            )}
+            <div className="topbar-utilities" aria-label="Application status">
+              <span className="topbar-icon" title="QuantForge notifications">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7.5 17h9l-1.2-1.8V11a3.3 3.3 0 0 0-6.6 0v4.2L7.5 17Zm3 2h3" /></svg>
+              </span>
+              <span className="topbar-icon" title="Research methodology">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.5" /><path d="M10.4 9.6a1.8 1.8 0 0 1 3.4.8c0 1.6-1.8 1.7-1.8 3.1m0 2.6v.1" /></svg>
+              </span>
+              <span className="topbar-icon" title="Dark workspace">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" /><path d="M12 3.3v2M12 18.7v2M3.3 12h2M18.7 12h2M5.9 5.9l1.4 1.4m9.4 9.4 1.4 1.4m0-12.2-1.4 1.4M7.3 16.7l-1.4 1.4" /></svg>
+              </span>
+              <span className="topbar-divider" />
+              <span className="user-avatar">DA</span>
+              <span className="user-copy">
+                <strong>Daniel</strong>
+                <small>Local</small>
+              </span>
+              <span className="user-badge">Pro</span>
+            </div>
           </div>
-          {activeWorkspace === "Databank" && (
-            <button className="primary" onClick={openDatabank} disabled={loading}>
-              {loading ? "Validating…" : workspace ? "Open another" : "Open databank"}
-            </button>
-          )}
         </header>
 
         {error && (
@@ -485,12 +561,32 @@ function App() {
             <span>{error}</span>
           </div>
         )}
-
+        {stripMessage && !error && (
+          <div className="success-banner" role="status">
+            <span>{stripMessage}</span>
+            <button type="button" onClick={() => setStripMessage(null)} aria-label="Dismiss notification">×</button>
+          </div>
+        )}
+        {resultsDetailFp ? (
+          <ResultsDetailPage
+            fingerprint={resultsDetailFp}
+            workspace={workspace}
+            onError={setError}
+            onExportIr={(target) => void exportIr(target)}
+            onExportMq5={(target) => void exportMq5(target)}
+            onStage={(target) => void stageForCertification(target)}
+            onOpenResult={(target) => void openResultsDetail(target, resultsOrigin)}
+          />
+        ) : (
+          <>
         {activeWorkspace === "Home" ? (
           <HomeWorkspace
-            hasDatabank={workspace !== null}
+            workspace={workspace}
             onNavigate={setActiveWorkspace}
             onOpen={openDatabank}
+            onOpenPath={openDatabankPath}
+            onOpenResult={(fingerprint) => void openResultsDetail(fingerprint, "Home")}
+            onError={setError}
           />
         ) : activeWorkspace === "Data Lab" ? (
           <DataLabWorkspace onError={setError} onUse={useDataInDiscover} />
@@ -498,6 +594,11 @@ function App() {
           <DiscoverWorkspace
             onError={setError}
             onOpenDatabank={openDatabankPath}
+            onLiveWorkspace={(loaded) => {
+              setWorkspace(loaded);
+              setBatchSelection(new Set());
+            }}
+            onResultsView={setDiscoverResultsOpen}
             preset={discoverPreset}
           />
         ) : activeWorkspace === "Search Settings" ? (
@@ -514,7 +615,31 @@ function App() {
           <VaultWorkspace onError={setError} />
         ) : activeWorkspace === "Deploy" ? (
           <DeployWorkspace onError={setError} />
-        ) : activeWorkspace === "Databank" ? (!workspace ? (
+        ) : activeWorkspace === "Databank" ? (
+          <div className="databank-workspace">
+            <div className="workspace-tabs databank-tabs" role="tablist" aria-label="Databank sections">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={databankTab === "research"}
+                className={databankTab === "research" ? "active" : ""}
+                onClick={() => setDatabankTab("research")}
+              >
+                Research
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={databankTab === "certified"}
+                className={databankTab === "certified" ? "active" : ""}
+                onClick={() => setDatabankTab("certified")}
+              >
+                Certified
+              </button>
+            </div>
+            {databankTab === "certified" ? (
+              <VaultWorkspace onError={setError} />
+            ) : !workspace ? (
           <EmptyState onOpen={openDatabank} loading={loading} />
         ) : (
           <div className="workspace-content">
@@ -608,10 +733,10 @@ function App() {
                     </div>
                   </div>
                   <div className="family-grids">
-                    {workspace.families.map((item) => (
+                    {workspace.conditionGroups.map((item) => (
                       <CoverageGrid
-                        family={item}
-                        key={item.family}
+                        group={item}
+                        key={item.entryConditions}
                         onSelect={selectElite}
                       />
                     ))}
@@ -652,14 +777,14 @@ function App() {
                         value={query}
                       />
                       <select
-                        aria-label="Filter family"
-                        onChange={(event) => setFamily(event.target.value)}
-                        value={family}
+                        aria-label="Filter entry conditions"
+                        onChange={(event) => setEntryFilter(event.target.value)}
+                        value={entryFilter}
                       >
-                        <option value="all">All families</option>
-                        {workspace.families.map((item) => (
-                          <option key={item.family} value={item.family}>
-                            {item.family}
+                        <option value="all">All entry counts</option>
+                        {workspace.conditionGroups.map((item) => (
+                          <option key={item.entryConditions} value={String(item.entryConditions)}>
+                            {item.label}
                           </option>
                         ))}
                       </select>
@@ -672,9 +797,9 @@ function App() {
                         <option value="novelty">Novelty ↓</option>
                         <option value="trades">Trades ↓</option>
                         <option value="drawdown">Drawdown ↑</option>
-                        <option value="returnDrawdown">Return / DD ↓</option>
+                        <option value="recoveryFactor">Recovery factor ↓</option>
                         <option value="sharpe">Sharpe ↓</option>
-                        <option value="family">Family A–Z</option>
+                        <option value="entryConditions">Entry conditions</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
                     </div>
@@ -741,7 +866,7 @@ function App() {
                   <p className="batch-message">
                     EA batch writes one .mq5, .set, real-tick tester preset, evidence card, and
                     strategy IR per selected strategy. Every item is named
-                    <code>SYMBOL_FAMILY_UNIQUE_NUMBER</code>; that final number is also its distinct
+                    <code>SYMBOL_ENTRYCONDITIONS_UNIQUE_NUMBER</code>; that final number is also its distinct
                     magic number. Live trading is off. Choose the strategy’s decision timeframe.
                   </p>
                   {batchMessage && <p className="batch-message">{batchMessage}</p>}
@@ -749,8 +874,13 @@ function App() {
                     rows={filtered}
                     selected={detail?.fingerprint ?? null}
                     batchSelection={batchSelection}
+                    onDoubleClick={(fingerprint) => void openResultsDetail(fingerprint, "Databank")}
                     onSelect={selectElite}
                     onToggle={toggleBatchElite}
+                    showActions
+                    onExportIr={(fingerprint) => void exportIr(fingerprint)}
+                    onExportMq5={(fingerprint) => void exportMq5(fingerprint)}
+                    onStage={(fingerprint) => void stageForCertification(fingerprint)}
                   />
                 </section>
               </div>
@@ -764,113 +894,1548 @@ function App() {
                 tab={detailTab}
                 onTab={setDetailTab}
                 onParity={continueToParity}
+                onOpenResearch={(fingerprint) => void openResultsDetail(fingerprint, "Databank")}
               />
             </div>
           </div>
-        )) : null}
+            )}
+          </div>
+        ) : null}
+
+        {eliteModalOpen && workspace && (
+          <EliteDetailModal
+            detail={detail}
+            loading={detailLoading}
+            m1FidelityVerified={workspace.m1FidelityVerified}
+            onClose={() => setEliteModalOpen(false)}
+            onError={setError}
+            onParity={continueToParity}
+            onTab={setDetailTab}
+            researchGrade={workspace.researchGrade}
+            tab={detailTab}
+          />
+        )}
+          </>
+        )}
       </main>
+        </div>
+
+      </div>
     </div>
+  );
+}
+
+function DatabankStrip({
+  rows,
+  selected,
+  selection,
+  message,
+  busy,
+  collapsed = false,
+  onToggle,
+  onOpen,
+  onExportIr,
+  onExportMq5,
+  onStage,
+  onExportSelectedIr,
+  onExportSelectedMq5,
+  onClearSelection,
+  onOpenDatabank,
+  hasDatabank,
+}: {
+  rows: EliteRow[];
+  selected: string | null;
+  selection: Set<string>;
+  message: string | null;
+  busy: boolean;
+  /** Results detail already shows the full databank table; collapse to the summary bar. */
+  collapsed?: boolean;
+  onToggle: (fingerprint: string) => void;
+  onOpen: (fingerprint: string) => void;
+  onExportIr: (fingerprint: string) => void;
+  onExportMq5: (fingerprint: string) => void;
+  onStage: (fingerprint: string) => void;
+  onExportSelectedIr: () => void;
+  onExportSelectedMq5: () => void;
+  onClearSelection: () => void;
+  onOpenDatabank: () => void;
+  hasDatabank: boolean;
+}) {
+  const top = [...rows].sort((a, b) => b.evidence - a.evidence).slice(0, 40);
+  return (
+    <footer
+      className={collapsed ? "databank-strip collapsed" : "databank-strip"}
+      aria-label="Databank elites"
+    >
+      <div className="databank-strip-head">
+        <div>
+          <p className="eyebrow">Databank</p>
+          <strong>
+            {rows.length
+              ? `${formatNumber(rows.length)} elites${collapsed ? " · full table above" : ""}`
+              : "No databank loaded"}
+          </strong>
+        </div>
+        <div className="databank-strip-actions">
+          {!hasDatabank ? (
+            <button type="button" className="secondary" onClick={onOpenDatabank}>Open databank</button>
+          ) : (
+            <>
+              <button type="button" className="secondary" disabled={busy || selection.size === 0} onClick={onExportSelectedIr}>
+                Export {selection.size || ""} IR
+              </button>
+              <button type="button" className="secondary" disabled={busy || selection.size === 0} onClick={onExportSelectedMq5}>
+                Export MQ5
+              </button>
+              <button type="button" className="text-action" disabled={selection.size === 0} onClick={onClearSelection}>Clear</button>
+            </>
+          )}
+        </div>
+      </div>
+      {message && <p className="databank-strip-message">{message}</p>}
+      {collapsed ? null : top.length === 0 ? (
+        <p className="databank-strip-empty">Load or run Discover to populate the always-on elite strip.</p>
+      ) : (
+        <div className="databank-strip-table">
+          <div className="strip-row strip-header">
+            <span />
+            <span>Strategy</span>
+            <span>E/X</span>
+            <span>Ev</span>
+            <span>Ret</span>
+            <span>DD</span>
+            <span />
+          </div>
+          <div className="strip-body">
+            {top.map((row) => (
+              <div
+                className={`strip-row ${selected === row.fingerprint ? "selected" : ""}`}
+                key={row.fingerprint}
+              >
+                <span className="batch-check">
+                  <input
+                    aria-label={`Select ${row.strategyId}`}
+                    checked={selection.has(row.fingerprint)}
+                    onChange={() => onToggle(row.fingerprint)}
+                    type="checkbox"
+                  />
+                </span>
+                <button type="button" className="strip-open" onClick={() => onOpen(row.fingerprint)} title={row.fingerprint}>
+                  <strong>{row.strategyId}</strong>
+                </button>
+                <span>{conditionLabel(row.entryConditions, row.exitConditions)}</span>
+                <span>{row.evidence.toFixed(1)}</span>
+                <span className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(1)}%</span>
+                <span>{row.drawdownPercent.toFixed(1)}%</span>
+                <span className="row-actions">
+                  <button type="button" className="text-action" onClick={() => onOpen(row.fingerprint)}>Open</button>
+                  <button type="button" className="text-action" onClick={() => onExportIr(row.fingerprint)}>IR</button>
+                  <button type="button" className="text-action" onClick={() => onExportMq5(row.fingerprint)}>MQ5</button>
+                  <button type="button" className="text-action" onClick={() => onStage(row.fingerprint)} title="Stage for certification">Stage</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </footer>
+  );
+}
+
+function ResultsDetailPage({
+  fingerprint,
+  workspace,
+  backLabel,
+  onBack,
+  onError,
+  onExportIr,
+  onExportMq5,
+  onStage,
+  onOpenResult,
+}: {
+  fingerprint: string;
+  workspace: DatabankWorkspace | null;
+  backLabel?: string;
+  onBack?: () => void;
+  onError: (message: string | null) => void;
+  onExportIr: (fingerprint: string) => void;
+  onExportMq5: (fingerprint: string) => void;
+  onStage: (fingerprint: string) => void;
+  onOpenResult: (fingerprint: string) => void;
+}) {
+  const [detail, setDetail] = useState<EliteDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [partition, setPartition] = useState<PartitionEquityView | null>(null);
+  const [partitionBusy, setPartitionBusy] = useState(true);
+  const [robustnessMode, setRobustnessMode] = useState<ResultsRobustnessMode>("standard");
+  const [robustnessRun, setRobustnessRun] = useState<ResultsRobustnessView | null>(null);
+  const [robustnessBusy, setRobustnessBusy] = useState(false);
+  const [tableQuery, setTableQuery] = useState("");
+  const [analysisTab, setAnalysisTab] = useState<"overview" | "equity" | "walkForward" | "monteCarlo" | "parameters" | "trades" | "ir">("overview");
+  const row = workspace?.elites.find((elite) => elite.fingerprint === fingerprint) ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    setRobustnessRun(null);
+    setRobustnessBusy(false);
+    setLoading(true);
+    void loadElite(fingerprint)
+      .then((loaded) => {
+        if (!cancelled) setDetail(loaded);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fingerprint, onError]);
+
+  const runRobustness = async () => {
+    setRobustnessBusy(true);
+    onError(null);
+    try {
+      const result = await runEliteRobustness({ fingerprint, mode: robustnessMode });
+      setRobustnessRun(result);
+      if (result.evidence) {
+        setDetail((current) => current
+          ? {
+              ...current,
+              robustness: {
+                ...(current.robustness ?? {}),
+                evidence: result.evidence,
+              },
+            }
+          : current);
+      }
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setRobustnessBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setPartition(null);
+    setPartitionBusy(true);
+    void getElitePartitionEquity(fingerprint)
+      .then((next) => {
+        if (!cancelled) setPartition(next);
+      })
+      .catch(() => {
+        // A missing replay is not an error here: the stored signature is the fallback.
+      })
+      .finally(() => {
+        if (!cancelled) setPartitionBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fingerprint]);
+
+  const initialBalance = partition?.initialBalance ?? workspace?.initialBalance ?? 100_000;
+  const storedMetrics = detail?.metrics ?? {};
+  const usesReplay = partition !== null;
+  const returnPercent = usesReplay
+    ? partition.fullRunReturnPercent
+    : row?.returnPercent ?? Number(storedMetrics.return_percent ?? 0);
+  const drawdownPercent = usesReplay
+    ? partition.fullRunMaxDrawdownPercent
+    : row?.drawdownPercent ?? Number(storedMetrics.max_drawdown_percent ?? 0);
+  const trades = usesReplay
+    ? partition.fullRunTrades
+    : row?.trades ?? Number(storedMetrics.trade_count ?? 0);
+  const winRate = usesReplay ? partition.fullRunWinRate : Number(storedMetrics.win_rate ?? 0);
+  const profitFactor = usesReplay
+    ? partition.fullRunProfitFactor
+    : storedMetrics.profit_factor ?? null;
+  const sharpe = usesReplay
+    ? partition.fullRunSharpeRatio
+    : row?.sharpeRatio ?? (detail ? effectiveDetailSharpe(detail) : null);
+  const netProfit = usesReplay
+    ? partition.fullRunNetProfit
+    : (initialBalance * returnPercent) / 100;
+  const maxDrawdownAbs = usesReplay
+    ? partition.fullRunMaxDrawdown
+    : Number(storedMetrics.max_drawdown ?? 0);
+  const startMs = partition?.points[0]?.timestampMs ?? null;
+  const endMs = partition?.points.at(-1)?.timestampMs ?? null;
+  const cagr = startMs !== null && endMs !== null ? cagrPercent(returnPercent, startMs, endMs) : null;
+  const calmar = cagr !== null && drawdownPercent > 1e-9 ? cagr / drawdownPercent : null;
+  const recoveryFactor = usesReplay
+    ? partition.fullRunRecoveryFactor
+    : maxDrawdownAbs > 1e-9
+      ? netProfit / maxDrawdownAbs
+      : row?.recoveryFactor ?? null;
+  const averageTrade = trades > 0 ? netProfit / trades : null;
+  const expectancy = storedMetrics.expectancy ?? null;
+  const sortino =
+    typeof storedMetrics.sortino_ratio === "number"
+      ? storedMetrics.sortino_ratio
+      : null;
+  const conditions = useMemo(
+    () => describeStrategyConditions(detail?.strategyIr ?? null),
+    [detail?.strategyIr],
+  );
+  const evidence = robustnessRun?.evidence ?? detail?.robustness?.evidence ?? null;
+  const tableRows = useMemo(() => {
+    const rows = workspace?.elites ?? [];
+    return filterAndSortElites(rows, tableQuery, "all", "evidence");
+  }, [workspace, tableQuery]);
+
+  const universe = symbolFromDataPath(workspace?.dataPath) ?? "—";
+  const timeframe = timeframeFromDataPath(workspace?.dataPath) ?? "—";
+
+  return (
+    <div className="results-detail-page">
+      <section className="results-strategy-card">
+        <header className="results-detail-head">
+          <div className="results-detail-title">
+            {onBack && (
+              <button type="button" className="results-context-back" onClick={onBack} title={`Back to ${backLabel ?? "results"}`}>
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M14.5 6 9 12l5.5 6" /></svg>
+              </button>
+            )}
+            <span className="result-favorite" title="Featured strategy" aria-label="Featured strategy">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.8-5.2 2.8 1-5.8-4.3-4.1 5.9-.9L12 3Z" /></svg>
+            </span>
+            <div>
+              <h2>
+                {detail?.strategyId ?? row?.strategyId ?? "Strategy"}
+                <span className="results-badge">{usesReplay ? "M1 replay" : "Stored backtest"}</span>
+                {workspace?.legacyReadOnly && (
+                  <span className="results-badge legacy">v5 · retest only</span>
+                )}
+                {detail && <span className="grade-pill">{detail.grade}</span>}
+              </h2>
+              <code title={fingerprint}>{fingerprint}</code>
+            </div>
+          </div>
+          <div className="results-detail-actions">
+            <span className="result-more" title="Export and certification actions" aria-hidden="true">•••</span>
+            <button type="button" className="secondary" onClick={() => onExportIr(fingerprint)}>Export IR</button>
+            <button type="button" className="secondary" onClick={() => onExportMq5(fingerprint)}>Export MQ5</button>
+            <button
+              type="button"
+              className="primary"
+              disabled={workspace?.legacyReadOnly}
+              title={workspace?.legacyReadOnly ? "Run a fresh v6 Discover search before staging for certification." : undefined}
+              onClick={() => onStage(fingerprint)}
+            >
+              Stage
+            </button>
+          </div>
+        </header>
+
+        {loading && <div className="results-inline-loading">Loading elite…</div>}
+
+        <section className="results-meta" aria-label="Strategy metadata">
+          <div className="results-meta-facts">
+            <MetaFact label="Universe" value={universe} />
+            <MetaFact label="Timeframe" value={timeframe} />
+            <MetaFact label="Date range" value={formatDateRange(startMs, endMs)} />
+            <MetaFact label="Capital" value={`$${formatNumber(initialBalance)}`} />
+            <MetaFact
+              label="Fees"
+              value={workspace ? `$${formatNumber(workspace.commissionPerLotRoundTurn, 2)}/lot RT` : "—"}
+            />
+            <MetaFact
+              label="Slippage"
+              value={workspace ? `${formatNumber(workspace.slippagePointsPerSide, 2)} pts/side` : "—"}
+            />
+          </div>
+          <div className="results-conditions">
+            <ConditionList
+              title={`Entry conditions (${detail?.entryConditions ?? row?.entryConditions ?? 0})`}
+              items={conditions.entry}
+              note={conditions.side ? `${conditions.side} · ${conditions.order ?? "Market"} entry` : null}
+            />
+            <ConditionList
+              title={`Exit conditions (${detail?.exitConditions ?? row?.exitConditions ?? 0})`}
+              items={conditions.exit}
+              note={
+                conditions.stopLoss || conditions.takeProfit
+                  ? `Stop ${conditions.stopLoss ?? "—"} · Target ${conditions.takeProfit ?? "—"}`
+                  : null
+              }
+            />
+          </div>
+          <div className="results-trades-card">
+            <span>Total trades</span>
+            <strong>{formatNumber(trades)}</strong>
+            <small>{usesReplay ? "100% replayed" : "stored IS gate"}</small>
+          </div>
+        </section>
+      </section>
+
+      <ResultsAnalysisTabs active={analysisTab} onChange={setAnalysisTab} />
+
+      {analysisTab === "overview" && <>
+      <section className="results-kpi-strip" aria-label="Performance">
+        <KpiCell label="Net profit" value={`$${formatNumber(netProfit)}`} note={`${returnPercent.toFixed(2)}% return`} tone={netProfit >= 0 ? "positive" : "negative"} />
+        <KpiCell label="CAGR" value={cagr === null ? "—" : `${cagr.toFixed(2)}%`} note={cagr === null ? "window too short" : "annualized"} tone={cagr !== null && cagr >= 0 ? "positive" : undefined} />
+        <KpiCell label="Win rate" value={`${winRate.toFixed(1)}%`} note={`${formatNumber(trades)} trades`} />
+        <KpiCell label="Profit factor" value={profitFactor === null || profitFactor === undefined ? "—" : Number(profitFactor).toFixed(2)} note="gross win / gross loss" />
+        <KpiCell label="Max drawdown" value={`-${drawdownPercent.toFixed(2)}%`} note={maxDrawdownAbs > 0 ? `$${formatNumber(maxDrawdownAbs)} equity peak to valley` : "equity peak to valley"} tone="negative" />
+        <KpiCell label="Recovery factor" value={recoveryFactor === null || recoveryFactor === undefined ? "—" : Number(recoveryFactor).toFixed(2)} note="net profit / equity DD (MT5)" />
+        <KpiCell label="Sharpe" value={sharpe === null || sharpe === undefined ? "—" : Number(sharpe).toFixed(2)} note="per-bar equity, not MT5 scale" />
+        <KpiCell label="Sortino" value={sortino === null ? "—" : sortino.toFixed(2)} note={sortino === null ? "not recorded" : "downside deviation"} />
+        <KpiCell label="Calmar" value={calmar === null ? "—" : calmar.toFixed(2)} note="CAGR / max DD" />
+        <KpiCell label="Avg trade" value={averageTrade === null ? "—" : `$${formatNumber(averageTrade, 2)}`} note="net per closed trade" />
+        <KpiCell label="Expectancy" value={expectancy === null ? "—" : `$${formatNumber(Number(expectancy), 2)}`} note={expectancy === null ? "not recorded" : `${(Number(expectancy) / 1000).toFixed(2)}R at $1,000 risk`} />
+      </section>
+
+      <section className={`panel results-robustness-runner ${robustnessRun ? (robustnessRun.passed ? "pass" : "fail") : ""}`}>
+        <div className="results-robustness-copy">
+          <p className="eyebrow">Robustness battery</p>
+          <h2>Re-run the exact M1 promotion checks</h2>
+          <p>
+            Uses this databank’s bound IS, M1 chronology, broker costs, thresholds and frozen seed.
+            OOS1 and sealed OOS2 remain untouched.
+          </p>
+        </div>
+        <div className="results-robustness-controls">
+          <div className="segmented robustness-depth" aria-label="Robustness depth">
+            <button
+              type="button"
+              className={robustnessMode === "standard" ? "active" : ""}
+              disabled={robustnessBusy}
+              onClick={() => setRobustnessMode("standard")}
+              title="Repeat the battery strength sealed into this databank"
+            >
+              Standard
+            </button>
+            <button
+              type="button"
+              className={robustnessMode === "deep" ? "active" : ""}
+              disabled={robustnessBusy}
+              onClick={() => setRobustnessMode("deep")}
+              title="At least 5 folds, 1,000 Monte Carlo trials and 20 parameter neighbours"
+            >
+              Deep
+            </button>
+          </div>
+          <button
+            type="button"
+            className="primary robustness-run-button"
+            disabled={robustnessBusy || loading || !detail}
+            onClick={() => void runRobustness()}
+          >
+            {robustnessBusy ? "Running battery…" : robustnessRun ? "Run again" : "Run robustness battery"}
+          </button>
+        </div>
+        <div className="results-robustness-note">
+          {robustnessRun ? (
+            <>
+              <span className={`robustness-run-status ${robustnessRun.passed ? "pass" : "fail"}`}>
+                {robustnessRun.passed ? "Passed" : `Blocked · ${robustnessRun.blocker ?? "robustness gate"}`}
+              </span>
+              <span>
+                {robustnessRun.folds} folds · {formatNumber(robustnessRun.monteCarloTrials)} MC ·{" "}
+                {formatNumber(robustnessRun.neighborhoodSamples)} neighbours
+              </span>
+              <code title={robustnessRun.artifactPath}>{robustnessRun.artifactPath}</code>
+            </>
+          ) : (
+            <span>
+              {robustnessMode === "standard"
+                ? "Standard repeats the promotion battery already sealed into the databank."
+                : "Deep raises compute depth without changing thresholds or searching for a better seed."}
+            </span>
+          )}
+        </div>
+      </section>
+
+      <div className="results-robustness-grid">
+        <MonteCarloPanel evidence={evidence?.monte_carlo ?? null} fallback={detail?.robustness?.monteCarlo ?? detail?.robustness?.summary ?? null} />
+        <ParameterNeighborhoodPanel
+          evidence={evidence?.parameter_neighborhood ?? null}
+          retention={evidence?.m1_retention ?? null}
+          fallback={detail?.robustness?.paramPermutation ?? null}
+        />
+        <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} />
+      </div>
+
+      {detail?.thesis && (
+        <section className="panel">
+          <div className="panel-heading"><div><p className="eyebrow">Thesis</p><h2>Strategy brief</h2></div></div>
+          <p className="results-thesis">{detail.thesis}</p>
+        </section>
+      )}
+      </>}
+
+      {analysisTab === "equity" && (
+        <section className="panel results-equity-panel results-analysis-panel">
+          <div className="panel-heading">
+            <div><p className="eyebrow">Equity chart</p><h2>IS with distinct OOS evidence overlays</h2></div>
+            <span className="read-only-badge">M1 chronology · full history</span>
+          </div>
+          {usesReplay || partitionBusy ? (
+            <PartitionEquityChart
+              view={partition}
+              busy={partitionBusy}
+              researchGrade={workspace?.researchGrade ?? false}
+              m1FidelityVerified={workspace?.m1FidelityVerified ?? false}
+              large
+            />
+          ) : (
+            <StoredSignatureChart
+              initialBalance={initialBalance}
+              returnPercent={returnPercent}
+              values={detail?.equitySignature ?? row?.equitySignature ?? []}
+            />
+          )}
+        </section>
+      )}
+
+      {analysisTab === "walkForward" && (
+        <section className="results-analysis-single"><WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} expanded /></section>
+      )}
+
+      {analysisTab === "monteCarlo" && (
+        <section className="results-analysis-single">
+          <MonteCarloPanel evidence={evidence?.monte_carlo ?? null} fallback={detail?.robustness?.monteCarlo ?? detail?.robustness?.summary ?? null} expanded />
+        </section>
+      )}
+
+      {analysisTab === "parameters" && (
+        <section className="results-analysis-single">
+          <ParameterNeighborhoodPanel
+            evidence={evidence?.parameter_neighborhood ?? null}
+            retention={evidence?.m1_retention ?? null}
+            fallback={detail?.robustness?.paramPermutation ?? null}
+            expanded
+          />
+        </section>
+      )}
+
+      {analysisTab === "trades" && (
+        <section className="panel results-trades-panel">
+          <div className="panel-heading"><div><p className="eyebrow">List of trades</p><h2>M1 replay ledger</h2></div><span className="read-only-badge">{partition ? `${formatNumber(partition.trades.length)} rows` : "loading"}</span></div>
+          <TradeListPanel busy={partitionBusy} trades={partition?.trades ?? []} />
+        </section>
+      )}
+
+      {analysisTab === "ir" && (
+        <section className="panel results-ir-panel">
+          <div className="panel-heading"><div><p className="eyebrow">Strategy configuration</p><h2>Canonical QuantForge IR</h2></div></div>
+          <pre className="ir-tree results-ir-tree">{detail ? JSON.stringify(detail.strategyIr, null, 2) : "Loading strategy…"}</pre>
+        </section>
+      )}
+
+      <section className="panel results-databank-panel">
+        <div className="panel-heading results-databank-head">
+          <div className="results-databank-title">
+            <p className="eyebrow">Databank</p>
+            <span className="results-databank-tab">All results</span>
+          </div>
+          <input
+            aria-label="Search databank"
+            className="results-databank-search"
+            onChange={(event) => setTableQuery(event.target.value)}
+            placeholder="Search databank…"
+            value={tableQuery}
+          />
+        </div>
+        {tableRows.length === 0 ? (
+          <p className="cluster-empty">
+            {workspace
+              ? "No databank rows match this search."
+              : "Open a databank to list every result alongside this strategy."}
+          </p>
+        ) : (
+          <>
+            <EliteTable
+              batchSelection={new Set()}
+              onDoubleClick={onOpenResult}
+              onSelect={onOpenResult}
+              onToggle={() => {}}
+              rows={tableRows}
+              selected={fingerprint}
+              showBatch={false}
+              showActions
+              onExportIr={onExportIr}
+              onExportMq5={onExportMq5}
+              onStage={onStage}
+              rowHeightOverride={44}
+              viewportHeightOverride={70}
+            />
+            <p className="results-databank-foot">
+              Showing {formatNumber(tableRows.length)} of {formatNumber(workspace?.elites.length ?? 0)} results
+            </p>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function MetaFact({ label, value, wide = false }: { label: string; value: string; wide?: boolean }) {
+  return (
+    <div className={wide ? "meta-fact wide" : "meta-fact"}>
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
+    </div>
+  );
+}
+
+function ResultsAnalysisTabs({
+  active,
+  onChange,
+}: {
+  active: "overview" | "equity" | "walkForward" | "monteCarlo" | "parameters" | "trades" | "ir";
+  onChange: (tab: "overview" | "equity" | "walkForward" | "monteCarlo" | "parameters" | "trades" | "ir") => void;
+}) {
+  const tabs: Array<[typeof active, string]> = [
+    ["overview", "Overview"],
+    ["equity", "Equity"],
+    ["walkForward", "Walk-forward"],
+    ["monteCarlo", "Monte Carlo"],
+    ["parameters", "Parameters"],
+    ["trades", "Trades"],
+    ["ir", "Strategy IR"],
+  ];
+  return (
+    <nav className="results-analysis-tabs" aria-label="Strategy research views" role="tablist">
+      {tabs.map(([value, label]) => (
+        <button key={value} type="button" role="tab" aria-selected={active === value} className={active === value ? "active" : ""} onClick={() => onChange(value)}>{label}</button>
+      ))}
+    </nav>
+  );
+}
+
+function ConditionList({
+  title,
+  items,
+  note,
+}: {
+  title: string;
+  items: string[];
+  note: string | null;
+}) {
+  return (
+    <article className="condition-list">
+      <p className="eyebrow">{title}</p>
+      {items.length === 0 ? (
+        <p className="condition-empty">Condition tree unavailable for this stored IR.</p>
+      ) : (
+        <ol>
+          {items.map((item, index) => (
+            <li key={`${index}-${item}`}><span>{index + 1}.</span><code>{item}</code></li>
+          ))}
+        </ol>
+      )}
+      {note && <small>{note}</small>}
+    </article>
+  );
+}
+
+function KpiCell({
+  label,
+  value,
+  note,
+  tone,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  tone?: "positive" | "negative";
+}) {
+  return (
+    <article className="kpi-cell">
+      <span>{label}</span>
+      <strong className={tone ?? undefined}>{value}</strong>
+      <small>{note}</small>
+    </article>
+  );
+}
+
+function StoredSignatureChart({
+  initialBalance,
+  returnPercent,
+  values,
+}: {
+  initialBalance: number;
+  returnPercent: number;
+  values: number[];
+}) {
+  const curve = equityCurveValues(values, initialBalance, returnPercent);
+  if (curve.length < 2) {
+    return <p className="cluster-empty">No equity signature recorded for this elite.</p>;
+  }
+  const minimum = Math.min(...curve);
+  const maximum = Math.max(...curve);
+  const range = Math.max(maximum - minimum, 1e-9);
+  const points = curve
+    .map((value, index) => `${(index / Math.max(curve.length - 1, 1)) * 900},${300 - ((value - minimum) / range) * 288}`)
+    .join(" ");
+  return (
+    <div className="equity-chart results-equity-chart">
+      <span className="equity-axis equity-high">{formatNumber(maximum, 0)}</span>
+      <span className="equity-axis equity-low">{formatNumber(minimum, 0)}</span>
+      <svg viewBox="0 0 900 305" role="img" aria-label="Stored equity signature">
+        <polyline fill="none" points={points} />
+      </svg>
+    </div>
+  );
+}
+
+function RobustnessShell({
+  title,
+  status,
+  children,
+}: {
+  title: string;
+  status: { label: string; tone: "pass" | "fail" | "unknown" };
+  children: React.ReactNode;
+}) {
+  return (
+    <article className="panel robustness-panel">
+      <div className="robustness-head">
+        <p className="eyebrow">{title}</p>
+        <span className={`robustness-status ${status.tone}`}>{status.label}</span>
+      </div>
+      {children}
+    </article>
+  );
+}
+
+function RobustnessMissing({ fallback }: { fallback: string | null }) {
+  return (
+    <div className="robustness-missing">
+      {fallback && fallback.trim().length > 0 ? (
+        <p>{fallback}</p>
+      ) : (
+        <p>
+          No structured evidence was persisted for this elite. Use the Results robustness battery
+          above to create a new immutable report.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function StatRows({ rows }: { rows: Array<[string, string]> }) {
+  return (
+    <dl className="robustness-stats">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function GaugeBar({
+  fraction,
+  required,
+  passed,
+}: {
+  fraction: number;
+  required?: number | null;
+  passed: boolean;
+}) {
+  const clamped = Math.max(0, Math.min(1, fraction));
+  return (
+    <div className="gauge-bar" role="img" aria-label={`${(clamped * 100).toFixed(0)} percent`}>
+      <i className={passed ? "pass" : "fail"} style={{ width: `${clamped * 100}%` }} />
+      {required !== null && required !== undefined && (
+        <span className="gauge-threshold" style={{ left: `${Math.max(0, Math.min(1, required)) * 100}%` }} />
+      )}
+    </div>
+  );
+}
+
+function medianOf(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+function metricNumber(metrics: Record<string, number | null> | null | undefined, key: string): number | null {
+  if (!metrics) return null;
+  const value = metrics[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function MonteCarloPanel({
+  evidence,
+  fallback,
+  expanded = false,
+}: {
+  evidence: RobustnessEvidence["monte_carlo"] | null;
+  fallback: string | null;
+  expanded?: boolean;
+}) {
+  if (!evidence) {
+    return (
+      <RobustnessShell title="Monte Carlo analysis" status={{ label: "not recorded", tone: "unknown" }}>
+        <RobustnessMissing fallback={fallback} />
+      </RobustnessShell>
+    );
+  }
+  const scale = Math.max(
+    Math.abs(evidence.median_net_profit),
+    Math.abs(evidence.p05_net_profit),
+    1e-9,
+  );
+  const bars: Array<{ label: string; value: number; width: number; tone: string }> = [
+    {
+      label: "Median net profit",
+      value: evidence.median_net_profit,
+      width: Math.abs(evidence.median_net_profit) / scale,
+      tone: evidence.median_net_profit >= 0 ? "pass" : "fail",
+    },
+    {
+      label: "5th percentile",
+      value: evidence.p05_net_profit,
+      width: Math.abs(evidence.p05_net_profit) / scale,
+      tone: evidence.p05_net_profit >= 0 ? "pass" : "fail",
+    },
+  ];
+  return (
+    <RobustnessShell
+      title="Monte Carlo analysis"
+      status={{ label: evidence.passed ? "passed" : "failed", tone: evidence.passed ? "pass" : "fail" }}
+    >
+      <div className="robustness-bars">
+        {bars.map((bar) => (
+          <div className="robustness-bar" key={bar.label}>
+            <span>{bar.label}</span>
+            <i><b className={bar.tone} style={{ width: `${Math.max(2, bar.width * 100)}%` }} /></i>
+            <strong className={bar.value >= 0 ? "positive" : "negative"}>
+              ${formatNumber(bar.value)}
+            </strong>
+          </div>
+        ))}
+      </div>
+      <StatRows
+        rows={[
+          ["Trials", formatNumber(evidence.trials)],
+          ["Method", `${evidence.method} · block ${formatNumber(evidence.block_length)}`],
+          ["Trade removal", `${((evidence.skip_trade_probability ?? 0) * 100).toFixed(0)}% per simulation`],
+          ["Profit criterion", `P05 ≥ $${formatNumber(evidence.minimum_p05_net_profit ?? 0)}`],
+          ["Drawdown criterion", `P95 ≤ ${(evidence.maximum_p95_drawdown_percent ?? 0).toFixed(2)}%`],
+          ["P95 drawdown", `${evidence.p95_drawdown_percent.toFixed(2)}%`],
+          ["Worst drawdown", `${evidence.worst_drawdown_percent.toFixed(2)}%`],
+          ["Seed", String(evidence.seed)],
+        ]}
+      />
+      <MonteCarloPathChart paths={evidence.sample_paths ?? []} tall={expanded} />
+    </RobustnessShell>
+  );
+}
+
+function MonteCarloPathChart({ paths, tall = false }: { paths: number[][]; tall?: boolean }) {
+  if (paths.length === 0) {
+    return (
+      <p className="robustness-missing">
+        Path samples were not recorded in this older evidence artifact. Re-run the battery to generate them.
+      </p>
+    );
+  }
+  const values = paths.flat();
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  // Paths are balance levels that start at the opening deposit, so anchoring the
+  // axis at zero would squash every path into a thin band at the top.
+  const pad = Math.max((rawMax - rawMin) * 0.06, 1);
+  const minimum = rawMin - pad;
+  const maximum = rawMax + pad;
+  const span = Math.max(maximum - minimum, 1e-9);
+  const left = 68;
+  const right = 984;
+  const top = 20;
+  const bottom = 402;
+  const plotHeight = bottom - top;
+  const plotWidth = right - left;
+  const yAt = (value: number) => bottom - ((value - minimum) / span) * plotHeight;
+  const tickCount = 7;
+  const ticks = Array.from(
+    { length: tickCount },
+    (_, index) => maximum - ((maximum - minimum) * index) / (tickCount - 1),
+  );
+  const openingBalance = paths[0]?.[0];
+  const breakEvenY =
+    openingBalance !== undefined && openingBalance > minimum && openingBalance < maximum
+      ? yAt(openingBalance)
+      : null;
+  return (
+    <section className={`monte-carlo-paths${tall ? " tall" : ""}`}>
+      <div>
+        <p className="eyebrow">Resampled paths</p>
+        <small>{paths.length} deterministic samples · resampling + trade removal</small>
+      </div>
+      <svg viewBox="0 0 1000 420" role="img" aria-label="Monte Carlo resampled equity paths" preserveAspectRatio="none">
+        {ticks.map((tick) => (
+          <g key={tick}>
+            <line className="mc-grid" x1={left} x2={right} y1={yAt(tick)} y2={yAt(tick)} />
+            <text className="mc-axis-label" x={left - 8} y={yAt(tick) + 3} textAnchor="end">
+              {formatNumber(tick, 0)}
+            </text>
+          </g>
+        ))}
+        {breakEvenY !== null && (
+          <>
+            <line className="mc-zero" x1={left} x2={right} y1={breakEvenY} y2={breakEvenY} />
+            <text className="mc-axis-label" x={right} y={breakEvenY - 6} textAnchor="end">
+              break-even
+            </text>
+          </>
+        )}
+        {paths.map((path, pathIndex) => {
+          const points = path
+            .map((value, index) => {
+              const x = left + (index / Math.max(path.length - 1, 1)) * plotWidth;
+              const y = yAt(value);
+              return `${x},${y}`;
+            })
+            .join(" ");
+          return <polyline key={pathIndex} points={points} className={pathIndex === 0 ? "mc-path first" : "mc-path"} />;
+        })}
+      </svg>
+    </section>
+  );
+}
+
+function ParameterNeighborhoodPanel({
+  evidence,
+  retention,
+  fallback,
+  expanded = false,
+}: {
+  evidence: RobustnessEvidence["parameter_neighborhood"] | null;
+  retention: RobustnessEvidence["m1_retention"] | null;
+  fallback: string | null;
+  expanded?: boolean;
+}) {
+  if (!evidence) {
+    return (
+      <RobustnessShell title="Parameter neighborhood" status={{ label: "not recorded", tone: "unknown" }}>
+        <RobustnessMissing fallback={fallback} />
+      </RobustnessShell>
+    );
+  }
+  const passed = evidence.survival_fraction >= evidence.required_survival_fraction;
+  const ratio = (value: number | null | undefined) =>
+    value === null || value === undefined ? "—" : `${(value * 100).toFixed(1)}%`;
+  const samples = evidence.samples ?? [];
+  const original = evidence.original_metrics ?? null;
+  const distributionMetrics = ([
+    {
+      key: "net_profit",
+      label: "Net profit",
+      values: samples.map((sample) => sample.net_profit),
+      original: metricNumber(original, "net_profit"),
+      format: (value: number) => `$${formatNumber(value)}`,
+    },
+    {
+      key: "max_drawdown_percent",
+      label: "Max DD %",
+      values: samples.map((sample) => sample.max_drawdown_percent),
+      original: metricNumber(original, "max_drawdown_percent"),
+      format: (value: number) => `${value.toFixed(2)}%`,
+    },
+    {
+      key: "return_percent",
+      label: "Return %",
+      values: samples.map((sample) => sample.return_percent),
+      original: metricNumber(original, "return_percent"),
+      format: (value: number) => `${value.toFixed(2)}%`,
+    },
+    {
+      key: "sharpe_ratio",
+      label: "Sharpe",
+      values: samples
+        .map((sample) => sample.sharpe_ratio)
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+      original: metricNumber(original, "sharpe_ratio"),
+      format: (value: number) => value.toFixed(2),
+    },
+    {
+      key: "profit_factor",
+      label: "Profit factor",
+      values: samples
+        .map((sample) => sample.profit_factor)
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+      original: metricNumber(original, "profit_factor"),
+      format: (value: number) => value.toFixed(2),
+    },
+    {
+      key: "trade_count",
+      label: "Trades",
+      values: samples.map((sample) => sample.trade_count),
+      original: metricNumber(original, "trade_count"),
+      format: (value: number) => formatNumber(value),
+    },
+  ] as const).filter((metric) => metric.values.length > 0);
+
+  return (
+    <RobustnessShell
+      title="System parameter permutation"
+      status={{ label: passed ? "passed" : "failed", tone: passed ? "pass" : "fail" }}
+    >
+      <div className="robustness-gauge">
+        <div className="robustness-gauge-head">
+          <span>±{(evidence.perturbation_fraction * 100).toFixed(0)}% survival</span>
+          <strong className={passed ? "positive" : "negative"}>
+            {(evidence.survival_fraction * 100).toFixed(0)}%
+          </strong>
+        </div>
+        <GaugeBar
+          fraction={evidence.survival_fraction}
+          required={evidence.required_survival_fraction}
+          passed={passed}
+        />
+        <small>Marker is the required {(evidence.required_survival_fraction * 100).toFixed(0)}% floor.</small>
+      </div>
+      <StatRows
+        rows={[
+          ["Neighbors", `${formatNumber(evidence.surviving_samples)} / ${formatNumber(evidence.samples_evaluated)} survived`],
+          ["Requested", formatNumber(evidence.samples_requested)],
+          [
+            "ADX plateau",
+            evidence.plateau_neighbors > 0
+              ? `${formatNumber(evidence.plateau_surviving)} / ${formatNumber(evidence.plateau_neighbors)} (${ratio(evidence.plateau_survival_fraction)})`
+              : "not applicable",
+          ],
+          ["M1 return retention", ratio(retention?.return_retention)],
+          ["M1 trade retention", ratio(retention?.trade_retention)],
+        ]}
+      />
+      {distributionMetrics.length > 0 && (
+        <section className={`param-distribution${expanded ? " expanded" : ""}`}>
+          <div className="param-summary-wrap">
+            <p className="eyebrow">Median strategy properties</p>
+            <table className="param-summary-table">
+              <thead>
+                <tr>
+                  <th>Stat</th>
+                  <th>Median</th>
+                  <th>Orig.</th>
+                  <th>% Orig / Median</th>
+                </tr>
+              </thead>
+              <tbody>
+                {distributionMetrics.map((metric) => {
+                  const median = medianOf(metric.values);
+                  const orig = metric.original;
+                  const pct =
+                    median !== null && orig !== null && Math.abs(median) > 1e-12
+                      ? `${((orig / median) * 100).toFixed(2)}%`
+                      : "—";
+                  return (
+                    <tr key={metric.key}>
+                      <td>{metric.label}</td>
+                      <td>{median === null ? "—" : metric.format(median)}</td>
+                      <td>{orig === null ? "—" : metric.format(orig)}</td>
+                      <td>{pct}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="param-hist-caption">
+            One bar per group of neighbours, so a tall single bar means the plateau is flat and a
+            wide spread means small parameter changes move the result. The dashed line is the
+            original strategy: sitting at the edge of the spread is the warning sign.
+          </p>
+          <div className="param-hist-grid">
+            {distributionMetrics.map((metric) => (
+              <MetricHistogram
+                key={metric.key}
+                label={`${metric.label} across ${metric.values.length} neighbours`}
+                values={metric.values}
+                original={metric.original}
+                format={metric.format}
+                zeroIsMeaningful={metric.key === "net_profit" || metric.key === "return_percent"}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+      {expanded && samples.length === 0 && (
+        <section className="parameter-explainer">
+          <p className="eyebrow">Plateau test</p>
+          <p>
+            Each neighbour changes the strategy’s numeric genes by up to ±{(evidence.perturbation_fraction * 100).toFixed(0)}%.
+            Re-run the robustness battery to persist per-neighbour metrics for distribution charts.
+          </p>
+        </section>
+      )}
+    </RobustnessShell>
+  );
+}
+
+function MetricHistogram({
+  label,
+  values,
+  original,
+  format,
+  zeroIsMeaningful = false,
+}: {
+  label: string;
+  values: number[];
+  original: number | null;
+  format: (value: number) => string;
+  /// Profit and return histograms read as "how much of the plateau is losing",
+  /// so those charts get a break-even reference line and a shaded loss region.
+  zeroIsMeaningful?: boolean;
+}) {
+  const median = medianOf(values);
+  if (values.length === 0 || median === null) return null;
+  // Keep the original and the break-even line inside the axis, otherwise the
+  // most important reference on the chart is the one you cannot see.
+  const anchors = [...values, ...(original === null ? [] : [original]), ...(zeroIsMeaningful ? [0] : [])];
+  const min = Math.min(...anchors);
+  const max = Math.max(...anchors);
+  const span = Math.max(max - min, Math.max(Math.abs(max), 1e-9) * 1e-6);
+  const bins = Math.min(12, Math.max(5, Math.round(Math.sqrt(values.length))));
+  const counts = Array.from({ length: bins }, () => 0);
+  for (const value of values) {
+    const index = Math.min(bins - 1, Math.floor(((value - min) / span) * bins));
+    counts[index] += 1;
+  }
+  const peak = Math.max(...counts, 1);
+  const percent = (value: number) => ((value - min) / span) * 100;
+  const binEdge = (index: number) => min + (span * index) / bins;
+  const losing = zeroIsMeaningful ? values.filter((value) => value < 0).length : 0;
+  return (
+    <article className="param-hist">
+      <p className="eyebrow">{label}</p>
+      <div className="param-hist-body">
+        <div className="param-hist-yaxis" aria-hidden="true">
+          <span>{peak}</span>
+          <span>0</span>
+        </div>
+        <div
+          className="param-hist-plot"
+          role="img"
+          aria-label={`${label}: ${values.length} neighbours between ${format(min)} and ${format(max)}, median ${format(median)}`}
+        >
+          {zeroIsMeaningful && min < 0 && (
+            <span className="param-hist-loss" style={{ width: `${percent(Math.min(0, max))}%` }} />
+          )}
+          {counts.map((count, index) => (
+            <i
+              key={index}
+              style={{ height: `${(count / peak) * 100}%` }}
+              title={`${count} of ${values.length} between ${format(binEdge(index))} and ${format(binEdge(index + 1))}`}
+            />
+          ))}
+          {zeroIsMeaningful && min < 0 && max > 0 && (
+            <span className="param-hist-zero" style={{ left: `${percent(0)}%` }} title="Break-even" />
+          )}
+          <span className="param-hist-median" style={{ left: `${percent(median)}%` }} title={`Median ${format(median)}`} />
+          {original !== null && (
+            <span className="param-hist-original" style={{ left: `${percent(original)}%` }} title={`Original ${format(original)}`} />
+          )}
+        </div>
+      </div>
+      <div className="param-hist-xaxis" aria-hidden="true">
+        <span>{format(min)}</span>
+        <span>{format(max)}</span>
+      </div>
+      <small className="param-hist-legend">
+        <em className="median">Median {format(median)}</em>
+        {original !== null && <em className="original">Original {format(original)}</em>}
+        {zeroIsMeaningful && <em className="loss">{losing} of {values.length} losing</em>}
+      </small>
+    </article>
+  );
+}
+
+function WalkForwardPanel({
+  evidence,
+  fallback,
+  expanded = false,
+}: {
+  evidence: RobustnessEvidence["walk_forward"] | null;
+  fallback: string | null;
+  expanded?: boolean;
+}) {
+  if (!evidence) {
+    return (
+      <RobustnessShell title="Walk-forward analysis" status={{ label: "not recorded", tone: "unknown" }}>
+        <RobustnessMissing fallback={fallback} />
+      </RobustnessShell>
+    );
+  }
+  const passed = evidence.passing_fraction >= evidence.required_passing_fraction;
+  const folds = evidence.folds ?? [];
+  const returns = folds.map((fold) => Number(fold.metrics.return_percent ?? 0));
+  const scale = Math.max(...returns.map((value) => Math.abs(value)), 1e-9);
+  const scorePercent = (evidence.passing_fraction * 100).toFixed(0);
+  return (
+    <RobustnessShell
+      title="Walk-forward analysis"
+      status={{ label: passed ? "passed" : "failed", tone: passed ? "pass" : "fail" }}
+    >
+      <div className="wf-score-card">
+        <div>
+          <span>Result</span>
+          <strong className={passed ? "positive" : "negative"}>{passed ? "PASSED" : "FAILED"}</strong>
+        </div>
+        <div>
+          <span>Robustness score</span>
+          <strong>
+            {scorePercent}% ({formatNumber(evidence.passing_folds)} from {formatNumber(evidence.total_folds)} folds)
+          </strong>
+        </div>
+        <div>
+          <span>Required</span>
+          <strong>≥{(evidence.required_passing_fraction * 100).toFixed(0)}%</strong>
+        </div>
+        <div>
+          <span>Scheme</span>
+          <strong>{evidence.fold_scheme}</strong>
+        </div>
+      </div>
+      {!expanded && folds.length > 0 && (
+        <div className="fold-chart" role="img" aria-label="Return per walk-forward fold">
+          {folds.map((fold, index) => {
+            const value = returns[index];
+            const height = Math.max(3, (Math.abs(value) / scale) * 46);
+            return (
+              <div className="fold-column" key={fold.fold} title={`Fold ${fold.fold}: ${value.toFixed(2)}% · ${formatNumber(fold.trades_in_fold)} trades`}>
+                <div className="fold-plot">
+                  <i
+                    className={fold.passed ? "pass" : "fail"}
+                    style={value >= 0
+                      ? { height: `${height}%`, bottom: "50%" }
+                      : { height: `${height}%`, top: "50%" }}
+                  />
+                </div>
+                <span>{fold.fold}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {expanded && folds.length > 0 && (
+        <div className="wf-table-wrap">
+          <table className="wf-results-table">
+            <thead>
+              <tr>
+                <th>Fold</th>
+                <th>Period</th>
+                <th>Bars</th>
+                <th>Trades</th>
+                <th>Net profit</th>
+                <th>Max DD %</th>
+                <th>Return %</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {folds.map((fold) => {
+                const net = metricNumber(fold.metrics, "net_profit");
+                const dd = metricNumber(fold.metrics, "max_drawdown_percent");
+                const ret = metricNumber(fold.metrics, "return_percent");
+                return (
+                  <tr key={fold.fold} className={fold.passed ? "pass" : "fail"}>
+                    <td>{fold.fold}</td>
+                    <td>{formatDateRange(fold.start_timestamp_ms, fold.end_timestamp_ms)}</td>
+                    <td>{formatNumber(fold.decision_bars)}</td>
+                    <td>{formatNumber(fold.trades_in_fold)}</td>
+                    <td className={net !== null && net >= 0 ? "positive" : "negative"}>
+                      {net === null ? "—" : `$${formatNumber(net)}`}
+                    </td>
+                    <td className="negative">{dd === null ? "—" : `${dd.toFixed(2)}%`}</td>
+                    <td className={ret !== null && ret >= 0 ? "positive" : "negative"}>
+                      {ret === null ? "—" : `${ret.toFixed(2)}%`}
+                    </td>
+                    <td>{fold.passed ? "PASSED" : "FAILED"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {folds.length === 0 && (
+        <div className="robustness-gauge">
+          <div className="robustness-gauge-head">
+            <span>Passing folds</span>
+            <strong className={passed ? "positive" : "negative"}>
+              {(evidence.passing_fraction * 100).toFixed(0)}%
+            </strong>
+          </div>
+          <GaugeBar
+            fraction={evidence.passing_fraction}
+            required={evidence.required_passing_fraction}
+            passed={passed}
+          />
+          <small>Per-fold detail was not persisted for this elite.</small>
+        </div>
+      )}
+      {!expanded && (
+        <StatRows
+          rows={[
+            ["Segments", `${formatNumber(evidence.passing_folds)} / ${formatNumber(evidence.total_folds)} passed`],
+            ["Scheme", evidence.fold_scheme],
+            ["Passing fraction", `${(evidence.passing_fraction * 100).toFixed(1)}%`],
+            ["Required", `${(evidence.required_passing_fraction * 100).toFixed(0)}%`],
+          ]}
+        />
+      )}
+    </RobustnessShell>
   );
 }
 
 function HomeWorkspace({
-  hasDatabank,
+  workspace,
   onNavigate,
   onOpen,
+  onOpenPath,
+  onOpenResult,
+  onError,
 }: {
-  hasDatabank: boolean;
+  workspace: DatabankWorkspace | null;
   onNavigate: (workspace: WorkspaceName) => void;
   onOpen: () => void;
+  onOpenPath: (path: string) => Promise<void>;
+  onOpenResult: (fingerprint: string) => void;
+  onError: (message: string | null) => void;
 }) {
+  const [job, setJob] = useState<DiscoverJobView | null>(null);
+  const [rangeProfiles, setRangeProfiles] = useState<number | null>(null);
+  const hasDatabank = workspace !== null;
+  const active = job?.status === "running" || job?.status === "paused";
+
+  useEffect(() => {
+    void getDiscoverJob()
+      .then(setJob)
+      .catch((reason) => onError(String(reason)));
+    void listSearchRangeProfiles()
+      .then((profiles) => setRangeProfiles(profiles.length))
+      .catch(() => setRangeProfiles(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => {
+      void getDiscoverJob().then(setJob).catch(() => {});
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  const top = useMemo(
+    () =>
+      workspace
+        ? [...workspace.elites].sort((left, right) => right.evidence - left.evidence).slice(0, 6)
+        : [],
+    [workspace],
+  );
+  const progress = discoverProgress(
+    job?.completedGenerations ?? 0,
+    job?.requestedGenerations ?? 0,
+    job?.runUntilStopped ?? true,
+  );
+  const progressLabel = discoverProgressLabel(
+    job?.completedGenerations ?? 0,
+    job?.requestedGenerations ?? 0,
+    job?.runUntilStopped ?? true,
+  );
+  const best = top[0] ?? null;
+
   return (
-    <div className="landing-content">
-      <section className="hero-panel">
-        <div>
-          <p className="eyebrow">Local-first research</p>
-          <h2>From broker-bound OHLC to an auditable strategy archive</h2>
-          <p>
-            Inspect the source, run deterministic quality-diversity discovery, then
-            interrogate every occupied niche. Inputs and outputs stay on this machine.
+    <div className="overview-content">
+      <section className={`panel overview-status job-${job?.status ?? "idle"}`}>
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Discover</p>
+            <h2>{job?.phase ?? "No search has run on this machine yet"}</h2>
+          </div>
+          <span className="job-status">{job?.status ?? "idle"}</span>
+        </div>
+        <div className="overview-status-body">
+          <p className="overview-status-message">
+            {job?.message ?? "Bind a symbol in Discover to start the local Rust worker."}
           </p>
-          <div className="hero-actions">
-            <button className="primary" onClick={() => onNavigate("Data Lab")}>Inspect data</button>
-            <button className="secondary" onClick={() => onNavigate("Discover")}>Start discovery</button>
-            <button className="secondary" onClick={onOpen}>{hasDatabank ? "Open another archive" : "Open archive"}</button>
+          {(active || (job?.completedGenerations ?? 0) > 0) && (
+            <>
+              <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
+              <div className="progress-label">
+                <span>{progressLabel}</span>
+                <strong>{job?.runUntilStopped && (job?.requestedGenerations ?? 0) <= 0 ? "∞" : `${progress.toFixed(0)}%`}</strong>
+              </div>
+            </>
+          )}
+          <div className="overview-status-kpis">
+            <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
+            <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + WFO + MC + params" />
+            <KpiCell label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0)} note={`${job?.workerThreads ?? "—"} worker threads`} />
+          </div>
+          <div className="overview-status-actions">
+            <button className="primary" type="button" onClick={() => onNavigate("Discover")}>
+              {active ? "Open live progress" : "Configure Discover"}
+            </button>
+            {job?.status === "completed" && job.outputPath && (
+              <button className="secondary" type="button" onClick={() => void onOpenPath(job.outputPath!)}>
+                Open checkpoint in Databank
+              </button>
+            )}
+            <button className="secondary" type="button" onClick={() => onNavigate("Data Lab")}>Inspect data</button>
+            <button className="secondary" type="button" onClick={onOpen}>
+              {hasDatabank ? "Open another databank" : "Open databank"}
+            </button>
           </div>
         </div>
-        <div className="truth-chain" aria-label="QuantForge truth chain">
-          <span>OHLC + metadata</span><i />
-          <span>Broker profile</span><i />
-          <span>Deterministic search</span><i />
-          <span>Immutable databank</span>
-        </div>
       </section>
-      <section className="workflow-grid">
-        <WorkflowCard
-          action="Open Data Lab"
-          description="Parse MT5 exports, bind timezone and broker metadata, and surface quality defects before evaluation."
-          eyebrow="01 / Establish truth"
-          onClick={() => onNavigate("Data Lab")}
-          title="Data Lab"
-        />
-        <WorkflowCard
-          action="Configure Discover"
-          description="Generate four strategy families through a seeded, parallel MAP-Elites search with explicit gates and costs."
-          eyebrow="02 / Illuminate"
-          onClick={() => onNavigate("Discover")}
-          title="Discover"
-        />
-        <WorkflowCard
-          action={hasDatabank ? "View loaded archive" : "Choose archive"}
-          description="Inspect elites with IS / OOS1 / OOS2 equity on one chart. Pipeline: IS robustness → OOS1 expectancy ≥ 0.7× IS → databank. OOS2 display-only."
-          eyebrow="03 / Databank lab"
-          onClick={hasDatabank ? () => onNavigate("Databank") : onOpen}
-          title="Databank"
-        />
-        <WorkflowCard
-          action="Open Parity Lab"
-          description="Replay decisions on M1, generate the guarded MT5 expert, and compare trade-level and equity-path output with Strategy Tester."
-          eyebrow="04 / Reconcile"
-          onClick={() => onNavigate("Parity Lab")}
-          title="Parity Lab"
-        />
-        <WorkflowCard
-          action="Open Vault"
-          description="Admit only complete evidence chains, inspect immutable Certified entries, and hand a verified candidate to deployment packaging."
-          eyebrow="05 / Certify"
-          onClick={() => onNavigate("Vault")}
-          title="Vault + Deploy"
-        />
-      </section>
-      <section className="stage-note">
-        <span className="status-light" />
-        <p><strong>All required workspaces are functional:</strong> data, discovery, robustness, parity, certification, portfolio and guarded deployment.</p>
-        <p>Every promotion artifact is local, immutable and content-bound.</p>
-      </section>
+
+      <div className="overview-grid">
+        {hasDatabank ? (
+          <section className="panel overview-databank">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Loaded databank</p>
+                <h2>{workspace.sourcePath.split("/").at(-1)}</h2>
+              </div>
+              <span className="read-only-badge">
+                {workspace.researchGrade ? "research grade" : workspace.m1FidelityVerified ? "M1 verified" : "promotion grade"}
+              </span>
+            </div>
+            <div className="overview-status-kpis">
+              <KpiCell label="Elites" value={formatNumber(workspace.elites.length)} note={`${workspace.coverage} / ${workspace.totalNiches} niches`} />
+              <KpiCell label="QD score" value={formatNumber(workspace.qdScore, 2)} note="positive evidence mass" />
+              <KpiCell
+                label="Best return"
+                value={best ? `${best.returnPercent.toFixed(2)}%` : "—"}
+                note={best ? `DD ${best.drawdownPercent.toFixed(2)}%` : "no elites"}
+                tone={best && best.returnPercent >= 0 ? "positive" : undefined}
+              />
+              <KpiCell label="Data quality" value={`${workspace.qualityGrade} · ${workspace.qualityScore}`} note={`run ${workspace.runId.slice(0, 10)}`} />
+            </div>
+            <div className="overview-top-list">
+              <div className="overview-top-head">
+                <span>Top strategies by evidence</span>
+                <button className="text-action" type="button" onClick={() => onNavigate("Databank")}>
+                  Open databank →
+                </button>
+              </div>
+              {top.map((elite) => (
+                <button
+                  className="overview-top-row"
+                  key={elite.fingerprint}
+                  onClick={() => onOpenResult(elite.fingerprint)}
+                  title={elite.fingerprint}
+                  type="button"
+                >
+                  <strong>{elite.strategyId}</strong>
+                  <span>{conditionLabel(elite.entryConditions, elite.exitConditions)}</span>
+                  <span>Ev {elite.evidence.toFixed(2)}</span>
+                  <span className={elite.returnPercent >= 0 ? "positive" : "negative"}>
+                    {elite.returnPercent.toFixed(2)}%
+                  </span>
+                  <span className="negative">-{elite.drawdownPercent.toFixed(2)}%</span>
+                  <span>{formatNumber(elite.trades)} trades</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        ) : (
+          <section className="panel overview-empty">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Databank</p>
+                <h2>No archive loaded</h2>
+              </div>
+            </div>
+            <p>
+              Open a validated databank JSON to see KPIs, top strategies and full result detail here.
+              QuantForge revalidates the run manifest, fingerprints and niche map before displaying anything.
+            </p>
+            <button className="primary" type="button" onClick={onOpen}>Open databank</button>
+          </section>
+        )}
+
+        <section className="panel overview-checklist">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Getting started</p>
+              <h2>Research path</h2>
+            </div>
+          </div>
+          <ChecklistRow
+            done={rangeProfiles !== null && rangeProfiles > 0}
+            label="Save a search-range profile"
+            note={rangeProfiles === null ? "profiles unavailable" : `${rangeProfiles} saved`}
+            action="Settings"
+            onAction={() => onNavigate("Search Settings")}
+          />
+          <ChecklistRow
+            done={job?.jobId !== null && job?.jobId !== undefined}
+            label="Run Discover on a bound symbol"
+            note={job?.jobId ? `last job ${job.status}` : "no job yet"}
+            action="Discover"
+            onAction={() => onNavigate("Discover")}
+          />
+          <ChecklistRow
+            done={hasDatabank}
+            label="Open the resulting databank"
+            note={hasDatabank ? `${formatNumber(workspace.elites.length)} elites` : "not loaded"}
+            action="Databank"
+            onAction={hasDatabank ? () => onNavigate("Databank") : onOpen}
+          />
+          <ChecklistRow
+            done={hasDatabank && top.length > 0}
+            label="Inspect a result and its robustness evidence"
+            note={best ? `start with ${best.strategyId}` : "needs elites"}
+            action="Open"
+            onAction={best ? () => onOpenResult(best.fingerprint) : () => onNavigate("Databank")}
+          />
+          <ChecklistRow
+            done={false}
+            label="Retest on M1 / MT5, then stage for certification"
+            note="Retester → Databank · Certified"
+            action="Retester"
+            onAction={() => onNavigate("Parity Lab")}
+          />
+        </section>
+      </div>
     </div>
   );
 }
 
-function WorkflowCard({
+function ChecklistRow({
+  done,
+  label,
+  note,
   action,
-  description,
-  eyebrow,
-  onClick,
-  title,
+  onAction,
 }: {
+  done: boolean;
+  label: string;
+  note: string;
   action: string;
-  description: string;
-  eyebrow: string;
-  onClick: () => void;
-  title: string;
+  onAction: () => void;
 }) {
   return (
-    <article className="workflow-card">
-      <p className="eyebrow">{eyebrow}</p>
-      <h3>{title}</h3>
-      <p>{description}</p>
-      <button className="text-action" onClick={onClick}>{action} →</button>
-    </article>
+    <div className={done ? "checklist-row done" : "checklist-row"}>
+      <span className="checklist-mark" aria-hidden="true">
+        {done ? (
+          <svg viewBox="0 0 24 24" className="nav-glyph"><path d="M5 12.5 10 17.5 19 7" /></svg>
+        ) : (
+          <i />
+        )}
+      </span>
+      <div>
+        <strong>{label}</strong>
+        <small>{note}</small>
+      </div>
+      <button className="text-action" type="button" onClick={onAction}>{action} →</button>
+    </div>
   );
 }
 
@@ -1043,14 +2608,91 @@ function SearchSettingsWorkspace({ onError }: { onError: (message: string | null
       setSelectedId(null); setName("H1-M15 default"); setRanges(DEFAULT_SEARCH_RANGES); setDirty(false);
     } catch (reason) { onError(String(reason)); } finally { setBusy(false); }
   }
-  return <div className="wide-tool-content search-settings-workspace">
-    <section className="panel setup-panel">
-      <div className="panel-heading"><div><p className="eyebrow">Reusable research contract</p><h2>Search Settings</h2></div><span className="read-only-badge">saved locally</span></div>
-      <div className="form-stack compact"><label className="field-row"><span>Profile name</span><input value={name} onChange={(event) => { setName(event.target.value); setDirty(true); }} placeholder="e.g. H1 conservative plateau" /></label></div>
-      <div className="form-footer"><p>{selectedId ? !rangesAreValid ? "Unsaved: fix each range so min ≤ max and step is positive." : busy ? "Saving profile…" : dirty ? "Unsaved edits will save automatically." : "Saved locally. Edits to this profile save automatically." : "Create a named profile, then its subsequent edits will save automatically."} Each selected profile is sealed into a new databank.</p><div className="button-row"><button className="secondary" disabled={busy} onClick={() => { setSelectedId(null); setName("New profile"); setRanges(DEFAULT_SEARCH_RANGES); setDirty(false); }}>New</button><button className="primary" disabled={busy || !name.trim() || !rangesAreValid} onClick={() => void saveProfile()}>{busy ? "Saving…" : selectedId ? "Save now" : "Save profile"}</button>{selectedId && <button className="danger" disabled={busy} onClick={() => void removeProfile()}>Delete</button>}</div></div>
+  const state: { tone: "saved" | "dirty" | "invalid" | "new"; label: string } = !rangesAreValid
+    ? { tone: "invalid", label: "Invalid ranges" }
+    : busy
+      ? { tone: "dirty", label: "Saving…" }
+      : !selectedId
+        ? { tone: "new", label: "Unsaved profile" }
+        : dirty
+          ? { tone: "dirty", label: "Unsaved edits" }
+          : { tone: "saved", label: "Saved locally" };
+
+  return <div className="settings-workspace">
+    <section className="panel settings-profile-card">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Reusable research contract</p>
+          <h2>Search settings</h2>
+        </div>
+        <span className={`settings-state ${state.tone}`}>{state.label}</span>
+      </div>
+      <div className="settings-profile-body">
+        <label className="field-row">
+          <span>Profile name</span>
+          <input
+            value={name}
+            onChange={(event) => { setName(event.target.value); setDirty(true); }}
+            placeholder="e.g. H1 conservative plateau"
+          />
+        </label>
+        <div className="settings-profile-actions">
+          <button className="secondary" disabled={busy} onClick={() => { setSelectedId(null); setName("New profile"); setRanges(DEFAULT_SEARCH_RANGES); setDirty(false); }}>New</button>
+          <button className="primary" disabled={busy || !name.trim() || !rangesAreValid} onClick={() => void saveProfile()}>
+            {busy ? "Saving…" : selectedId ? "Save now" : "Save profile"}
+          </button>
+          {selectedId && <button className="danger" disabled={busy} onClick={() => void removeProfile()}>Delete</button>}
+        </div>
+      </div>
+      <p className="settings-help">
+        {!rangesAreValid
+          ? "Fix each range so minimum ≤ maximum and step is positive before saving."
+          : selectedId
+            ? dirty
+              ? "Edits to this saved profile persist automatically after a short pause."
+              : "This profile is stored locally; edits save automatically."
+            : "Name the profile and save it once, then later edits save automatically."}{" "}
+        The selected profile is sealed into every new databank, so an existing archive can never be re-scoped.
+      </p>
     </section>
-    <section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Allowed numeric genes</p><h2>Min / max / step wall</h2></div></div><SearchRangesWall value={ranges} onChange={(next) => { setRanges(next); setDirty(true); }} /></section>
-    <section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Persistent library</p><h2>Saved profiles</h2></div></div><div className="profile-list">{profiles.length ? profiles.map((profile) => <button key={profile.id} className={profile.id === selectedId ? "profile-row active" : "profile-row"} onClick={() => load(profile)}><strong>{profile.name}</strong><small>Updated {new Date(profile.updatedAt).toLocaleString()}</small></button>) : <p className="immutable-note">No saved profiles yet. Configure the wall, then save it with a name.</p>}</div></section>
+
+    <section className="panel settings-library-card">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Persistent library</p>
+          <h2>Saved profiles</h2>
+        </div>
+        <span className="read-only-badge">{profiles.length} stored</span>
+      </div>
+      {profiles.length ? (
+        <div className="profile-list">
+          {profiles.map((profile) => (
+            <button
+              key={profile.id}
+              className={profile.id === selectedId ? "profile-row active" : "profile-row"}
+              onClick={() => load(profile)}
+              type="button"
+            >
+              <strong>{profile.name}</strong>
+              <small>Updated {new Date(profile.updatedAt).toLocaleString()}</small>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="settings-help">No saved profiles yet. Set the ranges below, then save them with a name.</p>
+      )}
+    </section>
+
+    <section className="panel settings-ranges-card">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Allowed numeric genes</p>
+          <h2>Minimum / maximum / step</h2>
+        </div>
+        <span className="read-only-badge">sealed per databank</span>
+      </div>
+      <SearchRangesWall value={ranges} onChange={(next) => { setRanges(next); setDirty(true); }} />
+    </section>
   </div>;
 }
 
@@ -1059,16 +2701,20 @@ function SavedRangeProfilePicker({ value, onChange, onError }: { value: SearchRa
   const [selectedId, setSelectedId] = useState("");
   useEffect(() => { void listSearchRangeProfiles().then(setProfiles).catch((reason) => onError(String(reason))); }, []);
   const selected = profiles.find((profile) => profile.id === selectedId);
-  return <label className="field-row"><span>Saved profile</span><select value={selectedId} onChange={(event) => { const nextId = event.target.value; setSelectedId(nextId); const match = profiles.find((profile) => profile.id === nextId); if (match) onChange(normalizeSearchRanges(match.ranges)); }}><option value="">Current job profile</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{selected ? `Applied to this new job: ${selected.name}. The job will use its sealed ranges.` : profiles.length ? "Choose a profile to replace the current ranges for this new job." : "Create a reusable profile in Search Settings first."}</small></label>;
+  return <label className="field-row"><span>Saved profile</span><select value={selectedId} onChange={(event) => { const nextId = event.target.value; setSelectedId(nextId); const match = profiles.find((profile) => profile.id === nextId); if (match) onChange(normalizeSearchRanges(match.ranges)); }}><option value="">Current job profile</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{selected ? `Applied to this new job: ${selected.name}. The job will use its sealed ranges.` : profiles.length ? "Choose a profile to replace the current ranges for this new job." : "Create a reusable profile in Settings first."}</small></label>;
 }
 
 function DiscoverWorkspace({
   onError,
   onOpenDatabank,
+  onLiveWorkspace,
+  onResultsView,
   preset,
 }: {
   onError: (message: string | null) => void;
   onOpenDatabank: (path: string) => void;
+  onLiveWorkspace?: (workspace: DatabankWorkspace) => void;
+  onResultsView?: (open: boolean) => void;
   preset: Partial<DiscoverRequest>;
 }) {
   const [form, setForm] = useState<DiscoverRequest>(() => ({
@@ -1089,9 +2735,10 @@ function DiscoverWorkspace({
     correlationThreshold: 0.85,
     noveltyWeight: 10,
     seed: 42,
-    searchFamily: null,
+    universalGrammar: { ...DEFAULT_UNIVERSAL_GRAMMAR },
     runMode: "full_harvest" as DiscoverRunModeId,
     earlyStopPotElites: null,
+    targetDatabankElites: null,
     searchRanges: DEFAULT_SEARCH_RANGES,
     minimumTrades: 10,
     maximumDrawdownPercent: 40,
@@ -1103,16 +2750,20 @@ function DiscoverWorkspace({
     depositMinimumReturnPercent: 0,
     depositMinimumProfitFactor: 1,
     depositMinimumReturnDrawdown: 0,
-    minimumM1ReturnRetention: 0.90,
+    minimumM1ReturnRetention: 0.80,
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: false,
     simpleExits: true,
     allowBreakEven: false,
     allowTrailingStops: false,
     allowPartialExits: false,
+    allowMarketEntries: true,
     allowStopEntries: false,
     allowLimitEntries: false,
     flattenAt22: false,
+    endOfDayHour: 23,
+    entryWindowStartHour: 2,
+    entryWindowEndHour: 19,
     maxOneEntryPerDay: true,
     mutateAfterElites: 300,
     randomFillFraction: 0.4,
@@ -1121,6 +2772,8 @@ function DiscoverWorkspace({
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
     robustnessNeighborhoodSamples: 8,
+    robustnessPerturbationFraction: 0.2,
+    minimumNeighborhoodSurvivalFraction: 0.7,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
     multiSymbolMinimumPass: null,
@@ -1141,14 +2794,22 @@ function DiscoverWorkspace({
   const [discoverProfileBusy, setDiscoverProfileBusy] = useState(false);
   const [job, setJob] = useState<DiscoverJobView | null>(null);
   const [busy, setBusy] = useState(false);
-  const [testerFamilies, setTesterFamilies] = useState<SearchFamilyId[]>(
-    SEARCH_FAMILIES.map((family) => family.id),
-  );
+  const [testerCounts, setTesterCounts] = useState<number[]>([2, 3, 4]);
   const [testerGenerations, setTesterGenerations] = useState(3);
   const [testerCandidates, setTesterCandidates] = useState(60);
   const [testerSeed, setTesterSeed] = useState(42);
   const [testerBusy, setTesterBusy] = useState(false);
-  const [testerReport, setTesterReport] = useState<FamilyBakeoffReport | null>(null);
+  const [testerReport, setTesterReport] = useState<ConditionBakeoffReport | null>(null);
+  const [resultsViewFp, setResultsViewFp] = useState<string | null>(null);
+  const [liveWorkspace, setLiveWorkspace] = useState<DatabankWorkspace | null>(null);
+  const [liveSelected, setLiveSelected] = useState<string | null>(null);
+  const [liveDetail, setLiveDetail] = useState<EliteDetail | null>(null);
+  const [liveDetailOpen, setLiveDetailOpen] = useState(false);
+  const [liveDetailLoading, setLiveDetailLoading] = useState(false);
+  const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
+  const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir">("overview");
+  const lastDatabankCountRef = useRef(0);
+  const liveReloadBusyRef = useRef(false);
   const active = job?.status === "running" || job?.status === "paused";
 
   useEffect(() => {
@@ -1160,12 +2821,70 @@ function DiscoverWorkspace({
   }, []);
 
   useEffect(() => {
+    if (active) setDiscoverTab("progress");
+  }, [active]);
+
+  // The always-on strip collapses while this workspace shows its own results
+  // page, so the screenshot-style elite table is never rendered twice.
+  useEffect(() => {
+    onResultsView?.(resultsViewFp !== null);
+    return () => onResultsView?.(false);
+  }, [resultsViewFp]);
+
+  useEffect(() => {
     if (!active) return;
     const timer = window.setInterval(() => {
       void getDiscoverJob().then(setJob).catch((reason) => onError(String(reason)));
     }, 500);
     return () => window.clearInterval(timer);
   }, [active]);
+
+  useEffect(() => {
+    if (!job?.outputPath) return;
+    const eliteCount = job.databankElites ?? 0;
+    const shouldReload =
+      job.status === "completed"
+      || (active && eliteCount > 0 && eliteCount !== lastDatabankCountRef.current);
+    if (!shouldReload || liveReloadBusyRef.current) return;
+
+    const timer = window.setTimeout(() => {
+      liveReloadBusyRef.current = true;
+      void loadDatabankPath(job.outputPath!)
+        .then((workspace) => {
+          lastDatabankCountRef.current = eliteCount;
+          setLiveWorkspace(workspace);
+          onLiveWorkspace?.(workspace);
+        })
+        .catch(() => {})
+        .finally(() => {
+          liveReloadBusyRef.current = false;
+        });
+    }, active ? 1800 : 0);
+    return () => window.clearInterval(timer);
+  }, [active, job?.outputPath, job?.databankElites, job?.status]);
+
+  const liveEliteRows = useMemo(() => {
+    if (!liveWorkspace) return [];
+    return [...liveWorkspace.elites].sort((left, right) => right.evidence - left.evidence);
+  }, [liveWorkspace]);
+
+  async function inspectLiveElite(fingerprint: string) {
+    if (!job?.outputPath) return;
+    setLiveDetailLoading(true);
+    setLiveDetailOpen(true);
+    setLiveInspectorTab("overview");
+    setLiveSelected(fingerprint);
+    onError(null);
+    try {
+      await loadDatabankPath(job.outputPath);
+      setLiveDetail(await loadElite(fingerprint));
+    } catch (reason) {
+      onError(String(reason));
+      setLiveDetailOpen(false);
+    } finally {
+      setLiveDetailLoading(false);
+    }
+  }
 
   function update<K extends keyof DiscoverRequest>(key: K, value: DiscoverRequest[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -1241,6 +2960,11 @@ function DiscoverWorkspace({
   }
 
   async function start() {
+    const blocker = entryWindowError(form) ?? entryOrderError(form) ?? perturbationError(form);
+    if (blocker) {
+      onError(blocker);
+      return;
+    }
     setBusy(true);
     onError(null);
     try {
@@ -1257,9 +2981,9 @@ function DiscoverWorkspace({
             correlationThreshold: null,
             noveltyWeight: null,
             seed: null,
-            searchFamily: null,
             runMode: null,
             earlyStopPotElites: null,
+            targetDatabankElites: null,
             searchRanges: null,
             minimumTrades: null,
             maximumDrawdownPercent: null,
@@ -1278,9 +3002,12 @@ function DiscoverWorkspace({
             allowBreakEven: null,
             allowTrailingStops: null,
             allowPartialExits: null,
+            allowMarketEntries: null,
             allowStopEntries: null,
             allowLimitEntries: null,
             flattenAt22: null,
+            entryWindowStartHour: null,
+            entryWindowEndHour: null,
             maxOneEntryPerDay: null,
             mutateAfterElites: null,
             randomFillFraction: null,
@@ -1289,6 +3016,8 @@ function DiscoverWorkspace({
             robustnessFolds: null,
             robustnessMonteCarloTrials: null,
             robustnessNeighborhoodSamples: null,
+            robustnessPerturbationFraction: null,
+            minimumNeighborhoodSurvivalFraction: null,
             calendarYearFolds: null,
             minimumDeflatedTradeSharpe: null,
             multiSymbolMinimumPass: null,
@@ -1303,7 +3032,11 @@ function DiscoverWorkspace({
             sealedFraction: null,
           }
         : sourceBoundForm;
-      setJob(await startDiscover(request));
+      const started = await startDiscover(request);
+      setJob(started);
+      if (form.mode === "new" && started.outputPath) {
+        setForm((current) => ({ ...current, databankPath: started.outputPath! }));
+      }
     } catch (reason) {
       onError(String(reason));
     } finally {
@@ -1320,28 +3053,28 @@ function DiscoverWorkspace({
     }
   }
 
-  function toggleTesterFamily(id: SearchFamilyId) {
-    setTesterFamilies((current) =>
-      current.includes(id)
-        ? current.filter((family) => family !== id)
-        : [...current, id],
+  function toggleTesterCount(count: number) {
+    setTesterCounts((current) =>
+      current.includes(count)
+        ? current.filter((value) => value !== count)
+        : [...current, count].sort(),
     );
   }
 
   async function runTester() {
-    if (testerFamilies.length < 1) {
-      onError("Select at least one search family for the family tester.");
+    if (testerCounts.length < 1) {
+      onError("Select at least one entry-condition count for the condition bakeoff.");
       return;
     }
     if (!form.dataPath || !form.m1DataPath || !form.brokerPath) {
-      onError("Choose a symbol (decision timeframe, M1, broker) before running the family tester.");
+      onError("Choose a symbol (decision timeframe, M1, broker) before running the condition bakeoff.");
       return;
     }
     setTesterBusy(true);
     onError(null);
     try {
       const bound = bindDiscoverTimezone(form);
-      const report = await runFamilyBakeoff({
+      const report = await runConditionBakeoff({
         dataPath: bound.dataPath,
         metadataPath: bound.metadataPath,
         sourceTimezone: bound.sourceTimezone,
@@ -1356,7 +3089,7 @@ function DiscoverWorkspace({
         slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
         fallbackSpreadPoints: form.fallbackSpreadPoints,
         validationFraction: form.validationFraction ?? 0.2,
-        families: testerFamilies,
+        entryConditionCounts: testerCounts,
       });
       setTesterReport(report);
     } catch (reason) {
@@ -1366,11 +3099,29 @@ function DiscoverWorkspace({
     }
   }
 
-  function applyFamily(id: SearchFamilyId) {
-    update("searchFamily", id);
-    if (form.mode === "continue") {
-      update("mode", "new");
-    }
+  function applyRecommendedCount(count: number) {
+    setForm((current) => ({
+      ...current,
+      mode: "new",
+      universalGrammar: {
+        ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR),
+        minimumEntryConditions: count,
+        maximumEntryConditions: count,
+      },
+    }));
+  }
+
+  function updateGrammar<K extends keyof typeof DEFAULT_UNIVERSAL_GRAMMAR>(
+    key: K,
+    value: number,
+  ) {
+    setForm((current) => ({
+      ...current,
+      universalGrammar: {
+        ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR),
+        [key]: value,
+      },
+    }));
   }
 
   const progress = discoverProgress(
@@ -1387,10 +3138,42 @@ function DiscoverWorkspace({
   const rejected = job?.rejectedTotal ?? 0;
   return (
     <div className="discover-layout">
-      <div className="discover-main">
+      <div className="discover-dashboard">
+        <div className="discover-tabs" role="tablist" aria-label="Discover dashboard">
+          <button
+            type="button"
+            className={discoverTab === "progress" ? "active" : ""}
+            onClick={() => setDiscoverTab("progress")}
+            role="tab"
+            aria-selected={discoverTab === "progress"}
+          >
+            Live progress
+          </button>
+          <button
+            type="button"
+            className={discoverTab === "settings" ? "active" : ""}
+            onClick={() => setDiscoverTab("settings")}
+            role="tab"
+            aria-selected={discoverTab === "settings"}
+          >
+            Configure
+          </button>
+          <button
+            type="button"
+            className={discoverTab === "results" ? "active" : ""}
+            onClick={() => setDiscoverTab("results")}
+            role="tab"
+            aria-selected={discoverTab === "results"}
+          >
+            Results
+          </button>
+        </div>
+
+      {discoverTab === "settings" && (
+      <div className="discover-main discover-settings-pane">
       <section className="panel discover-form">
         <div className="panel-heading">
-          <div><p className="eyebrow">Job contract</p><h2>Configure deterministic evolution</h2></div>
+          <div><p className="eyebrow">Discover</p><h2>Configure deterministic evolution</h2></div>
           <div className="mode-toggle">
             <button className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
             <button className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
@@ -1411,42 +3194,88 @@ function DiscoverWorkspace({
               <div className="hypothesis-strip">
                 <div className="hypothesis-heading">
                   <p className="eyebrow">Hypothesis</p>
-                  <h3>Search Family + run mode</h3>
+                  <h3>Universal grammar + run mode</h3>
                 </div>
-                <div className="family-chips" role="group" aria-label="Search Family">
-                  {SEARCH_FAMILIES.map((family) => (
-                    <button
-                      key={family.id}
-                      type="button"
-                      className={form.searchFamily === family.id ? "family-chip active" : "family-chip"}
-                      onClick={() => update("searchFamily", family.id)}
-                    >
-                      {family.label}
-                    </button>
-                  ))}
+                <p className="recipe-summary">
+                  Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts.
+                  Entry conditions 2–4 · exit conditions 1–3.
+                </p>
+                <div className="form-grid universal-grammar-grid">
+                  <NumberField label="Entry conditions min" value={form.universalGrammar?.minimumEntryConditions ?? 2} onChange={(value) => updateGrammar("minimumEntryConditions", value ?? 2)} min={2} max={4} />
+                  <NumberField label="Entry conditions max" value={form.universalGrammar?.maximumEntryConditions ?? 4} onChange={(value) => updateGrammar("maximumEntryConditions", value ?? 4)} min={2} max={4} />
+                  <NumberField label="Exit conditions min" value={form.universalGrammar?.minimumExitConditions ?? 1} onChange={(value) => updateGrammar("minimumExitConditions", value ?? 1)} min={1} max={3} />
+                  <NumberField label="Exit conditions max" value={form.universalGrammar?.maximumExitConditions ?? 3} onChange={(value) => updateGrammar("maximumExitConditions", value ?? 3)} min={1} max={3} />
+                  <NumberField label="Closed-bar shift min" value={form.universalGrammar?.minimumShift ?? 1} onChange={(value) => updateGrammar("minimumShift", value ?? 1)} min={1} />
+                  <NumberField label="Closed-bar shift max" value={form.universalGrammar?.maximumShift ?? 3} onChange={(value) => updateGrammar("maximumShift", value ?? 3)} min={1} />
                 </div>
                 <div className="mode-toggle run-mode-toggle">
                   <button
                     type="button"
                     className={form.runMode === "fast_scout" ? "active" : ""}
-                    onClick={() => update("runMode", "fast_scout")}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "fast_scout",
+                        mutateAfterElites: 20,
+                        earlyStopPotElites: 8,
+                        targetDatabankElites: null,
+                      }))
+                    }
                   >
                     Fast Scout
                   </button>
                   <button
                     type="button"
                     className={form.runMode === "full_harvest" ? "active" : ""}
-                    onClick={() => update("runMode", "full_harvest")}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "full_harvest",
+                        mutateAfterElites: 300,
+                        earlyStopPotElites: null,
+                        targetDatabankElites: null,
+                        robustnessMonteCarloTrials: 250,
+                        robustnessNeighborhoodSamples: 8,
+                        minimumNeighborhoodSurvivalFraction: 0.7,
+                      }))
+                    }
                   >
                     Full Harvest
                   </button>
+                  <button
+                    type="button"
+                    className={form.runMode === "quota_harvest" ? "active" : ""}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "quota_harvest",
+                        mutateAfterElites: 25,
+                        earlyStopPotElites: null,
+                        targetDatabankElites: 20,
+                        initialCandidates: Math.max(current.initialCandidates ?? 500, 1000),
+                        batchSize: Math.max(current.batchSize ?? 200, 300),
+                        randomFillFraction: Math.max(current.randomFillFraction ?? 0.4, 0.75),
+                        robustnessMonteCarloTrials: 80,
+                        robustnessNeighborhoodSamples: 5,
+                        minimumNeighborhoodSurvivalFraction: 0.5,
+                        requireM1Robustness: true,
+                        simpleExits: true,
+                      }))
+                    }
+                  >
+                    Quota (20)
+                  </button>
                 </div>
-                <p className="recipe-summary">{familyRecipe(form.searchFamily)}</p>
+                {form.runMode === "quota_harvest" && (
+                  <p className="recipe-summary">
+                    Stops at 20 databank elites. Softer ±param gate (50% of 5). Pot is only a breeding bag — not the goal.
+                  </p>
+                )}
               </div>
             </>
           ) : (
             <p className="immutable-note">
-              Continuation loads Search Family, run mode, grammar, seed, gates and cost model from the
+              Continuation loads search grammar, run mode, seed, gates and cost model from the
               verified databank. Only the generation count can change.
             </p>
           )}
@@ -1464,21 +3293,23 @@ function DiscoverWorkspace({
                   m1MetadataPath: symbol.m1MetadataPath,
                   m1SourceTimezone: null,
                   brokerPath: symbol.brokerPath,
-                  databankPath:
-                    current.mode === "new" && !current.databankPath
-                      ? symbol.defaultDatabankPath
-                      : current.databankPath || symbol.defaultDatabankPath,
+                  // New runs automatically receive a unique immutable path at
+                  // Start. Never carry the previous archive into a fresh run.
+                  databankPath: current.mode === "new" ? "" : current.databankPath || symbol.defaultDatabankPath,
                 }));
               }}
               selectedDataPath={form.dataPath}
             />
             <PathField
-              label={form.mode === "new" ? "New databank" : "Existing databank"}
+              label={form.mode === "new" ? "New databank (auto if blank)" : "Existing databank"}
               path={form.databankPath}
               choose={chooseOutput}
               onChange={(value) => update("databankPath", value)}
-              required
+              required={form.mode !== "new"}
             />
+            {form.mode === "new" && !form.databankPath && (
+              <p className="immutable-note">QuantForge will create a unique archive under <code>runs/SYMBOL/Databank</code> when you start. Choose a path only if you want a specific location.</p>
+            )}
             <div className="field-row">
               <span>Decision timeframe <small>required</small></span>
               <div className="mode-toggle">
@@ -1542,7 +3373,7 @@ function DiscoverWorkspace({
                   <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
                   <NumberField label="Minimum return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value)} step={0.1} />
                   <NumberField label="Minimum profit factor" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value)} step={0.01} />
-                  <NumberField label="Minimum return / DD" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
+                  <NumberField label="Minimum recovery factor" value={form.minimumReturnDrawdown} onChange={(value) => update("minimumReturnDrawdown", value)} min={0} step={0.05} />
                 </div>
               </details>
               <details className="advanced-settings" open>
@@ -1553,25 +3384,34 @@ function DiscoverWorkspace({
                   <NumberField label="Maximum drawdown %" value={form.depositMaximumDrawdownPercent} onChange={(value) => update("depositMaximumDrawdownPercent", value)} step={0.1} />
                   <NumberField label="Minimum return %" value={form.depositMinimumReturnPercent} onChange={(value) => update("depositMinimumReturnPercent", value)} step={0.1} />
                   <NumberField label="Minimum profit factor" value={form.depositMinimumProfitFactor} onChange={(value) => update("depositMinimumProfitFactor", value)} step={0.01} />
-                  <NumberField label="Minimum return / DD" value={form.depositMinimumReturnDrawdown} onChange={(value) => update("depositMinimumReturnDrawdown", value)} min={0} step={0.05} />
+                  <NumberField label="Minimum recovery factor" value={form.depositMinimumReturnDrawdown} onChange={(value) => update("depositMinimumReturnDrawdown", value)} min={0} step={0.05} />
                 </div>
               </details>
               <details className="advanced-settings">
                 <summary>Search profile</summary>
-                <p className="immutable-note">Load a saved range profile from Search Settings. Its complete numeric gene space is sealed into this new databank.</p>
+                <p className="immutable-note">Load a saved range profile from Settings. Its complete numeric gene space is sealed into this new databank.</p>
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
                 <summary>M1 robustness — on IS, before OOS1</summary>
-                <p className="immutable-note">SQX-style: pot fills on the Selected-TF deposit first. M1 WFO/MC/±10% then OOS1 0.7× run only for pot members (databank path). ADX strategies also need a 75% M1 plateau across ± one configured ADX period/threshold step. OOS2 never used in Discover.</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood for databank (after pot)</span></label>
+                <p className="immutable-note">{`Pot = Selected-TF breeding bag only. M1 retention, walk-forward, Monte Carlo (15% trade removal), ±${perturbationPercent(form)}% parameter neighbourhood, and OOS1 ≥0.7× run only when promoting pot members into the databank. OOS2 is never used in Discover.`}</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood for databank (not the pot)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
-                  <NumberField label="Param samples (±10%)" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
+                  <NumberField label="Param samples" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
+                  <NumberField
+                    label="Param jitter ±% (SQX default 20)"
+                    value={perturbationPercent(form)}
+                    onChange={(value) => update("robustnessPerturbationFraction", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
+                    min={1}
+                    max={100}
+                    step={1}
+                  />
                   <NumberField label="Multi-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
                 </div>
+                {perturbationError(form) && <p className="field-error">{perturbationError(form)}</p>}
               </details>
               <details className="advanced-settings">
                 <summary>Diversity and cost model</summary>
@@ -1590,23 +3430,52 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">SQX-style default: Selected-TF H1/M15 scout using completed bars and next-open market entries. Promotion still requires M1 fidelity and robustness; OOS2 is never used in Discover.</p>
-            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>Fast Selected-TF scout (M1 runs after the deposit gate)</span></label>
+            <p className="immutable-note">SQX-style default: Selected-TF H1/M15 scout fills the pot. Databank promotion still requires M1 fidelity and robustness; OOS2 is never used in Discover.</p>
+            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>Fast Selected-TF scout (no extra M1 precision gate before the databank)</span></label>
             <details className="advanced-settings" open>
               <summary>Execution modules — individually parity-gated</summary>
-              <p className="immutable-note">Disabled is the high-parity baseline. Enabling any module makes it a distinct search gene and automatically requires M1 precision before deposit. Final promotion still needs an MT5 tick-parity run.</p>
+              <p className="immutable-note">Disabled is the high-parity baseline. Enabling any module makes it a distinct search gene and automatically requires M1 precision before databank promotion. The pot still fills on Selected-TF evidence alone. Final promotion still needs an MT5 tick-parity run.</p>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Break-even stop move</span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Trailing stop</span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Partial exit</span></label>
+            </details>
+            <details className="advanced-settings" open>
+              <summary>Entry order types — sampled in equal shares</summary>
+              <p className="immutable-note">{entryOrderSummary(form)}</p>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false, requireM1Precision: event.target.checked ? current.requireM1Precision : true }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop / sell-stop entry <small>(experimental; weaker in current OOS screen)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-limit / sell-limit entry <small>(test independently; preferred over stops in current screen)</small></span></label>
+              {entryOrderError(form) && <p className="field-error">{entryOrderError(form)}</p>}
             </details>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day; entries only 02:00–19:00 broker)</span></label>
-            <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Close positions and cancel pending orders at 22:00 broker time</span></label>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day)</span></label>
+            <div className="discover-split">
+              <NumberField
+                label="Entry window start hour (broker local, inclusive)"
+                value={form.entryWindowStartHour ?? 2}
+                onChange={(value) => update("entryWindowStartHour", Math.min(23, Math.max(0, value ?? 2)))}
+                min={0}
+              />
+              <NumberField
+                label="Entry window end hour (broker local, exclusive)"
+                value={form.entryWindowEndHour ?? 19}
+                onChange={(value) => update("entryWindowEndHour", Math.min(24, Math.max(1, value ?? 19)))}
+                min={1}
+              />
+            </div>
+            <p className="immutable-note">{entryWindowSummary(form)} Broker local time, so it follows the symbol profile's timezone rather than UTC. Widen the start hour when your broker only accepts orders a few minutes after midnight; the exported expert and every M1 replay use the same window.</p>
+            <label className="check-field discover-split"><input type="checkbox" checked={form.flattenAt22 ?? false} onChange={(event) => update("flattenAt22", event.target.checked)} /><span>Exit at end of day (SQX ExitAtEndOfDay)</span></label>
+            {(form.flattenAt22 ?? false) && (
+              <NumberField
+                label="EOD exit hour (broker local, 0–23)"
+                value={form.endOfDayHour ?? 23}
+                onChange={(value) => update("endOfDayHour", Math.min(23, Math.max(0, value ?? 23)))}
+                min={0}
+              />
+            )}
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: hypothesis → H1/M15 scout → deposit → pot (breeding bag, no niche block) → M1 robustness on pot members → OOS1 (≥0.7× IS expectancy) → databank (MAP-Elites niches). Expectancy in R ($1,000 risk). Methodology Researcher (full recipe grid + FDR) is not shipped yet — use Family Tester below.</p>
+          <p>Pipeline: hypothesis → H1/M15 scout → deposit gate → pot (breeding bag, Selected-TF evidence only) → M1 precision + robustness on pot members → OOS1 (≥0.7× IS expectancy) → databank (MAP-Elites niches). Expectancy in R ($1,000 risk). Methodology Researcher (full recipe grid + FDR) is not shipped yet — use Condition Bakeoff under Results.</p>
           <button
             className="primary"
             disabled={
@@ -1615,17 +3484,21 @@ function DiscoverWorkspace({
               || !form.dataPath
               || !form.m1DataPath
               || !form.brokerPath
-              || !form.databankPath
-              || (form.mode === "new" && !form.searchFamily)
+              || (form.mode === "continue" && !form.databankPath)
+              || (form.mode === "new" && !form.universalGrammar)
               || (!(form.runUntilStopped ?? true) && form.generations < 1)
             }
             onClick={start}
           >
-            {busy ? "Starting…" : form.mode === "new" ? "Start discovery" : "Continue discovery"}
+            {busy ? "Starting…" : form.mode === "new" ? "Start Discover" : "Continue optimization"}
           </button>
         </div>
       </section>
+      <DiscoverContractSummary form={form} active={active} />
+      </div>
+      )}
 
+      {discoverTab === "progress" && (
       <section className={`panel job-panel job-${job?.status ?? "idle"}`}>
         <div className="panel-heading"><div><p className="eyebrow">Live worker</p><h2>{job?.phase ?? "No job loaded"}</h2></div><span className="job-status">{job?.status ?? "idle"}</span></div>
         <div className="job-body">
@@ -1641,8 +3514,16 @@ function DiscoverWorkspace({
             />
             <Kpi
               label="Databank"
-              value={formatNumber(job?.databankElites ?? job?.coverage ?? 0)}
-              note="Passed M1 + WFO + MC + params"
+              value={
+                job?.targetDatabankElites
+                  ? `${formatNumber(job?.databankElites ?? 0)}/${job.targetDatabankElites}`
+                  : formatNumber(job?.databankElites ?? job?.coverage ?? 0)
+              }
+              note={
+                job?.targetDatabankElites
+                  ? "Quota target · M1 + WFO + MC + params"
+                  : "Passed M1 + WFO + MC + params"
+              }
             />
             <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note="Eligible for M1 promotion" />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
@@ -1651,20 +3532,24 @@ function DiscoverWorkspace({
           </div>
           <div className="reject-funnel">
             <p className="eyebrow">Reject reasons</p>
+            <p className="funnel-group-label">Pot gates — Selected-TF only</p>
             <ul>
               <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
               <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
               <li><span>Ambiguous same-bar</span><strong>{formatNumber(job?.rejectedAmbiguous ?? 0)}</strong></li>
-              <li><span>OOS1 pick</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
-              <li><span>M1 retention (90/80/130)</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
-              <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
-              <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
-              <li><span>Param ±10%</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
-              <li><span>M1 precision</span><strong>{formatNumber(job?.rejectedPrecision ?? 0)}</strong></li>
               <li><span>Clone</span><strong>{formatNumber(job?.rejectedClone ?? 0)}</strong></li>
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
-              <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
+            </ul>
+            <p className="funnel-group-label">Databank gates — run after the pot deposit</p>
+            <ul>
+              <li><span>M1 precision</span><strong>{formatNumber(job?.rejectedPrecision ?? 0)}</strong></li>
+              <li><span>M1 retention (80/80/130)</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
+              <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
+              <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
+              <li><span>Param plateau</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
+              <li><span>OOS1 pick</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
             </ul>
             {job?.bestIsExpectancy != null && (
               <p className="funnel-best">
@@ -1703,135 +3588,355 @@ function DiscoverWorkspace({
           {job?.status === "failed" && <div className="job-error">{job.message}</div>}
         </div>
       </section>
+      )}
+
+      {discoverTab === "results" && (
+      <div className="results-pane">
+        {resultsViewFp ? (
+          <ResultsDetailPage
+            fingerprint={resultsViewFp}
+            workspace={liveWorkspace}
+            backLabel="Discover results"
+            onBack={() => setResultsViewFp(null)}
+            onError={onError}
+            onExportIr={(target) => void exportEliteStrategy(target).catch((reason) => onError(String(reason)))}
+            onExportMq5={(target) => void exportEliteEas([target], "H1", 42_424_242).catch((reason) => onError(String(reason)))}
+            onStage={(target) => void promoteEliteToVault(target).then(() => undefined).catch((reason) => onError(String(reason)))}
+            onOpenResult={setResultsViewFp}
+          />
+        ) : (
+          <>
+            <section className="panel results-elites-panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">Results</p>
+                  <h2>
+                    {liveEliteRows.length
+                      ? `${liveEliteRows.length} databank elites`
+                      : "No elites yet"}
+                  </h2>
+                </div>
+                <span className="read-only-badge">click a row for full detail</span>
+              </div>
+              {liveEliteRows.length > 0 ? (
+                <EliteTable
+                  batchSelection={new Set()}
+                  onDoubleClick={(fingerprint) => setResultsViewFp(fingerprint)}
+                  onSelect={(fingerprint) => setResultsViewFp(fingerprint)}
+                  onToggle={() => {}}
+                  rows={liveEliteRows}
+                  selected={resultsViewFp}
+                  showBatch={false}
+                  showActions
+                  onExportIr={(fingerprint) => void exportEliteStrategy(fingerprint).catch((reason) => onError(String(reason)))}
+                  onExportMq5={(fingerprint) => void exportEliteEas([fingerprint], "H1", 42_424_242).catch((reason) => onError(String(reason)))}
+                  onStage={(fingerprint) => void promoteEliteToVault(fingerprint).then((path) => path && onError(null)).catch((reason) => onError(String(reason)))}
+                />
+              ) : (
+                <p className="cluster-empty">
+                  Run Discover until elites pass M1 robustness, or open a databank. Results appear here as promotions land.
+                </p>
+              )}
+            </section>
+
+            <section className="panel family-tester-panel condition-bakeoff-panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">Methodology lite</p>
+                  <h2>Condition bakeoff</h2>
+                </div>
+                <span className="read-only-badge">equal-budget OOS1 · no sealed</span>
+              </div>
+              <div className="family-tester-body">
+                <p className="immutable-note">
+                  Equal-budget Fast Scout per entry-condition count. Every retained pot member is rechecked on OOS1;
+                  expectancy is shown in R ($1,000 fixed risk). This advises which entry cardinality to harvest — it does
+                  not replace M1 robustness or the sealed OOS2 final.
+                </p>
+                <div className="family-tester-toggles" role="group" aria-label="Entry counts to test">
+                  {[2, 3, 4].map((count) => (
+                    <label key={count} className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={testerCounts.includes(count)}
+                        disabled={active || testerBusy}
+                        onChange={() => toggleTesterCount(count)}
+                      />
+                      <span>{count} entry conditions</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="numeric-grid family-tester-numbers">
+                  <NumberField
+                    label="Generations / count"
+                    value={testerGenerations}
+                    onChange={(value) => setTesterGenerations(value ?? 3)}
+                    min={1}
+                  />
+                  <NumberField
+                    label="Initial candidates"
+                    value={testerCandidates}
+                    onChange={(value) => setTesterCandidates(value ?? 60)}
+                    min={20}
+                  />
+                  <NumberField
+                    label="Seed"
+                    value={testerSeed}
+                    onChange={(value) => setTesterSeed(value ?? 42)}
+                    min={0}
+                  />
+                </div>
+                <div className="family-tester-actions">
+                  <button
+                    className="primary"
+                    disabled={
+                      active
+                      || testerBusy
+                      || testerCounts.length < 1
+                      || !form.dataPath
+                      || !form.m1DataPath
+                      || !form.brokerPath
+                    }
+                    onClick={() => void runTester()}
+                  >
+                    {testerBusy ? "Running condition bakeoff…" : "Run condition bakeoff"}
+                  </button>
+                  {testerReport?.recommended != null && (
+                    <button
+                      className="secondary"
+                      disabled={active || testerBusy}
+                      onClick={() => applyRecommendedCount(testerReport.recommended!)}
+                    >
+                      Use recommended ({testerReport.recommended} entry)
+                    </button>
+                  )}
+                </div>
+                {testerReport && (
+                  <div className="family-tester-results">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Entry</th>
+                          <th>IS E (R)</th>
+                          <th>OOS1 E (R)</th>
+                          <th>Retention</th>
+                          <th>OOS1 pass</th>
+                          <th>Elites</th>
+                          <th>Pot</th>
+                          <th>OOS1 tested</th>
+                          <th>Evals</th>
+                          <th />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {testerReport.rows.map((row) => {
+                          const recommended = testerReport.recommended === row.entryConditions;
+                          return (
+                            <tr key={row.entryConditions} className={recommended ? "recommended" : undefined}>
+                              <td>
+                                {row.entryConditions}
+                                {recommended ? " · recommended" : ""}
+                              </td>
+                              <td>{formatNumber(row.medianIsExpectancyR, 3)}</td>
+                              <td>{formatNumber(row.medianOos1ExpectancyR, 3)}</td>
+                              <td>{formatNumber(row.medianRetention, 3)}</td>
+                              <td>{formatNumber(row.passRate * 100, 0)}%</td>
+                              <td>{formatNumber(row.elites)}</td>
+                              <td>{formatNumber(row.potElites)}</td>
+                              <td>{formatNumber(row.oos1Tested)}</td>
+                              <td>{formatNumber(row.evaluations)}</td>
+                              <td>
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  disabled={active || testerBusy}
+                                  onClick={() => applyRecommendedCount(row.entryConditions)}
+                                >
+                                  Use
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </section>
+          </>
+        )}
+      </div>
+      )}
       </div>
 
-      <section className="panel family-tester-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Methodology lite</p>
-            <h2>Family tester</h2>
-          </div>
-          <span className="read-only-badge">equal-budget OOS1 · no sealed</span>
-        </div>
-        <div className="family-tester-body">
-          <p className="immutable-note">
-            Equal-budget Fast Scout per selected family. Every retained pot member is rechecked on OOS1; expectancy is
-            shown in R ($1,000 fixed risk), and Pass is OOS1 passes / OOS1-tested pot. This only advises which grammar
-            to harvest — it does not replace M1 robustness or the sealed OOS2 final.
-          </p>
-          <div className="family-tester-toggles" role="group" aria-label="Families to test">
-            {SEARCH_FAMILIES.map((family) => (
-              <label key={family.id} className="check-field">
-                <input
-                  type="checkbox"
-                  checked={testerFamilies.includes(family.id)}
-                  disabled={active || testerBusy}
-                  onChange={() => toggleTesterFamily(family.id)}
-                />
-                <span>{family.label}</span>
-              </label>
-            ))}
-          </div>
-          <div className="numeric-grid family-tester-numbers">
-            <NumberField
-              label="Generations / family"
-              value={testerGenerations}
-              onChange={(value) => setTesterGenerations(value ?? 3)}
-              min={1}
-            />
-            <NumberField
-              label="Initial candidates"
-              value={testerCandidates}
-              onChange={(value) => setTesterCandidates(value ?? 60)}
-              min={20}
-            />
-            <NumberField
-              label="Seed"
-              value={testerSeed}
-              onChange={(value) => setTesterSeed(value ?? 42)}
-              min={0}
-            />
-          </div>
-          <div className="family-tester-actions">
-            <button
-              className="primary"
-              disabled={
-                active
-                || testerBusy
-                || testerFamilies.length < 1
-                || !form.dataPath
-                || !form.m1DataPath
-                || !form.brokerPath
-              }
-              onClick={() => void runTester()}
-            >
-              {testerBusy ? "Running family tester…" : "Run family tester"}
-            </button>
-            {testerReport?.recommended && (
-              <button
-                className="secondary"
-                disabled={active || testerBusy}
-                onClick={() => applyFamily(testerReport.recommended!)}
-              >
-                Use recommended ({familyLabel(testerReport.recommended)})
-              </button>
-            )}
-          </div>
-          {testerReport && (
-            <div className="family-tester-results">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Family</th>
-                    <th>IS E (R)</th>
-                    <th>OOS1 E (R)</th>
-                    <th>Retention</th>
-                    <th>OOS1 pass</th>
-                    <th>Elites</th>
-                    <th>Pot</th>
-                    <th>OOS1 tested</th>
-                    <th>Evals</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {testerReport.rows.map((row) => {
-                    const recommended = testerReport.recommended === row.family;
-                    return (
-                      <tr key={row.family} className={recommended ? "recommended" : undefined}>
-                        <td>
-                          {familyLabel(row.family)}
-                          {recommended ? " · recommended" : ""}
-                        </td>
-                        <td>{formatNumber(row.medianIsExpectancyR, 3)}</td>
-                        <td>{formatNumber(row.medianOos1ExpectancyR, 3)}</td>
-                        <td>{formatNumber(row.medianRetention, 3)}</td>
-                        <td>{formatNumber(row.passRate * 100, 0)}%</td>
-                        <td>{formatNumber(row.elites)}</td>
-                        <td>{formatNumber(row.potElites)}</td>
-                        <td>{formatNumber(row.oos1Tested)}</td>
-                        <td>{formatNumber(row.evaluations)}</td>
-                        <td>
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={active || testerBusy}
-                            onClick={() => applyFamily(row.family)}
-                          >
-                            Use
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+      {(active || (job?.databankElites ?? 0) > 0) && (
+        <section className={`panel discover-live-databank ${liveEliteRows.length ? "" : "empty"}`}>
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Live databank</p>
+              <h2>
+                {liveEliteRows.length
+                  ? `${formatNumber(liveEliteRows.length)} promoted strategies`
+                  : "Waiting for first promotion"}
+              </h2>
             </div>
+            <span className="read-only-badge">
+              {active ? "search running · inspect without stopping" : "checkpoint loaded"}
+            </span>
+          </div>
+          {liveEliteRows.length > 0 ? (
+            <>
+              <p className="live-strip-hint">
+                Single-click to highlight. Double-click any row for equity curve, partition metrics, and trade list.
+                Updates automatically as new elites pass M1 robustness.
+              </p>
+              <EliteTable
+                batchSelection={new Set()}
+                compact
+                onDoubleClick={(fingerprint) => void inspectLiveElite(fingerprint)}
+                onSelect={setLiveSelected}
+                onToggle={() => {}}
+                rows={liveEliteRows}
+                selected={liveSelected}
+                showBatch={false}
+              />
+            </>
+          ) : (
+            <p>
+              {active
+                ? "Strategies appear here after they pass the deposit gate, M1 retention, walk-forward, Monte Carlo, and parameter neighborhood checks."
+                : "No databank elites in the latest checkpoint."}
+            </p>
           )}
-        </div>
-      </section>
+        </section>
+      )}
+
+      {liveDetailOpen && (
+        <EliteDetailModal
+          detail={liveDetail}
+          loading={liveDetailLoading}
+          m1FidelityVerified={liveWorkspace?.m1FidelityVerified ?? true}
+          onClose={() => setLiveDetailOpen(false)}
+          onError={onError}
+          onParity={async () => {
+            if (liveDetail) {
+              setLiveDetailOpen(false);
+              onOpenDatabank(job?.outputPath ?? "");
+            }
+          }}
+          onTab={setLiveInspectorTab}
+          researchGrade={liveWorkspace?.researchGrade ?? false}
+          tab={liveInspectorTab}
+        />
+      )}
     </div>
   );
+}
+
+function DiscoverContractSummary({
+  active,
+  form,
+}: {
+  active: boolean;
+  form: DiscoverRequest;
+}) {
+  const grammar = form.universalGrammar;
+  const enabledModules = [
+    (form.allowMarketEntries ?? true) ? "Market entries" : null,
+    form.allowStopEntries ? "Stop entries" : null,
+    form.allowLimitEntries ? "Limit entries" : null,
+    form.allowBreakEven ? "Break-even" : null,
+    form.allowTrailingStops ? "Trailing stop" : null,
+    form.allowPartialExits ? "Partial exits" : null,
+    form.flattenAt22 ? `EOD exit ${String(form.endOfDayHour ?? 23).padStart(2, "0")}:00` : null,
+    entryWindowSummary(form).replace("Entries allowed ", "Entries "),
+    form.maxOneEntryPerDay ? "One fill / day" : null,
+  ].filter((value): value is string => Boolean(value));
+  const boundSources = [
+    ["Decision data", Boolean(form.dataPath)],
+    ["M1 chronology", Boolean(form.m1DataPath)],
+    ["Broker profile", Boolean(form.brokerPath)],
+    ["New databank", Boolean(form.databankPath)],
+  ] as const;
+
+  return (
+    <aside className="panel discover-contract" aria-label="Discover research contract summary">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Research contract</p>
+          <h2>Run summary</h2>
+        </div>
+        <span className={active ? "contract-state running" : "contract-state"}>
+          {active ? "Running" : "Ready to configure"}
+        </span>
+      </div>
+
+      <div className="contract-section">
+        <p className="eyebrow">Hypothesis</p>
+        <div className="contract-hero">
+          <strong>{form.decisionTimeframe ?? "—"}</strong>
+          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : "Full harvest"}</span>
+        </div>
+        <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
+        <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
+        <SummaryLine label="Closed-bar shifts" value={grammar ? `${grammar.minimumShift}–${grammar.maximumShift}` : "—"} />
+        <SummaryLine label="Fixed risk / trade" value="$1,000" accent />
+      </div>
+
+      <div className="contract-section">
+        <p className="eyebrow">Search budget</p>
+        <SummaryLine label="Initial candidates" value={formatNumber(form.initialCandidates ?? 0)} />
+        <SummaryLine label="Batch / generation" value={formatNumber(form.batchSize ?? 0)} />
+        <SummaryLine label="Worker threads" value={(form.workerThreads ?? 0) === 0 ? "All available" : formatNumber(form.workerThreads ?? 0)} />
+        <SummaryLine label="Breeding begins" value={`${formatNumber(form.mutateAfterElites ?? 0)} pot elites`} />
+        <SummaryLine label="Generation limit" value={form.runUntilStopped ? "Continuous" : formatNumber(form.generations)} />
+      </div>
+
+      <div className="contract-section">
+        <p className="eyebrow">Validation firewall</p>
+        <SummaryLine label="IS / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .1)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .1) * 100, 0)}%`} />
+        <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
+        <SummaryLine label="OOS1 expectancy" value={`≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× IS`} />
+        <SummaryLine label="Robustness" value={`${form.robustnessFolds ?? 0} WFO · ${form.robustnessMonteCarloTrials ?? 0} MC · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
+        <SummaryLine label="OOS2" value="Sealed · display only" accent />
+      </div>
+
+      <div className="contract-section">
+        <p className="eyebrow">Execution modules</p>
+        <div className="contract-chips">
+          {enabledModules.map((module) => <span key={module}>{module}</span>)}
+        </div>
+      </div>
+
+      <div className="contract-section contract-bindings">
+        <p className="eyebrow">Bindings</p>
+        {boundSources.map(([label, bound]) => (
+          <div className={bound ? "contract-binding bound" : "contract-binding"} key={label}>
+            <i aria-hidden="true" />
+            <span>{label}</span>
+            <strong>{bound ? "Bound" : "Required"}</strong>
+          </div>
+        ))}
+      </div>
+
+      <p className="contract-note">
+        OOS2 is never used to breed, rank, or select a Discover candidate. The full contract is sealed into the databank manifest.
+      </p>
+    </aside>
+  );
+}
+
+function SummaryLine({
+  accent = false,
+  label,
+  value,
+}: {
+  accent?: boolean;
+  label: string;
+  value: string;
+}) {
+  return <div className="summary-line"><span>{label}</span><strong className={accent ? "accent" : ""}>{value}</strong></div>;
 }
 
 function SymbolSelect({
@@ -1906,7 +4011,7 @@ function JudgePanel({
   onError: (message: string | null) => void;
   preset: Partial<JudgeRequest>;
 }) {
-  const [form, setForm] = useState<JudgeRequest>({ decisionDataPath: "", decisionMetadataPath: null, decisionSourceTimezone: "Etc/UTC", m1DataPath: "", m1MetadataPath: null, m1SourceTimezone: "Etc/UTC", splitPlanPath: null, strategyPath: "", brokerPath: "", outputPath: "", commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000 });
+  const [form, setForm] = useState<JudgeRequest>({ decisionDataPath: "", decisionMetadataPath: null, decisionSourceTimezone: "Etc/UTC", m1DataPath: "", m1MetadataPath: null, m1SourceTimezone: "Etc/UTC", splitPlanPath: null, strategyPath: "", brokerPath: "", outputPath: "", commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000, entryWindowStartHour: 2, entryWindowEndHour: 19 });
   const [result, setResult] = useState<JudgeView | null>(null); const [busy, setBusy] = useState(false);
   useEffect(() => {
     setForm((current) => ({ ...current, ...preset }));
@@ -1937,7 +4042,7 @@ function JudgePanel({
         <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
         <PathField label="New Judge artifact" path={form.outputPath} choose={() => chooseOutputJson("Save Judge artifact", "judge.json")} onChange={(value) => update("outputPath", value)} required />
       </div>
-      <div className="numeric-grid"><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Slippage / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value ?? 0)} step={.1} /><NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} /></div>
+      <div className="numeric-grid"><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Slippage / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value ?? 0)} step={.1} /><NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} /><NumberField label="Entry window start (broker)" value={form.entryWindowStartHour ?? 2} onChange={(value) => update("entryWindowStartHour", Math.min(23, Math.max(0, value ?? 2)))} min={0} /><NumberField label="Entry window end (broker, exclusive)" value={form.entryWindowEndHour ?? 19} onChange={(value) => update("entryWindowEndHour", Math.min(24, Math.max(1, value ?? 19)))} min={1} /></div>
       <div className="form-footer"><p>M1 files contain only minutes that received ticks. Gaps pass only when H1 and M1 volumes reconcile exactly; missing tick history remains a hard failure.</p><button className="primary" disabled={busy || !form.decisionDataPath || !form.m1DataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Replaying…" : "Run M1 Judge"}</button></div>
     </section>
     {result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">M1 Judge</p><h2>Execution chronology replayed</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /><Kpi label="Decision / M1 bars" value={`${formatNumber(result.decisionBars)} / ${formatNumber(result.m1Bars)}`} note={`${formatNumber(result.verifiedNoTickMinutes)} verified no-tick min`} /><Kpi label="Managed exits" value={formatNumber(result.partialExits + result.endOfDayFlattens)} note={`${result.breakEvenMoves} BE · ${result.trailingMoves} trail`} /></div><ArtifactPath label="Judge artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No M1 replay yet" copy="Use matching decision-timeframe and M1 exports with their metadata files. The Judge enforces pending-order chronology and every active trade-management gene." />}
@@ -1951,14 +4056,14 @@ function ExportPanel({
   onError: (message: string | null) => void;
   preset: Partial<ExportRequest>;
 }) {
-  const [form, setForm] = useState<ExportRequest>({ strategyPath: "", brokerPath: "", outputDirectory: "", expertName: "QuantForgeStrategy", expertDirectory: "QuantForge", timeframe: "H1", magic: 42424242, deviationPoints: 10, maxSpreadPoints: null, slippagePointsPerSide: 0, commissionPerLotRoundTurn: 7, deposit: 100000, currency: "USD", leverage: 100, testerModel: 1 });
+  const [form, setForm] = useState<ExportRequest>({ strategyPath: "", brokerPath: "", outputDirectory: "", expertName: "", expertDirectory: "QuantForge", timeframe: "H1", magic: 42424242, deviationPoints: 10, maxSpreadPoints: null, slippagePointsPerSide: 0, commissionPerLotRoundTurn: 7, deposit: 100000, currency: "USD", leverage: 100, testerModel: 1, entryWindowStartHour: 2, entryWindowEndHour: 19 });
   const [result, setResult] = useState<ExportView | null>(null); const [busy, setBusy] = useState(false);
   useEffect(() => {
     setForm((current) => ({ ...current, ...preset }));
   }, [preset]);
   function update<K extends keyof ExportRequest>(key: K, value: ExportRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await exportMql5(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Guarded compiler target</p><h2>Generate MT5 expert + tester pack</h2></div><span className="read-only-badge">Live off</span></div><div className="form-stack compact"><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New export directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create EA export directory", "quantforge-ea-export")} onChange={(value) => update("outputDirectory", value)} required /><label className="field-row"><span>Expert name</span><input value={form.expertName} onChange={(event) => update("expertName", event.target.value)} /></label><label className="field-row"><span>Timeframe</span><input value={form.timeframe} onChange={(event) => update("timeframe", event.target.value.toUpperCase())} /></label></div><div className="numeric-grid"><NumberField label="Magic" value={form.magic} onChange={(value) => update("magic", value ?? 42424242)} min={1} /><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Deposit" value={form.deposit} onChange={(value) => update("deposit", value ?? 100000)} min={1} /><NumberField label="Leverage" value={form.leverage} onChange={(value) => update("leverage", value ?? 100)} min={1} /></div><div className="form-footer"><p>The generated set file keeps AllowLiveTrading=false. Protective stops and all selected management/order genes are emitted into the EA.</p><button className="primary" disabled={busy || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? "Generating…" : "Generate EA pack"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">EA export</p><h2>{result.symbol} · {result.timeframe}</h2></div><span className="grade-pill">guarded</span></div><ArtifactPath label="MQL5 source" value={result.sourcePath} /><ArtifactPath label="Tester config" value={result.testerPath} /><ArtifactPath label="Evidence" value={result.evidencePath} /><div className="safety-card"><strong>Live trading default</strong><span>{String(result.liveTradingDefault)}</span></div></section> : <WorkspacePrimer title="No EA generated yet" copy="Export writes MQL5 source, guarded settings, Strategy Tester configuration and a source-hash evidence card into one new directory." />}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Guarded compiler target</p><h2>Generate MT5 expert + tester pack</h2></div><span className="read-only-badge">Live off</span></div><div className="form-stack compact"><PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New export directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create EA export directory", "quantforge-ea-export")} onChange={(value) => update("outputDirectory", value)} required /><label className="field-row"><span>Expert name</span><input value={form.expertName} placeholder="auto: symbol + generation, e.g. EURUSD_g898_84" onChange={(event) => update("expertName", event.target.value)} /></label><label className="field-row"><span>Timeframe</span><input value={form.timeframe} onChange={(event) => update("timeframe", event.target.value.toUpperCase())} /></label></div><div className="numeric-grid"><NumberField label="Magic" value={form.magic} onChange={(value) => update("magic", value ?? 42424242)} min={1} /><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Deposit" value={form.deposit} onChange={(value) => update("deposit", value ?? 100000)} min={1} /><NumberField label="Leverage" value={form.leverage} onChange={(value) => update("leverage", value ?? 100)} min={1} /><NumberField label="Entry window start (broker)" value={form.entryWindowStartHour ?? 2} onChange={(value) => update("entryWindowStartHour", Math.min(23, Math.max(0, value ?? 2)))} min={0} /><NumberField label="Entry window end (broker, exclusive)" value={form.entryWindowEndHour ?? 19} onChange={(value) => update("entryWindowEndHour", Math.min(24, Math.max(1, value ?? 19)))} min={1} /></div><div className="form-footer"><p>The generated EA inherits this entry window as inputs, and the set file keeps AllowLiveTrading=false. Protective stops and all selected management/order genes are emitted into the EA.</p><button className="primary" disabled={busy || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={run}>{busy ? "Generating…" : "Generate EA pack"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">EA export</p><h2>{result.symbol} · {result.timeframe}</h2></div><span className="grade-pill">guarded</span></div><ArtifactPath label="MQL5 source" value={result.sourcePath} /><ArtifactPath label="Tester config" value={result.testerPath} /><ArtifactPath label="Evidence" value={result.evidencePath} /><div className="safety-card"><strong>Live trading default</strong><span>{String(result.liveTradingDefault)}</span></div></section> : <WorkspacePrimer title="No EA generated yet" copy="Export writes MQL5 source, guarded settings, Strategy Tester configuration and a source-hash evidence card into one new directory." />}</div>;
 }
 
 function ParityComparePanel({ onError }: { onError: (message: string | null) => void }) {
@@ -1966,7 +4071,7 @@ function ParityComparePanel({ onError }: { onError: (message: string | null) => 
   const [result, setResult] = useState<ParityView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof ParityRequest>(key: K, value: ParityRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await compareExternalParity(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><details className="advanced-settings"><summary>Parity tolerances</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash and tester metadata must match the evidence card before any comparison is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "")} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><details className="advanced-settings"><summary>Parity tolerances</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash and tester metadata must match the evidence card before any comparison is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "")} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Win rate" value={`${formatNumber(result.referenceWinRate, 1)}% / ${formatNumber(result.externalWinRate, 1)}%`} note={`${formatNumber(result.referenceWinningTrades)} / ${formatNumber(result.externalWinningTrades)} wins`} /><Kpi label="Profit factor" value={`${result.referenceProfitFactor === null ? "—" : formatNumber(result.referenceProfitFactor, 2)} / ${result.externalProfitFactor === null ? "—" : formatNumber(result.externalProfitFactor, 2)}`} note="QuantForge / MT5" /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
 }
 
 function IndicatorParityPanel({ onError }: { onError: (message: string | null) => void }) {
@@ -1977,11 +4082,11 @@ function IndicatorParityPanel({ onError }: { onError: (message: string | null) =
 }
 
 function PortfolioWorkspace({ onError, workspace }: { onError: (message: string | null) => void; workspace: DatabankWorkspace | null }) {
-  const [form, setForm] = useState<PortfolioRequest>({ databankPath: workspace?.sourcePath ?? "", brokerPath: "", outputPath: "", objective: "risk_adjusted_return", maximumPairwiseCorrelation: .7, maximumWeightPerStrategy: .25, maximumSymbolExposure: 1, maximumFamilyExposure: .5, maximumStrategies: 10, minimumReturnPercent: 0, cvarTailFraction: .05, stressTrials: 1000, stressBlockLength: 5, seed: 42 });
+  const [form, setForm] = useState<PortfolioRequest>({ databankPath: workspace?.sourcePath ?? "", brokerPath: "", outputPath: "", objective: "risk_adjusted_return", maximumPairwiseCorrelation: .7, maximumWeightPerStrategy: .25, maximumSymbolExposure: 1, maximumCohortExposure: .5, maximumStrategies: 10, minimumReturnPercent: 0, cvarTailFraction: .05, stressTrials: 1000, stressBlockLength: 5, seed: 42 });
   const [result, setResult] = useState<PortfolioView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof PortfolioRequest>(key: K, value: PortfolioRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await buildPortfolio(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max family exposure" value={form.maximumFamilyExposure} onChange={(value) => update("maximumFamilyExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, family exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.family}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>;
 }
 
 function VaultWorkspace({ onError }: { onError: (message: string | null) => void }) {
@@ -2056,12 +4161,50 @@ function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onCh
   function set(key: keyof SearchRangeProfile, field: "minimum" | "maximum" | "step", next: number) {
     onChange({ ...value, [key]: { ...value[key], [field]: next } });
   }
-  return <div className="search-ranges-wall">{groups.map(([title, rows]) => <div className="range-group" key={title}><p className="eyebrow">{title}</p>{rows.map(([key, label]) => <div className="range-row" key={key}><span>{label}</span><label><small>Min</small><input type="number" value={value[key].minimum} step="any" onChange={(event) => set(key, "minimum", Number(event.target.value))} /></label><label><small>Max</small><input type="number" value={value[key].maximum} step="any" onChange={(event) => set(key, "maximum", Number(event.target.value))} /></label><label><small>Step</small><input type="number" value={value[key].step} step="any" onChange={(event) => set(key, "step", Number(event.target.value))} /></label></div>)}</div>)}</div>;
+  return (
+    <div className="search-ranges-wall">
+      {groups.map(([title, rows]) => (
+        <div className="range-group" key={title}>
+          <div className="range-group-head">
+            <p className="eyebrow">{title}</p>
+            <span>{rows.length} genes</span>
+          </div>
+          <div className="range-group-body">
+            <div className="range-row range-row-head">
+              <span>Gene</span>
+              <span>Minimum</span>
+              <span>Maximum</span>
+              <span>Step</span>
+            </div>
+            {rows.map(([key, label]) => {
+              const range = value[key];
+              const invalid = !(range.minimum <= range.maximum) || !(range.step > 0);
+              return (
+                <div className={invalid ? "range-row invalid" : "range-row"} key={key}>
+                  <span>{label}</span>
+                  <label>
+                    <input aria-label={`${label} minimum`} type="number" value={range.minimum} step="any" onChange={(event) => set(key, "minimum", Number(event.target.value))} />
+                  </label>
+                  <label>
+                    <input aria-label={`${label} maximum`} type="number" value={range.maximum} step="any" onChange={(event) => set(key, "maximum", Number(event.target.value))} />
+                  </label>
+                  <label>
+                    <input aria-label={`${label} step`} type="number" value={range.step} step="any" onChange={(event) => set(key, "step", Number(event.target.value))} />
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function NumberField({
   label,
   min,
+  max,
   onChange,
   optional = false,
   step = 1,
@@ -2069,12 +4212,13 @@ function NumberField({
 }: {
   label: string;
   min?: number;
+  max?: number;
   onChange: (value: number | null) => void;
   optional?: boolean;
   step?: number;
   value: number | null;
 }) {
-  return <label className="number-field"><span>{label}{optional && <small>optional</small>}</span><input type="number" min={min} step={step} value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value))} /></label>;
+  return <label className="number-field"><span>{label}{optional && <small>optional</small>}</span><input type="number" min={min} max={max} step={step} value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value))} /></label>;
 }
 
 function ClusterView({
@@ -2089,8 +4233,7 @@ function ClusterView({
   const evidenceMinimum = Math.min(...rows.map((row) => row.evidence));
   const evidenceMaximum = Math.max(...rows.map((row) => row.evidence));
   const evidenceRange = Math.max(evidenceMaximum - evidenceMinimum, 1e-9);
-  const familyClass = (family: string) =>
-    `cluster-${family.toLowerCase().replaceAll(" ", "-")}`;
+  const entryClass = (count: number) => `cluster-entry-${count}`;
 
   return (
     <section className="panel cluster-panel">
@@ -2099,9 +4242,9 @@ function ClusterView({
           <p className="eyebrow">Behavioral cluster</p>
           <h2>Evidence × novelty</h2>
         </div>
-        <div className="cluster-legend" aria-label="Strategy families">
-          {["trend", "momentum", "breakout", "mean reversion"].map((name) => (
-            <span key={name}><i className={familyClass(name)} />{name}</span>
+        <div className="cluster-legend" aria-label="Entry condition counts">
+          {[2, 3, 4].map((count) => (
+            <span key={count}><i className={entryClass(count)} />{count} entry</span>
           ))}
         </div>
       </div>
@@ -2117,11 +4260,11 @@ function ClusterView({
             return (
               <button
                 aria-label={`${row.strategyId}: evidence ${row.evidence.toFixed(2)}, novelty ${row.novelty.toFixed(3)}`}
-                className={`cluster-point ${familyClass(row.family)} ${selected === row.fingerprint ? "selected" : ""}`}
+                className={`cluster-point ${entryClass(row.entryConditions)} ${selected === row.fingerprint ? "selected" : ""}`}
                 key={row.fingerprint}
                 onClick={() => onSelect(row.fingerprint)}
                 style={{ left: `${x}%`, top: `${y}%` }}
-                title={`${row.strategyId} · ${row.family} · evidence ${row.evidence.toFixed(2)} · novelty ${row.novelty.toFixed(3)}`}
+                title={`${row.strategyId} · ${conditionLabel(row.entryConditions, row.exitConditions)} · evidence ${row.evidence.toFixed(2)} · novelty ${row.novelty.toFixed(3)}`}
               />
             );
           })}
@@ -2241,20 +4384,20 @@ function Kpi({ label, value, note }: { label: string; value: string; note: strin
 }
 
 function CoverageGrid({
-  family,
+  group,
   onSelect,
 }: {
-  family: FamilyCoverage;
+  group: ConditionCoverage;
   onSelect: (fingerprint: string) => void;
 }) {
   return (
     <article className="family-grid-card">
       <header>
-        <strong>{family.family}</strong>
-        <span>{family.occupied} / {family.total}</span>
+        <strong>{group.label}</strong>
+        <span>{group.occupied} / {group.total}</span>
       </header>
       <div className="coverage-grid">
-        {family.cells.map((cell) => (
+        {group.cells.map((cell) => (
           <button
             aria-label={`${cell.niche}: ${cell.occupied ? "occupied" : "empty"}`}
             className={cell.occupied ? "coverage-cell occupied" : "coverage-cell"}
@@ -2363,25 +4506,53 @@ function EliteTable({
   selected,
   onSelect,
   onToggle,
+  onDoubleClick,
+  compact = false,
+  showBatch = true,
+  showActions = false,
+  onExportIr,
+  onExportMq5,
+  onStage,
+  rowHeightOverride,
+  viewportHeightOverride,
 }: {
   batchSelection: Set<string>;
   rows: EliteRow[];
   selected: string | null;
   onSelect: (fingerprint: string) => void;
   onToggle: (fingerprint: string) => void;
+  onDoubleClick?: (fingerprint: string) => void;
+  compact?: boolean;
+  showBatch?: boolean;
+  showActions?: boolean;
+  onExportIr?: (fingerprint: string) => void;
+  onExportMq5?: (fingerprint: string) => void;
+  onStage?: (fingerprint: string) => void;
+  rowHeightOverride?: number;
+  viewportHeightOverride?: number;
 }) {
   const [scrollTop, setScrollTop] = useState(0);
-  const rowHeight = 48;
-  const viewportHeight = 360;
+  const rowHeight = rowHeightOverride ?? (showActions ? 56 : 48);
+  const viewportHeight = viewportHeightOverride ?? (compact ? 168 : 360);
   const overscan = 5;
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
   const end = Math.min(rows.length, start + Math.ceil(viewportHeight / rowHeight) + overscan * 2);
 
   return (
-    <div className="elite-table">
+    <div className={`elite-table ${compact ? "compact" : ""} ${showBatch ? "" : "no-batch"} ${showActions ? "with-actions" : ""}`}>
       <div className="elite-row elite-header">
-        <span>Select</span><span>Strategy</span><span>Family</span><span>Evidence</span><span>Novelty</span>
-        <span>Trades</span><span>Return</span><span>DD</span><span>Ret/DD</span><span>Sharpe</span><span>OOS1×</span>
+        {showBatch && <span>Select</span>}
+        <span>Strategy</span>
+        <span>Entry/Exit</span>
+        <span>Evidence</span>
+        <span>Novelty</span>
+        <span>Trades</span>
+        <span>Return</span>
+        <span>DD</span>
+        <span>Recovery</span>
+        <span>Sharpe</span>
+        <span>OOS1×</span>
+        {showActions && <span>Actions</span>}
       </div>
       <div
         className="elite-viewport"
@@ -2394,6 +4565,7 @@ function EliteTable({
               className={`elite-row interactive ${selected === row.fingerprint ? "selected" : ""}`}
               key={row.fingerprint}
               onClick={() => onSelect(row.fingerprint)}
+              onDoubleClick={() => onDoubleClick?.(row.fingerprint)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") onSelect(row.fingerprint);
               }}
@@ -2401,27 +4573,36 @@ function EliteTable({
               style={{ height: rowHeight, transform: `translateY(${(start + offset) * rowHeight}px)` }}
               tabIndex={0}
             >
-              <span className="batch-check">
-                <input
-                  aria-label={`Select ${row.strategyId} for batch export`}
-                  checked={batchSelection.has(row.fingerprint)}
-                  onChange={() => onToggle(row.fingerprint)}
-                  onClick={(event) => event.stopPropagation()}
-                  type="checkbox"
-                />
-              </span>
+              {showBatch && (
+                <span className="batch-check">
+                  <input
+                    aria-label={`Select ${row.strategyId} for batch export`}
+                    checked={batchSelection.has(row.fingerprint)}
+                    onChange={() => onToggle(row.fingerprint)}
+                    onClick={(event) => event.stopPropagation()}
+                    type="checkbox"
+                  />
+                </span>
+              )}
               <span className="strategy-cell"><strong>{row.strategyId}</strong><small>{row.fingerprint.slice(0, 10)}</small></span>
-              <span>{row.family}</span>
+              <span>{conditionLabel(row.entryConditions, row.exitConditions)}</span>
               <span>{row.evidence.toFixed(2)}</span>
               <span>{row.novelty.toFixed(3)}</span>
               <span>{formatNumber(row.trades)}</span>
               <span className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</span>
               <span>{row.drawdownPercent.toFixed(2)}%</span>
-              <span>{formatReturnDrawdown(row)}</span>
+              <span>{formatRecoveryFactor(row)}</span>
               <span>{row.sharpeRatio === null ? "—" : row.sharpeRatio.toFixed(2)}</span>
               <span title={row.oos1Expectancy === null ? "No OOS1 pick metrics (legacy databank)" : `OOS1 ${(row.oos1Expectancy / 1000).toFixed(2)}R / IS ${(row.isExpectancy / 1000).toFixed(2)}R`}>
                 {row.oos1ExpectancyRatio === null ? "—" : `${row.oos1ExpectancyRatio.toFixed(2)}×`}
               </span>
+              {showActions && (
+                <span className="row-actions" onClick={(event) => event.stopPropagation()}>
+                  <button type="button" className="text-action" onClick={() => onExportIr?.(row.fingerprint)}>IR</button>
+                  <button type="button" className="text-action" onClick={() => onExportMq5?.(row.fingerprint)}>MQ5</button>
+                  <button type="button" className="text-action" onClick={() => onStage?.(row.fingerprint)} title="Stage for certification">Stage</button>
+                </span>
+              )}
             </div>
           ))}
         </div>
@@ -2437,6 +4618,7 @@ function EliteInspector({
   m1FidelityVerified,
   onError,
   onParity,
+  onOpenResearch,
   tab,
   onTab,
 }: {
@@ -2446,9 +4628,58 @@ function EliteInspector({
   m1FidelityVerified: boolean;
   onError: (message: string | null) => void;
   onParity: (fingerprint: string) => Promise<void>;
+  onOpenResearch?: (fingerprint: string) => void;
   tab: "overview" | "ir";
   onTab: (tab: "overview" | "ir") => void;
 }) {
+  const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
+  const [partitionBusy, setPartitionBusy] = useState(false);
+
+  useEffect(() => {
+    if (!detail || tab !== "overview") {
+      setPartitionView(null);
+      return;
+    }
+    let cancelled = false;
+    setPartitionBusy(true);
+    setPartitionView(null);
+    void getElitePartitionEquity(detail.fingerprint)
+      .then((next) => {
+        if (!cancelled) setPartitionView(next);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setPartitionBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.fingerprint, tab, onError]);
+
+  const displayMetrics = partitionView
+    ? {
+        returnPercent: partitionView.fullRunReturnPercent,
+        maxDrawdownPercent: partitionView.fullRunMaxDrawdownPercent,
+        tradeCount: partitionView.fullRunTrades,
+        winRate: partitionView.fullRunWinRate,
+        profitFactor: partitionView.fullRunProfitFactor,
+        sharpeRatio: partitionView.fullRunSharpeRatio,
+        source: "m1-full-run" as const,
+      }
+    : {
+        returnPercent: Number(detail?.metrics.return_percent ?? 0),
+        maxDrawdownPercent: Number(detail?.metrics.max_drawdown_percent ?? 0),
+        tradeCount: Number(detail?.metrics.trade_count ?? 0),
+        winRate: Number(detail?.metrics.win_rate ?? 0),
+        profitFactor: detail?.metrics.profit_factor === null || detail?.metrics.profit_factor === undefined
+          ? null
+          : Number(detail.metrics.profit_factor),
+        sharpeRatio: detail ? effectiveDetailSharpe(detail) : null,
+        source: m1FidelityVerified ? "stored-is" as const : "stored-scout" as const,
+      };
+
   return (
     <aside className="panel inspector inspector-wide">
       {loading && <div className="inspector-loading">Loading elite…</div>}
@@ -2466,7 +4697,10 @@ function EliteInspector({
             <button className={tab === "overview" ? "active" : ""} onClick={() => onTab("overview")}>Overview</button>
             <button className={tab === "ir" ? "active" : ""} onClick={() => onTab("ir")}>IR tree</button>
             <button onClick={() => void exportEliteStrategy(detail.fingerprint).catch((reason) => onError(String(reason)))}>Export IR</button>
+            <button onClick={() => void exportEliteEas([detail.fingerprint], "H1", 42_424_242).catch((reason) => onError(String(reason)))}>Export MQ5</button>
+            <button onClick={() => void promoteEliteToVault(detail.fingerprint).catch((reason) => onError(String(reason)))}>Stage for certification</button>
             <button onClick={() => void onParity(detail.fingerprint)}>Go to M1 / MT5 →</button>
+            {onOpenResearch && <button className="primary" onClick={() => onOpenResearch(detail.fingerprint)}>Open research workspace</button>}
           </div>
           {tab === "overview" ? (
             <div className="inspector-body">
@@ -2474,7 +4708,7 @@ function EliteInspector({
                 <p className="eyebrow">Thesis</p>
                 <p>{detail.thesis}</p>
               </section>
-              {!m1FidelityVerified && (
+              {!m1FidelityVerified && !partitionView && (
                 <section className="legacy-metrics-warning">
                   <p className="eyebrow">Research-only archive</p>
                   <p>
@@ -2484,36 +4718,55 @@ function EliteInspector({
                 </section>
               )}
               <PartitionEquityChart
-                fingerprint={detail.fingerprint}
-                onError={onError}
+                view={partitionView}
+                busy={partitionBusy}
                 researchGrade={researchGrade}
                 m1FidelityVerified={m1FidelityVerified}
               />
               <section className="metric-list">
                 <Metric label="Evidence" value={Number(detail.evidence.total).toFixed(2)} />
-                <Metric label={m1FidelityVerified ? "Return" : "Selected-TF return"} value={`${Number(detail.metrics.return_percent).toFixed(2)}%`} />
-                <Metric label="Max drawdown" value={`${Number(detail.metrics.max_drawdown_percent).toFixed(2)}%`} />
                 <Metric
-                  label="Return / DD"
-                  value={formatReturnDrawdown({
-                    returnPercent: Number(detail.metrics.return_percent),
-                    drawdownPercent: Number(detail.metrics.max_drawdown_percent),
-                    returnDrawdown: finiteRatio(
-                      Number(detail.metrics.return_percent),
-                      Number(detail.metrics.max_drawdown_percent),
-                    ),
+                  label={displayMetrics.source === "m1-full-run" ? "Return (M1 full run)" : m1FidelityVerified ? "Return (IS stored)" : "Selected-TF return"}
+                  value={`${displayMetrics.returnPercent.toFixed(2)}%`}
+                />
+                <Metric
+                  label={displayMetrics.source === "m1-full-run" ? "Max drawdown (M1)" : "Max drawdown"}
+                  value={`${displayMetrics.maxDrawdownPercent.toFixed(2)}%`}
+                />
+                <Metric
+                  label="Recovery factor"
+                  value={formatRecoveryFactor({
+                    recoveryFactor: partitionView?.fullRunRecoveryFactor
+                      ?? finiteRecoveryFromMetrics(detail?.metrics ?? {}),
                   })}
                 />
-                <Metric label="Trades" value={formatNumber(Number(detail.metrics.trade_count))} />
-                <Metric label="Win rate" value={`${Number(detail.metrics.win_rate).toFixed(1)}%`} />
-                <Metric label="Profit factor" value={detail.metrics.profit_factor === null ? "—" : Number(detail.metrics.profit_factor).toFixed(2)} />
+                <Metric
+                  label={displayMetrics.source === "m1-full-run" ? "Trades (M1 full run)" : "Trades"}
+                  value={formatNumber(displayMetrics.tradeCount)}
+                />
+                <Metric label="Win rate" value={`${displayMetrics.winRate.toFixed(1)}%`} />
+                <Metric
+                  label="Profit factor"
+                  value={displayMetrics.profitFactor === null ? "—" : displayMetrics.profitFactor.toFixed(2)}
+                />
                 <Metric
                   label="Sharpe"
-                  value={effectiveDetailSharpe(detail)?.toFixed(2) ?? "—"}
+                  value={displayMetrics.sharpeRatio?.toFixed(2) ?? "—"}
                 />
               </section>
+              {partitionView && m1FidelityVerified && (
+                <section className="legacy-metrics-warning">
+                  <p className="eyebrow">IS gate metrics (archived)</p>
+                  <p>
+                    Promotion used IS-only M1: {formatNumber(Number(detail.metrics.trade_count))} trades ·{" "}
+                    {Number(detail.metrics.return_percent).toFixed(2)}% return. Metric cards above are the full-run M1
+                    replay that Parity Lab and MT5 should match.
+                  </p>
+                </section>
+              )}
               <section>
-                <p className="eyebrow">Behavioral niche</p>
+                <p className="eyebrow">Conditions · niche</p>
+                <p>{conditionLabel(detail.entryConditions, detail.exitConditions)}</p>
                 <code className="niche-code">{detail.niche}</code>
               </section>
               <div className="gate-stack">
@@ -2532,37 +4785,20 @@ function EliteInspector({
 }
 
 function PartitionEquityChart({
-  fingerprint,
-  onError,
+  view,
+  busy,
   researchGrade,
   m1FidelityVerified,
+  large = false,
 }: {
-  fingerprint: string;
-  onError: (message: string | null) => void;
+  view: PartitionEquityView | null;
+  busy: boolean;
   researchGrade: boolean;
   m1FidelityVerified: boolean;
+  /** Results detail uses the full-width, taller chart from the reference layout. */
+  large?: boolean;
 }) {
-  const [view, setView] = useState<PartitionEquityView | null>(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    setBusy(true);
-    setView(null);
-    void getElitePartitionEquity(fingerprint)
-      .then((next) => {
-        if (!cancelled) setView(next);
-      })
-      .catch((reason) => {
-        if (!cancelled) onError(String(reason));
-      })
-      .finally(() => {
-        if (!cancelled) setBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [fingerprint, onError]);
-
+  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("full");
   if (busy && !view) {
     return <div className="partition-equity loading">Replaying full IS / OOS1 / OOS2 equity…</div>;
   }
@@ -2570,26 +4806,43 @@ function PartitionEquityChart({
     return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
   }
 
-  const width = 520;
-  const height = 300;
+  const points = sample === "full"
+    ? view.points
+    : view.points.filter((point) => (
+      sample === "is"
+        ? point.timestampMs < view.isEndTimestampMs
+        : sample === "oos1"
+          ? point.timestampMs >= view.isEndTimestampMs && point.timestampMs < view.oos1EndTimestampMs
+          : point.timestampMs >= view.oos1EndTimestampMs
+    ));
+  const chartPoints = points.length >= 2 ? points : view.points;
+  const width = large ? 1000 : 520;
+  const height = large ? 340 : 300;
   const pad = 18;
-  const equities = view.points.map((point) => point.equity);
+  const equities = chartPoints.map((point) => point.equity);
   const min = Math.min(...equities);
   const max = Math.max(...equities);
   const span = Math.max(max - min, 1e-9);
-  const t0 = view.points[0].timestampMs;
-  const t1 = view.points[view.points.length - 1].timestampMs;
+  const t0 = chartPoints[0].timestampMs;
+  const t1 = chartPoints[chartPoints.length - 1].timestampMs;
   const tSpan = Math.max(t1 - t0, 1);
   const xAt = (timestamp: number) => pad + ((timestamp - t0) / tSpan) * (width - pad * 2);
   const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
-  const path = view.points
+  const path = chartPoints
     .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
     .join(" ");
+  const firstX = xAt(chartPoints[0].timestampMs);
+  const lastX = xAt(chartPoints.at(-1)!.timestampMs);
+  const chartBottom = height - pad;
+  const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
   const isX = xAt(view.isEndTimestampMs);
   const oos1X = xAt(view.oos1EndTimestampMs);
+  const gradientId = large ? "equity-area-large" : "equity-area-small";
+  const horizontalGuides = [0, 1, 2, 3, 4];
+  const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
 
   return (
-    <section className="partition-equity">
+    <section className={large ? "partition-equity large" : "partition-equity"}>
       <div className="partition-equity-head">
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
@@ -2598,17 +4851,63 @@ function PartitionEquityChart({
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>
+        <div className="partition-equity-scale">
+          <label className="partition-sample-select">Sample
+            <select value={sample} onChange={(event) => setSample(event.target.value as typeof sample)}>
+              <option value="full">Full (IS + OOS)</option>
+              <option value="is">IS</option>
+              <option value="oos1">OOS 1</option>
+              <option value="oos2">OOS 2</option>
+            </select>
+          </label>
+          <span>${formatNumber(Math.max(...equities), 0)} peak</span>
+          <span>${formatNumber(Math.min(...equities), 0)} trough</span>
+        </div>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve">
-        <rect x={pad} y={pad} width={isX - pad} height={height - pad * 2} className="region-is" />
-        <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1" />
-        <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2" />
-        <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
-        <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#35d4bd" stopOpacity=".30" />
+            <stop offset="68%" stopColor="#1eae9a" stopOpacity=".08" />
+            <stop offset="100%" stopColor="#1eae9a" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {horizontalGuides.map((guide) => {
+          const y = pad + (guide / 4) * (height - pad * 2);
+          const value = max - (guide / 4) * span;
+          return (
+            <g key={`h-${guide}`}>
+              <line x1={pad} y1={y} x2={width - pad} y2={y} className="chart-grid-line" />
+              {large && <text x={width - pad - 4} y={y - 4} textAnchor="end" className="chart-axis-label">${formatNumber(value, 0)}</text>}
+            </g>
+          );
+        })}
+        {verticalGuides.map((guide) => {
+          const fraction = guide / 6;
+          const x = pad + fraction * (width - pad * 2);
+          const timestamp = t0 + fraction * tSpan;
+          return (
+            <g key={`v-${guide}`}>
+              <line x1={x} y1={pad} x2={x} y2={height - pad} className="chart-grid-line vertical" />
+              {large && <text x={x} y={height - 4} textAnchor={guide === 0 ? "start" : guide === 6 ? "end" : "middle"} className="chart-axis-label">{new Date(timestamp).getUTCFullYear()}</text>}
+            </g>
+          );
+        })}
+        {sample === "full" && <>
+          <rect x={pad} y={pad} width={isX - pad} height={height - pad * 2} className="region-is" />
+          <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1" />
+          <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2" />
+          <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
+          <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
+        </>}
+        <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
         <path d={path} className="equity-path" />
-        <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
-        <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>
-        <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
+        <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
+        {sample === "full" ? <>
+          <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
+          <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>
+          <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
+        </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}%`} />
@@ -2620,21 +4919,160 @@ function PartitionEquityChart({
   );
 }
 
+function EliteDetailModal({
+  detail,
+  loading,
+  researchGrade,
+  m1FidelityVerified,
+  onClose,
+  onError,
+  onParity,
+  tab,
+  onTab,
+}: {
+  detail: EliteDetail | null;
+  loading: boolean;
+  researchGrade: boolean;
+  m1FidelityVerified: boolean;
+  onClose: () => void;
+  onError: (message: string | null) => void;
+  onParity: (fingerprint: string) => Promise<void>;
+  tab: "overview" | "ir";
+  onTab: (tab: "overview" | "ir") => void;
+}) {
+  const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
+  const [partitionBusy, setPartitionBusy] = useState(false);
+
+  useEffect(() => {
+    if (!detail || tab !== "overview") {
+      setPartitionView(null);
+      return;
+    }
+    let cancelled = false;
+    setPartitionBusy(true);
+    setPartitionView(null);
+    void getElitePartitionEquity(detail.fingerprint)
+      .then((next) => {
+        if (!cancelled) setPartitionView(next);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setPartitionBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.fingerprint, tab, onError]);
+
+  return (
+    <div
+      className="elite-detail-modal-backdrop"
+      onClick={onClose}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") onClose();
+      }}
+      role="presentation"
+    >
+      <div
+        className="elite-detail-modal"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={detail?.strategyId ?? "Strategy detail"}
+      >
+        <div className="elite-detail-modal-head">
+          <div>
+            <h2>{detail?.strategyId ?? "Loading strategy…"}</h2>
+            <small>Inspection does not pause Discover · Esc to close</small>
+          </div>
+          <button className="secondary" type="button" onClick={onClose}>Close</button>
+        </div>
+        <div className="elite-detail-modal-body">
+          <EliteInspector
+            detail={detail}
+            loading={loading}
+            m1FidelityVerified={m1FidelityVerified}
+            onError={onError}
+            onParity={onParity}
+            onTab={onTab}
+            researchGrade={researchGrade}
+            tab={tab}
+          />
+          <TradeListPanel busy={partitionBusy} trades={partitionView?.trades ?? []} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolean }) {
+  return (
+    <aside className="trade-list-panel">
+      <header>
+        <p className="eyebrow">Trade list</p>
+        <p>{busy ? "Replaying M1 chronology…" : `${formatNumber(trades.length)} trades (full run)`}</p>
+      </header>
+      <div className="trade-list-scroll">
+        {trades.length === 0 ? (
+          <p className="empty-inline">{busy ? "Loading…" : "No trades in replay."}</p>
+        ) : (
+          <table className="trade-list-table">
+            <thead>
+              <tr>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>Exit</th>
+                <th>Net</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trades.map((trade, index) => (
+                <tr key={`${trade.entryTimestampMs}-${index}`}>
+                  <td>{trade.side}</td>
+                  <td>{formatTradeTimestamp(trade.entryTimestampMs)} @ {trade.entryPrice.toFixed(5)}</td>
+                  <td>{formatTradeTimestamp(trade.exitTimestampMs)} @ {trade.exitPrice.toFixed(5)}</td>
+                  <td className={trade.netProfit >= 0 ? "profit" : "loss"}>
+                    {trade.netProfit >= 0 ? "+" : ""}{trade.netProfit.toFixed(2)}
+                  </td>
+                  <td>{trade.exitReason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function formatTradeTimestamp(timestampMs: number): string {
+  return new Date(timestampMs).toISOString().replace("T", " ").slice(0, 16);
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function finiteRatio(returnPercent: number, drawdownPercent: number): number | null {
-  if (drawdownPercent <= 1e-12) return null;
-  const value = returnPercent / drawdownPercent;
-  return Number.isFinite(value) ? value : null;
+function formatRecoveryFactor(
+  value: Pick<EliteRow, "recoveryFactor"> | { recoveryFactor: number | null | undefined },
+): string {
+  const factor = value.recoveryFactor;
+  if (factor === null || factor === undefined) return "—";
+  if (!Number.isFinite(factor)) return factor > 0 ? "∞" : "—";
+  return factor.toFixed(2);
 }
 
-function formatReturnDrawdown(
-  value: Pick<EliteRow, "returnPercent" | "drawdownPercent" | "returnDrawdown">,
-): string {
-  if (value.returnDrawdown !== null) return value.returnDrawdown.toFixed(2);
-  return value.drawdownPercent <= 1e-12 && value.returnPercent > 0 ? "∞" : "—";
+function finiteRecoveryFromMetrics(metrics: Record<string, unknown>): number | null {
+  const netProfit = Number(metrics.net_profit ?? NaN);
+  const maxDrawdown = Number(metrics.max_drawdown ?? NaN);
+  if (!Number.isFinite(netProfit) || !Number.isFinite(maxDrawdown) || maxDrawdown <= 1e-12) {
+    return null;
+  }
+  const value = netProfit / maxDrawdown;
+  return Number.isFinite(value) ? value : null;
 }
 
 function effectiveDetailSharpe(detail: EliteDetail): number | null {

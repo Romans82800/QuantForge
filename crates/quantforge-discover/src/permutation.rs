@@ -56,11 +56,7 @@ pub struct PermutationNullReport {
 
 /// Stationary bootstrap of M1 log-return path, rebuilding OHLC around the
 /// synthetic close path while preserving each bar's spread stamp.
-pub fn stationary_bootstrap_bars(
-    source: &[Bar],
-    mean_block_length: usize,
-    seed: u64,
-) -> Vec<Bar> {
+pub fn stationary_bootstrap_bars(source: &[Bar], mean_block_length: usize, seed: u64) -> Vec<Bar> {
     assert!(!source.is_empty());
     let mean_block = mean_block_length.max(1);
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -221,15 +217,9 @@ pub fn run_permutation_null(
 
 fn metrics_tuple(metrics: &BacktestMetrics) -> (f64, f64, f64, f64) {
     let pf = metrics.profit_factor.unwrap_or(0.0);
-    let ret_dd = if metrics.max_drawdown_percent > 1.0e-9 {
-        metrics.return_percent / metrics.max_drawdown_percent
-    } else if metrics.return_percent > 0.0 {
-        f64::INFINITY
-    } else {
-        0.0
-    };
+    let recovery = metrics.recovery_factor();
     let sharpe = metrics.sharpe_ratio.unwrap_or(0.0);
-    (pf, ret_dd, metrics.expectancy, sharpe)
+    (pf, recovery, metrics.expectancy, sharpe)
 }
 
 fn percentile(values: &mut [f64], probability: f64) -> f64 {
@@ -269,7 +259,10 @@ mod tests {
         let synth = stationary_bootstrap_bars(&source, 60, 11);
         assert_eq!(synth.len(), source.len());
         assert_eq!(synth[0].timestamp_ms, source[0].timestamp_ms);
-        assert_eq!(synth.last().unwrap().timestamp_ms, source.last().unwrap().timestamp_ms);
+        assert_eq!(
+            synth.last().unwrap().timestamp_ms,
+            source.last().unwrap().timestamp_ms
+        );
         for (left, right) in source.iter().zip(synth.iter()) {
             assert_eq!(left.spread_points, right.spread_points);
             assert_eq!(left.timestamp_ms, right.timestamp_ms);

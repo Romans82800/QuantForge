@@ -4,20 +4,33 @@ use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
-use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
-use quantforge_quality::{monte_carlo_from_trade_profits, perturb_strategy_parameters};
-use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
+use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
+use quantforge_quality::{monte_carlo_trade_resampling_with_skip, perturb_strategy_parameters};
+
+use crate::model::{
+    M1RetentionEvidence, ParameterNeighborhoodEvidence, ParameterNeighborhoodSample,
+    RobustnessEvidence, WalkForwardEvidence, WalkForwardFold,
+};
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+
+/// M1 replay that leaves the battery plus the structured record of what the
+/// battery measured. `evidence` is `None` only on the research-only path that
+/// skips the battery entirely.
+pub struct RobustnessOutcome {
+    pub result: ScoutResult,
+    pub evidence: Option<RobustnessEvidence>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RobustnessReject {
+pub enum RobustnessReject {
     M1Fidelity,
     WalkForward,
     MonteCarlo,
     ParamNeighborhood,
 }
 
-pub(crate) struct RobustnessConfig {
+pub struct RobustnessConfig {
     pub folds: usize,
     pub monte_carlo_trials: usize,
     pub neighborhood_samples: usize,
@@ -40,6 +53,10 @@ pub(crate) struct RobustnessConfig {
     pub adx_threshold_min: f64,
     pub adx_threshold_max: f64,
     pub adx_threshold_step: f64,
+    pub indicator_engine: quantforge_eval::IndicatorEngine,
+    /// Mirrors the scout entry window so M1 retention is not measured against a
+    /// different trading session than the one that admitted the candidate.
+    pub entry_window: quantforge_eval::EntryWindow,
     /// When true, folds are broker-local calendar years and every year must pass.
     pub calendar_year_folds: bool,
 }
@@ -49,20 +66,28 @@ pub(crate) struct RobustnessConfig {
 /// 90% for promotion-grade databanks.
 pub(crate) const SQX_TRADE_RETENTION: f64 = 0.80;
 pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
+/// Results and promotion test the actual local plateau. ±20% matches the SQX
+/// parameter-sensitivity default: wide enough to expose a knife-edge fit, narrow
+/// enough that a genuinely robust plateau survives.
+pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
+/// SQX-style trade manipulation: each resampled path loses 15% of fills.
+pub const MONTE_CARLO_SKIP_TRADE_PROBABILITY: f64 = 0.15;
 
 /// M1 baseline → SQX retention vs H1 → WFO/MC/params.
-pub(crate) fn run_m1_predeposit_robustness(
+pub fn run_m1_predeposit_robustness(
     strategy: &StrategyIr,
     is_decision: &BarDataset,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     config: &RobustnessConfig,
     h1_metrics: &quantforge_eval::BacktestMetrics,
-) -> Result<ScoutResult, RobustnessReject> {
+) -> Result<RobustnessOutcome, RobustnessReject> {
     let judge = JudgeConfig {
         initial_balance: config.initial_balance,
         costs: config.costs.clone(),
-        allow_execution_gaps: true,
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
     };
     let baseline = evaluate_strategy_m1(strategy, is_decision, m1_dataset, broker, &judge)
         .map_err(|_| RobustnessReject::M1Fidelity)?;
@@ -83,6 +108,7 @@ pub(crate) fn run_m1_predeposit_robustness(
     ) {
         return Err(RobustnessReject::M1Fidelity);
     }
+    let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
 
     let folds = if config.calendar_year_folds {
         calendar_year_fold_ranges(is_decision, &broker.timezone)
@@ -95,7 +121,8 @@ pub(crate) fn run_m1_predeposit_robustness(
     }
 
     let mut passing_folds = 0usize;
-    for (start, end) in &folds {
+    let mut fold_rows = Vec::with_capacity(folds.len());
+    for (index, (start, end)) in folds.iter().enumerate() {
         if *end <= *start + 1 {
             continue;
         }
@@ -117,13 +144,22 @@ pub(crate) fn run_m1_predeposit_robustness(
                 trade.entry_timestamp_ms >= start_ms && trade.entry_timestamp_ms <= last_open_ms
             })
             .count();
-        if fold_trades >= config.minimum_fold_trades
+        let fold_passed = fold_trades >= config.minimum_fold_trades
             && fold_result.metrics.return_percent > config.minimum_return_percent
             && effective_pf(&fold_result.metrics) >= config.minimum_profit_factor
-            && fold_result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent
-        {
+            && fold_result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent;
+        if fold_passed {
             passing_folds += 1;
         }
+        fold_rows.push(WalkForwardFold {
+            fold: index,
+            start_timestamp_ms: start_ms,
+            end_timestamp_ms: last_open_ms,
+            decision_bars: end.saturating_sub(*start),
+            trades_in_fold: fold_trades,
+            metrics: fold_result.metrics.clone(),
+            passed: fold_passed,
+        });
     }
     let required_fraction = if config.calendar_year_folds {
         1.0
@@ -134,17 +170,30 @@ pub(crate) fn run_m1_predeposit_robustness(
     if fold_fraction + 1e-12 < required_fraction {
         return Err(RobustnessReject::WalkForward);
     }
+    let walk_forward_evidence = WalkForwardEvidence {
+        fold_scheme: if config.calendar_year_folds {
+            "calendar_year".into()
+        } else {
+            "contiguous".into()
+        },
+        total_folds: folds.len(),
+        passing_folds,
+        passing_fraction: fold_fraction,
+        required_passing_fraction: required_fraction,
+        folds: fold_rows,
+    };
 
     let profits: Vec<_> = baseline
         .trades
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
-    let mc = monte_carlo_from_trade_profits(
+    let mc = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.initial_balance,
         config.monte_carlo_trials,
         5,
+        MONTE_CARLO_SKIP_TRADE_PROBABILITY,
         config.seed,
         0.0,
         config.maximum_drawdown_percent.max(35.0),
@@ -154,6 +203,8 @@ pub(crate) fn run_m1_predeposit_robustness(
     }
 
     let mut surviving = 0usize;
+    let mut evaluated_samples = 0usize;
+    let mut neighborhood_samples = Vec::with_capacity(config.neighborhood_samples);
     for sample in 0..config.neighborhood_samples {
         let Ok(neighbor) = perturb_strategy_parameters(
             strategy,
@@ -167,22 +218,42 @@ pub(crate) fn run_m1_predeposit_robustness(
         else {
             continue;
         };
-        if neighborhood_survives(&result.metrics, &baseline.metrics, config) {
+        evaluated_samples += 1;
+        let survived = neighborhood_survives(&result.metrics, &baseline.metrics, config);
+        if survived {
             surviving += 1;
         }
+        neighborhood_samples.push(ParameterNeighborhoodSample {
+            sample_index: sample,
+            net_profit: result.metrics.net_profit,
+            return_percent: result.metrics.return_percent,
+            max_drawdown_percent: result.metrics.max_drawdown_percent,
+            trade_count: result.metrics.trade_count,
+            profit_factor: result.metrics.profit_factor,
+            sharpe_ratio: result.metrics.sharpe_ratio,
+            survived,
+        });
     }
-    let survival = surviving as f64 / config.neighborhood_samples.max(1) as f64;
+    // A neighbor that could not be built or replayed says nothing about the width of
+    // the plateau, so score against the samples that actually ran. Still demand that
+    // most of them ran, otherwise the evidence is too thin to promote on.
+    if evaluated_samples * 2 < config.neighborhood_samples {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+    let survival = surviving as f64 / evaluated_samples.max(1) as f64;
     if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
         return Err(RobustnessReject::ParamNeighborhood);
     }
 
-    // ADX gets an explicit local plateau check. The generic ±10% neighborhood
+    // ADX gets an explicit local plateau check. The generic ±20% neighborhood
     // perturbs many genes at once; that cannot prove that ADX itself is not a
     // single lucky threshold or period. These neighbours isolate one search
     // profile step in each available direction and require 3 of 4 to survive.
     let plateau_neighbors = adx_plateau_neighbors(strategy, config);
+    let mut plateau_surviving = 0usize;
+    let mut plateau_survival_fraction = None;
     if !plateau_neighbors.is_empty() {
-        let passing = plateau_neighbors
+        plateau_surviving = plateau_neighbors
             .iter()
             .filter_map(|neighbor| {
                 evaluate_strategy_m1(neighbor, is_decision, m1_dataset, broker, &judge)
@@ -191,12 +262,52 @@ pub(crate) fn run_m1_predeposit_robustness(
             })
             .filter(|passed| *passed)
             .count();
-        let plateau_survival = passing as f64 / plateau_neighbors.len() as f64;
-        if plateau_survival + 1e-12 < 0.75 {
+        let plateau_survival = plateau_surviving as f64 / plateau_neighbors.len() as f64;
+        plateau_survival_fraction = Some(plateau_survival);
+        if plateau_survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
             return Err(RobustnessReject::ParamNeighborhood);
         }
     }
-    Ok(baseline_result)
+    Ok(RobustnessOutcome {
+        result: baseline_result,
+        evidence: Some(RobustnessEvidence {
+            m1_retention: retention_evidence,
+            walk_forward: walk_forward_evidence,
+            monte_carlo: mc,
+            parameter_neighborhood: ParameterNeighborhoodEvidence {
+                perturbation_fraction: config.parameter_perturbation_fraction,
+                samples_requested: config.neighborhood_samples,
+                samples_evaluated: evaluated_samples,
+                surviving_samples: surviving,
+                survival_fraction: survival,
+                required_survival_fraction: config.minimum_neighborhood_survival_fraction,
+                plateau_neighbors: plateau_neighbors.len(),
+                plateau_surviving,
+                plateau_survival_fraction,
+                original_metrics: Some(baseline.metrics.clone()),
+                samples: neighborhood_samples,
+            },
+        }),
+    })
+}
+
+fn m1_retention_evidence(
+    h1: &quantforge_eval::BacktestMetrics,
+    m1: &quantforge_eval::BacktestMetrics,
+    config: &RobustnessConfig,
+) -> M1RetentionEvidence {
+    let ratio = |numerator: f64, denominator: f64| {
+        (denominator > 0.0)
+            .then_some(numerator / denominator)
+            .filter(|value| value.is_finite())
+    };
+    M1RetentionEvidence {
+        selected_timeframe_metrics: h1.clone(),
+        minimum_return_retention: config.minimum_return_retention,
+        return_retention: ratio(m1.return_percent, h1.return_percent),
+        trade_retention: ratio(m1.trade_count as f64, h1.trade_count as f64),
+        drawdown_expansion: ratio(m1.max_drawdown_percent, h1.max_drawdown_percent),
+    }
 }
 
 fn neighborhood_survives(
@@ -268,6 +379,8 @@ fn strategy_uses_adx(strategy: &StrategyIr) -> bool {
         .iter()
         .chain(strategy.entry.short.iter())
         .chain(strategy.exit.iter())
+        .chain(strategy.exit_long.iter())
+        .chain(strategy.exit_short.iter())
         .chain(strategy.filters.iter())
         .any(bool_uses_adx)
 }
@@ -310,6 +423,8 @@ fn adjust_adx_periods(
         .iter_mut()
         .chain(strategy.entry.short.iter_mut())
         .chain(strategy.exit.iter_mut())
+        .chain(strategy.exit_long.iter_mut())
+        .chain(strategy.exit_short.iter_mut())
         .chain(strategy.filters.iter_mut())
     {
         adjust_adx_periods_bool(expression, direction, config, &mut changed);
@@ -379,6 +494,8 @@ fn adjust_adx_thresholds(
         .iter_mut()
         .chain(strategy.entry.short.iter_mut())
         .chain(strategy.exit.iter_mut())
+        .chain(strategy.exit_long.iter_mut())
+        .chain(strategy.exit_short.iter_mut())
         .chain(strategy.filters.iter_mut())
     {
         adjust_adx_thresholds_bool(expression, direction, config, &mut changed);
