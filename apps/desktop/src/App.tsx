@@ -108,6 +108,7 @@ import {
   discoverProgress,
   discoverProgressLabel,
   filterAndSortElites,
+  databankFilterError,
   formatDateRange,
   conditionLabel,
   formatNumber,
@@ -291,6 +292,7 @@ function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [filterExpression, setFilterExpression] = useState("");
   const [entryFilter, setEntryFilter] = useState("all");
   const [entryOrderFilter, setEntryOrderFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
@@ -522,10 +524,11 @@ function App() {
   const filtered = useMemo(
     () =>
       workspace
-        ? filterAndSortElites(workspace.elites, query, entryFilter, sort, entryOrderFilter)
+        ? filterAndSortElites(workspace.elites, query, entryFilter, sort, entryOrderFilter, filterExpression)
         : [],
-    [workspace, query, entryFilter, entryOrderFilter, sort],
+    [workspace, query, entryFilter, entryOrderFilter, sort, filterExpression],
   );
+  const filterExprError = useMemo(() => databankFilterError(filterExpression), [filterExpression]);
 
   useEffect(() => {
     if (!workspace) return;
@@ -856,6 +859,14 @@ function App() {
                         onChange={(event) => setQuery(event.target.value)}
                         placeholder="Search ID or fingerprint"
                         value={query}
+                      />
+                      <input
+                        aria-label="Databank filter expression"
+                        className={filterExprError ? "input-error" : undefined}
+                        onChange={(event) => setFilterExpression(event.target.value)}
+                        placeholder="PF > 1.5 AND Drawdown < 20"
+                        title={filterExprError ?? "SQX-style ranking filter"}
+                        value={filterExpression}
                       />
                       <select
                         aria-label="Filter entry conditions"

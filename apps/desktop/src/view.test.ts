@@ -10,6 +10,9 @@ import {
   entryWindowError,
   entryWindowSummary,
   filterAndSortElites,
+  databankFilterError,
+  parseDatabankFilter,
+  evalDatabankFilter,
   perturbationError,
   perturbationPercent,
   formatDateRange,
@@ -25,6 +28,9 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
   strategyId: "trend-one",
   entryConditions: 2,
   exitConditions: 1,
+  islandId: 0,
+  entryOrder: "market",
+  management: "none",
   evidence: 10,
   novelty: 0.5,
   trades: 20,
@@ -94,6 +100,24 @@ describe("databank view rules", () => {
       "drawdown",
     );
     expect(rows.map((row) => row.strategyId)).toEqual(["tight", "slow"]);
+  });
+
+  it("applies SQX-style ranking expressions", () => {
+    const rows = filterAndSortElites(
+      [
+        elite({ strategyId: "keep", profitFactor: 2, drawdownPercent: 10, trades: 40 }),
+        elite({ strategyId: "drop", profitFactor: 1.1, drawdownPercent: 10, trades: 40 }),
+      ],
+      "",
+      "all",
+      "evidence",
+      "all",
+      "PF > 1.5 AND Drawdown < 20 AND Trades >= 30",
+    );
+    expect(rows.map((row) => row.strategyId)).toEqual(["keep"]);
+    expect(databankFilterError("PF >> 1")).toMatch(/operator|column|unexpected/i);
+    const node = parseDatabankFilter("grade == 'illuminated'");
+    expect(evalDatabankFilter(node, elite({}))).toBe(true);
   });
 
   it("keeps the inspector inside the visible filtered result", () => {

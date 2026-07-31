@@ -1,0 +1,46 @@
+{
+  "protocol": "quantforge-task-graph-v1",
+  "schema_version": 1,
+  "name": "retester-challenge-matrix-export",
+  "description": "QF-native stand-in for SQX ProjectRetester / TaskRetest chaining. SQX project XML schemas are not publicly documented outside proprietary plugin JARs.",
+  "steps": [
+    {
+      "id": "challenge",
+      "kind": "challenge",
+      "depends_on": [],
+      "enabled": true,
+      "params": {
+        "strategy": "strategy.ir.json",
+        "folds": 5,
+        "monte_carlo_trials": 200,
+        "neighborhood_samples": 20
+      }
+    },
+    {
+      "id": "wf_matrix",
+      "kind": "walk_forward_matrix",
+      "depends_on": ["challenge"],
+      "enabled": true,
+      "params": {
+        "fold_counts": [3, 4, 5, 6],
+        "lookback_bars": [60, 120, 240]
+      }
+    },
+    {
+      "id": "judge",
+      "kind": "judge",
+      "depends_on": ["challenge"],
+      "enabled": true,
+      "params": {}
+    },
+    {
+      "id": "export",
+      "kind": "export_mql5",
+      "depends_on": ["judge"],
+      "enabled": true,
+      "params": {
+        "timeframe": "H1"
+      }
+    }
+  ]
+}

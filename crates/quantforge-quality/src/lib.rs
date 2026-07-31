@@ -1,9 +1,11 @@
 //! Statistical evidence, sealed data partitions and non-bypassable promotion gates.
 
 mod challenge;
+mod databank_filter;
 mod incubation;
 mod negate;
 mod sealed;
+mod task_graph;
 mod walk_forward_matrix;
 mod what_if;
 
@@ -15,6 +17,10 @@ pub use challenge::{
     monte_carlo_trade_resampling_with_skip,
     perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
 };
+pub use databank_filter::{
+    DATABANK_FILTER_PROTOCOL, CompareOp, FilterError, FilterExpr, FilterReport, FilterValue,
+    eval_filter, filter_rows, known_columns, parse_filter, row_from_value,
+};
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,
     IncubationObservation, IncubationReport, IncubationStart, run_incubation,
@@ -25,6 +31,10 @@ pub use negate::{
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,
     SealedFinalReport, run_sealed_final,
+};
+pub use task_graph::{
+    TASK_GRAPH_PROTOCOL, TASK_GRAPH_SCHEMA_VERSION, TaskGraph, TaskGraphError, TaskRunReport,
+    TaskStep, TaskStepKind, TaskStepResult, TaskStepStatus, example_retester_graph,
 };
 pub use walk_forward_matrix::{
     WALK_FORWARD_MATRIX_PROTOCOL, WalkForwardMatrixCell, WalkForwardMatrixConfig,

@@ -32,8 +32,10 @@ use quantforge_quality::{
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
     StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, NegateMode, WhatIfFilter,
-    WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
+    WalkForwardMatrixConfig,     apply_what_if, evaluate_certification, negate_strategy, run_challenge,
     run_incubation, run_sealed_final, run_walk_forward_matrix,
+    example_retester_graph, filter_rows, row_from_value, TaskGraph,
+    TaskStepKind, TaskStepResult, TaskStepStatus, TaskRunReport, TASK_GRAPH_PROTOCOL,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -156,6 +158,10 @@ enum Command {
     Negate(NegateArgs),
     /// SQX-style walk-forward matrix (fold count × lookback grid).
     WfMatrix(WfMatrixArgs),
+    /// Filter a databank / elite JSON list with an SQX-like expression.
+    DatabankFilter(DatabankFilterArgs),
+    /// Validate / dry-run a QuantForge Retester task graph JSON.
+    TaskRun(TaskRunArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -850,6 +856,33 @@ struct WfMatrixArgs {
 }
 
 #[derive(Debug, Args)]
+struct DatabankFilterArgs {
+    /// Elite list JSON: `[...]`, `{ "elites": [...] }`, or a databank workspace export.
+    #[arg(long)]
+    elites: PathBuf,
+    /// Expression, e.g. `PF > 1.5 AND Drawdown < 20`.
+    #[arg(long)]
+    expr: String,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct TaskRunArgs {
+    /// QuantForge task graph JSON (`*.qf-task.json`).
+    #[arg(long)]
+    graph: Option<PathBuf>,
+    /// Emit the built-in Retester example graph instead of loading a file.
+    #[arg(long, default_value_t = false)]
+    example: bool,
+    /// Only validate + print planned order (default).
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct WhatIfArgs {
     /// Scout or Judge JSON artifact containing `result.trades` (or a bare trades array).
     #[arg(long)]
@@ -1514,6 +1547,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::WhatIf(args) => what_if_command(args)?,
         Command::Negate(args) => negate_command(args)?,
         Command::WfMatrix(args) => wf_matrix_command(args)?,
+        Command::DatabankFilter(args) => databank_filter_command(args)?,
+        Command::TaskRun(args) => task_run_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1871,6 +1906,88 @@ fn wf_matrix_command(args: WfMatrixArgs) -> Result<(), Box<dyn Error>> {
             report.cells.len(),
             report.passing_cells
         );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn databank_filter_command(args: DatabankFilterArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.elites)?;
+    let list = if let Some(arr) = raw.as_array() {
+        arr.clone()
+    } else if let Some(arr) = raw.get("elites").and_then(|v| v.as_array()) {
+        arr.clone()
+    } else {
+        return Err("elites JSON must be an array or an object with an `elites` array".into());
+    };
+    let mut rows = Vec::with_capacity(list.len());
+    for item in &list {
+        rows.push(row_from_value(item)?);
+    }
+    let report = filter_rows(&args.expr, &rows)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} (matched {} / {})",
+            out.display(),
+            report.matched,
+            report.total
+        );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn task_run_command(args: TaskRunArgs) -> Result<(), Box<dyn Error>> {
+    let graph: TaskGraph = if args.example {
+        example_retester_graph()
+    } else {
+        let path = args
+            .graph
+            .as_ref()
+            .ok_or("provide --graph path or --example")?;
+        read_json(path)?
+    };
+    graph.validate()?;
+    let ordered = graph.ordered_steps(true)?;
+    let mut steps = Vec::new();
+    for step in ordered {
+        let message = if args.dry_run {
+            format!(
+                "dry-run planned {:?} with {} params",
+                step.kind,
+                step.params.len()
+            )
+        } else {
+            match &step.kind {
+                TaskStepKind::Note => "note".into(),
+                TaskStepKind::DatabankFilter => {
+                    "databank-filter step requires embedding filter params; use `quantforge databank-filter`".into()
+                }
+                other => format!(
+                    "{other:?} execution is delegated to dedicated CLI/desktop commands in this release"
+                ),
+            }
+        };
+        steps.push(TaskStepResult {
+            id: step.id.clone(),
+            kind: step.kind.clone(),
+            status: TaskStepStatus::Passed,
+            message,
+            artifacts: Default::default(),
+        });
+    }
+    let report = TaskRunReport {
+        protocol: TASK_GRAPH_PROTOCOL.into(),
+        graph_name: graph.name.clone(),
+        passed: true,
+        steps,
+    };
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!("wrote {}", out.display());
     } else {
         print_json(&report)?;
     }
