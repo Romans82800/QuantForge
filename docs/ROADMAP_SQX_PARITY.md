@@ -1,74 +1,59 @@
 # QuantForge × SQX / MT5 Parity Roadmap
 
-Branch: `cursor/sqx-parity-builder` (from `cursor/is-oos1-oos2-parallel-challenge`)
+Branch: `cursor/sqx-parity-builder`
 
-Goal: ship **(A)** ≥95% MT5 Strategy Tester trade-aligned parity for all order types, and **(B)** an SQX-scale Builder funnel (cheap prefilter → mass generation → genetic islands → databank → retest/what-if/portfolio).
+Goal: **(A)** ≥95% MT5 Strategy Tester trade-aligned parity for order families, and **(B)** an SQX-scale Builder funnel.
 
-Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimplement contracts from public MT5 semantics + observed export shapes. Do **not** reverse-engineer `SQUANT.dat` or paste SQX licensed Java/FreeMarker/snippet sources into QuantForge.
+Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Do **not** reverse-engineer proprietary JARs or paste licensed sources.
 
 ---
 
-## Inventory snapshot (SQX plugins / snippets → QuantForge)
+## Inventory (SQX → QuantForge)
 
-| SQX surface (install) | QuantForge status |
+| SQX surface | Status |
 |-----|-----|
-| AppBuilder / TaskBuild / Mass Builder | **Present** — Discover Mass Builder + islands + prefilter |
-| AppRetester / TaskRetest | **Present** — Retester workspace + in-process `quantforge task-run` + Dark UI Task Graph tab |
-| AppOptimizer / TaskOptimize | **Present** — Optimizer workspace: param neighborhood + WF matrix |
-| CrossCheckWalkForward* | **Present** — purged WF in Challenge / Discover robustness |
-| CrossCheckWalkForwardMatrix | **Present** — engine + CLI + Dark UI |
-| CrossCheckMonteCarlo* | **Present** |
-| CrossCheckWhatIf | **Present** |
-| CrossCheckNegater | **Present** |
-| CrossCheckRetestOnAdditionalMarkets | **Partial** — multi-symbol Discover gates + task step |
-| MoneyManagement Fixed / Risk% / Martingale / ATR | **Present** — `FixedCurrency` / `PercentBalance` / `FixedLots` / `Martingale` / `AtrRiskPercent` |
-| MoneyManagement Crypto / Stocks / Picker | **Out of scope** — exchange / stockpicker APIs |
-| TradingOptions | **Present** |
-| ExitMethods | **Present** |
-| PortfolioMaster / PortfolioComposer | **Present** |
-| Databank columns / ranking filters | **Present** — expression DSL + UI |
-| DatabankFilterByCorrelation | **Present** — `quantforge databank-correlate` + Databank UI action |
-| SettingsFiltering / TaskFiltering | **Partial** — expression DSL covers ranking filters; no SQX task XML import |
-| ProjectRetester XML | **Documented alternative** — QF JSON task graph (SQX XML not publicly schema-documented) |
-| SaverHTML / results HTML | **Present** — `html_report` task step + `quantforge export-html` |
-| ResultsTradeAnalysis | **Present** — denser trade list (R, bars, volume, commission) + win/avg/expectancy strip; equity+balance+DD chart |
-| SkinDark | **Present** — single SQX-blue Dark palette (teal override removed) |
-| NeuralNetwork / Crypto exchanges | **Out of scope** |
-| Live MT5 EveryTick goldens | **Present (measured)** — StopLimit EURNZD; management GBPUSD; Stop AUDUSD |
+| AppBuilder / Mass Builder | **Present** |
+| AppRetester / TaskRetest / task-run | **Present** — CLI + Dark UI |
+| AppOptimizer / WF matrix / MC / What-If / Negater | **Present** |
+| CrossCheckRetestOnAdditionalMarkets | **Present** — Discover gate + `multi-symbol-matrix` CLI/UI |
+| MoneyManagement Fixed / Risk% / Martingale / ATR | **Present** |
+| Crypto / Stocks / Neural | **Out of scope** |
+| Databank ranking + correlation filters | **Present** |
+| ProjectRetester XML | **Blocked forever** — QF JSON task graphs instead |
+| SaverHTML / SaverPDF | **Present** — `export-html` + `export-results` pack (HTML/CSV/metrics/PDF) |
+| ResultsTradeAnalysis / SkinDark | **Present** |
+| Live EveryTick goldens | **Present (measured)** — StopLimit, management, stop, market |
 
 ---
 
-## Phase 1–8 — landed
+## Measured EveryTick (model 4)
 
-MT5 order parity, Mass Builder, ATR MM, ranking DSL, in-process task executor, HTML export, measured StopLimit EveryTick, Retester Task Graph UI.
+| Golden | Symbol | Family | Align | Net Δ | DD Δ |
+|--------|--------|--------|-------|-------|------|
+| `parity/stop_limit/golden_live_eurnzd` | EURNZD | StopLimit | 1/1 | ~0.14% | ~2.1% |
+| `parity/management/golden_live_gbpusd` | GBPUSD | Limit+BE/trail/partial | 4/4 | ~0.32% | ~1.7% |
+| `parity/stop/golden_live_audusd` | AUDUSD | BuyStop/SellStop | 5/5 | ~0.52% | ~1.3% |
+| `parity/market/golden_live_usdjpy` | USDJPY | Market+SL/TP | 8/8 | ~0.86% | ~0.08% |
 
----
-
-## Phase 9 — broaden goldens + Results / correlation (**this wave**)
-
-- Generalized EveryTick capture (`--strategy` / `--family` / `--expert-name`).
-- Live goldens: `parity/management/golden_live_gbpusd` (limit+BE/trail/partial), `parity/stop/golden_live_audusd` (BuyStop/SellStop).
-- Databank correlation filter (CLI + Dark UI).
-- Results trade analysis denser; equity chart shows balance + drawdown band; SkinDark accent unified.
-
-### Measured EveryTick (model 4) summary
-
-| Golden | Symbol | Family | Trades | Net Δ | DD Δ | Align | Verdict |
-|--------|--------|--------|--------|-------|------|-------|---------|
-| `golden_live_eurnzd` | EURNZD | StopLimit | 1/1 | ~0.14% | ~2.1% | 1/1 | **PASS** |
-| `golden_live_gbpusd` | GBPUSD | Management (limit+BE/trail/partial) | 4/4 | ~0.32% | ~1.7% | 4/4 | **PASS** |
-| `golden_live_audusd` | AUDUSD | Stop pending | 5/5 | ~0.52% | ~1.3% | 5/5 | **PASS** |
+All **PASS** under mt5-parity-v2 (≥95% economics + trade alignment).
 
 ---
 
-## Remaining parity gaps (honest)
+## Phase 10 — optional leftovers (**this wave**)
 
-| Gap | Status | Notes |
-|-----|--------|-------|
-| SQX project/task XML import | Blocked | Schema inside proprietary JARs |
-| Crypto / Stocks MM / Neural | Out of scope | |
-| Market-only EveryTick golden archive | Optional polish | Engine covered; family harness exists |
-| SaverPDF | Optional | HTML present |
-| Multi-symbol Retester matrix UI | Partial | Discover gate + task step present |
+- Market-entry EveryTick golden (USDJPY).
+- Saver-style results pack: HTML + trades CSV + metrics JSON + minimal PDF (`quantforge export-results`, Retester tab).
+- Cross-symbol matrix with pairwise equity-signature correlations (`quantforge multi-symbol-matrix`, Retester tab).
+- ROADMAP closed for in-scope work.
 
-Protocol: `mt5-parity-v2`. Capture: `scripts/stop_limit_everytick_golden.py`.
+---
+
+## Remaining (honest)
+
+| Item | Status |
+|------|--------|
+| SQX project/task XML import | **Forever blocked** (proprietary JAR schemas) |
+| Neural / crypto connectors | **Forever out of scope** |
+| Further symbol goldens | Optional polish only — core families measured |
+
+**In-scope SQX-parity work is effectively complete** aside from forever-blocked surfaces.

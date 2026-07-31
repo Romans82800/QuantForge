@@ -4,8 +4,10 @@ mod challenge;
 mod databank_correlation;
 mod databank_filter;
 mod incubation;
+mod multi_symbol_matrix;
 mod negate;
 mod results_html;
+mod results_pack;
 mod sealed;
 mod task_executor;
 mod task_graph;
@@ -28,6 +30,11 @@ pub use databank_filter::{
     DATABANK_FILTER_PROTOCOL, CompareOp, FilterError, FilterExpr, FilterReport, FilterValue,
     eval_filter, filter_rows, known_columns, parse_filter, row_from_value,
 };
+pub use multi_symbol_matrix::{
+    MULTI_SYMBOL_MATRIX_PROTOCOL, MatrixSymbolInput, MultiSymbolMatrixError,
+    MultiSymbolMatrixReport, MultiSymbolMatrixRow, PairwiseSymbolCorrelation,
+    run_multi_symbol_matrix,
+};
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,
     IncubationObservation, IncubationReport, IncubationStart, run_incubation,
@@ -38,6 +45,10 @@ pub use negate::{
 pub use results_html::{
     HTML_REPORT_PROTOCOL, render_results_html, render_results_html_from_json,
     render_results_html_from_scout,
+};
+pub use results_pack::{
+    RESULTS_PACK_PROTOCOL, ResultsPackPaths, render_results_pdf, render_trades_csv,
+    write_results_pack, write_results_pack_from_json, write_results_pack_from_scout,
 };
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,

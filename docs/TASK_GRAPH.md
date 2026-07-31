@@ -35,10 +35,28 @@ Shared inputs live under top-level `inputs` and are merged into each step's `par
 quantforge export-html --input scout-or-judge.json --out results.html
 ```
 
+## Results pack (SaverHTML / SaverPDF stand-in)
+
+```bash
+quantforge export-results --input scout-or-judge.json --out-dir ./results-pack
+```
+
+Writes `results.html`, `trades.csv`, `metrics.json`, and a minimal `results.pdf`.
+
+## Multi-symbol matrix
+
+```bash
+quantforge multi-symbol-matrix --strategy ir.json --pack-dir /path/to/ICMarkets_pack --symbols USDJPY,GBPUSD,AUDUSD --required-pass 1 --out matrix.json
+```
+
+Desktop: Retester → **5 · Multi-Symbol** and **6 · Results Pack**.
+
 ## Desktop
 
 Retester → **4 · Task Graph** runs the same executor (`run_task_graph_workflow`).
 Choose a `*.qf-task.json`, a work directory, optional dry-run / stop-on-failure.
+
+## Databank ranking filters
 
 SQX-style expressions over elite columns:
 

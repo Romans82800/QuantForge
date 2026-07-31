@@ -12,6 +12,10 @@ import type {
   ChallengeView,
   TaskRunRequest,
   TaskRunView,
+  MultiSymbolMatrixRequest,
+  MultiSymbolMatrixView,
+  ExportResultsPackRequest,
+  ExportResultsPackView,
   OptimizerRequest,
   OptimizerView,
   WalkForwardMatrixRequest,
@@ -214,6 +218,18 @@ export function runChallenge(request: ChallengeRequest): Promise<ChallengeView> 
 
 export function runTaskGraph(request: TaskRunRequest): Promise<TaskRunView> {
   return invoke<TaskRunView>("run_task_graph_workflow", { request });
+}
+
+export function runMultiSymbolMatrix(
+  request: MultiSymbolMatrixRequest,
+): Promise<MultiSymbolMatrixView> {
+  return invoke<MultiSymbolMatrixView>("run_multi_symbol_matrix_workflow", { request });
+}
+
+export function exportResultsPack(
+  request: ExportResultsPackRequest,
+): Promise<ExportResultsPackView> {
+  return invoke<ExportResultsPackView>("export_results_pack_workflow", { request });
 }
 
 export function runOptimizerNeighborhood(request: OptimizerRequest): Promise<OptimizerView> {

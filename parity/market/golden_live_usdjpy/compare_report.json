@@ -1,0 +1,24 @@
+{
+  "protocol_version": "mt5-parity-v2",
+  "mode": "quantforge_parity_live_capture",
+  "passed": true,
+  "trade_count_delta": 0,
+  "aligned_trade_count": 8,
+  "required_aligned_trade_count": 8,
+  "trade_alignment_passed": true,
+  "net_profit_delta_relative": 0.008610326183267897,
+  "net_profit_passed": true,
+  "max_drawdown_delta_relative": 0.0007544188261915909,
+  "max_drawdown_passed": true,
+  "equity_path_passed": true,
+  "reference": {
+    "trade_count": 8,
+    "net_profit": -1911.2868028019,
+    "max_drawdown": 2047.7751198977348
+  },
+  "external": {
+    "trade_count": 8,
+    "net_profit": -1894.8300000000004,
+    "max_drawdown": 2049.3199999999924
+  }
+}

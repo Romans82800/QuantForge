@@ -35,7 +35,8 @@ use quantforge_quality::{
     WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
     run_incubation, run_sealed_final, run_task_graph, run_walk_forward_matrix,
     example_retester_graph, filter_rows, row_from_value, render_results_html_from_json, TaskGraph,
-    TaskRunOptions, candidates_from_values, filter_by_correlation,
+    TaskRunOptions, candidates_from_values, filter_by_correlation, write_results_pack_from_json,
+    run_multi_symbol_matrix, MatrixSymbolInput,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -166,6 +167,10 @@ enum Command {
     TaskRun(TaskRunArgs),
     /// Render an SQX SaverHTML-style results report from Scout/Judge JSON.
     ExportHtml(ExportHtmlArgs),
+    /// Write a Saver-style results pack (HTML + trades CSV + metrics JSON + PDF).
+    ExportResults(ExportResultsArgs),
+    /// Cross-symbol retest matrix with pairwise equity-signature correlations.
+    MultiSymbolMatrix(MultiSymbolMatrixArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -920,6 +925,44 @@ struct ExportHtmlArgs {
 }
 
 #[derive(Debug, Args)]
+struct ExportResultsArgs {
+    /// Scout / Judge / metrics JSON artifact.
+    #[arg(long)]
+    input: PathBuf,
+    /// Report title.
+    #[arg(long, default_value = "QuantForge results")]
+    title: String,
+    /// Output directory for the pack (HTML, CSV, metrics JSON, PDF).
+    #[arg(long)]
+    out_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct MultiSymbolMatrixArgs {
+    #[arg(long)]
+    strategy: PathBuf,
+    /// Pack root containing `ICMarketsSC-Demo_<SYM>_H1_*.tsv` and `<SYM>.broker.json`.
+    #[arg(long)]
+    pack_dir: PathBuf,
+    /// Comma-separated symbols (default: DEFAULT FX pack majors).
+    #[arg(long, default_value = "AUDUSD,EURGBP,EURJPY,EURNZD,GBPJPY,GBPUSD,NZDUSD,USDCHF,USDJPY")]
+    symbols: String,
+    #[arg(long, default_value = "Etc/UTC")]
+    source_timezone: String,
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    #[arg(long, default_value_t = 7.0)]
+    commission_per_lot_round_turn: f64,
+    /// Minimum number of symbols that must pass (net profit > floor).
+    #[arg(long, default_value_t = 1)]
+    required_pass: usize,
+    #[arg(long, default_value_t = 0.0)]
+    minimum_net_profit: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct WhatIfArgs {
     /// Scout or Judge JSON artifact containing `result.trades` (or a bare trades array).
     #[arg(long)]
@@ -1588,6 +1631,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::DatabankCorrelate(args) => databank_correlate_command(args)?,
         Command::TaskRun(args) => task_run_command(args)?,
         Command::ExportHtml(args) => export_html_command(args)?,
+        Command::ExportResults(args) => export_results_command(args)?,
+        Command::MultiSymbolMatrix(args) => multi_symbol_matrix_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -2044,6 +2089,93 @@ fn export_html_command(args: ExportHtmlArgs) -> Result<(), Box<dyn Error>> {
     fs::write(&args.out, html)?;
     println!("wrote {}", args.out.display());
     Ok(())
+}
+
+fn export_results_command(args: ExportResultsArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.input)?;
+    let paths = write_results_pack_from_json(&args.out_dir, &args.title, &raw)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    println!("wrote results pack {}", paths.directory.display());
+    println!("  html {}", paths.html.display());
+    println!("  trades {}", paths.trades_csv.display());
+    println!("  metrics {}", paths.metrics_json.display());
+    println!("  pdf {}", paths.pdf.display());
+    Ok(())
+}
+
+fn multi_symbol_matrix_command(args: MultiSymbolMatrixArgs) -> Result<(), Box<dyn Error>> {
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let timezone: SourceTimezone = args.source_timezone.parse()?;
+    let symbols: Vec<String> = args
+        .symbols
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if symbols.is_empty() {
+        return Err("provide at least one symbol".into());
+    }
+    let mut markets = Vec::new();
+    for symbol in &symbols {
+        let data = find_pack_h1(&args.pack_dir, symbol)?;
+        let broker_path = args.pack_dir.join(format!("{symbol}.broker.json"));
+        if !broker_path.is_file() {
+            return Err(format!("missing broker profile {}", broker_path.display()).into());
+        }
+        let broker: SymbolSpecification = read_json(&broker_path)?;
+        let dataset = BarDataset::load_mt5(&data, timezone.clone())?;
+        markets.push(MatrixSymbolInput {
+            symbol: symbol.clone(),
+            dataset,
+            broker,
+        });
+    }
+    let scout = ScoutConfig {
+        initial_balance: args.initial_balance,
+        costs: CostModel {
+            commission_per_lot_round_turn: args.commission_per_lot_round_turn,
+            ..CostModel::default()
+        },
+        ..ScoutConfig::default()
+    };
+    let report = run_multi_symbol_matrix(
+        &strategy,
+        &markets,
+        &scout,
+        args.required_pass,
+        args.minimum_net_profit,
+    )?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} ({} / {} symbols passed, max pairwise {:.3})",
+            out.display(),
+            report.passing_count,
+            report.symbols.len(),
+            report.maximum_pairwise_correlation
+        );
+    } else {
+        print_json(&report)?;
+    }
+    if !report.matrix_passed {
+        return Err("multi-symbol matrix did not meet required_pass".into());
+    }
+    Ok(())
+}
+
+fn find_pack_h1(pack_dir: &Path, symbol: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let exact = pack_dir.join(format!("ICMarketsSC-Demo_{symbol}_H1_2020_present.tsv"));
+    if exact.is_file() {
+        return Ok(exact);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains(&format!("_{symbol}_H1_")) && name.ends_with(".tsv") {
+            return Ok(path);
+        }
+    }
+    Err(format!("H1 TSV for {symbol} not found under {}", pack_dir.display()).into())
 }
 
 fn what_if_command(args: WhatIfArgs) -> Result<(), Box<dyn Error>> {

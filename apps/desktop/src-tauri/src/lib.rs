@@ -5,6 +5,7 @@ mod databank;
 mod deploy;
 mod discover;
 mod evidence;
+mod multi_symbol;
 mod optimizer;
 mod parity_lab;
 mod portfolio;
@@ -51,6 +52,8 @@ pub fn run() {
             discover::stop_discover,
             challenge::run_challenge_workflow,
             task_run::run_task_graph_workflow,
+            multi_symbol::run_multi_symbol_matrix_workflow,
+            multi_symbol::export_results_pack_workflow,
             optimizer::run_optimizer_neighborhood,
             optimizer::run_walk_forward_matrix_workflow,
             promotion_ledger::run_sealed_final,

@@ -46,6 +46,8 @@ import {
   runOptimizerNeighborhood,
   runChallenge,
   runTaskGraph,
+  runMultiSymbolMatrix,
+  exportResultsPack,
   runWalkForwardMatrix,
   runSealedFinal,
   startIncubation,
@@ -77,6 +79,9 @@ import type {
   ChallengeView,
   TaskRunRequest,
   TaskRunView,
+  MultiSymbolMatrixRequest,
+  MultiSymbolMatrixView,
+  ExportResultsPackView,
   OptimizerRequest,
   OptimizerView,
   WalkForwardMatrixRequest,
@@ -4682,6 +4687,206 @@ function TaskGraphPanel({ onError }: { onError: (message: string | null) => void
   );
 }
 
+function MultiSymbolMatrixPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<MultiSymbolMatrixRequest>({
+    strategyPath: "",
+    packDir: "C:\\Users\\Administrator\\Documents\\QuantForge\\ICMarkets_EST7_2020_present",
+    symbols: [],
+    sourceTimezone: "ICMarkets/EST+7",
+    initialBalance: 100000,
+    commissionPerLotRoundTurn: 7,
+    requiredPass: 3,
+    minimumNetProfit: 0,
+    outputPath: "",
+  });
+  const [result, setResult] = useState<MultiSymbolMatrixView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof MultiSymbolMatrixRequest>(key: K, value: MultiSymbolMatrixRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await runMultiSymbolMatrix(form));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">CrossCheckRetestOnAdditionalMarkets</p>
+            <h2>Cross-symbol retest matrix</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Data pack directory" path={form.packDir} choose={() => chooseDirectory("Choose ICMarkets data pack")} onChange={(value) => update("packDir", value)} required />
+          <PathField label="New matrix artifact" path={form.outputPath} choose={() => chooseOutputJson("Save multi-symbol matrix", "multi-symbol-matrix.json")} onChange={(value) => update("outputPath", value)} required />
+          <label className="field-row">
+            <span>Symbols <small>blank = default FX pack</small></span>
+            <input
+              value={form.symbols.join(",")}
+              placeholder="AUDUSD,GBPUSD,USDJPY"
+              onChange={(event) =>
+                update(
+                  "symbols",
+                  event.target.value
+                    .split(",")
+                    .map((part) => part.trim())
+                    .filter(Boolean),
+                )
+              }
+            />
+          </label>
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Required pass" value={form.requiredPass} onChange={(value) => update("requiredPass", value ?? 1)} min={1} />
+          <NumberField label="Min net profit" value={form.minimumNetProfit} onChange={(value) => update("minimumNetProfit", value ?? 0)} />
+          <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 7)} step={0.01} />
+          <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
+        </div>
+        <div className="form-footer">
+          <p>Identical params on each pack symbol; reports pass grid plus pairwise equity-signature correlations.</p>
+          <button className="primary" disabled={busy || !form.strategyPath || !form.packDir || !form.outputPath} onClick={() => void run()}>
+            {busy ? "Screening…" : "Run multi-symbol matrix"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero">
+            <div>
+              <p className="eyebrow">Multi-symbol matrix</p>
+              <h2>{result.passed ? "Matrix gate passed" : "Matrix gate blocked"}</h2>
+            </div>
+            <span className="grade-pill">{result.strategyId}</span>
+          </div>
+          <div className="job-kpis">
+            <Kpi label="Passing" value={`${formatNumber(result.passingCount)}/${formatNumber(result.symbolCount)}`} note={`need ≥ ${formatNumber(result.requiredPass)}`} />
+            <Kpi label="Mean return" value={`${formatNumber(result.meanReturnPercent, 2)}%`} note={`mean net ${formatNumber(result.meanNetProfit, 0)}`} />
+            <Kpi label="Max pairwise" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="equity signatures" />
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Pass</th>
+                  <th>Trades</th>
+                  <th>Return %</th>
+                  <th>PF</th>
+                  <th>DD %</th>
+                  <th>Net</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.rows.map((row) => (
+                  <tr key={row.symbol}>
+                    <td>{row.symbol}</td>
+                    <td>{row.passed ? "yes" : "no"}</td>
+                    <td>{formatNumber(row.tradeCount)}</td>
+                    <td>{formatNumber(row.returnPercent, 2)}</td>
+                    <td>{row.profitFactor === null ? "∞" : formatNumber(row.profitFactor, 2)}</td>
+                    <td>{formatNumber(row.maxDrawdownPercent, 2)}</td>
+                    <td className={row.netProfit >= 0 ? "profit" : "loss"}>{formatNumber(row.netProfit, 2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {result.pairwise.length > 0 ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Left</th>
+                    <th>Right</th>
+                    <th>Corr</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.pairwise.map((pair) => (
+                    <tr key={`${pair.left}-${pair.right}`}>
+                      <td>{pair.left}</td>
+                      <td>{pair.right}</td>
+                      <td>{formatNumber(pair.correlation, 3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          <ArtifactPath label="Matrix artifact" value={result.outputPath} />
+        </section>
+      ) : (
+        <WorkspacePrimer title="No multi-symbol matrix yet" copy="Retest one IR across the FX pack with the same costs and gates, then inspect pairwise path correlation." />
+      )}
+    </div>
+  );
+}
+
+function ResultsPackPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [inputPath, setInputPath] = useState("");
+  const [title, setTitle] = useState("QuantForge results");
+  const [outputDirectory, setOutputDirectory] = useState("");
+  const [result, setResult] = useState<ExportResultsPackView | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await exportResultsPack({ inputPath, title, outputDirectory }));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">SaverHTML / SaverPDF</p>
+            <h2>Export results pack</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField label="Scout / Judge JSON" path={inputPath} choose={() => chooseJsonFile("Choose Scout or Judge artifact")} onChange={setInputPath} required />
+          <label className="field-row"><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+          <PathField label="New pack directory" path={outputDirectory} choose={() => chooseNewDirectory("Create results pack directory", "qf-results-pack")} onChange={setOutputDirectory} required />
+        </div>
+        <div className="form-footer">
+          <p>Writes results.html, trades.csv, metrics.json, and a minimal results.pdf (print archive).</p>
+          <button className="primary" disabled={busy || !inputPath || !outputDirectory} onClick={() => void run()}>
+            {busy ? "Exporting…" : "Export results pack"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">Results pack</p><h2>Archive ready</h2></div><span className="grade-pill">Saver</span></div>
+          <ArtifactPath label="Directory" value={result.directory} />
+          <ArtifactPath label="HTML" value={result.htmlPath} />
+          <ArtifactPath label="Trades CSV" value={result.tradesCsvPath} />
+          <ArtifactPath label="Metrics JSON" value={result.metricsJsonPath} />
+          <ArtifactPath label="PDF" value={result.pdfPath} />
+        </section>
+      ) : (
+        <WorkspacePrimer title="No results pack yet" copy="Pick a Scout/Judge artifact to emit the SQX-style HTML/CSV/PDF hand-off bundle." />
+      )}
+    </div>
+  );
+}
+
 function ParityWorkspace({
   exportPreset,
   judgePreset,
@@ -4691,21 +4896,25 @@ function ParityWorkspace({
   judgePreset: Partial<JudgeRequest>;
   onError: (message: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "task" | "export" | "compare" | "indicators">("judge");
+  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "task" | "multisymbol" | "results" | "export" | "compare" | "indicators">("judge");
   return <div className="wide-tool-content">
     <div className="workspace-tabs">
       <button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button>
       <button className={tab === "challenge" ? "active" : ""} onClick={() => setTab("challenge")}>2 · Challenge</button>
       <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>3 · WF Matrix</button>
       <button className={tab === "task" ? "active" : ""} onClick={() => setTab("task")}>4 · Task Graph</button>
-      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>5 · EA Export</button>
-      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>6 · MT5 Compare</button>
-      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>7 · Indicators</button>
+      <button className={tab === "multisymbol" ? "active" : ""} onClick={() => setTab("multisymbol")}>5 · Multi-Symbol</button>
+      <button className={tab === "results" ? "active" : ""} onClick={() => setTab("results")}>6 · Results Pack</button>
+      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>7 · EA Export</button>
+      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>8 · MT5 Compare</button>
+      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>9 · Indicators</button>
     </div>
     {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} />
       : tab === "challenge" ? <ChallengeRetestPanel onError={onError} />
       : tab === "matrix" ? <WalkForwardMatrixPanel onError={onError} />
       : tab === "task" ? <TaskGraphPanel onError={onError} />
+      : tab === "multisymbol" ? <MultiSymbolMatrixPanel onError={onError} />
+      : tab === "results" ? <ResultsPackPanel onError={onError} />
       : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} />
       : tab === "compare" ? <ParityComparePanel onError={onError} />
       : <IndicatorParityPanel onError={onError} />}

@@ -713,6 +713,64 @@ export interface TaskRunView {
   skippedCount: number;
 }
 
+export interface MultiSymbolMatrixRequest {
+  strategyPath: string;
+  packDir: string;
+  symbols: string[];
+  sourceTimezone: string | null;
+  initialBalance: number;
+  commissionPerLotRoundTurn: number;
+  requiredPass: number;
+  minimumNetProfit: number;
+  outputPath: string;
+}
+
+export interface MultiSymbolMatrixRowView {
+  symbol: string;
+  passed: boolean;
+  tradeCount: number;
+  returnPercent: number;
+  profitFactor: number | null;
+  maxDrawdownPercent: number;
+  netProfit: number;
+  winRate: number;
+  expectancy: number;
+}
+
+export interface PairwiseCorrelationView {
+  left: string;
+  right: string;
+  correlation: number;
+}
+
+export interface MultiSymbolMatrixView {
+  passed: boolean;
+  strategyId: string;
+  outputPath: string;
+  passingCount: number;
+  requiredPass: number;
+  symbolCount: number;
+  meanReturnPercent: number;
+  meanNetProfit: number;
+  maximumPairwiseCorrelation: number;
+  rows: MultiSymbolMatrixRowView[];
+  pairwise: PairwiseCorrelationView[];
+}
+
+export interface ExportResultsPackRequest {
+  inputPath: string;
+  title: string;
+  outputDirectory: string;
+}
+
+export interface ExportResultsPackView {
+  directory: string;
+  htmlPath: string;
+  tradesCsvPath: string;
+  metricsJsonPath: string;
+  pdfPath: string;
+}
+
 export interface ChallengeItemView {
   strategyPath: string;
   strategyId: string;

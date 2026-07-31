@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": "MetaTrader 5",
+  "strategy_fingerprint": "e5fcaad9241ee39904e994571d1047565f341e3650d19c67d909c6a799e48d43",
+  "broker_spec_hash": "c2bb5c2b36795024d2444ad40f71fb2495ebb9b57172ee756bd1c8f89b13978b",
+  "source_hash": "12ab0786b5e867db2976be39ebe5bb37fe0442068e40e7635a9b9e7b73f92777",
+  "strategy_ir_version": 1,
+  "expert_name": "QFMarketGolden",
+  "symbol": "USDJPY",
+  "timeframe": "H1",
+  "live_trading_default": false,
+  "mandatory_stop_loss": true,
+  "mandatory_take_profit": true,
+  "parity_deals_file": "QuantForge\\QF_e5fcaad9241e_deals.csv",
+  "parity_equity_file": "QuantForge\\QF_e5fcaad9241e_equity.csv",
+  "parity_metadata_file": "QuantForge\\QF_e5fcaad9241e_metadata.csv",
+  "export_style": "sqx",
+  "config": {
+    "expert_name": "QFMarketGolden",
+    "expert_directory": "QuantForge",
+    "timeframe": "H1",
+    "magic": 42424242,
+    "deviation_points": 10,
+    "max_spread_points": null,
+    "estimated_slippage_points_per_side": 0.0,
+    "commission_per_lot_round_turn": 7.0,
+    "allow_live_trading_default": false,
+    "export_style": "sqx",
+    "entry_window_start_hour": 2,
+    "entry_window_end_hour": 19,
+    "tester": {
+      "from_date": "2024.01.01",
+      "to_date": "2024.02.01",
+      "deposit": 100000.0,
+      "currency": "USD",
+      "leverage": 100,
+      "model": 4
+    }
+  }
+}
