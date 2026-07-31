@@ -43,4 +43,7 @@ Do **not** block the product branch. Unit tests already cover:
 - Scout two-stage trigger→limit fill
 - MQL5 export kind `3`
 
+Stub golden layout + one-command recipe: `docs/STOP_LIMIT_EVERYTICK_GOLDEN.md` /
+`python scripts/stop_limit_everytick_golden.py --prepare`.
+
 Re-run the family harness when a stable MT5 terminal + data pack is available. Remaining measured gaps are listed in `docs/PARITY_GAPS_PHASE1.md`.

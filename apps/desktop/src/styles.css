@@ -152,6 +152,26 @@ main { min-width: 0; }
 .main-grid { display: grid; grid-template-columns: minmax(650px, 1fr) 320px; gap: 12px; align-items: start; }
 .primary-column { min-width: 0; display: grid; gap: 12px; }
 .panel { border: 1px solid var(--line); background: var(--surface); }
+.panel.dense { font-size: 11px; }
+.databank-toolbar, .table-controls {
+  background: #303030;
+  border-bottom: 1px solid var(--line);
+}
+.reject-funnel, .discover-contract {
+  background: #303030;
+  border: 1px solid #696969;
+}
+.funnel-group-label {
+  color: #cccccc;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin: 10px 0 4px;
+}
+.quant-tabs-like .mode-toggle button.active {
+  background: #36648b;
+  color: #fff;
+}
 .panel-heading { padding: 13px 15px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 15px; }
 .panel-heading h2 { margin: 4px 0 0; font-size: 14px; font-weight: 600; }
 .heat-legend { display: flex; align-items: center; gap: 4px; color: var(--dim); font-size: 8px; }
