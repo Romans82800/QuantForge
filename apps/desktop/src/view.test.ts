@@ -67,17 +67,37 @@ describe("databank view rules", () => {
 
   it("states the resulting entry-order split, including single-kind runs", () => {
     expect(
-      entryOrderSummary({ allowMarketEntries: false, allowStopEntries: true, allowLimitEntries: false }),
+      entryOrderSummary({
+        allowMarketEntries: false,
+        allowStopEntries: true,
+        allowLimitEntries: false,
+        allowStopLimitEntries: false,
+      }),
     ).toBe("Every candidate uses a stop entry.");
     expect(
-      entryOrderSummary({ allowMarketEntries: true, allowStopEntries: true, allowLimitEntries: true }),
+      entryOrderSummary({
+        allowMarketEntries: true,
+        allowStopEntries: true,
+        allowLimitEntries: true,
+        allowStopLimitEntries: false,
+      }),
     ).toBe("Each candidate draws one of market, stop, limit — roughly 33% each.");
     // Market defaults to on, so an untouched form is never empty.
     expect(
-      entryOrderError({ allowMarketEntries: null, allowStopEntries: null, allowLimitEntries: null }),
+      entryOrderError({
+        allowMarketEntries: null,
+        allowStopEntries: null,
+        allowLimitEntries: null,
+        allowStopLimitEntries: null,
+      }),
     ).toBeNull();
     expect(
-      entryOrderError({ allowMarketEntries: false, allowStopEntries: false, allowLimitEntries: false }),
+      entryOrderError({
+        allowMarketEntries: false,
+        allowStopEntries: false,
+        allowLimitEntries: false,
+        allowStopLimitEntries: false,
+      }),
     ).toMatch(/at least one entry order type/);
   });
 
