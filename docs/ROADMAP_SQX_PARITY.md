@@ -8,41 +8,39 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 
 ---
 
-## Phase 1 — MT5 order-type + execution parity (in progress)
+## Phase 1 — MT5 order-type + execution parity (**landed**)
 
-**Scope**
+**Shipped**
 
-- End-to-end **BuyStopLimit / SellStopLimit** (IR → Scout → M1 Judge → MQL5 export → unit/parity harness).
-- Expand order-type probe coverage: market + limit + stop + stop-limit.
-- Honest gap list toward 95% trade alignment vs Strategy Tester (EveryTick / M1).
+- End-to-end **BuyStopLimit / SellStopLimit** (IR → Scout → M1 Judge → MQL5 export → unit tests + fixtures).
+- Order-type coverage expanded: market + limit + stop + stop-limit (`family_mt5_parity.py --mode stop_limit`).
+- Measurement notes: `docs/STOP_LIMIT_PARITY_HARNESS.md`, gaps: `docs/PARITY_GAPS_PHASE1.md`.
 
-**Success metrics**
+**Still open for measured ≥95%**
 
-- Fixed probe suite: ≥95% trades aligned (count + side + entry/exit within protocol `mt5-parity-v2` tolerances) on market, stop, limit, and stop-limit fixtures.
-- Scout and Judge both honor two-stage stop-limit (trigger → limit fill) with expiry/cancel parity to existing pending rules.
-- Exported EA uses `CTrade::BuyStopLimit` / `SellStopLimit` with stop + limit prices.
-
-**Non-goals (Phase 1)**
-
-- Genetic islands / SQX Builder throughput (Phase 2).
-- Enabling pending/BE/trail in default Discover genes (Phase 3).
-- Tick-level EveryTick engine rewrite (tighten same-bar/minute approximations only as needed for probes).
+- Archive live Strategy Tester EveryTick goldens and run `quantforge parity` on the stop-limit suite.
 
 ---
 
-## Phase 2 — SQX-like mass Builder
+## Phase 2 — SQX-like mass Builder (**landed core**)
 
-**Scope**
+**Shipped**
 
-- Cheap reject stage (fast Scout / filters) before expensive M1 Judge.
-- Mass generation + **genetic islands** (replacing / extending MAP-Elites as the scale path).
-- Databank UX throughput for storing, ranking, and promoting candidates.
+- **Cheap prefilter**: trailing-window Scout + `prefilter_gates` before full IS (`enable_cheap_prefilter`).
+- **Genetic islands**: `island_count` + ring `migration_interval` / `migration_elites` on the breeding pot (`crates/quantforge-discover/src/islands.rs`).
+- **`DiscoverRunMode::MassBuilder`**: large batch, continuous pot (no early pot stop), prefilter + islands + M1 robustness for databank.
+- CLI: `--run-mode mass_builder` (aliases `builder`, `mass`).
+- How to run a long harvest: `docs/MASS_BUILDER_HARVEST.md`.
 
-**Success metrics**
+**Success metrics (partial)**
 
-- Sustained candidates/hour at SQX-comparable funnel ratios (cheap reject ≫ Judge).
-- Island isolation + periodic migration documented and measurable.
-- Databank write path keeps up with generation without blocking search.
+- Funnel telemetry: `rejected_prefilter`, `island_migrations`.
+- Continuous harvest knobs ready for EURNZD-style multi-day runs via `--continue`.
+
+**Still open**
+
+- Databank UX throughput polish (desktop ranking/streaming).
+- Production soak metrics (candidates/hour) on real packs.
 
 ---
 

@@ -13,6 +13,7 @@ pub(crate) struct CandidateEvaluation {
     pub strategy: StrategyIr,
     pub result: ScoutResult,
     pub generation: u64,
+    pub island_id: u16,
     pub is_expectancy: f64,
     pub oos1_expectancy: Option<f64>,
     pub oos1_expectancy_ratio: Option<f64>,
@@ -116,6 +117,7 @@ fn deposit_into_breeding_pool(
             robustness: candidate.robustness,
             equity_signature: signature,
             discovered_generation: candidate.generation,
+            island_id: candidate.island_id,
         };
         refresh_fingerprint_coverage_map(entries, coverage_map);
         return Ok(DepositDecision::ReplacedInPot);
@@ -145,6 +147,7 @@ fn deposit_into_breeding_pool(
         robustness: candidate.robustness,
         equity_signature: signature,
         discovered_generation: candidate.generation,
+        island_id: candidate.island_id,
     });
     refresh_fingerprint_coverage_map(entries, coverage_map);
     Ok(DepositDecision::AcceptedToPot)
@@ -209,6 +212,7 @@ fn deposit_into_map_elites(
         robustness: candidate.robustness,
         equity_signature: signature,
         discovered_generation: candidate.generation,
+    island_id: candidate.island_id,
     };
 
     if let Some(index) = entries.iter().position(|value| value.niche == niche) {
@@ -598,6 +602,7 @@ mod tests {
                 strategy: trend.clone(),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -618,6 +623,7 @@ mod tests {
                 strategy: trend,
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -638,6 +644,7 @@ mod tests {
                 strategy: generate_seed(42, 1),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -662,6 +669,7 @@ mod tests {
                 strategy: generate_seed(7, 0),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -688,6 +696,7 @@ mod tests {
                 strategy: generate_seed(7, 3),
                 result: second_result,
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -703,5 +712,48 @@ mod tests {
         assert_eq!(second, DepositDecision::AcceptedToPot);
         assert_eq!(bank.accepted_pool.len(), 2);
         assert_eq!(bank.accepted_coverage_map.len(), 2);
+    }
+
+    #[test]
+    fn island_migration_moves_top_elites_around_the_ring() {
+        let mut bank = bank(1.0);
+        bank.config.island_count = 4;
+        bank.config.migration_elites = 1;
+        for island in 0..4_u16 {
+            let decision = deposit_to_accepted_pool(
+                &mut bank,
+                CandidateEvaluation {
+                    strategy: generate_seed(11, u64::from(island)),
+                    result: profitable_result(),
+                    generation: 0,
+                    island_id: island,
+                    is_expectancy: f64::from(island) + 1.0,
+                    oos1_expectancy: None,
+                    oos1_expectancy_ratio: None,
+                    observed_trade_sharpe: None,
+                    expected_max_lucky_sharpe: None,
+                    deflated_trade_sharpe: None,
+                    multi_symbol_results: Vec::new(),
+                    gate_results: Vec::new(),
+                    robustness: None,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                decision,
+                DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot
+            ));
+            if let Some(elite) = bank.accepted_pool.last_mut() {
+                elite.island_id = island;
+                elite.evidence.total = f64::from(island) + 1.0;
+            }
+        }
+        assert_eq!(bank.accepted_pool.len(), 4);
+        let before: Vec<u16> = bank.accepted_pool.iter().map(|elite| elite.island_id).collect();
+        let moved = crate::islands::migrate_islands(&mut bank);
+        assert_eq!(moved, 4);
+        let after: Vec<u16> = bank.accepted_pool.iter().map(|elite| elite.island_id).collect();
+        assert_ne!(before, after);
+        assert_eq!(bank.telemetry.island_migrations, 4);
     }
 }

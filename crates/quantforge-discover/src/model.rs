@@ -50,6 +50,17 @@ impl GateConfig {
             minimum_recovery_factor: 0.0,
         }
     }
+
+    /// Ultra-loose gates for the cheap trailing-window prefilter (reject no-trades / trash PF).
+    pub fn prefilter_defaults() -> Self {
+        Self {
+            minimum_trades: 1,
+            maximum_drawdown_percent: 80.0,
+            minimum_return_percent: -100.0,
+            minimum_profit_factor: 0.5,
+            minimum_recovery_factor: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,7 +527,8 @@ pub struct SearchFamilySpec {
 }
 
 /// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates;
-/// Quota Harvest = ~20 databank elites per family without chasing pot 300.
+/// Quota Harvest = ~20 databank elites per family without chasing pot 300;
+/// Mass Builder = SQX-scale funnel (cheap prefilter + genetic islands + continuous harvest).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverRunMode {
@@ -525,6 +537,8 @@ pub enum DiscoverRunMode {
     FullHarvest,
     /// Seed-heavy, softer param neighborhood, stop when databank hits quota.
     QuotaHarvest,
+    /// Long continuous harvest: prefilter → islanded breeding → databank promotion.
+    MassBuilder,
 }
 
 /// Named gate outcome persisted on elites for evidence-first promotion.
@@ -658,6 +672,24 @@ pub struct DiscoverConfig {
     /// symbols before M1 work. `0` disables the multi-symbol screen.
     #[serde(default = "default_multi_symbol_minimum_pass")]
     pub multi_symbol_minimum_pass: usize,
+    /// When true, run a cheap trailing-window Scout before the full IS replay.
+    #[serde(default)]
+    pub enable_cheap_prefilter: bool,
+    /// Fraction of IS bars used by the cheap prefilter (trailing window).
+    #[serde(default = "default_prefilter_bar_fraction")]
+    pub prefilter_bar_fraction: f64,
+    /// Loose gates applied only on the cheap prefilter window.
+    #[serde(default = "GateConfig::prefilter_defaults")]
+    pub prefilter_gates: GateConfig,
+    /// Number of isolated breeding islands (`1` = classic single-population breed).
+    #[serde(default = "default_island_count")]
+    pub island_count: usize,
+    /// Migrate elites between islands every N completed generations (`0` = never).
+    #[serde(default = "default_migration_interval")]
+    pub migration_interval: u64,
+    /// How many top elites each island sends to the next island on migration.
+    #[serde(default = "default_migration_elites")]
+    pub migration_elites: usize,
     pub scout: ScoutConfig,
 }
 
@@ -741,6 +773,22 @@ fn default_multi_symbol_minimum_pass() -> usize {
     0
 }
 
+fn default_prefilter_bar_fraction() -> f64 {
+    0.25
+}
+
+fn default_island_count() -> usize {
+    1
+}
+
+fn default_migration_interval() -> u64 {
+    0
+}
+
+fn default_migration_elites() -> usize {
+    2
+}
+
 impl Default for DiscoverConfig {
     fn default() -> Self {
         Self {
@@ -786,13 +834,19 @@ impl Default for DiscoverConfig {
             calendar_year_folds: default_calendar_year_folds(),
             minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
             multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
+            enable_cheap_prefilter: false,
+            prefilter_bar_fraction: default_prefilter_bar_fraction(),
+            prefilter_gates: GateConfig::prefilter_defaults(),
+            island_count: default_island_count(),
+            migration_interval: default_migration_interval(),
+            migration_elites: default_migration_elites(),
             scout: ScoutConfig::default(),
         }
     }
 }
 
 impl DiscoverConfig {
-    /// Apply Fast Scout, Full Harvest, or Quota Harvest presets.
+    /// Apply Fast Scout, Full Harvest, Quota Harvest, or Mass Builder presets.
     pub fn apply_run_mode(&mut self) {
         match self.run_mode {
             DiscoverRunMode::FastScout => {
@@ -840,7 +894,41 @@ impl DiscoverConfig {
                 self.minimum_neighborhood_survival_fraction =
                     self.minimum_neighborhood_survival_fraction.min(0.5);
             }
+            DiscoverRunMode::MassBuilder => {
+                // SQX-scale Builder: cheap reject ≫ full Scout ≫ M1 promotion.
+                if !self.has_complex_execution() {
+                    self.simple_exits = true;
+                } else {
+                    self.simple_exits = false;
+                }
+                self.enable_cheap_prefilter = true;
+                self.prefilter_bar_fraction = self.prefilter_bar_fraction.clamp(0.1, 0.5);
+                self.island_count = self.island_count.max(4);
+                if self.migration_interval == 0 {
+                    self.migration_interval = 10;
+                }
+                self.migration_elites = self.migration_elites.max(1);
+                self.require_m1_precision = false;
+                self.require_m1_robustness = true;
+                self.initial_candidates = self.initial_candidates.max(2_000);
+                self.batch_size = self.batch_size.max(500);
+                self.random_fill_fraction = self.random_fill_fraction.max(0.7);
+                self.mutate_after_elites = self.mutate_after_elites.min(40);
+                self.early_stop_pot_elites = None;
+                // Continuous harvest: do not force a small databank quota.
+                self.trial_budget_warning = self.trial_budget_warning.max(50_000);
+                self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.min(100);
+                self.robustness_neighborhood_samples = self.robustness_neighborhood_samples.min(6);
+            }
         }
+    }
+
+    pub fn effective_island_count(&self) -> usize {
+        self.island_count.max(1)
+    }
+
+    pub const fn cheap_prefilter_enabled(&self) -> bool {
+        self.enable_cheap_prefilter
     }
 
     pub const fn has_complex_execution(&self) -> bool {
@@ -880,6 +968,16 @@ impl DiscoverConfig {
         {
             return Err(DiscoverError::InvalidConfig(
                 "enable at least one entry order kind: market, stop, limit or stop_limit".into(),
+            ));
+        }
+        if self.island_count == 0 {
+            return Err(DiscoverError::InvalidConfig(
+                "island_count must be at least 1".into(),
+            ));
+        }
+        if !(0.05..=1.0).contains(&self.prefilter_bar_fraction) {
+            return Err(DiscoverError::InvalidConfig(
+                "prefilter_bar_fraction must be within 0.05..=1.0".into(),
             ));
         }
         if self.has_complex_execution() && !self.require_m1_precision {
@@ -1218,6 +1316,9 @@ pub struct Elite {
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
+    /// Breeding island this elite belongs to (`0` when islands are disabled).
+    #[serde(default)]
+    pub island_id: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1252,6 +1353,8 @@ pub enum DepositDecision {
     RejectedMultiSymbol,
     RejectedDeflatedSharpe,
     RejectedEvaluation,
+    /// Cheap trailing-window Scout rejected the candidate before full IS replay.
+    RejectedPrefilter,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1293,6 +1396,10 @@ pub struct DiscoverTelemetry {
     #[serde(default)]
     pub rejected_deflated_sharpe: u64,
     pub rejected_evaluation: u64,
+    #[serde(default)]
+    pub rejected_prefilter: u64,
+    #[serde(default)]
+    pub island_migrations: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
 }
 
@@ -1330,6 +1437,7 @@ impl DiscoverTelemetry {
             DepositDecision::RejectedMultiSymbol => self.rejected_multi_symbol += 1,
             DepositDecision::RejectedDeflatedSharpe => self.rejected_deflated_sharpe += 1,
             DepositDecision::RejectedEvaluation => self.rejected_evaluation += 1,
+            DepositDecision::RejectedPrefilter => self.rejected_prefilter += 1,
         }
     }
 }

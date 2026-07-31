@@ -1605,6 +1605,12 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
+        enable_cheap_prefilter: false,
+        prefilter_bar_fraction: 0.25,
+        prefilter_gates: GateConfig::prefilter_defaults(),
+        island_count: 1,
+        migration_interval: 0,
+        migration_elites: 2,
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,

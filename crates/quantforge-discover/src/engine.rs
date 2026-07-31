@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 enum CandidateOutcome {
+    PrefilterRejected,
     CoarseRejected,
     AmbiguousRejected,
     DepositGateRejected,
@@ -41,6 +42,7 @@ enum CandidateOutcome {
     },
     Accepted {
         result: Box<ScoutResult>,
+        island_id: u16,
         is_expectancy: f64,
         observed_trade_sharpe: Option<f64>,
         expected_max_lucky_sharpe: f64,
@@ -132,10 +134,33 @@ fn evaluate_and_deposit(
         indicator_engine: scout.indicator_engine,
     };
     let evaluate_batch = || {
+        let island_count = discover_config.effective_island_count();
+        let prefilter_dataset = if discover_config.cheap_prefilter_enabled() {
+            trailing_window_dataset(dataset, discover_config.prefilter_bar_fraction)
+        } else {
+            None
+        };
+        let prefilter_cache = prefilter_dataset
+            .as_ref()
+            .map(|window| IndicatorBufferCache::new(window.bars.len()));
+        let prefilter_gates = discover_config.prefilter_gates.clone();
         candidates
             .into_par_iter()
-            .map(|strategy| {
+            .enumerate()
+            .map(|(index, strategy)| {
+                let island_id = (index % island_count) as u16;
                 let result = (|| {
+                    if let (Some(window), Some(pre_cache)) =
+                        (prefilter_dataset.as_ref(), prefilter_cache.as_ref())
+                    {
+                        let preview = evaluate_strategy_cached(
+                            &strategy, window, broker, &scout, pre_cache,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if !crate::archive::passes_gate_config(&preview, &prefilter_gates) {
+                            return Ok::<_, String>(CandidateOutcome::PrefilterRejected);
+                        }
+                    }
                     let coarse =
                         evaluate_strategy_cached(&strategy, dataset, broker, &scout, indicator_cache)
                             .map_err(|error| error.to_string())?;
@@ -192,6 +217,7 @@ fn evaluate_and_deposit(
                     let is_expectancy = coarse.metrics.expectancy;
                     Ok(CandidateOutcome::Accepted {
                         result: Box::new(coarse),
+                        island_id,
                         is_expectancy,
                         observed_trade_sharpe: observed,
                         expected_max_lucky_sharpe: expected,
@@ -216,6 +242,7 @@ fn evaluate_and_deposit(
         match result {
             Ok(CandidateOutcome::Accepted {
                 result,
+                island_id,
                 is_expectancy,
                 observed_trade_sharpe,
                 expected_max_lucky_sharpe,
@@ -226,6 +253,7 @@ fn evaluate_and_deposit(
                     strategy: strategy.clone(),
                     result: *result,
                     generation,
+                    island_id,
                     is_expectancy,
                     oos1_expectancy: None,
                     oos1_expectancy_ratio: None,
@@ -254,6 +282,9 @@ fn evaluate_and_deposit(
                 ) {
                     pot_promotions.push(pot_evaluation);
                 }
+            }
+            Ok(CandidateOutcome::PrefilterRejected) => {
+                bank.telemetry.record(DepositDecision::RejectedPrefilter);
             }
             Ok(CandidateOutcome::CoarseRejected) => {
                 bank.telemetry.record(DepositDecision::RejectedGate);
@@ -530,6 +561,28 @@ pub(crate) fn ambiguous_trade_fraction(result: &ScoutResult) -> f64 {
     ambiguous as f64 / total as f64
 }
 
+/// Trailing fraction of IS bars for the cheap Mass Builder prefilter.
+fn trailing_window_dataset(full: &BarDataset, fraction: f64) -> Option<BarDataset> {
+    let fraction = fraction.clamp(0.05, 1.0);
+    if (fraction - 1.0).abs() < 1e-9 || full.bars.len() < 64 {
+        return None;
+    }
+    let take = ((full.bars.len() as f64) * fraction)
+        .ceil()
+        .max(64.0) as usize;
+    let take = take.min(full.bars.len());
+    let start = full.bars.len().saturating_sub(take);
+    Some(BarDataset {
+        bars: full.bars[start..].to_vec(),
+        source_rows: take,
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: full.delimiter,
+        source_timezone: full.source_timezone.clone(),
+        data_hash: full.data_hash.clone(),
+    })
+}
+
 pub fn evolve_new(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
@@ -780,6 +833,12 @@ fn run_generations(
             indicator_cache,
         )?;
         bank.completed_generations = generation;
+        if bank.config.migration_interval > 0
+            && generation % bank.config.migration_interval == 0
+            && bank.config.effective_island_count() > 1
+        {
+            crate::islands::migrate_islands(bank);
+        }
     }
     Ok(())
 }
@@ -793,8 +852,10 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
         .maximum_entry_conditions
         .max(1);
     let market_only = bank.config.market_entries_only();
+    let island_count = bank.config.effective_island_count();
     (0..bank.config.batch_size)
         .map(|index| {
+            let island_id = (index % island_count) as u16;
             let sequence = generation
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
@@ -803,7 +864,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 let mut seeded = build_seed(
                     SearchFamily::Universal,
                     rng,
-                    format!("g{generation}-{index}"),
+                    format!("i{island_id}-g{generation}-{index}"),
                     max_atoms,
                     true,
                     market_only,
@@ -819,9 +880,17 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 return fresh_seed(&mut rng);
             }
 
-            let first_index = tournament(bank, &mut rng, None);
+            let first_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
+                .or_else(|| {
+                    // Fall back to global tournament when this island is empty.
+                    (!bank.accepted_pool.is_empty()).then(|| tournament(bank, &mut rng, None))
+                });
+            let Some(first_index) = first_index else {
+                return fresh_seed(&mut rng);
+            };
             let first = &bank.accepted_pool[first_index];
-            let second_index = tournament(bank, &mut rng, None);
+            let second_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
+                .unwrap_or_else(|| tournament(bank, &mut rng, None));
             let crossed = crossover(
                 &first.strategy,
                 &bank.accepted_pool[second_index].strategy,
@@ -836,7 +905,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 SearchFamily::Universal,
                 &bank.config.universal_grammar,
             );
-            child.id = format!("g{generation}-{index}");
+            child.id = format!("i{island_id}-g{generation}-{index}");
             apply_search_ranges(&mut child, &mut rng, &bank.config.search_ranges);
             let child = apply_production_policy(child, &bank.config);
             crate::grammar::fit_within_ir_limits(
@@ -1331,6 +1400,12 @@ mod tests {
             calendar_year_folds: false,
             minimum_deflated_trade_sharpe: None,
             multi_symbol_minimum_pass: 0,
+            enable_cheap_prefilter: false,
+            prefilter_bar_fraction: 0.25,
+            prefilter_gates: GateConfig::prefilter_defaults(),
+            island_count: 1,
+            migration_interval: 0,
+            migration_elites: 2,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -1624,5 +1699,30 @@ mod tests {
         }
         config.robustness_perturbation_fraction = 0.35;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn mass_builder_enables_prefilter_and_islands() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::MassBuilder;
+        config.island_count = 1;
+        config.migration_interval = 0;
+        config.apply_run_mode();
+        assert!(config.enable_cheap_prefilter);
+        assert!(config.island_count >= 4);
+        assert_eq!(config.migration_interval, 10);
+        assert!(config.batch_size >= 500);
+        assert!(config.early_stop_pot_elites.is_none());
+        assert!(config.trial_budget_warning >= 50_000);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn trailing_prefilter_window_uses_a_suffix_of_bars() {
+        let full = dataset();
+        let window = trailing_window_dataset(&full, 0.25).expect("window");
+        assert!(window.bars.len() < full.bars.len());
+        assert_eq!(window.bars.last(), full.bars.last());
+        assert!(trailing_window_dataset(&full, 1.0).is_none());
     }
 }

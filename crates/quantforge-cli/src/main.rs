@@ -348,7 +348,7 @@ struct EvolveArgs {
     /// Maximum exit conditions (1..=3). Default 3.
     #[arg(long)]
     maximum_exit_conditions: Option<usize>,
-    /// fast_scout | full_harvest
+    /// fast_scout | full_harvest | quota_harvest | mass_builder
     #[arg(long, default_value = "full_harvest")]
     run_mode: String,
     #[arg(long)]
@@ -1381,6 +1381,7 @@ fn parse_cli_run_mode(value: &str) -> Result<DiscoverRunMode, Box<dyn Error>> {
         "fast_scout" | "scout" => Ok(DiscoverRunMode::FastScout),
         "full_harvest" | "harvest" => Ok(DiscoverRunMode::FullHarvest),
         "quota_harvest" | "quota" => Ok(DiscoverRunMode::QuotaHarvest),
+        "mass_builder" | "builder" | "mass" => Ok(DiscoverRunMode::MassBuilder),
         other => Err(format!("unknown run mode: {other}").into()),
     }
 }
@@ -4620,6 +4621,12 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        enable_cheap_prefilter: false,
+        prefilter_bar_fraction: 0.25,
+        prefilter_gates: GateConfig::prefilter_defaults(),
+        island_count: 1,
+        migration_interval: 0,
+        migration_elites: 2,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
