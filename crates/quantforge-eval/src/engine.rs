@@ -206,6 +206,7 @@ fn evaluate_strategy_inner(
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
     let mut entries_today: u16 = 0;
+    let mut loss_streak: u8 = 0;
     let stack_mode = matches!(
         config.position_accounting,
         crate::PositionAccounting::HedgedStack
@@ -272,6 +273,7 @@ fn evaluate_strategy_inner(
                     config,
                     &mut balance,
                     &mut trades,
+                &mut loss_streak,
                 );
                 telemetry.end_of_day_flattens += 1;
                 if friday_flatten {
@@ -335,6 +337,7 @@ fn evaluate_strategy_inner(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                     if !stack_mode {
                         closed_this_bar = true;
@@ -394,6 +397,7 @@ fn evaluate_strategy_inner(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                     if !stack_mode {
                         closed_this_bar = true;
@@ -545,6 +549,7 @@ fn evaluate_strategy_inner(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                     telemetry.netting_closes += 1;
                 }
@@ -627,6 +632,7 @@ fn evaluate_strategy_inner(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                loss_streak,
                                 )? {
                                     balance -= open.entry_commission;
                                     positions.push(open);
@@ -650,6 +656,7 @@ fn evaluate_strategy_inner(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                loss_streak,
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
@@ -716,6 +723,7 @@ fn evaluate_strategy_inner(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                 }
             }
@@ -760,6 +768,7 @@ fn evaluate_strategy_inner(
             config,
             &mut balance,
             &mut trades,
+        &mut loss_streak,
         );
         if let Some(last) = equity.last_mut() {
             last.balance = balance;
@@ -788,6 +797,7 @@ fn open_position(
     config: &ScoutConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut ScoutTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<OpenPosition>, EvalError> {
     let Some(stop_distance) = stop_distance(strategy, index, broker, features)? else {
         return Ok(None);
@@ -810,16 +820,14 @@ fn open_position(
     } else {
         0.0
     };
-    let Some(mut volume) = (match strategy.risk {
-        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
-        RiskPolicy::FixedCurrency { amount } => {
-            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
-        }
-        RiskPolicy::PercentBalance { percent } => normalize_volume(
-            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
-            broker,
-        ),
-    }) else {
+    let Some(mut volume) = resolve_entry_volume(
+        strategy,
+        balance,
+        price_risk_per_lot,
+        cost_risk_per_lot,
+        loss_streak,
+        broker,
+    ) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -920,6 +928,7 @@ fn place_pending_order(
     config: &ScoutConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut ScoutTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<PendingOrder>, EvalError> {
     let (kind, stop_distance_policy, limit_offset_policy, expiry_bars) =
         match &strategy.entry.order {
@@ -1022,16 +1031,14 @@ fn place_pending_order(
     } else {
         0.0
     };
-    let Some(volume) = (match strategy.risk {
-        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
-        RiskPolicy::FixedCurrency { amount } => {
-            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
-        }
-        RiskPolicy::PercentBalance { percent } => normalize_volume(
-            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
-            broker,
-        ),
-    }) else {
+    let Some(volume) = resolve_entry_volume(
+        strategy,
+        balance,
+        price_risk_per_lot,
+        cost_risk_per_lot,
+        loss_streak,
+        broker,
+    ) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -1075,6 +1082,7 @@ fn modify_pending_order(
         config,
         features,
         telemetry,
+        0,
     )?
     else {
         return Ok(false);
@@ -1300,6 +1308,42 @@ fn target_distance(
     })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
+}
+
+fn resolve_entry_volume(
+    strategy: &StrategyIr,
+    balance: f64,
+    price_risk_per_lot: f64,
+    cost_risk_per_lot: f64,
+    loss_streak: u8,
+    broker: &SymbolSpecification,
+) -> Option<f64> {
+    let raw = match strategy.risk {
+        RiskPolicy::FixedLots { lots } => lots,
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => crate::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+        RiskPolicy::FixedCurrency { amount } => {
+            amount / (price_risk_per_lot + cost_risk_per_lot)
+        }
+        RiskPolicy::PercentBalance { percent } => {
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot)
+        }
+    };
+    normalize_volume(raw, broker)
+}
+
+fn note_closed_trade_streak(trades: &[Trade], loss_streak: &mut u8) {
+    let Some(last) = trades.last() else {
+        return;
+    };
+    if last.net_profit < 0.0 {
+        *loss_streak = loss_streak.saturating_add(1);
+    } else if last.net_profit > 0.0 {
+        *loss_streak = 0;
+    }
 }
 
 fn clamp_distance_points(
@@ -1659,6 +1703,7 @@ fn close_position(
     config: &ScoutConfig,
     balance: &mut f64,
     trades: &mut Vec<Trade>,
+    loss_streak: &mut u8,
 ) {
     let remaining = position.volume;
     realize_exit_volume(
@@ -1694,6 +1739,7 @@ fn close_position(
         bars_held: exit_index - position.entry_index,
         exit_reason: event.reason,
     });
+    note_closed_trade_streak(trades, loss_streak);
 }
 
 fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f64 {
@@ -2824,6 +2870,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.trades[0].volume, 3.0);
+    }
+
+    #[test]
+    fn martingale_scales_volume_after_losses() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::Martingale {
+            base_lots: 1.0,
+            multiplier: 2.0,
+            max_steps: 3,
+        };
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        // Decision → SL fill, decision → SL fill, decision → SL fill.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 101.0, 97.0, 98.0),
+            bar(120_000, 100.0, 101.0, 99.0, 100.0),
+            bar(180_000, 100.0, 101.0, 97.0, 98.0),
+            bar(240_000, 100.0, 101.0, 99.0, 100.0),
+            bar(300_000, 100.0, 101.0, 97.0, 98.0),
+        ]);
+        let result = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(result.trades.len() >= 3, "trades={}", result.trades.len());
+        assert_eq!(result.trades[0].volume, 1.0);
+        assert_eq!(result.trades[1].volume, 2.0);
+        assert_eq!(result.trades[2].volume, 4.0);
+        assert!(result.trades.iter().all(|t| t.exit_reason == ExitReason::StopLoss));
     }
 
     #[test]

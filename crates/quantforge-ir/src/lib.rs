@@ -523,6 +523,25 @@ pub enum RiskPolicy {
     PercentBalance { percent: f64 },
     /// SQX-style fixed lot size (ignores stop-distance risk budget for sizing).
     FixedLots { lots: f64 },
+    /// SQX SimpleMartingaleMM: scale lots after consecutive losses.
+    ///
+    /// `lots = base_lots * multiplier.min(loss_streak, max_steps)`.
+    /// A winning trade resets the streak to zero.
+    Martingale {
+        base_lots: f64,
+        #[serde(default = "default_martingale_multiplier")]
+        multiplier: f64,
+        #[serde(default = "default_martingale_max_steps")]
+        max_steps: u8,
+    },
+}
+
+fn default_martingale_multiplier() -> f64 {
+    2.0
+}
+
+fn default_martingale_max_steps() -> u8 {
+    5
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1077,6 +1096,27 @@ fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
             Ok(())
         }
         RiskPolicy::FixedLots { lots } => require_positive("risk.lots", *lots),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => {
+            require_positive("risk.base_lots", *base_lots)?;
+            require_positive("risk.multiplier", *multiplier)?;
+            if *multiplier < 1.0 {
+                return Err(IrError::Invalid {
+                    path: "risk.multiplier".into(),
+                    reason: "must be at least 1.0".into(),
+                });
+            }
+            if *max_steps == 0 {
+                return Err(IrError::Invalid {
+                    path: "risk.max_steps".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1317,6 +1357,14 @@ fn canonicalize_risk(risk: &mut RiskPolicy, policy: FloatPolicy) -> Result<(), I
         RiskPolicy::FixedCurrency { amount } => *amount = q(*amount, policy)?,
         RiskPolicy::PercentBalance { percent } => *percent = q(*percent, policy)?,
         RiskPolicy::FixedLots { lots } => *lots = q(*lots, policy)?,
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            ..
+        } => {
+            *base_lots = q(*base_lots, policy)?;
+            *multiplier = q(*multiplier, policy)?;
+        }
     }
     Ok(())
 }

@@ -254,6 +254,7 @@ pub fn evaluate_strategy_m1(
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
     let mut signal_taken_today = false;
+    let mut loss_streak: u8 = 0;
 
     for (decision_index, decision_bar) in decision_bars.iter().enumerate().skip(1) {
         let start = decision_bar.timestamp_ms;
@@ -342,6 +343,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 telemetry.end_of_day_flattens += 1;
             }
@@ -398,6 +400,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 closed_this_decision = true;
             }
@@ -449,6 +452,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 closed_this_decision = true;
             }
@@ -584,6 +588,7 @@ pub fn evaluate_strategy_m1(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                    loss_streak,
                                 )? {
                                     balance -= open.entry_commission;
                                     position = Some(open);
@@ -604,6 +609,7 @@ pub fn evaluate_strategy_m1(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                    loss_streak,
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
@@ -692,6 +698,7 @@ pub fn evaluate_strategy_m1(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                 }
             }
@@ -727,6 +734,7 @@ pub fn evaluate_strategy_m1(
             config,
             &mut balance,
             &mut trades,
+                    &mut loss_streak,
         );
         if let Some(last) = equity.last_mut() {
             last.balance = balance;
@@ -772,6 +780,7 @@ fn open_position(
     config: &JudgeConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut JudgeTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<OpenPosition>, JudgeError> {
     let Some(stop_distance) = stop_distance(strategy, decision_index, broker, features)? else {
         return Ok(None);
@@ -797,6 +806,14 @@ fn open_position(
     };
     let Some(volume) = (match strategy.risk {
         RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => normalize_volume(
+            quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+            broker,
+        ),
         RiskPolicy::FixedCurrency { amount } => {
             normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
         }
@@ -873,6 +890,7 @@ fn place_pending_order(
     config: &JudgeConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut JudgeTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<PendingOrder>, JudgeError> {
     let (kind, stop_distance_policy, limit_offset_policy, expiry_bars) =
         match &strategy.entry.order {
@@ -980,6 +998,14 @@ fn place_pending_order(
     };
     let Some(volume) = (match strategy.risk {
         RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => normalize_volume(
+            quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+            broker,
+        ),
         RiskPolicy::FixedCurrency { amount } => {
             normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
         }
@@ -1534,6 +1560,7 @@ fn close_position(
     config: &JudgeConfig,
     balance: &mut f64,
     trades: &mut Vec<Trade>,
+    loss_streak: &mut u8,
 ) {
     let remaining = position.volume;
     realize_exit_volume(
@@ -1568,6 +1595,13 @@ fn close_position(
         bars_held: decision_index - position.entry_decision_index,
         exit_reason: event.reason,
     });
+    if let Some(last) = trades.last() {
+        if last.net_profit < 0.0 {
+            *loss_streak = loss_streak.saturating_add(1);
+        } else if last.net_profit > 0.0 {
+            *loss_streak = 0;
+        }
+    }
 }
 
 fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f64 {

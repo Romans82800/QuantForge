@@ -995,6 +995,14 @@ fn perturb_strategy(
         RiskPolicy::FixedCurrency { .. } => {}
         RiskPolicy::PercentBalance { percent } => perturb_positive(percent, fraction, 0.01, rng),
         RiskPolicy::FixedLots { lots } => perturb_positive(lots, fraction, 0.01, rng),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            ..
+        } => {
+            perturb_positive(base_lots, fraction, 0.01, rng);
+            perturb_positive(multiplier, fraction, 1.0, rng);
+        }
     }
     match &mut neighbor.stops.stop_loss {
         StopLossPolicy::FixedPoints { points } => perturb_positive(points, fraction, 0.01, rng),

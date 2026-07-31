@@ -26,6 +26,7 @@ int g_metadata_file=INVALID_HANDLE;
 double g_initial_volume=0.0;
 double g_initial_risk=0.0;
 double g_peak_favorable=EMPTY_VALUE;
+int g_loss_streak=0;
 bool g_partial_done[];
 
 // Strategy fingerprint: @@STRATEGY_FINGERPRINT@@
@@ -563,6 +564,34 @@ double QFFixedLots()
    return @@FIXED_LOTS@@;
 }
 
+double QFMartingaleMultiplier()
+{
+   return @@MARTINGALE_MULTIPLIER@@;
+}
+
+int QFMartingaleMaxSteps()
+{
+   return @@MARTINGALE_MAX_STEPS@@;
+}
+
+double QFMartingaleLots()
+{
+   const int steps=(int)MathMin(g_loss_streak,QFMartingaleMaxSteps());
+   return QFFixedLots()*MathPow(QFMartingaleMultiplier(),steps);
+}
+
+double QFResolveVolume(const double risk_per_lot)
+{
+   const int mode=QFVolumeMode();
+   if(mode==1)
+      return QFFixedLots();
+   if(mode==2)
+      return QFMartingaleLots();
+   if(risk_per_lot<=0.0)
+      return 0.0;
+   return QFRiskBudget()/risk_per_lot;
+}
+
 int QFEntryOrderKind()
 {
    return @@ENTRY_ORDER_KIND@@;
@@ -808,9 +837,7 @@ bool QFOpenOrder(const bool buy)
    const double risk_per_lot=loss_per_lot+InpCommissionPerLotRoundTurn+slippage_cost;
    if(risk_per_lot<=0.0)
       return false;
-   const double volume=(QFVolumeMode()==1)
-      ? QFNormalizeVolume(QFFixedLots())
-      : QFNormalizeVolume(QFRiskBudget()/risk_per_lot);
+   const double volume=QFNormalizeVolume(QFResolveVolume(risk_per_lot));
    if(volume<=0.0)
       return false;
 
@@ -1221,6 +1248,14 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    }
    if(deal_entry==DEAL_ENTRY_OUT || deal_entry==DEAL_ENTRY_OUT_BY)
    {
+      const double deal_profit=HistoryDealGetDouble(transaction.deal,DEAL_PROFIT)
+         +HistoryDealGetDouble(transaction.deal,DEAL_SWAP)
+         +HistoryDealGetDouble(transaction.deal,DEAL_COMMISSION)
+         +HistoryDealGetDouble(transaction.deal,DEAL_FEE);
+      if(deal_profit<0.0)
+         g_loss_streak++;
+      else if(deal_profit>0.0)
+         g_loss_streak=0;
       g_last_exit_bar=iTime(_Symbol,_Period,0);
       if(!QFOwnPosition())
          QFResetPositionState();

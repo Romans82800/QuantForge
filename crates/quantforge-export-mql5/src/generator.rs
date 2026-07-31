@@ -129,6 +129,8 @@ pub fn generate_bundle(
         ("@@RISK_BUDGET@@", risk_budget(&strategy)),
         ("@@VOLUME_MODE@@", volume_mode(&strategy).to_string()),
         ("@@FIXED_LOTS@@", fixed_lots(&strategy)),
+        ("@@MARTINGALE_MULTIPLIER@@", martingale_multiplier(&strategy)),
+        ("@@MARTINGALE_MAX_STEPS@@", martingale_max_steps(&strategy)),
         ("@@ENTRY_ORDER_KIND@@", entry_order_kind(&strategy).to_string()),
         ("@@ENTRY_DISTANCE@@", entry_distance(&strategy)),
         ("@@ENTRY_LIMIT_OFFSET@@", entry_limit_offset(&strategy)),
@@ -741,14 +743,14 @@ fn risk_budget(strategy: &StrategyIr) -> String {
             "AccountInfoDouble(ACCOUNT_BALANCE)*{}/100.0",
             mql_double(percent)
         ),
-        // Unused when volume mode is fixed lots; keep a positive placeholder.
-        RiskPolicy::FixedLots { .. } => "0.0".into(),
+        RiskPolicy::FixedLots { .. } | RiskPolicy::Martingale { .. } => "0.0".into(),
     }
 }
 
 fn volume_mode(strategy: &StrategyIr) -> u8 {
     match strategy.risk {
         RiskPolicy::FixedLots { .. } => 1,
+        RiskPolicy::Martingale { .. } => 2,
         _ => 0,
     }
 }
@@ -756,7 +758,22 @@ fn volume_mode(strategy: &StrategyIr) -> u8 {
 fn fixed_lots(strategy: &StrategyIr) -> String {
     match strategy.risk {
         RiskPolicy::FixedLots { lots } => mql_double(lots),
+        RiskPolicy::Martingale { base_lots, .. } => mql_double(base_lots),
         _ => "0.0".into(),
+    }
+}
+
+fn martingale_multiplier(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::Martingale { multiplier, .. } => mql_double(multiplier),
+        _ => "2.0".into(),
+    }
+}
+
+fn martingale_max_steps(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::Martingale { max_steps, .. } => max_steps.to_string(),
+        _ => "5".into(),
     }
 }
 
