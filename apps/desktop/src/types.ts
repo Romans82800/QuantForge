@@ -677,6 +677,35 @@ export interface ChallengeRequest {
   seed: number;
 }
 
+export interface TaskRunRequest {
+  graphPath: string;
+  workDir: string;
+  dryRun: boolean;
+  stopOnFailure: boolean;
+}
+
+export interface TaskStepView {
+  id: string;
+  kind: string;
+  status: string;
+  message: string;
+  artifacts: Record<string, string>;
+}
+
+export interface TaskRunView {
+  passed: boolean;
+  protocol: string;
+  graphName: string;
+  graphPath: string;
+  workDir: string;
+  dryRun: boolean;
+  reportPath: string;
+  steps: TaskStepView[];
+  passedCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
 export interface ChallengeItemView {
   strategyPath: string;
   strategyId: string;

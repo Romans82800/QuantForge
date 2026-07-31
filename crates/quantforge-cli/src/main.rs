@@ -614,6 +614,9 @@ struct Mt5TestArgs {
     wine_prefix: Option<PathBuf>,
     #[arg(long)]
     common_files: Option<PathBuf>,
+    /// Launch terminal with `/portable` (data beside the executable).
+    #[arg(long, default_value_t = false)]
+    portable: bool,
     #[arg(long, default_value_t = 1_800)]
     timeout_seconds: u64,
 }
@@ -4215,6 +4218,7 @@ fn terminal_config(args: &Mt5TestArgs) -> Result<(TerminalConfig, PathBuf), Box<
                 wine_binary: None,
                 wine_prefix: None,
                 timeout_seconds: args.timeout_seconds,
+                portable: args.portable,
             },
             common_files,
         ));
@@ -4253,6 +4257,7 @@ fn terminal_config(args: &Mt5TestArgs) -> Result<(TerminalConfig, PathBuf), Box<
             wine_binary,
             wine_prefix,
             timeout_seconds: args.timeout_seconds,
+            portable: args.portable,
         },
         common_files,
     ))

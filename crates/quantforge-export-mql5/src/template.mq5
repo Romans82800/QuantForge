@@ -814,7 +814,7 @@ bool QFApplyPreferredFilling()
       else if(preferred[i]==ORDER_FILLING_IOC)
          flag=SYMBOL_FILLING_IOC;
       else if(preferred[i]==ORDER_FILLING_RETURN)
-         flag=SYMBOL_FILLING_RETURN;
+         flag=4; // SYMBOL_FILLING_RETURN — named constant missing on some terminal builds
       if(flag!=0 && (allowed&flag)==flag)
       {
          g_trade.SetTypeFilling(preferred[i]);
@@ -908,11 +908,12 @@ bool QFOpenOrder(const bool buy)
               : g_trade.SellLimit(volume,intended_entry,_Symbol,stop,target,
                                   ORDER_TIME_SPECIFIED,expiration,comment);
       else
+         // Prefer OrderOpen over CTrade::BuyStopLimit — older Trade.mqh builds lack the helpers.
          sent=buy
-              ? g_trade.BuyStopLimit(volume,intended_entry,stop_trigger,_Symbol,stop,target,
-                                     ORDER_TIME_SPECIFIED,expiration,comment)
-              : g_trade.SellStopLimit(volume,intended_entry,stop_trigger,_Symbol,stop,target,
-                                      ORDER_TIME_SPECIFIED,expiration,comment);
+              ? g_trade.OrderOpen(_Symbol,ORDER_TYPE_BUY_STOP_LIMIT,volume,intended_entry,stop_trigger,stop,target,
+                                  ORDER_TIME_SPECIFIED,expiration,comment)
+              : g_trade.OrderOpen(_Symbol,ORDER_TYPE_SELL_STOP_LIMIT,volume,intended_entry,stop_trigger,stop,target,
+                                  ORDER_TIME_SPECIFIED,expiration,comment);
    }
    if(!sent)
       Print("QuantForge entry rejected: ",g_trade.ResultRetcodeDescription());

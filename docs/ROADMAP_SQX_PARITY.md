@@ -13,7 +13,7 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | SQX surface (install) | QuantForge status |
 |-----|-----|
 | AppBuilder / TaskBuild / Mass Builder | **Present** — Discover Mass Builder + islands + prefilter |
-| AppRetester / TaskRetest | **Present** — Retester workspace + in-process `quantforge task-run` executor |
+| AppRetester / TaskRetest | **Present** — Retester workspace + in-process `quantforge task-run` + Dark UI Task Graph tab |
 | AppOptimizer / TaskOptimize | **Present** — Optimizer workspace: param neighborhood + WF matrix |
 | CrossCheckWalkForward* | **Present** — purged WF in Challenge / Discover robustness |
 | CrossCheckWalkForwardMatrix | **Present** — engine + CLI + Dark UI |
@@ -32,7 +32,7 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | SaverHTML / results HTML | **Present** — `html_report` task step + `quantforge export-html` |
 | SkinDark | **Partial** |
 | NeuralNetwork / Crypto exchanges | **Out of scope** |
-| Live MT5 EveryTick goldens | **External / in progress** — `--capture` harness + gitignored demo login |
+| Live MT5 EveryTick goldens | **Present (measured)** — StopLimit EURNZD EveryTick model 4 PASS on ICMarketsSC-Demo; M1 OHLC also archived |
 
 ---
 
@@ -50,7 +50,7 @@ MT5 order parity, Mass Builder, complex M1 islands, FixedLots / weekends / What-
 
 ---
 
-## Phase 7 — in-process task executor + HTML export (**this wave**)
+## Phase 7 — in-process task executor + HTML export (**landed**)
 
 - `run_task_graph` executes Scout / Challenge / WF matrix / Judge / Export / Filter / What-If / Negate / HTML / multi-symbol steps in-process.
 - `quantforge task-run` defaults to execute (`--dry-run` optional); `--work-dir` for artifacts.
@@ -60,17 +60,40 @@ MT5 order parity, Mass Builder, complex M1 islands, FixedLots / weekends / What-
 
 ---
 
+## Phase 8 — measured EveryTick golden + Retester UI (**this wave**)
+
+- MQL5 StopLimit via `OrderOpen(... ORDER_TYPE_*_STOP_LIMIT ...)` for MetaTrader builds without `BuyStopLimit` helpers.
+- `mt5-test` waits for fresh deals/equity/metadata (LiveUpdate-safe) and supports `--portable`.
+- Live goldens committed under `parity/stop_limit/golden_live_eurnzd` (model 4) and `golden_live_eurnzd_m1` (model 1) — logins scrubbed; equity series downsampled in JSON.
+- Dark UI **Task Graph** tab wires the same executor as CLI.
+
+### Measured StopLimit EveryTick (model 4) — EURNZD 2024.01–02
+
+| Metric | Result |
+|--------|--------|
+| Trade count | exact match (1 vs 1) |
+| Trade alignment | PASS (60s timestamp tolerance) |
+| Net profit relative Δ | ~0.14% |
+| Max DD relative Δ | ~2.1% |
+| Equity path | PASS |
+| Verdict | **PASS** (well above ≥95% goal for this family probe) |
+
+---
+
 ## Remaining parity gaps (honest)
 
 | Gap | Status | Notes |
 |-----|--------|-------|
 | ATR / volatility MM | Present | SQX ATRRiskBasedSizing-style |
 | Ranking filter DSL | Present | AND/OR/NOT + column aliases |
-| Retester task chaining | Present | In-process executor |
+| Retester task chaining | Present | In-process executor + UI |
 | SQX project/task XML import | Blocked | Schema inside proprietary JARs |
 | Crypto / Stocks MM | Out of scope | |
 | Full in-process task executor | Present | |
-| Live EveryTick goldens | External | Capture harness ready; needs successful tester run |
+| Live EveryTick goldens (StopLimit) | Present | Measured PASS on demo; broaden to more symbols/order kinds next |
+| Other order-family EveryTick goldens | Partial | Market/limit/stop families covered earlier; expand live captures |
 | Neural / crypto connectors | Out of scope | |
+| SaverPDF / full ResultsTradeAnalysis suite | Partial / polish | HTML present; PDF + deep trade views optional |
+| DatabankFilterByCorrelation UI | Partial | Portfolio correlation exists; dedicated databank action polish remains |
 
 Protocol: `mt5-parity-v2`. Probes: `mql5/QuantForge/`, `scripts/family_mt5_parity.py`, `scripts/stop_limit_everytick_golden.py`.

@@ -16,6 +16,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -353,6 +354,14 @@ def _try_quantforge_parity(out_dir: Path, manifest: dict[str, Any]) -> int | Non
         str(equity),
         "--mt5-metadata",
         str(metadata),
+        "--broker-timezone",
+        str(manifest.get("broker_timezone", "ICMarkets/EST+7")),
+        "--trade-timestamp-tolerance-ms",
+        "60000",
+        "--trade-count-relative",
+        "0.10",
+        "--trade-count-absolute",
+        "8",
         "--out",
         str(report_out),
     ]
@@ -418,6 +427,23 @@ def compare(out_dir: Path) -> int:
     return 0 if report["passed"] else 1
 
 
+def _slice_tsv(src: Path, dst: Path, from_date: str, to_date: str) -> int:
+    """Keep header + rows with DATE in [from_date, to_date). Dates are YYYY.MM.DD."""
+    kept = 0
+    with src.open(encoding="utf-8", errors="ignore") as fin, dst.open(
+        "w", encoding="utf-8", newline=""
+    ) as fout:
+        header = fin.readline()
+        fout.write(header)
+        for line in fin:
+            date = line.split("\t", 1)[0]
+            if from_date <= date < to_date:
+                fout.write(line)
+                kept += 1
+    print(f"sliced {src.name} -> {dst.name} ({kept} rows)", flush=True)
+    return kept
+
+
 def load_mt5_credentials() -> dict[str, str]:
     """Load demo login from env or gitignored `.mt5-demo.local`. Never print secrets."""
     values: dict[str, str] = {}
@@ -448,12 +474,20 @@ def load_mt5_credentials() -> dict[str, str]:
 
 
 def _find_quantforge() -> Path:
-    candidates = [
-        ROOT / "target" / "release" / "quantforge.exe",
-        ROOT / "target" / "release" / "quantforge",
-        ROOT / "target" / "debug" / "quantforge.exe",
-        ROOT / "target" / "debug" / "quantforge",
-    ]
+    target_roots = []
+    if os.environ.get("CARGO_TARGET_DIR"):
+        target_roots.append(Path(os.environ["CARGO_TARGET_DIR"]))
+    target_roots.append(ROOT / "target")
+    candidates: list[Path] = []
+    for root in target_roots:
+        candidates.extend(
+            [
+                root / "release" / "quantforge.exe",
+                root / "release" / "quantforge",
+                root / "debug" / "quantforge.exe",
+                root / "debug" / "quantforge",
+            ]
+        )
     for path in candidates:
         if path.is_file():
             return path
@@ -490,7 +524,8 @@ def _inject_login(tester_ini: Path, creds: dict[str, str], out_ini: Path) -> Non
         "ProxyEnable=0\n"
         "KeepPrivate=1\n"
         "NewsEnable=0\n"
-        "CertInstall=0\n\n"
+        "CertInstall=0\n"
+        "UpdateNews=0\n\n"
     )
     out_ini.write_text(header + body, encoding="utf-8")
 
@@ -549,7 +584,12 @@ def capture(
     export_dir.mkdir()
     expert = "QFStopLimitGolden"
 
-    # Judge reference on the same window.
+    # Slice pack data to the same tester window so Judge and MT5 share the window.
+    h1_slice = work / f"{symbol}_H1.tsv"
+    m1_slice = work / f"{symbol}_M1.tsv"
+    _slice_tsv(h1, h1_slice, from_date, to_date)
+    _slice_tsv(m1, m1_slice, from_date, to_date)
+
     judge_out = out_dir / "qf_judge.json"
     if judge_out.exists():
         judge_out.unlink()
@@ -557,11 +597,11 @@ def capture(
         [
             str(qf),
             "judge",
-            str(h1),
+            str(h1_slice),
             "--source-timezone",
             "ICMarkets/EST+7",
             "--m1",
-            str(m1),
+            str(m1_slice),
             "--m1-source-timezone",
             "ICMarkets/EST+7",
             "--strategy",
@@ -585,8 +625,7 @@ def capture(
     sys.stderr.write(r.stderr)
     if r.returncode:
         return r.returncode
-
-    # Export + compile with EveryTick model (4) by default.
+    # Export + compile (model 4 = EveryTick real ticks; model 1 = 1-minute OHLC).
     r = _run(
         [
             str(qf),
@@ -622,7 +661,43 @@ def capture(
     if r.returncode:
         return r.returncode
 
-    terminal_data = _terminal_data_dir()
+    portable_candidates = []
+    env_portable = os.environ.get("QUANTFORGE_MT5_PORTABLE", "").strip()
+    if env_portable:
+        portable_candidates.append(Path(env_portable))
+    portable_candidates.extend(
+        [
+            Path(r"C:\Users\Administrator\Documents\Codex\2026-07-05\we\work\MT5_Backtest_A240"),
+            Path(r"C:\Users\Administrator\Documents\Codex\2026-07-05\we\work\MT5_Backtest_A240_2"),
+            Path(r"C:\Users\Administrator\Documents\Codex\2026-07-05\we\work\MT5_Backtest_A240_3"),
+            Path(r"C:\Program Files\MetaTrader 5"),
+        ]
+    )
+    terminal_exe = None
+    portable = False
+    for candidate in portable_candidates:
+        exe = candidate / "terminal64.exe"
+        has_config = (candidate / "Config").is_dir() or (candidate / "config").is_dir()
+        is_program_files = candidate == Path(r"C:\Program Files\MetaTrader 5")
+        if candidate.is_dir() and exe.is_file():
+            # Prefer known ICMarkets portables (accounts.dat already logged in).
+            if has_config and not is_program_files:
+                terminal_exe = exe
+                portable = True
+                break
+            if terminal_exe is None:
+                terminal_exe = exe
+                portable = False
+    if terminal_exe is None:
+        raise SystemExit("no MT5 terminal64.exe found")
+
+    if portable:
+        terminal_data = terminal_exe.parent
+        print(f"using portable MT5 at {terminal_data}", flush=True)
+    else:
+        terminal_data = _terminal_data_dir()
+        print(f"using installed MT5 data dir {terminal_data}", flush=True)
+
     experts = terminal_data / "MQL5" / "Experts" / "QuantForge"
     indicators = terminal_data / "MQL5" / "Indicators"
     experts.mkdir(parents=True, exist_ok=True)
@@ -639,7 +714,6 @@ def capture(
 
     ex5 = experts / f"{expert}.ex5"
     if not ex5.is_file():
-        # Also accept compile beside export dir if MetaEditor wrote there.
         alt = export_dir / f"{expert}.ex5"
         if alt.is_file():
             shutil.copy2(alt, ex5)
@@ -666,7 +740,6 @@ def capture(
         if path.exists():
             path.unlink()
 
-    # Kill any running terminal before headless /config run.
     subprocess.run(
         ["taskkill", "/F", "/IM", "terminal64.exe"],
         stdout=subprocess.DEVNULL,
@@ -682,47 +755,72 @@ def capture(
     time.sleep(2)
 
     source_ini = export_dir / f"{expert}.tester.ini"
-    # Expert path in ini is QuantForge\Name.ex5 — ensure that matches Experts layout.
-    logged_ini = work / "tester_with_login.ini"
-    _inject_login(source_ini, creds, logged_ini)
-    # Keep a redacted copy in the golden dir for audit (no password).
+    # Portable ICMarkets installs already store the demo account; omit password.
+    # Match working worker INI style: Login+Server only, Leverage=100.
+    body = source_ini.read_text(encoding="utf-8", errors="ignore")
+    body = body.replace("Leverage=1:100", "Leverage=100")
+    if portable:
+        # Account is already saved in portable accounts.dat — do not embed password.
+        header = (
+            "[Common]\n"
+            f"Login={creds['login']}\n"
+            f"Server={creds['server']}\n"
+            "CertInstall=0\n"
+            "NewsEnable=0\n\n"
+        )
+        if "[Common]" in body:
+            # Replace generated body entirely below by stripping any prior Common.
+            idx = body.find("[Tester]")
+            body = body[idx:] if idx >= 0 else body
+        logged_ini = work / "tester_portable.ini"
+        logged_ini.write_text(header + body, encoding="utf-8")
+    else:
+        logged_ini = work / "tester_with_login.ini"
+        _inject_login(source_ini, creds, logged_ini)
+
     redacted = logged_ini.read_text(encoding="utf-8")
-    redacted = redacted.replace(creds["password"], "***")
+    if creds.get("password"):
+        redacted = redacted.replace(creds["password"], "***")
+    # Never commit account numbers — scrub Login= even when password was omitted.
+    redacted = re.sub(r"(?im)^(Login=)\d+", r"\1<redacted>", redacted)
+    redacted = re.sub(r"(?im)^(Password=).+$", r"\1***", redacted)
     (out_dir / "tester_config.redacted.ini").write_text(redacted, encoding="utf-8")
 
     mt5_out = work / "mt5-run.json"
     if mt5_out.exists():
         mt5_out.unlink()
-    r = _run(
-        [
-            str(qf),
-            "mt5-test",
-            "--tester-ini",
-            str(logged_ini),
-            "--evidence",
-            str(evidence),
-            "--out",
-            str(mt5_out),
-            "--timeout-seconds",
-            str(timeout_seconds),
-            "--terminal",
-            r"C:\Program Files\MetaTrader 5\terminal64.exe",
-            "--common-files",
-            str(common_files),
-        ],
-        capture_output=True,
-    )
+    mt5_cmd = [
+        str(qf),
+        "mt5-test",
+        "--tester-ini",
+        str(logged_ini),
+        "--evidence",
+        str(evidence),
+        "--out",
+        str(mt5_out),
+        "--timeout-seconds",
+        str(timeout_seconds),
+        "--terminal",
+        str(terminal_exe),
+        "--common-files",
+        str(common_files),
+    ]
+    if portable:
+        mt5_cmd.append("--portable")
+    r = _run(mt5_cmd, capture_output=True)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
 
     capture_notes = [
         "# Capture attempt notes",
         "",
-        f"- login: {creds['login']} (demo)",
+        "- login: <demo account from gitignored .mt5-demo.local / env>",
         f"- server: {creds['server']}",
+        f"- terminal: `{terminal_exe}`",
+        f"- portable: {portable}",
         f"- symbol: {symbol}",
         f"- window: {from_date} → {to_date}",
-        f"- tester_model: {tester_model} (4 = every tick based on real ticks)",
+        f"- tester_model: {tester_model} (4 = every tick based on real ticks; 1 = 1-minute OHLC)",
         f"- mt5-test exit: {r.returncode}",
         f"- deals fresh path expected: `{deals}`",
         f"- equity fresh path expected: `{equity}`",
@@ -730,8 +828,11 @@ def capture(
     if r.returncode != 0:
         capture_notes.append("- status: **blocked or failed** during mt5-test")
         (out_dir / "capture_notes.md").write_text("\n".join(capture_notes) + "\n", encoding="utf-8")
-        # Still copy whatever artifacts exist for diagnosis.
-        for src, name in ((deals, "mt5_deals.csv"), (equity, "mt5_equity.csv"), (metadata, "mt5_metadata.json")):
+        for src, name in (
+            (deals, "mt5_deals.csv"),
+            (equity, "mt5_equity.csv"),
+            (metadata, "mt5_metadata.json"),
+        ):
             if src.is_file() and src.stat().st_size > 0:
                 shutil.copy2(src, out_dir / name)
         return r.returncode
@@ -754,6 +855,7 @@ def capture(
     manifest["from_date"] = from_date
     manifest["to_date"] = to_date
     manifest["tester_model_code"] = tester_model
+    manifest["broker_timezone"] = "ICMarkets/EST+7"
     manifest["files"]["evidence"] = "evidence.json"
     manifest["files"]["mq5"] = "expert.mq5"
     manifest["files"]["metadata"] = "mt5_metadata.json"

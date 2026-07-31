@@ -1348,8 +1348,9 @@ mod tests {
         };
         let bundle = generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
         assert!(bundle.source.contains("return 3;"));
-        assert!(bundle.source.contains("g_trade.BuyStopLimit"));
-        assert!(bundle.source.contains("g_trade.SellStopLimit"));
+        assert!(bundle.source.contains("ORDER_TYPE_BUY_STOP_LIMIT"));
+        assert!(bundle.source.contains("ORDER_TYPE_SELL_STOP_LIMIT"));
+        assert!(bundle.source.contains("g_trade.OrderOpen"));
         assert!(bundle.source.contains("QFEntryLimitOffset"));
         assert!(!bundle.source.contains("@@"));
     }

@@ -9,6 +9,7 @@ mod optimizer;
 mod parity_lab;
 mod portfolio;
 mod promotion_ledger;
+mod task_run;
 mod vault;
 mod workflow;
 
@@ -49,6 +50,7 @@ pub fn run() {
             discover::resume_discover,
             discover::stop_discover,
             challenge::run_challenge_workflow,
+            task_run::run_task_graph_workflow,
             optimizer::run_optimizer_neighborhood,
             optimizer::run_walk_forward_matrix_workflow,
             promotion_ledger::run_sealed_final,

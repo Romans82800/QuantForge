@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": "MetaTrader 5",
+  "strategy_fingerprint": "c1caf5c06cbc15e55c971b7ed6d172fda5ab65fa5732447e9300333b7609b2f6",
+  "broker_spec_hash": "81ad02fe3832336e21a39b89a4633dc7c9604d84cf0ecaa299760f875177a296",
+  "source_hash": "9f003e161cd2b98242e534a1463121422c0f919054b5b669d3e610f08c5cdb51",
+  "strategy_ir_version": 1,
+  "expert_name": "QFStopLimitGolden",
+  "symbol": "EURNZD",
+  "timeframe": "H1",
+  "live_trading_default": false,
+  "mandatory_stop_loss": true,
+  "mandatory_take_profit": true,
+  "parity_deals_file": "QuantForge\\QF_c1caf5c06cbc_deals.csv",
+  "parity_equity_file": "QuantForge\\QF_c1caf5c06cbc_equity.csv",
+  "parity_metadata_file": "QuantForge\\QF_c1caf5c06cbc_metadata.csv",
+  "export_style": "sqx",
+  "config": {
+    "expert_name": "QFStopLimitGolden",
+    "expert_directory": "QuantForge",
+    "timeframe": "H1",
+    "magic": 42424242,
+    "deviation_points": 10,
+    "max_spread_points": null,
+    "estimated_slippage_points_per_side": 0.0,
+    "commission_per_lot_round_turn": 7.0,
+    "allow_live_trading_default": false,
+    "export_style": "sqx",
+    "entry_window_start_hour": 2,
+    "entry_window_end_hour": 19,
+    "tester": {
+      "from_date": "2024.01.01",
+      "to_date": "2024.02.01",
+      "deposit": 100000.0,
+      "currency": "USD",
+      "leverage": 100,
+      "model": 4
+    }
+  }
+}

@@ -10,6 +10,8 @@ import type {
   EvidenceView,
   ChallengeRequest,
   ChallengeView,
+  TaskRunRequest,
+  TaskRunView,
   OptimizerRequest,
   OptimizerView,
   WalkForwardMatrixRequest,
@@ -208,6 +210,10 @@ export function stopDiscover(): Promise<DiscoverJobView> {
 
 export function runChallenge(request: ChallengeRequest): Promise<ChallengeView> {
   return invoke<ChallengeView>("run_challenge_workflow", { request });
+}
+
+export function runTaskGraph(request: TaskRunRequest): Promise<TaskRunView> {
+  return invoke<TaskRunView>("run_task_graph_workflow", { request });
 }
 
 export function runOptimizerNeighborhood(request: OptimizerRequest): Promise<OptimizerView> {

@@ -45,6 +45,7 @@ import {
   runM1Judge,
   runOptimizerNeighborhood,
   runChallenge,
+  runTaskGraph,
   runWalkForwardMatrix,
   runSealedFinal,
   startIncubation,
@@ -74,6 +75,8 @@ import type {
   JudgeView,
   ChallengeRequest,
   ChallengeView,
+  TaskRunRequest,
+  TaskRunView,
   OptimizerRequest,
   OptimizerView,
   WalkForwardMatrixRequest,
@@ -4497,6 +4500,130 @@ function ChallengeRetestPanel({ onError }: { onError: (message: string | null) =
   );
 }
 
+function TaskGraphPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<TaskRunRequest>({
+    graphPath: "",
+    workDir: "",
+    dryRun: false,
+    stopOnFailure: true,
+  });
+  const [result, setResult] = useState<TaskRunView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof TaskRunRequest>(key: K, value: TaskRunRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await runTaskGraph(form));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">TaskRetest / task-run</p>
+            <h2>Execute a QuantForge task graph</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField
+            label="Task graph JSON"
+            path={form.graphPath}
+            choose={() => chooseJsonFile("Choose .qf-task.json graph")}
+            onChange={(value) => update("graphPath", value)}
+            required
+          />
+          <PathField
+            label="Work directory"
+            path={form.workDir}
+            choose={() => chooseNewDirectory("Create task-run work directory", "task-run")}
+            onChange={(value) => update("workDir", value)}
+            required
+          />
+          <label className="check-field">
+            <input
+              type="checkbox"
+              checked={form.dryRun}
+              onChange={(event) => update("dryRun", event.target.checked)}
+            />
+            <span>Dry-run (plan only)</span>
+          </label>
+          <label className="check-field">
+            <input
+              type="checkbox"
+              checked={form.stopOnFailure}
+              onChange={(event) => update("stopOnFailure", event.target.checked)}
+            />
+            <span>Stop on first failure</span>
+          </label>
+        </div>
+        <div className="form-footer">
+          <p>Runs Scout / Challenge / WF / Judge / Export / Filter / What-If / Negate / HTML / multi-symbol steps in-process.</p>
+          <button
+            className="primary"
+            disabled={busy || !form.graphPath || !form.workDir}
+            onClick={() => void run()}
+          >
+            {busy ? "Running…" : form.dryRun ? "Plan task graph" : "Run task graph"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero">
+            <div>
+              <p className="eyebrow">{result.dryRun ? "Dry-run plan" : "Task graph"}</p>
+              <h2>{result.passed ? "Graph finished cleanly" : "Graph blocked"}</h2>
+            </div>
+            <span className="grade-pill">{result.graphName}</span>
+          </div>
+          <div className="job-kpis">
+            <Kpi label="Passed" value={formatNumber(result.passedCount)} note={result.protocol} />
+            <Kpi label="Failed" value={formatNumber(result.failedCount)} note={`skipped ${formatNumber(result.skippedCount)}`} />
+            <Kpi label="Steps" value={formatNumber(result.steps.length)} note={result.dryRun ? "planned" : "executed"} />
+          </div>
+          <ArtifactPath label="Report" value={result.reportPath} />
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Kind</th>
+                  <th>Status</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.steps.map((step) => (
+                  <tr key={step.id}>
+                    <td>{step.id}</td>
+                    <td>{step.kind}</td>
+                    <td>{step.status}</td>
+                    <td>{step.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : (
+        <WorkspacePrimer
+          title="No task graph yet"
+          copy="Load a *.qf-task.json (see docs/examples) and execute the same in-process runner as quantforge task-run."
+        />
+      )}
+    </div>
+  );
+}
+
 function ParityWorkspace({
   exportPreset,
   judgePreset,
@@ -4506,19 +4633,21 @@ function ParityWorkspace({
   judgePreset: Partial<JudgeRequest>;
   onError: (message: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "export" | "compare" | "indicators">("judge");
+  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "task" | "export" | "compare" | "indicators">("judge");
   return <div className="wide-tool-content">
     <div className="workspace-tabs">
       <button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button>
       <button className={tab === "challenge" ? "active" : ""} onClick={() => setTab("challenge")}>2 · Challenge</button>
       <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>3 · WF Matrix</button>
-      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>4 · EA Export</button>
-      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>5 · MT5 Compare</button>
-      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>6 · Indicators</button>
+      <button className={tab === "task" ? "active" : ""} onClick={() => setTab("task")}>4 · Task Graph</button>
+      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>5 · EA Export</button>
+      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>6 · MT5 Compare</button>
+      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>7 · Indicators</button>
     </div>
     {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} />
       : tab === "challenge" ? <ChallengeRetestPanel onError={onError} />
       : tab === "matrix" ? <WalkForwardMatrixPanel onError={onError} />
+      : tab === "task" ? <TaskGraphPanel onError={onError} />
       : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} />
       : tab === "compare" ? <ParityComparePanel onError={onError} />
       : <IndicatorParityPanel onError={onError} />}

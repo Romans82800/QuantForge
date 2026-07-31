@@ -35,7 +35,10 @@ Shared inputs live under top-level `inputs` and are merged into each step's `par
 quantforge export-html --input scout-or-judge.json --out results.html
 ```
 
-## Databank ranking filters
+## Desktop
+
+Retester → **4 · Task Graph** runs the same executor (`run_task_graph_workflow`).
+Choose a `*.qf-task.json`, a work directory, optional dry-run / stop-on-failure.
 
 SQX-style expressions over elite columns:
 
