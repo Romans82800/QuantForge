@@ -205,6 +205,7 @@ fn write_databank(
         allow_market_entries: true,
         allow_stop_entries: false,
         allow_limit_entries: false,
+        allow_stop_limit_entries: false,
         flatten_at_22: false,
         end_of_day_hour: 23,
         max_one_entry_per_day: false,

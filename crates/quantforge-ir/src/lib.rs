@@ -497,6 +497,15 @@ pub enum EntryOrderPolicy {
         distance: EntryDistancePolicy,
         expiry_bars: u16,
     },
+    /// MT5 stop-limit: stop trigger first, then limit fill.
+    /// `stop_distance` places the trigger away from the signal reference;
+    /// `limit_offset` places the limit inward from that trigger
+    /// (buy: limit = stop − offset; sell: limit = stop + offset).
+    StopLimit {
+        stop_distance: EntryDistancePolicy,
+        limit_offset: EntryDistancePolicy,
+        expiry_bars: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -824,6 +833,21 @@ fn policy_complexity(strategy: &StrategyIr) -> Complexity {
                 | EntryDistancePolicy::RangeMultiple { .. } => 2,
             };
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            node_count += 1;
+            parameter_count += 1; // expiry bars
+            for distance in [stop_distance, limit_offset] {
+                parameter_count += match distance {
+                    EntryDistancePolicy::FixedPoints { .. } => 1,
+                    EntryDistancePolicy::AtrMultiple { .. }
+                    | EntryDistancePolicy::RangeMultiple { .. } => 2,
+                };
+            }
+        }
     }
 
     parameter_count += match strategy.stops.stop_loss {
@@ -1009,16 +1033,11 @@ fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
 }
 
 fn validate_entry_order(order: &EntryOrderPolicy, limits: IrLimits) -> Result<(), IrError> {
-    let (distance, expiry_bars) = match order {
+    let expiry_bars = match order {
         EntryOrderPolicy::Market => return Ok(()),
-        EntryOrderPolicy::Stop {
-            distance,
-            expiry_bars,
-        }
-        | EntryOrderPolicy::Limit {
-            distance,
-            expiry_bars,
-        } => (distance, *expiry_bars),
+        EntryOrderPolicy::Stop { expiry_bars, .. }
+        | EntryOrderPolicy::Limit { expiry_bars, .. }
+        | EntryOrderPolicy::StopLimit { expiry_bars, .. } => *expiry_bars,
     };
     if expiry_bars == 0 {
         return Err(IrError::Invalid {
@@ -1026,14 +1045,35 @@ fn validate_entry_order(order: &EntryOrderPolicy, limits: IrLimits) -> Result<()
             reason: "must be greater than zero".into(),
         });
     }
+    match order {
+        EntryOrderPolicy::Market => Ok(()),
+        EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+            validate_entry_distance("entry.order.distance", distance, limits)
+        }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            validate_entry_distance("entry.order.stop_distance", stop_distance, limits)?;
+            validate_entry_distance("entry.order.limit_offset", limit_offset, limits)
+        }
+    }
+}
+
+fn validate_entry_distance(
+    path: &str,
+    distance: &EntryDistancePolicy,
+    limits: IrLimits,
+) -> Result<(), IrError> {
     match distance {
         EntryDistancePolicy::FixedPoints { points } => {
-            require_positive("entry.order.distance.points", *points)
+            require_positive(&format!("{path}.points"), *points)
         }
         EntryDistancePolicy::AtrMultiple { period, multiplier }
         | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
-            validate_period("entry.order.distance.period", *period, limits)?;
-            require_positive("entry.order.distance.multiplier", *multiplier)
+            validate_period(&format!("{path}.period"), *period, limits)?;
+            require_positive(&format!("{path}.multiplier"), *multiplier)
         }
     }
 }
@@ -1236,12 +1276,26 @@ fn canonicalize_entry_order(
     order: &mut EntryOrderPolicy,
     policy: FloatPolicy,
 ) -> Result<(), IrError> {
-    let distance = match order {
-        EntryOrderPolicy::Market => return Ok(()),
+    match order {
+        EntryOrderPolicy::Market => Ok(()),
         EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
-            distance
+            canonicalize_entry_distance(distance, policy)
         }
-    };
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            canonicalize_entry_distance(stop_distance, policy)?;
+            canonicalize_entry_distance(limit_offset, policy)
+        }
+    }
+}
+
+fn canonicalize_entry_distance(
+    distance: &mut EntryDistancePolicy,
+    policy: FloatPolicy,
+) -> Result<(), IrError> {
     match distance {
         EntryDistancePolicy::FixedPoints { points } => *points = q(*points, policy)?,
         EntryDistancePolicy::AtrMultiple { multiplier, .. }

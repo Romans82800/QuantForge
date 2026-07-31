@@ -139,6 +139,7 @@ struct OpenPosition {
 enum PendingKind {
     Stop,
     Limit,
+    StopLimit,
 }
 
 #[derive(Debug)]
@@ -146,7 +147,12 @@ struct PendingOrder {
     side: PositionSide,
     kind: PendingKind,
     expiry_decision_index: usize,
+    /// Stop/Limit fill level, or StopLimit stop-trigger price.
     activation_price: f64,
+    /// StopLimit limit price once the stop trigger is hit.
+    limit_price: Option<f64>,
+    /// StopLimit: whether the stop trigger has already fired.
+    stop_triggered: bool,
     stop_loss: f64,
     take_profit: f64,
     stop_distance: f64,
@@ -519,7 +525,9 @@ pub fn evaluate_strategy_m1(
                                     signal_taken_today = true;
                                 }
                             }
-                            EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. } => {
+                            EntryOrderPolicy::Stop { .. }
+                            | EntryOrderPolicy::Limit { .. }
+                            | EntryOrderPolicy::StopLimit { .. } => {
                                 if let Some(order) = place_pending_order(
                                     side,
                                     decision_index,
@@ -575,8 +583,8 @@ pub fn evaluate_strategy_m1(
                 && !closed_this_decision
                 && minute_in_entry_window
                 && let Some(fill_price) = pending
-                    .as_ref()
-                    .and_then(|order| pending_fill_price(order, minute, spread_price))
+                    .as_mut()
+                    .and_then(|order| advance_pending_order(order, minute, spread_price))
             {
                 let order = pending.take().expect("pending order was checked");
                 let open = fill_pending_order(
@@ -805,20 +813,40 @@ fn place_pending_order(
     features: &mut FeatureCache<'_>,
     telemetry: &mut JudgeTelemetry,
 ) -> Result<Option<PendingOrder>, JudgeError> {
-    let (kind, distance_policy, expiry_bars) = match &strategy.entry.order {
-        EntryOrderPolicy::Market => return Ok(None),
-        EntryOrderPolicy::Stop {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Stop, distance, *expiry_bars),
-        EntryOrderPolicy::Limit {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Limit, distance, *expiry_bars),
-    };
-    let Some(entry_distance) = entry_distance(distance_policy, decision_index, broker, features)?
+    let (kind, stop_distance_policy, limit_offset_policy, expiry_bars) =
+        match &strategy.entry.order {
+            EntryOrderPolicy::Market => return Ok(None),
+            EntryOrderPolicy::Stop {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Stop, distance, None, *expiry_bars),
+            EntryOrderPolicy::Limit {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Limit, distance, None, *expiry_bars),
+            EntryOrderPolicy::StopLimit {
+                stop_distance,
+                limit_offset,
+                expiry_bars,
+            } => (
+                PendingKind::StopLimit,
+                stop_distance,
+                Some(limit_offset),
+                *expiry_bars,
+            ),
+        };
+    let Some(trigger_distance) =
+        entry_distance(stop_distance_policy, decision_index, broker, features)?
     else {
         return Ok(None);
+    };
+    let limit_offset = if let Some(policy) = limit_offset_policy {
+        let Some(offset) = entry_distance(policy, decision_index, broker, features)? else {
+            return Ok(None);
+        };
+        Some(offset)
+    } else {
+        None
     };
     let Some(stop_distance) = stop_distance(strategy, decision_index, broker, features)? else {
         return Ok(None);
@@ -829,9 +857,10 @@ fn place_pending_order(
         return Ok(None);
     };
     let minimum_distance = broker.stops_level_points as f64 * broker.point;
-    if entry_distance < minimum_distance
+    if trigger_distance < minimum_distance
         || stop_distance < minimum_distance
         || target_distance < minimum_distance
+        || limit_offset.is_some_and(|offset| offset < minimum_distance)
     {
         telemetry.skipped_for_broker_stop_level += 1;
         return Ok(None);
@@ -840,26 +869,43 @@ fn place_pending_order(
         PositionSide::Long => bar.open + spread_price,
         PositionSide::Short => bar.open,
     };
-    let activation_price = normalize_price(
-        match (side, kind) {
-            (PositionSide::Long, PendingKind::Stop) => reference + entry_distance,
-            (PositionSide::Short, PendingKind::Stop) => reference - entry_distance,
-            (PositionSide::Long, PendingKind::Limit) => reference - entry_distance,
-            (PositionSide::Short, PendingKind::Limit) => reference + entry_distance,
-        },
-        broker,
-    );
+    let (activation_price, limit_price) = match (side, kind, limit_offset) {
+        (PositionSide::Long, PendingKind::Stop, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Stop, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::Limit, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Limit, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference + trigger_distance, broker);
+            let limit = normalize_price(stop - offset, broker);
+            (stop, Some(limit))
+        }
+        (PositionSide::Short, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference - trigger_distance, broker);
+            let limit = normalize_price(stop + offset, broker);
+            (stop, Some(limit))
+        }
+        (_, PendingKind::StopLimit, None) => return Ok(None),
+    };
+    let intended_entry = limit_price.unwrap_or(activation_price);
     let (stop_loss, take_profit) = match side {
         PositionSide::Long => (
-            normalize_price(activation_price - stop_distance, broker),
-            normalize_price(activation_price + target_distance, broker),
+            normalize_price(intended_entry - stop_distance, broker),
+            normalize_price(intended_entry + target_distance, broker),
         ),
         PositionSide::Short => (
-            normalize_price(activation_price + stop_distance, broker),
-            normalize_price(activation_price - target_distance, broker),
+            normalize_price(intended_entry + stop_distance, broker),
+            normalize_price(intended_entry - target_distance, broker),
         ),
     };
-    let normalized_stop_distance = (activation_price - stop_loss).abs();
+    let normalized_stop_distance = (intended_entry - stop_loss).abs();
     if normalized_stop_distance <= 0.0 {
         return Ok(None);
     }
@@ -887,6 +933,8 @@ fn place_pending_order(
         kind,
         expiry_decision_index: decision_index.saturating_add(expiry_bars as usize),
         activation_price,
+        limit_price,
+        stop_triggered: false,
         stop_loss,
         take_profit,
         stop_distance: normalized_stop_distance,
@@ -913,6 +961,56 @@ fn entry_distance(
     Ok(value.filter(|distance| distance.is_finite() && *distance > 0.0))
 }
 
+fn advance_pending_order(order: &mut PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
+    match order.kind {
+        PendingKind::Stop | PendingKind::Limit => pending_fill_price(order, bar, spread_price),
+        PendingKind::StopLimit => {
+            let mut just_triggered = false;
+            if !order.stop_triggered {
+                let stop_touched = match order.side {
+                    PositionSide::Long => bar.high + spread_price >= order.activation_price,
+                    PositionSide::Short => bar.low <= order.activation_price,
+                };
+                if !stop_touched {
+                    return None;
+                }
+                order.stop_triggered = true;
+                just_triggered = true;
+            }
+            let limit_price = order.limit_price?;
+            let open = match order.side {
+                PositionSide::Long => bar.open + spread_price,
+                PositionSide::Short => bar.open,
+            };
+            let touched = match order.side {
+                PositionSide::Long => bar.low + spread_price <= limit_price,
+                PositionSide::Short => bar.high >= limit_price,
+            };
+            if !touched {
+                return None;
+            }
+            // On the trigger minute the open is pre-stop; fill at the limit level.
+            // On later minutes the working limit uses the same gap-through rule as Limit.
+            Some(match order.side {
+                PositionSide::Long => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.min(limit_price)
+                    }
+                }
+                PositionSide::Short => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.max(limit_price)
+                    }
+                }
+            })
+        }
+    }
+}
+
 fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
     let open = match order.side {
         PositionSide::Long => bar.open + spread_price,
@@ -927,6 +1025,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
             bar.low + spread_price <= order.activation_price
         }
         (PositionSide::Short, PendingKind::Limit) => bar.high >= order.activation_price,
+        (_, PendingKind::StopLimit) => return None,
     };
     if !touched {
         return None;
@@ -936,6 +1035,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
         (PositionSide::Short, PendingKind::Stop) => open.min(order.activation_price),
         (PositionSide::Long, PendingKind::Limit) => open.min(order.activation_price),
         (PositionSide::Short, PendingKind::Limit) => open.max(order.activation_price),
+        (_, PendingKind::StopLimit) => return None,
     })
 }
 

@@ -4602,6 +4602,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         allow_market_entries: true,
         allow_stop_entries: false,
         allow_limit_entries: false,
+        allow_stop_limit_entries: false,
         flatten_at_22: args.flatten_at_22,
         end_of_day_hour: args.end_of_day_hour,
         max_one_entry_per_day: true,

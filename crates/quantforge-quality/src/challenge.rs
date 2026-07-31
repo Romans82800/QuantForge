@@ -1035,6 +1035,25 @@ fn perturb_strategy(
             }
             perturb_period(expiry_bars, fraction, rng);
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            expiry_bars,
+        } => {
+            for distance in [stop_distance, limit_offset] {
+                match distance {
+                    EntryDistancePolicy::FixedPoints { points } => {
+                        perturb_positive(points, fraction, 0.01, rng)
+                    }
+                    EntryDistancePolicy::AtrMultiple { period, multiplier }
+                    | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
+                        perturb_period(period, fraction, rng);
+                        perturb_positive(multiplier, fraction, 0.01, rng);
+                    }
+                }
+            }
+            perturb_period(expiry_bars, fraction, rng);
+        }
     }
     if let Some(value) = &mut neighbor.manage.break_even_at_r {
         perturb_positive(value, fraction, 0.01, rng);

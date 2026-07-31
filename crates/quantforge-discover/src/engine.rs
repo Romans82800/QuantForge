@@ -933,6 +933,7 @@ enum EntryOrderKind {
     Market,
     Stop,
     Limit,
+    StopLimit,
 }
 
 /// Restrict the grammar to the individually enabled execution genes.  The
@@ -952,7 +953,7 @@ fn enforce_execution_feature_flags(
             (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
         });
 
-    let (distance, expiry_bars) = match &strategy.entry.order {
+    let (distance, limit_offset, expiry_bars) = match &strategy.entry.order {
         EntryOrderPolicy::Stop {
             distance,
             expiry_bars,
@@ -960,18 +961,27 @@ fn enforce_execution_feature_flags(
         | EntryOrderPolicy::Limit {
             distance,
             expiry_bars,
-        } => (distance.clone(), *expiry_bars),
+        } => (distance.clone(), distance.clone(), *expiry_bars),
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            expiry_bars,
+        } => (stop_distance.clone(), limit_offset.clone(), *expiry_bars),
         EntryOrderPolicy::Market => (
             EntryDistancePolicy::AtrMultiple {
                 period: crate::FROZEN_ATR_PERIOD,
                 multiplier: 0.5,
+            },
+            EntryDistancePolicy::AtrMultiple {
+                period: crate::FROZEN_ATR_PERIOD,
+                multiplier: 0.25,
             },
             4,
         ),
     };
     // Every enabled order kind is an equally weighted gene, so unchecking
     // market yields a pure stop-only or limit-only run and vice versa.
-    let mut enabled = Vec::with_capacity(3);
+    let mut enabled = Vec::with_capacity(4);
     if config.allow_market_entries {
         enabled.push(EntryOrderKind::Market);
     }
@@ -980,6 +990,9 @@ fn enforce_execution_feature_flags(
     }
     if config.allow_limit_entries {
         enabled.push(EntryOrderKind::Limit);
+    }
+    if config.allow_stop_limit_entries {
+        enabled.push(EntryOrderKind::StopLimit);
     }
     // `validate` rejects a run with nothing enabled; market keeps replay safe.
     let chosen = enabled
@@ -994,6 +1007,11 @@ fn enforce_execution_feature_flags(
         },
         EntryOrderKind::Limit => EntryOrderPolicy::Limit {
             distance,
+            expiry_bars,
+        },
+        EntryOrderKind::StopLimit => EntryOrderPolicy::StopLimit {
+            stop_distance: distance,
+            limit_offset,
             expiry_bars,
         },
     };
@@ -1296,6 +1314,7 @@ mod tests {
             allow_market_entries: true,
             allow_stop_entries: false,
             allow_limit_entries: false,
+            allow_stop_limit_entries: false,
             flatten_at_22: false,
             end_of_day_hour: 23,
             // Fixture series is short; pendings need multiple fills/day to illuminate niches.

@@ -126,11 +126,9 @@ pub fn generate_bundle(
         ("@@STOP_DISTANCE@@", stop_distance(&strategy)),
         ("@@TARGET_DISTANCE@@", target_distance(&strategy)),
         ("@@RISK_BUDGET@@", risk_budget(&strategy)),
-        (
-            "@@ENTRY_ORDER_KIND@@",
-            entry_order_kind(&strategy).to_string(),
-        ),
+        ("@@ENTRY_ORDER_KIND@@", entry_order_kind(&strategy).to_string()),
         ("@@ENTRY_DISTANCE@@", entry_distance(&strategy)),
+        ("@@ENTRY_LIMIT_OFFSET@@", entry_limit_offset(&strategy)),
         ("@@ENTRY_EXPIRY@@", entry_expiry(&strategy).to_string()),
         (
             "@@BREAK_EVEN_R@@",
@@ -722,6 +720,7 @@ fn entry_order_kind(strategy: &StrategyIr) -> u8 {
         EntryOrderPolicy::Market => 0,
         EntryOrderPolicy::Stop { .. } => 1,
         EntryOrderPolicy::Limit { .. } => 2,
+        EntryOrderPolicy::StopLimit { .. } => 3,
     }
 }
 
@@ -731,7 +730,19 @@ fn entry_distance(strategy: &StrategyIr) -> String {
         EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
             distance
         }
+        EntryOrderPolicy::StopLimit { stop_distance, .. } => stop_distance,
     };
+    distance_expr(policy)
+}
+
+fn entry_limit_offset(strategy: &StrategyIr) -> String {
+    match &strategy.entry.order {
+        EntryOrderPolicy::StopLimit { limit_offset, .. } => distance_expr(limit_offset),
+        _ => "0.0".into(),
+    }
+}
+
+fn distance_expr(policy: &EntryDistancePolicy) -> String {
     match *policy {
         EntryDistancePolicy::FixedPoints { points } => format!("{}*_Point", mql_double(points)),
         EntryDistancePolicy::AtrMultiple { period, multiplier } => {
@@ -747,7 +758,8 @@ fn entry_expiry(strategy: &StrategyIr) -> u16 {
     match strategy.entry.order {
         EntryOrderPolicy::Market => 0,
         EntryOrderPolicy::Stop { expiry_bars, .. }
-        | EntryOrderPolicy::Limit { expiry_bars, .. } => expiry_bars,
+        | EntryOrderPolicy::Limit { expiry_bars, .. }
+        | EntryOrderPolicy::StopLimit { expiry_bars, .. } => expiry_bars,
     }
 }
 
@@ -1203,6 +1215,28 @@ mod tests {
                 .contains("current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour")
         );
         assert!(bundle.source.contains("QFMarkEntrySignalTaken"));
+    }
+
+    #[test]
+    fn stop_limit_entries_are_exported() {
+        let mut strategy = strategy();
+        strategy.entry.order = EntryOrderPolicy::StopLimit {
+            stop_distance: EntryDistancePolicy::AtrMultiple {
+                period: 14,
+                multiplier: 0.5,
+            },
+            limit_offset: EntryDistancePolicy::AtrMultiple {
+                period: 14,
+                multiplier: 0.25,
+            },
+            expiry_bars: 4,
+        };
+        let bundle = generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
+        assert!(bundle.source.contains("return 3;"));
+        assert!(bundle.source.contains("g_trade.BuyStopLimit"));
+        assert!(bundle.source.contains("g_trade.SellStopLimit"));
+        assert!(bundle.source.contains("QFEntryLimitOffset"));
+        assert!(!bundle.source.contains("@@"));
     }
 
     #[test]

@@ -131,6 +131,21 @@ pub(crate) fn apply_search_ranges(
             };
             *expiry_bars = sample_u16(rng, &ranges.pending_expiry_bars);
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            expiry_bars,
+        } => {
+            *stop_distance = EntryDistancePolicy::AtrMultiple {
+                period: atr_period,
+                multiplier: sample_range(rng, &ranges.pending_distance_atr),
+            };
+            *limit_offset = EntryDistancePolicy::AtrMultiple {
+                period: atr_period,
+                multiplier: sample_range(rng, &ranges.pending_distance_atr),
+            };
+            *expiry_bars = sample_u16(rng, &ranges.pending_expiry_bars);
+        }
     }
     if strategy.manage.time_stop_bars.is_some() {
         strategy.manage.time_stop_bars = Some(sample_u16(rng, &ranges.time_stop_bars));
@@ -2269,7 +2284,7 @@ fn random_entry_distance(rng: &mut ChaCha8Rng) -> EntryDistancePolicy {
 }
 
 pub(crate) fn random_entry_order(rng: &mut ChaCha8Rng) -> EntryOrderPolicy {
-    match rng.gen_range(0..5) {
+    match rng.gen_range(0..6) {
         0 => EntryOrderPolicy::Stop {
             distance: random_entry_distance(rng),
             expiry_bars: rng.gen_range(1..=12),
@@ -2278,24 +2293,32 @@ pub(crate) fn random_entry_order(rng: &mut ChaCha8Rng) -> EntryOrderPolicy {
             distance: random_entry_distance(rng),
             expiry_bars: rng.gen_range(1..=12),
         },
+        2 => EntryOrderPolicy::StopLimit {
+            stop_distance: random_entry_distance(rng),
+            limit_offset: random_entry_distance(rng),
+            expiry_bars: rng.gen_range(1..=12),
+        },
         _ => EntryOrderPolicy::Market,
     }
 }
 
-/// Institutional Search Families: stop or limit only (no market).
+/// Institutional Search Families: stop, limit, or stop-limit (no market).
 pub(crate) fn random_pending_entry_order(rng: &mut ChaCha8Rng) -> EntryOrderPolicy {
-    let distance = random_entry_distance(rng);
     let expiry_bars = rng.gen_range(2..=8);
-    if rng.gen_bool(0.5) {
-        EntryOrderPolicy::Stop {
-            distance,
+    match rng.gen_range(0..3) {
+        0 => EntryOrderPolicy::Stop {
+            distance: random_entry_distance(rng),
             expiry_bars,
-        }
-    } else {
-        EntryOrderPolicy::Limit {
-            distance,
+        },
+        1 => EntryOrderPolicy::Limit {
+            distance: random_entry_distance(rng),
             expiry_bars,
-        }
+        },
+        _ => EntryOrderPolicy::StopLimit {
+            stop_distance: random_entry_distance(rng),
+            limit_offset: random_entry_distance(rng),
+            expiry_bars,
+        },
     }
 }
 
@@ -2407,6 +2430,16 @@ fn mutate_policies(strategy: &mut StrategyIr, rng: &mut ChaCha8Rng) {
             let delta = rng.gen_range(-2_i32..=2);
             *expiry_bars = (i32::from(*expiry_bars) + delta).clamp(1, 100) as u16;
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            expiry_bars,
+        } => {
+            mutate_entry_distance(stop_distance, rng);
+            mutate_entry_distance(limit_offset, rng);
+            let delta = rng.gen_range(-2_i32..=2);
+            *expiry_bars = (i32::from(*expiry_bars) + delta).clamp(1, 100) as u16;
+        }
     }
     if rng.gen_bool(0.15) {
         strategy.entry.order = match &strategy.entry.order {
@@ -2420,8 +2453,17 @@ fn mutate_policies(strategy: &mut StrategyIr, rng: &mut ChaCha8Rng) {
             EntryOrderPolicy::Limit {
                 distance,
                 expiry_bars,
+            } => EntryOrderPolicy::StopLimit {
+                stop_distance: distance.clone(),
+                limit_offset: distance.clone(),
+                expiry_bars: *expiry_bars,
+            },
+            EntryOrderPolicy::StopLimit {
+                stop_distance,
+                expiry_bars,
+                ..
             } => EntryOrderPolicy::Stop {
-                distance: distance.clone(),
+                distance: stop_distance.clone(),
                 expiry_bars: *expiry_bars,
             },
             EntryOrderPolicy::Market => random_pending_entry_order(rng),
@@ -2763,6 +2805,18 @@ fn freeze_atr_period(strategy: &mut StrategyIr) {
                 *period = FROZEN_ATR_PERIOD;
             }
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            if let EntryDistancePolicy::AtrMultiple { period, .. } = stop_distance {
+                *period = FROZEN_ATR_PERIOD;
+            }
+            if let EntryDistancePolicy::AtrMultiple { period, .. } = limit_offset {
+                *period = FROZEN_ATR_PERIOD;
+            }
+        }
     }
     if let Some(TrailingPolicy::AtrMultiple { period, .. }) = &mut strategy.manage.trailing {
         *period = FROZEN_ATR_PERIOD;
@@ -2848,6 +2902,27 @@ fn enforce_atr_relative_policies(strategy: &mut StrategyIr) {
                     multiplier: 0.5,
                 },
             };
+        }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            for distance in [&mut *stop_distance, &mut *limit_offset] {
+                *distance = match &*distance {
+                    EntryDistancePolicy::AtrMultiple { period, multiplier } => {
+                        EntryDistancePolicy::AtrMultiple {
+                            period: snap_period(*period).clamp(8, 20),
+                            multiplier: snap_to_ladder(*multiplier, &ATR_ENTRY_MULTIPLIERS),
+                        }
+                    }
+                    EntryDistancePolicy::FixedPoints { .. }
+                    | EntryDistancePolicy::RangeMultiple { .. } => EntryDistancePolicy::AtrMultiple {
+                        period: 14,
+                        multiplier: 0.5,
+                    },
+                };
+            }
         }
     }
     if let Some(value) = &mut strategy.manage.break_even_at_r {
@@ -3002,7 +3077,9 @@ mod tests {
             ));
             assert!(matches!(
                 child.entry.order,
-                EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. }
+                EntryOrderPolicy::Stop { .. }
+                    | EntryOrderPolicy::Limit { .. }
+                    | EntryOrderPolicy::StopLimit { .. }
             ));
         }
     }
@@ -3015,7 +3092,9 @@ mod tests {
         assert!(population.iter().all(|value| {
             matches!(
                 value.entry.order,
-                EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. }
+                EntryOrderPolicy::Stop { .. }
+                    | EntryOrderPolicy::Limit { .. }
+                    | EntryOrderPolicy::StopLimit { .. }
             ) && value.side == Side::Both
                 && value.manage.trailing.is_none()
                 && value.manage.break_even_at_r.is_none()
@@ -3036,7 +3115,14 @@ mod tests {
             .iter()
             .filter(|value| matches!(value.entry.order, EntryOrderPolicy::Limit { .. }))
             .count();
-        assert!(stops > 0 && limits > 0, "both pending kinds should appear");
+        let stop_limits = population
+            .iter()
+            .filter(|value| matches!(value.entry.order, EntryOrderPolicy::StopLimit { .. }))
+            .count();
+        assert!(
+            stops > 0 && limits > 0 && stop_limits > 0,
+            "stop, limit, and stop-limit should appear"
+        );
         for strategy in &population {
             assert_eq!(classify_family(strategy), FamilyStyle::TrendPullback);
             assert_eq!(
@@ -3072,6 +3158,20 @@ mod tests {
                     assert!(
                         matches!(distance, EntryDistancePolicy::AtrMultiple { .. }),
                         "entry distance must be ATR multiple, got {distance:?}"
+                    );
+                }
+                EntryOrderPolicy::StopLimit {
+                    stop_distance,
+                    limit_offset,
+                    ..
+                } => {
+                    assert!(
+                        matches!(stop_distance, EntryDistancePolicy::AtrMultiple { .. }),
+                        "stop distance must be ATR multiple, got {stop_distance:?}"
+                    );
+                    assert!(
+                        matches!(limit_offset, EntryDistancePolicy::AtrMultiple { .. }),
+                        "limit offset must be ATR multiple, got {limit_offset:?}"
                     );
                 }
             }

@@ -80,11 +80,24 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+        "stop_limit" => {
+            strategy.entry.order = EntryOrderPolicy::StopLimit {
+                stop_distance: quantforge_ir::EntryDistancePolicy::AtrMultiple {
+                    period: 14,
+                    multiplier: 0.5,
+                },
+                limit_offset: quantforge_ir::EntryDistancePolicy::AtrMultiple {
+                    period: 14,
+                    multiplier: 0.25,
+                },
+                expiry_bars: 4,
+            };
+        }
         "market" => {
             strategy.entry.order = EntryOrderPolicy::Market;
         }
         other => {
-            eprintln!("unknown mode: {other} (expected pending|market)");
+            eprintln!("unknown mode: {other} (expected pending|stop_limit|market)");
             return ExitCode::FAILURE;
         }
     }

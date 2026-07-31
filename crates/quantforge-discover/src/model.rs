@@ -601,6 +601,10 @@ pub struct DiscoverConfig {
     pub allow_stop_entries: bool,
     #[serde(default)]
     pub allow_limit_entries: bool,
+    /// Stop-limit entries (BuyStopLimit / SellStopLimit). Off by default until
+    /// Phase 3 Discover islands opt in; Phase 1 wires IR/Scout/Judge/export.
+    #[serde(default)]
+    pub allow_stop_limit_entries: bool,
     /// Mandatory portfolio protection applied to every generated strategy.
     /// When enabled, exposure is flattened at `end_of_day_hour` broker time.
     pub flatten_at_22: bool,
@@ -765,6 +769,7 @@ impl Default for DiscoverConfig {
             allow_market_entries: default_allow_market_entries(),
             allow_stop_entries: false,
             allow_limit_entries: false,
+            allow_stop_limit_entries: false,
             flatten_at_22: false,
             end_of_day_hour: default_end_of_day_hour(),
             max_one_entry_per_day: default_max_one_entry_per_day(),
@@ -844,13 +849,17 @@ impl DiscoverConfig {
             || self.allow_partial_exits
             || self.allow_stop_entries
             || self.allow_limit_entries
+            || self.allow_stop_limit_entries
             || !self.allow_market_entries
     }
 
     /// True when the search may only ever place market orders, so seeding never
     /// samples pending distances that `enforce_execution_feature_flags` discards.
     pub const fn market_entries_only(&self) -> bool {
-        self.simple_exits || !(self.allow_stop_entries || self.allow_limit_entries)
+        self.simple_exits
+            || !(self.allow_stop_entries
+                || self.allow_limit_entries
+                || self.allow_stop_limit_entries)
     }
 
     /// Planned evaluations for honesty UI: initial + batch × generations.
@@ -864,9 +873,13 @@ impl DiscoverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
-        if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
+        if !(self.allow_market_entries
+            || self.allow_stop_entries
+            || self.allow_limit_entries
+            || self.allow_stop_limit_entries)
+        {
             return Err(DiscoverError::InvalidConfig(
-                "enable at least one entry order kind: market, stop or limit".into(),
+                "enable at least one entry order kind: market, stop, limit or stop_limit".into(),
             ));
         }
         if self.has_complex_execution() && !self.require_m1_precision {

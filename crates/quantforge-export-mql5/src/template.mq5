@@ -563,6 +563,11 @@ double QFEntryDistance()
    return @@ENTRY_DISTANCE@@;
 }
 
+double QFEntryLimitOffset()
+{
+   return @@ENTRY_LIMIT_OFFSET@@;
+}
+
 int QFEntryExpiryBars()
 {
    return @@ENTRY_EXPIRY@@;
@@ -686,19 +691,30 @@ bool QFOpenOrder(const bool buy)
       return false;
    const int entry_kind=QFEntryOrderKind();
    const double entry_distance=QFEntryDistance();
+   const double limit_offset=QFEntryLimitOffset();
    if(entry_kind!=0 && (!QFValid(entry_distance) || entry_distance<=0.0))
+      return false;
+   if(entry_kind==3 && (!QFValid(limit_offset) || limit_offset<=0.0))
       return false;
    const double minimum_distance=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
    if(stop_distance<minimum_distance || target_distance<minimum_distance
-      || (entry_kind!=0 && entry_distance<minimum_distance))
+      || (entry_kind!=0 && entry_distance<minimum_distance)
+      || (entry_kind==3 && limit_offset<minimum_distance))
       return false;
 
    const double reference=buy ? tick.ask : tick.bid;
    double intended_entry=reference;
+   double stop_trigger=0.0;
    if(entry_kind==1)
       intended_entry=buy ? reference+entry_distance : reference-entry_distance;
    else if(entry_kind==2)
       intended_entry=buy ? reference-entry_distance : reference+entry_distance;
+   else if(entry_kind==3)
+   {
+      stop_trigger=buy ? reference+entry_distance : reference-entry_distance;
+      intended_entry=buy ? stop_trigger-limit_offset : stop_trigger+limit_offset;
+      stop_trigger=NormalizeDouble(stop_trigger,_Digits);
+   }
    intended_entry=NormalizeDouble(intended_entry,_Digits);
    const double stop=NormalizeDouble(buy ? intended_entry-stop_distance
                                          : intended_entry+stop_distance,_Digits);
@@ -740,12 +756,18 @@ bool QFOpenOrder(const bool buy)
                                 ORDER_TIME_SPECIFIED,expiration,comment)
               : g_trade.SellStop(volume,intended_entry,_Symbol,stop,target,
                                  ORDER_TIME_SPECIFIED,expiration,comment);
-      else
+      else if(entry_kind==2)
          sent=buy
               ? g_trade.BuyLimit(volume,intended_entry,_Symbol,stop,target,
                                  ORDER_TIME_SPECIFIED,expiration,comment)
               : g_trade.SellLimit(volume,intended_entry,_Symbol,stop,target,
                                   ORDER_TIME_SPECIFIED,expiration,comment);
+      else
+         sent=buy
+              ? g_trade.BuyStopLimit(volume,intended_entry,stop_trigger,_Symbol,stop,target,
+                                     ORDER_TIME_SPECIFIED,expiration,comment)
+              : g_trade.SellStopLimit(volume,intended_entry,stop_trigger,_Symbol,stop,target,
+                                      ORDER_TIME_SPECIFIED,expiration,comment);
    }
    if(!sent)
       Print("QuantForge entry rejected: ",g_trade.ResultRetcodeDescription());

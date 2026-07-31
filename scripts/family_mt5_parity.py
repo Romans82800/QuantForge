@@ -48,7 +48,7 @@ FAMILIES = [
     "supply_demand_reclaim",
     "sweep_reclaim",
 ]
-MODES = ["market", "pending"]
+MODES = ["market", "pending", "stop_limit"]
 
 
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
