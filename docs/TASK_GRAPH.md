@@ -6,20 +6,34 @@ QuantForge therefore ships a **native JSON task graph**:
 
 - Protocol: `quantforge-task-graph-v1`
 - Example: [`examples/retester-challenge-matrix-export.qf-task.json`](examples/retester-challenge-matrix-export.qf-task.json)
-- Validate / plan: `quantforge task-run --graph path.json` (or `--example`)
+- Execute end-to-end: `quantforge task-run --graph path.json --work-dir ./runs/task`
+- Plan only: `quantforge task-run --graph path.json --dry-run`
+
+Shared inputs live under top-level `inputs` and are merged into each step's `params` (step wins on conflict). Artifacts from earlier steps (`scout`, `challenge`, `wf_matrix`, `judge`, `mq5`, `html_report`, …) are wired automatically when later steps omit explicit paths.
 
 ## Step kinds
 
 | Kind | Maps to |
 |------|---------|
-| `challenge` | `quantforge challenge` / Retester Challenge tab |
-| `walk_forward_matrix` | `quantforge wf-matrix` / Optimizer & Retester WF Matrix |
-| `judge` | `quantforge judge` / Retester M1 Judge |
-| `export_mql5` | `quantforge export` / EA Export |
-| `databank_filter` | `quantforge databank-filter` |
+| `scout` | Completed-bar Scout backtest |
+| `challenge` | Validation Challenge battery |
+| `walk_forward_matrix` | Fold × lookback WF matrix |
+| `judge` | M1 Judge replay |
+| `export_mql5` | MQL5 EA pack |
+| `databank_filter` | Expression filter over elite JSON |
+| `what_if` | What-If trade blotter filters |
+| `negate` | Strategy Negater (flip sides) |
+| `html_report` | SQX SaverHTML-style results HTML |
+| `multi_symbol_retest` | Retest on additional symbol datasets |
 | `note` | Documentation node |
 
 `depends_on` forms a DAG. Disabled steps (`enabled: false`) are skipped.
+
+## HTML export
+
+```bash
+quantforge export-html --input scout-or-judge.json --out results.html
+```
 
 ## Databank ranking filters
 

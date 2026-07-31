@@ -2667,11 +2667,14 @@ dependencies = [
  "quantforge-core",
  "quantforge-data",
  "quantforge-eval",
+ "quantforge-export-mql5",
  "quantforge-ir",
+ "quantforge-tick",
  "rand",
  "rand_chacha",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 

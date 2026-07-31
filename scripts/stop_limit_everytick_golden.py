@@ -15,9 +15,11 @@ import argparse
 import csv
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -416,6 +418,352 @@ def compare(out_dir: Path) -> int:
     return 0 if report["passed"] else 1
 
 
+def load_mt5_credentials() -> dict[str, str]:
+    """Load demo login from env or gitignored `.mt5-demo.local`. Never print secrets."""
+    values: dict[str, str] = {}
+    local = ROOT / ".mt5-demo.local"
+    if local.is_file():
+        for line in local.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    login = os.environ.get("MT5_LOGIN") or values.get("MT5_LOGIN") or values.get("Login")
+    password = (
+        os.environ.get("MT5_PASSWORD") or values.get("MT5_PASSWORD") or values.get("Password")
+    )
+    server = (
+        os.environ.get("MT5_SERVER")
+        or values.get("MT5_SERVER")
+        or values.get("Server")
+        or "ICMarketsSC-Demo"
+    )
+    if not login or not password:
+        raise SystemExit(
+            "MT5 demo credentials missing. Set MT5_LOGIN/MT5_PASSWORD/MT5_SERVER "
+            "or create gitignored .mt5-demo.local (see docs/STOP_LIMIT_EVERYTICK_GOLDEN.md)."
+        )
+    return {"login": login, "password": password, "server": server}
+
+
+def _find_quantforge() -> Path:
+    candidates = [
+        ROOT / "target" / "release" / "quantforge.exe",
+        ROOT / "target" / "release" / "quantforge",
+        ROOT / "target" / "debug" / "quantforge.exe",
+        ROOT / "target" / "debug" / "quantforge",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    which = shutil.which("quantforge")
+    if which:
+        return Path(which)
+    raise SystemExit("quantforge CLI not found — build with cargo build -p quantforge-cli --release")
+
+
+def _terminal_data_dir() -> Path:
+    appdata = Path(os.environ.get("APPDATA", ""))
+    origin_hit = appdata / "MetaQuotes" / "Terminal"
+    preferred = origin_hit / "D0E8209F77C8CF37AD8BF550E51FF075"
+    if preferred.is_dir():
+        return preferred
+    if origin_hit.is_dir():
+        for child in origin_hit.iterdir():
+            origin = child / "origin.txt"
+            if origin.is_file() and "MetaTrader 5" in origin.read_text(encoding="utf-8", errors="ignore"):
+                if (child / "MQL5").is_dir():
+                    return child
+    raise SystemExit("MT5 terminal data directory not found under %APPDATA%/MetaQuotes/Terminal")
+
+
+def _inject_login(tester_ini: Path, creds: dict[str, str], out_ini: Path) -> None:
+    body = tester_ini.read_text(encoding="utf-8", errors="ignore")
+    if "[Common]" in body:
+        raise SystemExit("tester.ini already contains [Common]; refusing to overwrite login block")
+    header = (
+        "[Common]\n"
+        f"Login={creds['login']}\n"
+        f"Password={creds['password']}\n"
+        f"Server={creds['server']}\n"
+        "ProxyEnable=0\n"
+        "KeepPrivate=1\n"
+        "NewsEnable=0\n"
+        "CertInstall=0\n\n"
+    )
+    out_ini.write_text(header + body, encoding="utf-8")
+
+
+def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    printable = []
+    for item in cmd:
+        # Never echo password-bearing args (none expected; defense in depth).
+        printable.append("<redacted>" if "Password=" in item else str(item))
+    print("+", " ".join(printable), flush=True)
+    return subprocess.run(cmd, cwd=ROOT, text=True, **kwargs)
+
+
+def capture(
+    out_dir: Path,
+    *,
+    from_date: str,
+    to_date: str,
+    symbol: str,
+    timeout_seconds: int,
+    tester_model: int,
+) -> int:
+    """Export + compile + Strategy Tester EveryTick capture into out_dir."""
+    creds = load_mt5_credentials()
+    print(
+        f"using MT5 demo login={creds['login']} server={creds['server']} (password redacted)",
+        flush=True,
+    )
+    prepare(out_dir)
+    pack = Path(
+        os.environ.get(
+            "QUANTFORGE_DATA_PACK",
+            r"C:\Users\Administrator\Documents\QuantForge\ICMarkets_EST7_2020_present",
+        )
+    )
+    if not pack.is_dir():
+        raise SystemExit(f"data pack missing: {pack}")
+
+    h1 = pack / f"ICMarketsSC-Demo_{symbol}_H1_2020_present.tsv"
+    m1 = pack / f"ICMarketsSC-Demo_{symbol}_M1_2020_present.tsv"
+    broker = pack / f"{symbol}.broker.json"
+    for path in (h1, m1, broker):
+        if not path.is_file():
+            raise SystemExit(f"required pack file missing: {path}")
+
+    strategy = out_dir / "strategy.ir.json"
+    if not strategy.is_file() and FIXTURE_IR.is_file():
+        shutil.copy2(FIXTURE_IR, strategy)
+
+    qf = _find_quantforge()
+    work = ROOT / "runs" / "stop-limit-everytick-capture"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    export_dir = work / "export"
+    export_dir.mkdir()
+    expert = "QFStopLimitGolden"
+
+    # Judge reference on the same window.
+    judge_out = out_dir / "qf_judge.json"
+    if judge_out.exists():
+        judge_out.unlink()
+    r = _run(
+        [
+            str(qf),
+            "judge",
+            str(h1),
+            "--source-timezone",
+            "ICMarkets/EST+7",
+            "--m1",
+            str(m1),
+            "--m1-source-timezone",
+            "ICMarkets/EST+7",
+            "--strategy",
+            str(strategy),
+            "--broker",
+            str(broker),
+            "--commission-per-lot-round-turn",
+            "7",
+            "--fallback-spread-points",
+            "1",
+            "--initial-balance",
+            "100000",
+            "--allow-execution-gaps",
+            "--allow-failed-data",
+            "--out",
+            str(judge_out),
+        ],
+        capture_output=True,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode:
+        return r.returncode
+
+    # Export + compile with EveryTick model (4) by default.
+    r = _run(
+        [
+            str(qf),
+            "export",
+            "--strategy",
+            str(strategy),
+            "--broker",
+            str(broker),
+            "--out",
+            str(export_dir),
+            "--expert-name",
+            expert,
+            "--expert-directory",
+            "QuantForge",
+            "--timeframe",
+            "H1",
+            "--from-date",
+            from_date,
+            "--to-date",
+            to_date,
+            "--commission-per-lot-round-turn",
+            "7",
+            "--deposit",
+            "100000",
+            "--tester-model",
+            str(tester_model),
+            "--compile",
+        ],
+        capture_output=True,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode:
+        return r.returncode
+
+    terminal_data = _terminal_data_dir()
+    experts = terminal_data / "MQL5" / "Experts" / "QuantForge"
+    indicators = terminal_data / "MQL5" / "Indicators"
+    experts.mkdir(parents=True, exist_ok=True)
+    for src in export_dir.iterdir():
+        if src.is_file() and src.suffix.lower() in {".mq5", ".ex5", ".set", ".evidence.json"}:
+            shutil.copy2(src, experts / src.name)
+    support = export_dir / "Indicators"
+    if support.is_dir():
+        for src in support.rglob("*"):
+            if src.is_file():
+                dst = indicators / src.relative_to(support)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+
+    ex5 = experts / f"{expert}.ex5"
+    if not ex5.is_file():
+        # Also accept compile beside export dir if MetaEditor wrote there.
+        alt = export_dir / f"{expert}.ex5"
+        if alt.is_file():
+            shutil.copy2(alt, ex5)
+        else:
+            print(f"compiled EA missing: {ex5}", file=sys.stderr)
+            return 1
+
+    evidence = export_dir / f"{expert}.evidence.json"
+    shutil.copy2(evidence, out_dir / "evidence.json")
+    shutil.copy2(export_dir / f"{expert}.mq5", out_dir / "expert.mq5")
+
+    evidence_data = json.loads(evidence.read_text(encoding="utf-8"))
+    common_files = Path(os.environ["APPDATA"]) / "MetaQuotes" / "Terminal" / "Common" / "Files"
+    common_files.mkdir(parents=True, exist_ok=True)
+
+    def win_to_path(rel: str) -> Path:
+        return common_files.joinpath(*rel.replace("\\", "/").split("/"))
+
+    deals = win_to_path(evidence_data["parity_deals_file"])
+    equity = win_to_path(evidence_data["parity_equity_file"])
+    metadata = win_to_path(evidence_data["parity_metadata_file"])
+    for path in (deals, equity, metadata):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+
+    # Kill any running terminal before headless /config run.
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "terminal64.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "metatester64.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    time.sleep(2)
+
+    source_ini = export_dir / f"{expert}.tester.ini"
+    # Expert path in ini is QuantForge\Name.ex5 — ensure that matches Experts layout.
+    logged_ini = work / "tester_with_login.ini"
+    _inject_login(source_ini, creds, logged_ini)
+    # Keep a redacted copy in the golden dir for audit (no password).
+    redacted = logged_ini.read_text(encoding="utf-8")
+    redacted = redacted.replace(creds["password"], "***")
+    (out_dir / "tester_config.redacted.ini").write_text(redacted, encoding="utf-8")
+
+    mt5_out = work / "mt5-run.json"
+    if mt5_out.exists():
+        mt5_out.unlink()
+    r = _run(
+        [
+            str(qf),
+            "mt5-test",
+            "--tester-ini",
+            str(logged_ini),
+            "--evidence",
+            str(evidence),
+            "--out",
+            str(mt5_out),
+            "--timeout-seconds",
+            str(timeout_seconds),
+            "--terminal",
+            r"C:\Program Files\MetaTrader 5\terminal64.exe",
+            "--common-files",
+            str(common_files),
+        ],
+        capture_output=True,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+
+    capture_notes = [
+        "# Capture attempt notes",
+        "",
+        f"- login: {creds['login']} (demo)",
+        f"- server: {creds['server']}",
+        f"- symbol: {symbol}",
+        f"- window: {from_date} → {to_date}",
+        f"- tester_model: {tester_model} (4 = every tick based on real ticks)",
+        f"- mt5-test exit: {r.returncode}",
+        f"- deals fresh path expected: `{deals}`",
+        f"- equity fresh path expected: `{equity}`",
+    ]
+    if r.returncode != 0:
+        capture_notes.append("- status: **blocked or failed** during mt5-test")
+        (out_dir / "capture_notes.md").write_text("\n".join(capture_notes) + "\n", encoding="utf-8")
+        # Still copy whatever artifacts exist for diagnosis.
+        for src, name in ((deals, "mt5_deals.csv"), (equity, "mt5_equity.csv"), (metadata, "mt5_metadata.json")):
+            if src.is_file() and src.stat().st_size > 0:
+                shutil.copy2(src, out_dir / name)
+        return r.returncode
+
+    for src, name in (
+        (deals, "mt5_deals.csv"),
+        (equity, "mt5_equity.csv"),
+        (metadata, "mt5_metadata.json"),
+    ):
+        if not src.is_file():
+            print(f"missing tester artifact: {src}", file=sys.stderr)
+            capture_notes.append(f"- missing artifact: {src}")
+            (out_dir / "capture_notes.md").write_text("\n".join(capture_notes) + "\n", encoding="utf-8")
+            return 1
+        shutil.copy2(src, out_dir / name)
+
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["status"] = "mt5_capture_ready"
+    manifest["symbol"] = symbol
+    manifest["from_date"] = from_date
+    manifest["to_date"] = to_date
+    manifest["tester_model_code"] = tester_model
+    manifest["files"]["evidence"] = "evidence.json"
+    manifest["files"]["mq5"] = "expert.mq5"
+    manifest["files"]["metadata"] = "mt5_metadata.json"
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    capture_notes.append("- status: capture artifacts written")
+    (out_dir / "capture_notes.md").write_text("\n".join(capture_notes) + "\n", encoding="utf-8")
+    print(f"captured into {out_dir}", flush=True)
+    return compare(out_dir)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true", help="create stub golden directory")
@@ -424,6 +772,21 @@ def main() -> int:
         "--write-fixture",
         action="store_true",
         help=f"write self-contained numeric fixture at {FIXTURE_DIR}",
+    )
+    parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="login via gitignored demo creds, export/compile, Strategy Tester, compare",
+    )
+    parser.add_argument("--from-date", default="2024.01.01")
+    parser.add_argument("--to-date", default="2024.02.01")
+    parser.add_argument("--symbol", default="EURNZD")
+    parser.add_argument("--timeout-seconds", type=int, default=2400)
+    parser.add_argument(
+        "--tester-model",
+        type=int,
+        default=4,
+        help="MT5 tester model (4=every tick real ticks, 1=1-minute OHLC)",
     )
     parser.add_argument(
         "--out",
@@ -438,6 +801,20 @@ def main() -> int:
     if args.prepare:
         prepare(args.out)
         return 0
+    if args.capture:
+        out = (
+            args.out
+            if args.out != DEFAULT_DIR
+            else ROOT / "parity" / "stop_limit" / "golden_live_eurnzd"
+        )
+        return capture(
+            out,
+            from_date=args.from_date,
+            to_date=args.to_date,
+            symbol=args.symbol,
+            timeout_seconds=args.timeout_seconds,
+            tester_model=args.tester_model,
+        )
     if args.compare:
         return compare(Path(args.compare))
     parser.print_help()

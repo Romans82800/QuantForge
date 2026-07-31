@@ -4,7 +4,9 @@ mod challenge;
 mod databank_filter;
 mod incubation;
 mod negate;
+mod results_html;
 mod sealed;
+mod task_executor;
 mod task_graph;
 mod walk_forward_matrix;
 mod what_if;
@@ -28,10 +30,15 @@ pub use incubation::{
 pub use negate::{
     NEGATE_PROTOCOL_VERSION, NegateError, NegateMode, NegateReport, negate_strategy,
 };
+pub use results_html::{
+    HTML_REPORT_PROTOCOL, render_results_html, render_results_html_from_json,
+    render_results_html_from_scout,
+};
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,
     SealedFinalReport, run_sealed_final,
 };
+pub use task_executor::{TaskArtifactStore, TaskRunOptions, run_task_graph};
 pub use task_graph::{
     TASK_GRAPH_PROTOCOL, TASK_GRAPH_SCHEMA_VERSION, TaskGraph, TaskGraphError, TaskRunReport,
     TaskStep, TaskStepKind, TaskStepResult, TaskStepStatus, example_retester_graph,

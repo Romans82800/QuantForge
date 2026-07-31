@@ -11,6 +11,10 @@ $env:QUANTFORGE_DATA_PACK = "C:\Users\Administrator\Documents\QuantForge\ICMarke
 # Stub layout for a live capture:
 python scripts/stop_limit_everytick_golden.py --prepare
 
+# Automated demo capture (credentials from env or gitignored `.mt5-demo.local` ONLY):
+#   MT5_LOGIN / MT5_PASSWORD / MT5_SERVER   or   .mt5-demo.local
+python scripts/stop_limit_everytick_golden.py --capture --symbol EURNZD --from-date 2024.01.01 --to-date 2024.02.01
+
 # Self-contained CI fixture (no MT5):
 python scripts/stop_limit_everytick_golden.py --write-fixture
 python scripts/stop_limit_everytick_golden.py --compare parity/stop_limit/golden_numeric_fixture
@@ -18,6 +22,8 @@ python scripts/stop_limit_everytick_golden.py --compare parity/stop_limit/golden
 ```
 
 After Strategy Tester EveryTick capture, drop deals/equity (+ Judge) into the golden dir and run `--compare`.
+
+**Never commit** MT5 passwords, account numbers, or `.mt5-demo.local`. Use env vars or the gitignored local file.
 
 ## Compare modes
 

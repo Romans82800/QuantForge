@@ -45,6 +45,16 @@ pub enum TaskStepKind {
     ExportMql5,
     /// SQX-like databank expression filter (reads/writes JSON elite lists).
     DatabankFilter,
+    /// Completed-bar Scout backtest.
+    Scout,
+    /// What-If trade filters on a prior Scout/Judge blotter.
+    WhatIf,
+    /// Strategy Negater (flip long/short).
+    Negate,
+    /// SQX SaverHTML-style metrics + trades report.
+    HtmlReport,
+    /// Retest the same strategy on additional symbol datasets.
+    MultiSymbolRetest,
     /// No-op marker / documentation node.
     Note,
 }
@@ -69,6 +79,9 @@ pub struct TaskGraph {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Shared inputs merged under each step's params (step wins on conflict).
+    #[serde(default)]
+    pub inputs: BTreeMap<String, Value>,
     pub steps: Vec<TaskStep>,
 }
 
@@ -225,6 +238,7 @@ pub fn example_retester_graph() -> TaskGraph {
         schema_version: TASK_GRAPH_SCHEMA_VERSION,
         name: "retester-challenge-matrix-export".into(),
         description: "Challenge → WF matrix → Judge → EA export".into(),
+        inputs: BTreeMap::new(),
         steps: vec![
             TaskStep {
                 id: "challenge".into(),

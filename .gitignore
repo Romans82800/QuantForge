@@ -11,3 +11,8 @@
 /runs/
 /ICMarkets_EST7_2020_present
 /data/icmarkets-est7-2020-present
+.mt5-demo.local
+*.mt5-demo.local
+.env
+.env.*
+!.env.example

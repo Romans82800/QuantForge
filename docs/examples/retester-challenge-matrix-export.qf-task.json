@@ -3,14 +3,29 @@
   "schema_version": 1,
   "name": "retester-challenge-matrix-export",
   "description": "QF-native stand-in for SQX ProjectRetester / TaskRetest chaining. SQX project XML schemas are not publicly documented outside proprietary plugin JARs.",
+  "inputs": {
+    "strategy": "strategy.ir.json",
+    "broker": "broker.json",
+    "data": "bars.tsv",
+    "source_timezone": "Etc/UTC",
+    "initial_balance": 100000.0,
+    "entry_window_start_hour": 0,
+    "entry_window_end_hour": 24
+  },
   "steps": [
+    {
+      "id": "scout",
+      "kind": "scout",
+      "depends_on": [],
+      "enabled": true,
+      "params": {}
+    },
     {
       "id": "challenge",
       "kind": "challenge",
-      "depends_on": [],
+      "depends_on": ["scout"],
       "enabled": true,
       "params": {
-        "strategy": "strategy.ir.json",
         "folds": 5,
         "monte_carlo_trials": 200,
         "neighborhood_samples": 20
@@ -19,7 +34,7 @@
     {
       "id": "wf_matrix",
       "kind": "walk_forward_matrix",
-      "depends_on": ["challenge"],
+      "depends_on": ["scout"],
       "enabled": true,
       "params": {
         "fold_counts": [3, 4, 5, 6],
@@ -31,7 +46,19 @@
       "kind": "judge",
       "depends_on": ["challenge"],
       "enabled": true,
-      "params": {}
+      "params": {
+        "m1": "m1.tsv",
+        "m1_source_timezone": "Etc/UTC"
+      }
+    },
+    {
+      "id": "html",
+      "kind": "html_report",
+      "depends_on": ["scout"],
+      "enabled": true,
+      "params": {
+        "out": "results.html"
+      }
     },
     {
       "id": "export",

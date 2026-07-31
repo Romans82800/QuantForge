@@ -32,10 +32,10 @@ use quantforge_quality::{
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
     StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, NegateMode, WhatIfFilter,
-    WalkForwardMatrixConfig,     apply_what_if, evaluate_certification, negate_strategy, run_challenge,
-    run_incubation, run_sealed_final, run_walk_forward_matrix,
-    example_retester_graph, filter_rows, row_from_value, TaskGraph,
-    TaskStepKind, TaskStepResult, TaskStepStatus, TaskRunReport, TASK_GRAPH_PROTOCOL,
+    WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
+    run_incubation, run_sealed_final, run_task_graph, run_walk_forward_matrix,
+    example_retester_graph, filter_rows, row_from_value, render_results_html_from_json, TaskGraph,
+    TaskRunOptions,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -160,8 +160,10 @@ enum Command {
     WfMatrix(WfMatrixArgs),
     /// Filter a databank / elite JSON list with an SQX-like expression.
     DatabankFilter(DatabankFilterArgs),
-    /// Validate / dry-run a QuantForge Retester task graph JSON.
+    /// Execute (or dry-run) a QuantForge Retester task graph JSON end-to-end.
     TaskRun(TaskRunArgs),
+    /// Render an SQX SaverHTML-style results report from Scout/Judge JSON.
+    ExportHtml(ExportHtmlArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -875,11 +877,29 @@ struct TaskRunArgs {
     /// Emit the built-in Retester example graph instead of loading a file.
     #[arg(long, default_value_t = false)]
     example: bool,
-    /// Only validate + print planned order (default).
-    #[arg(long, default_value_t = true)]
+    /// Validate + print planned order without executing steps.
+    #[arg(long, default_value_t = false)]
     dry_run: bool,
+    /// Working directory for step artifacts (created if missing).
+    #[arg(long, default_value = ".")]
+    work_dir: PathBuf,
+    /// Continue after a failed step instead of stopping.
+    #[arg(long, default_value_t = false)]
+    continue_on_failure: bool,
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ExportHtmlArgs {
+    /// Scout / Judge / metrics JSON artifact.
+    #[arg(long)]
+    input: PathBuf,
+    /// HTML title.
+    #[arg(long, default_value = "QuantForge results")]
+    title: String,
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -1549,6 +1569,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::WfMatrix(args) => wf_matrix_command(args)?,
         Command::DatabankFilter(args) => databank_filter_command(args)?,
         Command::TaskRun(args) => task_run_command(args)?,
+        Command::ExportHtml(args) => export_html_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1951,46 +1972,33 @@ fn task_run_command(args: TaskRunArgs) -> Result<(), Box<dyn Error>> {
         read_json(path)?
     };
     graph.validate()?;
-    let ordered = graph.ordered_steps(true)?;
-    let mut steps = Vec::new();
-    for step in ordered {
-        let message = if args.dry_run {
-            format!(
-                "dry-run planned {:?} with {} params",
-                step.kind,
-                step.params.len()
-            )
-        } else {
-            match &step.kind {
-                TaskStepKind::Note => "note".into(),
-                TaskStepKind::DatabankFilter => {
-                    "databank-filter step requires embedding filter params; use `quantforge databank-filter`".into()
-                }
-                other => format!(
-                    "{other:?} execution is delegated to dedicated CLI/desktop commands in this release"
-                ),
-            }
-        };
-        steps.push(TaskStepResult {
-            id: step.id.clone(),
-            kind: step.kind.clone(),
-            status: TaskStepStatus::Passed,
-            message,
-            artifacts: Default::default(),
-        });
-    }
-    let report = TaskRunReport {
-        protocol: TASK_GRAPH_PROTOCOL.into(),
-        graph_name: graph.name.clone(),
-        passed: true,
-        steps,
+    let options = TaskRunOptions {
+        work_dir: args.work_dir.clone(),
+        dry_run: args.dry_run,
+        stop_on_failure: !args.continue_on_failure,
     };
+    let report = run_task_graph(&graph, &options)?;
     if let Some(out) = args.out {
         write_json_new(&out, &report)?;
         println!("wrote {}", out.display());
     } else {
         print_json(&report)?;
     }
+    if !report.passed {
+        return Err("task graph failed one or more steps".into());
+    }
+    Ok(())
+}
+
+fn export_html_command(args: ExportHtmlArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.input)?;
+    let html = render_results_html_from_json(&args.title, &raw)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, html)?;
+    println!("wrote {}", args.out.display());
     Ok(())
 }
 
@@ -4156,9 +4164,18 @@ fn mt5_test_command(args: Mt5TestArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn metaeditor_config(args: &ExportArgs) -> Result<MetaEditorConfig, Box<dyn Error>> {
+    let native_windows = PathBuf::from(r"C:\Program Files\MetaTrader 5\metaeditor64.exe");
+    if args.metaeditor.is_none() && native_windows.is_file() {
+        return Ok(MetaEditorConfig {
+            executable: native_windows,
+            wine_binary: None,
+            wine_prefix: None,
+        });
+    }
     let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("HOME is unavailable; provide --metaeditor, --wine and --wine-prefix")?;
+        .ok_or("HOME/USERPROFILE is unavailable; provide --metaeditor")?;
     let default_prefix =
         user_home.join("Library/Application Support/net.metaquotes.wine.metatrader5");
     let executable = args.metaeditor.clone().unwrap_or_else(|| {
@@ -4181,12 +4198,36 @@ fn metaeditor_config(args: &ExportArgs) -> Result<MetaEditorConfig, Box<dyn Erro
 }
 
 fn terminal_config(args: &Mt5TestArgs) -> Result<(TerminalConfig, PathBuf), Box<dyn Error>> {
+    let native_terminal = PathBuf::from(r"C:\Program Files\MetaTrader 5\terminal64.exe");
+    // Prefer native Windows MT5 when present (or when explicitly pointed at).
+    if args.terminal.as_ref().is_some_and(|path| path.is_file())
+        || (args.terminal.is_none() && native_terminal.is_file())
+    {
+        let executable = args.terminal.clone().unwrap_or(native_terminal);
+        let common_files = args.common_files.clone().or_else(|| {
+            std::env::var_os("APPDATA").map(|appdata| {
+                PathBuf::from(appdata).join("MetaQuotes/Terminal/Common/Files")
+            })
+        }).ok_or("APPDATA unavailable; provide --common-files")?;
+        return Ok((
+            TerminalConfig {
+                executable,
+                wine_binary: None,
+                wine_prefix: None,
+                timeout_seconds: args.timeout_seconds,
+            },
+            common_files,
+        ));
+    }
+
     let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("HOME is unavailable; provide explicit MT5 terminal paths")?;
+        .ok_or("HOME/USERPROFILE is unavailable; provide explicit MT5 terminal paths")?;
     let user_name = std::env::var_os("USER")
+        .or_else(|| std::env::var_os("USERNAME"))
         .map(PathBuf::from)
-        .ok_or("USER is unavailable; provide --common-files")?;
+        .ok_or("USER/USERNAME is unavailable; provide --common-files")?;
     let default_prefix =
         user_home.join("Library/Application Support/net.metaquotes.wine.metatrader5");
     let executable = args.terminal.clone().unwrap_or_else(|| {
