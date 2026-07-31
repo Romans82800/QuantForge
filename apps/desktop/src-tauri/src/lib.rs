@@ -5,6 +5,7 @@ mod databank;
 mod deploy;
 mod discover;
 mod evidence;
+mod optimizer;
 mod parity_lab;
 mod portfolio;
 mod promotion_ledger;
@@ -48,6 +49,8 @@ pub fn run() {
             discover::resume_discover,
             discover::stop_discover,
             challenge::run_challenge_workflow,
+            optimizer::run_optimizer_neighborhood,
+            optimizer::run_walk_forward_matrix_workflow,
             promotion_ledger::run_sealed_final,
             promotion_ledger::start_incubation,
             promotion_ledger::record_incubation,

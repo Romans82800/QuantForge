@@ -8,6 +8,7 @@ export type WorkspaceName =
   | "Vault"
   | "Data Lab"
   | "Parity Lab"
+  | "Optimizer"
   | "Portfolio"
   | "Deploy";
 
@@ -718,6 +719,90 @@ export interface ChallengeView {
   passedCount: number;
   failedCount: number;
   totalCount: number;
+}
+
+export interface OptimizerRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  strategyPath: string;
+  brokerPath: string;
+  outputPath: string;
+  neighborhoodSamples: number;
+  perturbationFraction: number;
+  seed: number;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
+}
+
+export interface OptimizerNeighborView {
+  sample: number;
+  strategyFingerprint: string;
+  returnPercent: number;
+  profitFactor: number | null;
+  maximumDrawdownPercent: number;
+  tradeCount: number;
+  returnRatio: number | null;
+  drawdownRatio: number;
+  passed: boolean;
+}
+
+export interface OptimizerView {
+  outputPath: string;
+  baselineReturnPercent: number;
+  baselineProfitFactor: number | null;
+  baselineDrawdownPercent: number;
+  baselineTrades: number;
+  neighbors: OptimizerNeighborView[];
+  passedCount: number;
+  totalCount: number;
+  survivalFraction: number;
+}
+
+export interface WalkForwardMatrixRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  strategyPath: string;
+  brokerPath: string;
+  outputPath: string;
+  foldCounts: number[];
+  lookbackBars: number[];
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
+  minimumFoldTrades: number;
+  minimumReturnPercent: number;
+  minimumProfitFactor: number;
+  maximumDrawdownPercent: number;
+  minimumPassingFoldFraction: number;
+}
+
+export interface WalkForwardMatrixCellView {
+  foldCount: number;
+  lookbackBars: number;
+  totalFolds: number;
+  passingFolds: number;
+  passingFraction: number;
+  passed: boolean;
+  meanReturnPercent: number;
+  meanProfitFactor: number;
+  meanMaxDrawdownPercent: number;
+}
+
+export interface WalkForwardMatrixView {
+  outputPath: string;
+  protocol: string;
+  foldCounts: number[];
+  lookbackBars: number[];
+  cells: WalkForwardMatrixCellView[];
+  bestCellIndex: number | null;
+  passingCells: number;
 }
 
 export interface SealedRequest {

@@ -4,6 +4,7 @@ mod challenge;
 mod incubation;
 mod negate;
 mod sealed;
+mod walk_forward_matrix;
 mod what_if;
 
 pub use challenge::{
@@ -24,6 +25,11 @@ pub use negate::{
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,
     SealedFinalReport, run_sealed_final,
+};
+pub use walk_forward_matrix::{
+    WALK_FORWARD_MATRIX_PROTOCOL, WalkForwardMatrixCell, WalkForwardMatrixConfig,
+    WalkForwardMatrixError, WalkForwardMatrixFold, WalkForwardMatrixReport,
+    run_walk_forward_matrix,
 };
 pub use what_if::{
     WHAT_IF_PROTOCOL_VERSION, WhatIfError, WhatIfFilter, WhatIfReport, apply_what_if,

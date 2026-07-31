@@ -43,6 +43,9 @@ import {
   runFidelityDemo,
   runEliteRobustness,
   runM1Judge,
+  runOptimizerNeighborhood,
+  runChallenge,
+  runWalkForwardMatrix,
   runSealedFinal,
   startIncubation,
   finalizeIncubation,
@@ -69,6 +72,12 @@ import type {
   ConditionCoverage,
   JudgeRequest,
   JudgeView,
+  ChallengeRequest,
+  ChallengeView,
+  OptimizerRequest,
+  OptimizerView,
+  WalkForwardMatrixRequest,
+  WalkForwardMatrixView,
   IncubationStartRequest,
   IncubationView,
   IndicatorParityRequest,
@@ -119,6 +128,7 @@ type NavIcon =
   | "discover"
   | "databank"
   | "retester"
+  | "optimizer"
   | "data"
   | "portfolio"
   | "settings";
@@ -133,6 +143,7 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
   { name: "Discover", label: "Discover", icon: "discover" },
   { name: "Databank", label: "Databank", icon: "databank" },
   { name: "Parity Lab", label: "Retester", icon: "retester" },
+  { name: "Optimizer", label: "Optimizer", icon: "optimizer" },
   { name: "Data Lab", label: "Data Manager", icon: "data" },
   { name: "Portfolio", label: "Portfolio", icon: "portfolio" },
   { name: "Search Settings", label: "Settings", icon: "settings" },
@@ -234,6 +245,7 @@ const workspaceTitles: Record<WorkspaceName, string> = {
   Vault: "Certified",
   "Data Lab": "Data Manager",
   "Parity Lab": "Retester",
+  Optimizer: "Optimizer",
   Portfolio: "Portfolio",
   Deploy: "Deployment",
 };
@@ -247,6 +259,7 @@ const NAV_GLYPHS: Record<NavIcon, string> = {
   discover: "M10.5 4.5a6 6 0 1 0 0 12 6 6 0 0 0 0-12ZM15 15l4.5 4.5",
   databank: "M4.5 6.5h15M4.5 12h15M4.5 17.5h15M9 4v16",
   retester: "M5 19V9m4.7 10V5m4.6 14v-7m4.7 7V8",
+  optimizer: "M4.5 17.5 9 8l4 6.5L17 5.5l2.5 4",
   data: "M12 4c4 0 7 1.2 7 2.7S16 9.4 12 9.4 5 8.2 5 6.7 8 4 12 4Zm7 5v8.3c0 1.5-3 2.7-7 2.7s-7-1.2-7-2.7V9",
   portfolio: "M4.5 8.5h15v11h-15zM9 8.5V6a3 3 0 0 1 6 0v2.5",
   settings:
@@ -667,6 +680,8 @@ function App() {
             judgePreset={judgePreset}
             onError={setError}
           />
+        ) : activeWorkspace === "Optimizer" ? (
+          <OptimizerWorkspace onError={setError} />
         ) : activeWorkspace === "Portfolio" ? (
           <PortfolioWorkspace onError={setError} workspace={workspace} />
         ) : activeWorkspace === "Vault" ? (
@@ -4242,6 +4257,235 @@ function SymbolSelect({
   );
 }
 
+function OptimizerWorkspace({ onError }: { onError: (message: string | null) => void }) {
+  const [tab, setTab] = useState<"neighborhood" | "matrix">("neighborhood");
+  return (
+    <div className="wide-tool-content">
+      <div className="workspace-tabs">
+        <button className={tab === "neighborhood" ? "active" : ""} onClick={() => setTab("neighborhood")}>1 · Param neighborhood</button>
+        <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>2 · Walk-forward matrix</button>
+      </div>
+      {tab === "neighborhood" ? <OptimizerPanel onError={onError} /> : <WalkForwardMatrixPanel onError={onError} />}
+    </div>
+  );
+}
+
+function OptimizerPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<OptimizerRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", brokerPath: "",
+    outputPath: "", neighborhoodSamples: 20, perturbationFraction: 0.2, seed: 42,
+    commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19,
+  });
+  const [result, setResult] = useState<OptimizerView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof OptimizerRequest>(key: K, value: OptimizerRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    try { setResult(await runOptimizerNeighborhood(form)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">SQX-style AppOptimizer</p><h2>Perturb parameters and rank survivors</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New optimizer artifact" path={form.outputPath} choose={() => chooseOutputJson("Save optimizer artifact", "optimizer.json")} onChange={(value) => update("outputPath", value)} required />
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Neighbors" value={form.neighborhoodSamples} onChange={(value) => update("neighborhoodSamples", value ?? 20)} min={1} />
+          <NumberField label="Perturbation ±" value={form.perturbationFraction} onChange={(value) => update("perturbationFraction", value ?? 0.2)} step={0.05} />
+          <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} />
+          <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={0.01} />
+          <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
+        </div>
+        <div className="form-footer">
+          <p>Runs Scout on the baseline, then ±perturbation neighborhood samples. Survivors keep return / drawdown / trade-count ratios.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={() => void run()}>{busy ? "Optimizing…" : "Run optimizer"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">Neighborhood</p><h2>{formatNumber(result.passedCount)} / {formatNumber(result.totalCount)} survivors</h2></div><span className="grade-pill">{(result.survivalFraction * 100).toFixed(0)}%</span></div>
+          <div className="job-kpis">
+            <Kpi label="Baseline return" value={`${formatNumber(result.baselineReturnPercent, 2)}%`} note={`${formatNumber(result.baselineTrades)} trades`} />
+            <Kpi label="Baseline DD" value={`${formatNumber(result.baselineDrawdownPercent, 2)}%`} note={`PF ${result.baselineProfitFactor == null ? "∞" : formatNumber(result.baselineProfitFactor, 2)}`} />
+            <Kpi label="Survival" value={`${formatNumber(result.survivalFraction * 100, 1)}%`} note={`${formatNumber(result.passedCount)} passed`} />
+          </div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th>#</th><th>Return %</th><th>PF</th><th>DD %</th><th>Trades</th><th>Ret ratio</th><th>Status</th></tr></thead>
+              <tbody>
+                {result.neighbors.map((row) => (
+                  <tr key={row.sample} className={row.passed ? "" : "row-fail"}>
+                    <td>{row.sample}</td>
+                    <td>{formatNumber(row.returnPercent, 2)}</td>
+                    <td>{row.profitFactor == null ? "∞" : formatNumber(row.profitFactor, 2)}</td>
+                    <td>{formatNumber(row.maximumDrawdownPercent, 2)}</td>
+                    <td>{row.tradeCount}</td>
+                    <td>{row.returnRatio == null ? "—" : formatNumber(row.returnRatio, 2)}</td>
+                    <td>{row.passed ? "pass" : "fail"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <ArtifactPath label="Optimizer artifact" value={result.outputPath} />
+        </section>
+      ) : <WorkspacePrimer title="No optimizer run yet" copy="Pick data + strategy, set neighborhood size, then run. Results mirror SQX parameter-sensitivity tables." />}
+    </div>
+  );
+}
+
+function WalkForwardMatrixPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<WalkForwardMatrixRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", brokerPath: "",
+    outputPath: "", foldCounts: [3, 4, 5, 6], lookbackBars: [60, 120, 240],
+    commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19,
+    minimumFoldTrades: 3, minimumReturnPercent: 0, minimumProfitFactor: 1,
+    maximumDrawdownPercent: 35, minimumPassingFoldFraction: 0.5,
+  });
+  const [foldText, setFoldText] = useState("3,4,5,6");
+  const [lookbackText, setLookbackText] = useState("60,120,240");
+  const [result, setResult] = useState<WalkForwardMatrixView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof WalkForwardMatrixRequest>(key: K, value: WalkForwardMatrixRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  function parseList(text: string): number[] {
+    return text.split(/[,\s]+/).map((part) => Number(part.trim())).filter((value) => Number.isFinite(value) && value > 0);
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    const payload = { ...form, foldCounts: parseList(foldText), lookbackBars: parseList(lookbackText) };
+    try { setResult(await runWalkForwardMatrix(payload)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">CrossCheckWalkForwardMatrix</p><h2>Fold count × lookback grid</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New matrix artifact" path={form.outputPath} choose={() => chooseOutputJson("Save WF matrix", "wf-matrix.json")} onChange={(value) => update("outputPath", value)} required />
+          <label className="field-row"><span>Fold counts</span><input value={foldText} onChange={(event) => setFoldText(event.target.value)} /></label>
+          <label className="field-row"><span>Lookback bars</span><input value={lookbackText} onChange={(event) => setLookbackText(event.target.value)} /></label>
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Min fold trades" value={form.minimumFoldTrades} onChange={(value) => update("minimumFoldTrades", value ?? 0)} min={0} />
+          <NumberField label="Min return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value ?? 0)} step={0.1} />
+          <NumberField label="Min PF" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value ?? 1)} step={0.05} />
+          <NumberField label="Max DD %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value ?? 35)} step={0.5} />
+          <NumberField label="Pass fold frac" value={form.minimumPassingFoldFraction} onChange={(value) => update("minimumPassingFoldFraction", value ?? 0.5)} step={0.05} />
+        </div>
+        <div className="form-footer">
+          <p>Each cell replays contiguous OOS folds with the given lookback warmup on Scout.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={() => void run()}>{busy ? "Running matrix…" : "Run walk-forward matrix"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">WF matrix</p><h2>{formatNumber(result.passingCells)} / {formatNumber(result.cells.length)} cells pass</h2></div><span className="grade-pill">{result.protocol}</span></div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th>Folds</th><th>Lookback</th><th>Pass</th><th>Frac</th><th>Mean ret %</th><th>Mean PF</th><th>Mean DD %</th><th>Status</th></tr></thead>
+              <tbody>
+                {result.cells.map((cell, index) => (
+                  <tr key={`${cell.foldCount}-${cell.lookbackBars}`} className={index === result.bestCellIndex ? "row-best" : cell.passed ? "" : "row-fail"}>
+                    <td>{cell.foldCount}</td>
+                    <td>{cell.lookbackBars}</td>
+                    <td>{cell.passingFolds}/{cell.totalFolds}</td>
+                    <td>{formatNumber(cell.passingFraction, 2)}</td>
+                    <td>{formatNumber(cell.meanReturnPercent, 2)}</td>
+                    <td>{formatNumber(cell.meanProfitFactor, 2)}</td>
+                    <td>{formatNumber(cell.meanMaxDrawdownPercent, 2)}</td>
+                    <td>{cell.passed ? (index === result.bestCellIndex ? "best" : "pass") : "fail"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <ArtifactPath label="Matrix artifact" value={result.outputPath} />
+        </section>
+      ) : <WorkspacePrimer title="No matrix yet" copy="Enter fold counts and lookbacks, then run. The grid mirrors SQX Walk-Forward Matrix cells." />}
+    </div>
+  );
+}
+
+function ChallengeRetestPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<ChallengeRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", strategyPaths: [],
+    brokerPath: "", outputDirectory: "", validationFraction: 0.2, sealedFraction: 0.2,
+    evaluationsTouched: 1000, commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0,
+    fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19, folds: 5, monteCarloTrials: 200,
+    neighborhoodSamples: 20, seed: 42,
+  });
+  const [result, setResult] = useState<ChallengeView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof ChallengeRequest>(key: K, value: ChallengeRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    try { setResult(await runChallenge(form)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">TaskRetest / Challenge</p><h2>Purged walk-forward + MC + neighborhood</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New Challenge directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create Challenge directory", "challenge-run")} onChange={(value) => update("outputDirectory", value)} required />
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Folds" value={form.folds} onChange={(value) => update("folds", value ?? 5)} min={2} />
+          <NumberField label="MC trials" value={form.monteCarloTrials} onChange={(value) => update("monteCarloTrials", value ?? 200)} min={10} />
+          <NumberField label="Neighbors" value={form.neighborhoodSamples} onChange={(value) => update("neighborhoodSamples", value ?? 20)} min={1} />
+          <NumberField label="Validation frac" value={form.validationFraction} onChange={(value) => update("validationFraction", value ?? 0.2)} step={0.05} />
+          <NumberField label="Sealed frac" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value ?? 0.2)} step={0.05} />
+        </div>
+        <div className="form-footer">
+          <p>Writes split-plan + Challenge artifacts. OOS2/sealed stays locked.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={() => void run()}>{busy ? "Challenging…" : "Run Challenge retest"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero"><div><p className="eyebrow">Challenge</p><h2>{result.passed ? "Passed validation battery" : "Blocked"}</h2></div><span className="grade-pill">{result.grade}</span></div>
+          <div className="job-kpis">
+            <Kpi label="OOS1 trades" value={formatNumber(result.validationTrades)} note={`${formatNumber(result.returnPercent, 2)}%`} />
+            <Kpi label="WF folds" value={`${formatNumber(result.passingFolds)}/${formatNumber(result.totalFolds)}`} note={`cost shocks ${result.passingCostShocks}/${result.totalCostShocks}`} />
+            <Kpi label="Batch" value={`${formatNumber(result.passedCount)}/${formatNumber(result.totalCount)}`} note={result.blockers[0] ?? "no blockers"} />
+          </div>
+          <ArtifactPath label="Challenge artifact" value={result.challengePath} />
+          <ArtifactPath label="Split plan" value={result.splitPlanPath} />
+        </section>
+      ) : <WorkspacePrimer title="No Challenge yet" copy="Retester Challenge runs the same purged walk-forward / Monte Carlo / neighborhood battery as the CLI." />}
+    </div>
+  );
+}
+
 function ParityWorkspace({
   exportPreset,
   judgePreset,
@@ -4251,10 +4495,22 @@ function ParityWorkspace({
   judgePreset: Partial<JudgeRequest>;
   onError: (message: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"judge" | "export" | "compare" | "indicators">("judge");
+  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "export" | "compare" | "indicators">("judge");
   return <div className="wide-tool-content">
-    <div className="workspace-tabs"><button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button><button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>2 · EA Export</button><button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>3 · MT5 Compare</button><button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>4 · Indicators</button></div>
-    {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} /> : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} /> : tab === "compare" ? <ParityComparePanel onError={onError} /> : <IndicatorParityPanel onError={onError} />}
+    <div className="workspace-tabs">
+      <button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button>
+      <button className={tab === "challenge" ? "active" : ""} onClick={() => setTab("challenge")}>2 · Challenge</button>
+      <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>3 · WF Matrix</button>
+      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>4 · EA Export</button>
+      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>5 · MT5 Compare</button>
+      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>6 · Indicators</button>
+    </div>
+    {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} />
+      : tab === "challenge" ? <ChallengeRetestPanel onError={onError} />
+      : tab === "matrix" ? <WalkForwardMatrixPanel onError={onError} />
+      : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} />
+      : tab === "compare" ? <ParityComparePanel onError={onError} />
+      : <IndicatorParityPanel onError={onError} />}
   </div>;
 }
 

@@ -10,6 +10,10 @@ import type {
   EvidenceView,
   ChallengeRequest,
   ChallengeView,
+  OptimizerRequest,
+  OptimizerView,
+  WalkForwardMatrixRequest,
+  WalkForwardMatrixView,
   DataLabRequest,
   DataLabView,
   DeployRequest,
@@ -204,6 +208,16 @@ export function stopDiscover(): Promise<DiscoverJobView> {
 
 export function runChallenge(request: ChallengeRequest): Promise<ChallengeView> {
   return invoke<ChallengeView>("run_challenge_workflow", { request });
+}
+
+export function runOptimizerNeighborhood(request: OptimizerRequest): Promise<OptimizerView> {
+  return invoke<OptimizerView>("run_optimizer_neighborhood", { request });
+}
+
+export function runWalkForwardMatrix(
+  request: WalkForwardMatrixRequest,
+): Promise<WalkForwardMatrixView> {
+  return invoke<WalkForwardMatrixView>("run_walk_forward_matrix_workflow", { request });
 }
 
 export function runSealedFinal(request: SealedRequest): Promise<SealedView> {

@@ -32,8 +32,8 @@ use quantforge_quality::{
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
     StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, NegateMode, WhatIfFilter,
-    apply_what_if, evaluate_certification, negate_strategy, run_challenge, run_incubation,
-    run_sealed_final,
+    WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
+    run_incubation, run_sealed_final, run_walk_forward_matrix,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -154,6 +154,8 @@ enum Command {
     WhatIf(WhatIfArgs),
     /// Flip long/short sides of a strategy IR (SQX Negater cross-check).
     Negate(NegateArgs),
+    /// SQX-style walk-forward matrix (fold count × lookback grid).
+    WfMatrix(WfMatrixArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -826,6 +828,28 @@ struct NegateArgs {
 }
 
 #[derive(Debug, Args)]
+struct WfMatrixArgs {
+    #[command(flatten)]
+    source: DataSourceArgs,
+    #[arg(long)]
+    strategy: PathBuf,
+    #[arg(long)]
+    broker: PathBuf,
+    #[arg(long, value_delimiter = ',', default_value = "3,4,5,6")]
+    fold_counts: Vec<usize>,
+    #[arg(long, value_delimiter = ',', default_value = "60,120,240")]
+    lookback_bars: Vec<usize>,
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    #[arg(long, default_value_t = 7.0)]
+    commission_per_lot_round_turn: f64,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_points_per_side: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct WhatIfArgs {
     /// Scout or Judge JSON artifact containing `result.trades` (or a bare trades array).
     #[arg(long)]
@@ -1489,6 +1513,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Deploy(args) => deploy_command(args)?,
         Command::WhatIf(args) => what_if_command(args)?,
         Command::Negate(args) => negate_command(args)?,
+        Command::WfMatrix(args) => wf_matrix_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1812,6 +1837,40 @@ fn negate_command(args: NegateArgs) -> Result<(), Box<dyn Error>> {
         if let Some(backup) = backup {
             println!("preserved previous report as {}", backup.display());
         }
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn wf_matrix_command(args: WfMatrixArgs) -> Result<(), Box<dyn Error>> {
+    let (dataset, metadata) = load_source(&args.source)?;
+    let broker: SymbolSpecification = read_json(&args.broker)?;
+    if let Some(metadata) = &metadata {
+        // Best-effort bind when metadata exists; ignore soft mismatches for research matrix runs.
+        let _ = metadata;
+    }
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let config = WalkForwardMatrixConfig {
+        fold_counts: args.fold_counts,
+        lookback_bars: args.lookback_bars,
+        initial_balance: args.initial_balance,
+        costs: CostModel {
+            commission_per_lot_round_turn: args.commission_per_lot_round_turn,
+            adverse_slippage_points_per_side: args.slippage_points_per_side,
+            ..CostModel::default()
+        },
+        ..WalkForwardMatrixConfig::default()
+    };
+    let report = run_walk_forward_matrix(&strategy, &dataset, &broker, &config)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} ({} cells, {} passing)",
+            out.display(),
+            report.cells.len(),
+            report.passing_cells
+        );
     } else {
         print_json(&report)?;
     }

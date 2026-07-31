@@ -13,13 +13,15 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | SQX surface (install) | QuantForge status |
 |-----|-----|
 | AppBuilder / TaskBuild / Mass Builder | **Present** — Discover Mass Builder + islands + prefilter |
-| AppRetester / TaskRetest | **Partial** — Challenge / Judge / multi-symbol gates; no dedicated Retester UI app |
-| AppOptimizer / TaskOptimize | **Partial** — MAP-Elites + neighborhood perturbation; no classic grid optimizer UI |
-| CrossCheckWalkForward* | **Present** — purged walk-forward in Challenge / Discover robustness |
+| AppRetester / TaskRetest | **Present** — Retester workspace: M1 Judge, Challenge, WF Matrix, EA export, MT5 compare |
+| AppOptimizer / TaskOptimize | **Present** — Optimizer workspace: param neighborhood + WF matrix (Scout); MAP-Elites still powers Discover |
+| CrossCheckWalkForward* | **Present** — purged WF in Challenge / Discover robustness |
+| CrossCheckWalkForwardMatrix | **Present** — `run_walk_forward_matrix` + CLI `quantforge wf-matrix` + Dark UI grid |
 | CrossCheckMonteCarlo* | **Present** — moving-block / trade MC in Challenge |
 | CrossCheckWhatIf | **Present** — `quantforge what-if` + `quantforge_quality::apply_what_if` |
+| CrossCheckNegater | **Present** — `quantforge negate` |
 | CrossCheckRetestOnAdditionalMarkets | **Partial** — multi-symbol Discover gates |
-| MoneyManagement (FixedSize, RiskFixedPct, …) | **Present** — `FixedCurrency` / `PercentBalance` / `FixedLots` (Discover deposit still stamps fixed $ risk) |
+| MoneyManagement (FixedSize, RiskFixedPct, SimpleMartingaleMM, …) | **Present** — `FixedCurrency` / `PercentBalance` / `FixedLots` / `Martingale` (Scout/Judge/MQL5) |
 | TradingOptions (weekends, Friday exit, max trades/day) | **Present** — ManagePolicy + Scout/Judge/MQL5 |
 | ExitMethods (SL/TP/BE/trail/partial/time) | **Present** |
 | PortfolioMaster / PortfolioComposer | **Present** — `quantforge portfolio` packing |
@@ -34,7 +36,7 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 
 **Shipped**
 
-- End-to-end **BuyStopLimit / SellStopLimit** (IR → Scout → M1 Judge → MQL5 export → unit tests + fixtures).
+- End-to-end **BuyStopLimit / SellStopLimit** (IR → Scout → Judge → MQL5 export → unit tests + fixtures).
 - Order-type coverage expanded: market + limit + stop + stop-limit (`family_mt5_parity.py --mode stop_limit`).
 - Measurement notes: `docs/STOP_LIMIT_PARITY_HARNESS.md`, gaps: `docs/PARITY_GAPS_PHASE1.md`.
 
@@ -66,12 +68,21 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 
 ---
 
-## Phase 4 — Money management, trading options, What-If (**landed this wave**)
+## Phase 4 — Money management, trading options, What-If (**landed**)
 
 - `RiskPolicy::FixedLots` through Scout / Judge / MQL5 (`VOLUME_MODE` / `FIXED_LOTS`).
 - ManagePolicy: `dont_trade_on_weekends`, `exit_on_friday`, `max_trades_per_day`.
 - What-If cross-check filters + CLI `quantforge what-if`.
 - Discover samples weekend / Friday / max-trades genes (deposit risk remains fixed $).
+
+---
+
+## Phase 5 — Martingale MM, Optimizer / Retester shells, WF matrix (**landed this wave**)
+
+- `RiskPolicy::Martingale { base_lots, multiplier, max_steps }` — Scout loss-streak sizing, Judge, MQL5 volume mode `2`, Challenge perturb arms, export placeholders.
+- Desktop **Optimizer** workspace (neighborhood table + WF matrix).
+- Desktop **Retester** gains Challenge + WF Matrix tabs (alongside Judge / export / parity).
+- `quantforge-quality::run_walk_forward_matrix` + CLI `wf-matrix`.
 
 ---
 
@@ -87,10 +98,13 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | What-If cross-checks | Present | Biggest/lowest PnL, every Nth, side filters, max/day |
 | Strategy Negater | Present | `quantforge negate` flips long/short trees |
 | MinMax SL/PT clamps | Present | ManagePolicy min/max stop & TP points |
-| Classic parameter optimizer UI | Missing | Neighborhood exists; no SQX AppOptimizer clone |
-| Dedicated Retester app | Missing | Challenge/Judge cover rigor; no task graph UI |
-| Walk-forward *matrix* UI | Missing | Folds exist; matrix visualization not ported |
-| Martingale / ATM MM | Missing | Deliberately deprioritized (risk) |
+| Classic parameter optimizer UI | Present | Thin shell over neighborhood Scout + results table |
+| Dedicated Retester app | Present | Challenge / Judge / WF matrix / export / compare shells |
+| Walk-forward *matrix* | Present | Engine + CLI + Dark UI grid |
+| Martingale MM | Present | SimpleMartingale-style streak sizing (not full ATM/grid ladder) |
+| ATR / crypto / stock MM variants | Missing | Lower priority vs FX lot policies |
+| Full SQX task-graph Retester | Partial | Shells wired; no SQX project XML import |
+| Ranking filter DSL parity | Partial | Databank columns exist; SQX expression filters not cloned |
 | Neural / stockpicker / crypto feeds | Out of scope | |
 | Live EveryTick goldens | External | Operator capture |
 
