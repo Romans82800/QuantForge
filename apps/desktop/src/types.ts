@@ -179,6 +179,8 @@ export interface DatabankWorkspace {
   allowStopEntries: boolean;
   allowLimitEntries: boolean;
   maxOneEntryPerDay: boolean;
+  validationFraction: number;
+  sealedFraction: number;
   conditionGroups: ConditionCoverage[];
   elites: EliteRow[];
 }
@@ -429,6 +431,7 @@ export interface ConditionBakeoffRequest {
   slippagePointsPerSide: number;
   fallbackSpreadPoints: number | null;
   validationFraction: number;
+  sealedFraction: number;
   /** Entry-condition counts to compare; empty defaults to 2, 3, 4 on the backend. */
   entryConditionCounts: number[];
 }

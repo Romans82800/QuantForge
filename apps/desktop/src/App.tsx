@@ -138,7 +138,7 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
   { name: "Search Settings", label: "Settings", icon: "settings" },
 ];
 
-const DEFAULT_SEARCH_RANGES: SearchRangeProfile = {
+const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
   indicatorPeriod: { minimum: 10, maximum: 20, step: 1 }, atrPeriod: { minimum: 14, maximum: 14, step: 1 },
   atrStopMultiple: { minimum: 1.5, maximum: 4, step: .25 }, atrTargetMultiple: { minimum: 2, maximum: 6, step: .5 },
   riskTargetMultiple: { minimum: 1.5, maximum: 4.5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
@@ -151,6 +151,63 @@ const DEFAULT_SEARCH_RANGES: SearchRangeProfile = {
   sessionStartHour: { minimum: 7, maximum: 14, step: 1 }, sessionRangeBars: { minimum: 2, maximum: 4, step: 1 },
   swingBars: { minimum: 2, maximum: 4, step: 1 }, baseBars: { minimum: 2, maximum: 4, step: 1 }, liquiditySweepThreshold: { minimum: 0, maximum: .5, step: .5 },
 };
+
+/** SQX-style random periods / parameters within reason. Wider than H1 compact; not forced. */
+const SQX_RANDOM_SEARCH_RANGES: SearchRangeProfile = {
+  indicatorPeriod: { minimum: 10, maximum: 50, step: 1 }, atrPeriod: { minimum: 7, maximum: 28, step: 1 },
+  atrStopMultiple: { minimum: 1, maximum: 5, step: .25 }, atrTargetMultiple: { minimum: 1.5, maximum: 8, step: .5 },
+  riskTargetMultiple: { minimum: 1, maximum: 5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 3, step: .25 },
+  pendingExpiryBars: { minimum: 1, maximum: 12, step: 1 }, timeStopBars: { minimum: 2, maximum: 48, step: 1 },
+  rsiUpper: { minimum: 55, maximum: 80, step: 1 }, rsiLower: { minimum: 20, maximum: 45, step: 1 }, adxThreshold: { minimum: 15, maximum: 40, step: 1 },
+  rocThreshold: { minimum: .05, maximum: 5, step: .05 }, percentileLow: { minimum: 5, maximum: 30, step: 1 },
+  zscoreThreshold: { minimum: .5, maximum: 3, step: .1 }, impulseBodyRatio: { minimum: .5, maximum: .85, step: .05 },
+  impulseCloseLocation: { minimum: .6, maximum: .95, step: .05 }, atrPercentileMax: { minimum: 10, maximum: 50, step: 1 },
+  atrPercentileLookback: { minimum: 20, maximum: 100, step: 10 },
+  sessionStartHour: { minimum: 0, maximum: 20, step: 1 }, sessionRangeBars: { minimum: 1, maximum: 6, step: 1 },
+  swingBars: { minimum: 2, maximum: 8, step: 1 }, baseBars: { minimum: 2, maximum: 8, step: 1 }, liquiditySweepThreshold: { minimum: 0, maximum: 1, step: .25 },
+};
+
+const DEFAULT_SEARCH_RANGES = H1_COMPACT_SEARCH_RANGES;
+
+type BuiltInSearchPresetId = "h1_compact" | "sqx_random" | "custom";
+
+const BUILT_IN_SEARCH_PRESETS: Array<{
+  id: Exclude<BuiltInSearchPresetId, "custom">;
+  label: string;
+  note: string;
+  ranges: SearchRangeProfile;
+  maximumShift: number;
+}> = [
+  {
+    id: "h1_compact",
+    label: "H1 compact",
+    note: "Tight periods 10–20 · ATR14 fixed · current QuantForge default",
+    ranges: H1_COMPACT_SEARCH_RANGES,
+    maximumShift: 3,
+  },
+  {
+    id: "sqx_random",
+    label: "SQX random",
+    note: "Periods 10–50 · free ATR 7–28 · wider stops/targets within reason",
+    ranges: SQX_RANDOM_SEARCH_RANGES,
+    maximumShift: 5,
+  },
+];
+
+function rangesMatch(a: SearchRangeProfile, b: SearchRangeProfile): boolean {
+  return (Object.keys(a) as Array<keyof SearchRangeProfile>).every((key) => {
+    const left = a[key];
+    const right = b[key];
+    return left.minimum === right.minimum && left.maximum === right.maximum && left.step === right.step;
+  });
+}
+
+function detectBuiltInSearchPreset(ranges: SearchRangeProfile): BuiltInSearchPresetId {
+  for (const preset of BUILT_IN_SEARCH_PRESETS) {
+    if (rangesMatch(ranges, preset.ranges)) return preset.id;
+  }
+  return "custom";
+}
 
 // Search profiles are stored by Rust in snake_case while the TypeScript UI uses
 // camelCase. Accept both forms so profiles saved by any installed version stay
@@ -662,6 +719,14 @@ function App() {
                   <dt>Data quality</dt>
                   <dd className={`quality-${workspace.qualityGrade}`}>
                     {workspace.qualityGrade} · {workspace.qualityScore}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Split</dt>
+                  <dd>
+                    {formatNumber((1 - workspace.validationFraction - workspace.sealedFraction) * 100, 0)}/
+                    {formatNumber(workspace.validationFraction * 100, 0)}/
+                    {formatNumber(workspace.sealedFraction * 100, 0)}% IS/OOS1/OOS2
                   </dd>
                 </div>
                 <div>
@@ -2636,6 +2701,14 @@ function SearchSettingsWorkspace({ onError }: { onError: (message: string | null
             placeholder="e.g. H1 conservative plateau"
           />
         </label>
+        <BuiltInSearchPresetPicker
+          value={ranges}
+          onApply={(preset) => {
+            setRanges({ ...preset.ranges });
+            if (!selectedId) setName(preset.label);
+            setDirty(true);
+          }}
+        />
         <div className="settings-profile-actions">
           <button className="secondary" disabled={busy} onClick={() => { setSelectedId(null); setName("New profile"); setRanges(DEFAULT_SEARCH_RANGES); setDirty(false); }}>New</button>
           <button className="primary" disabled={busy || !name.trim() || !rangesAreValid} onClick={() => void saveProfile()}>
@@ -2694,6 +2767,39 @@ function SearchSettingsWorkspace({ onError }: { onError: (message: string | null
       <SearchRangesWall value={ranges} onChange={(next) => { setRanges(next); setDirty(true); }} />
     </section>
   </div>;
+}
+
+function BuiltInSearchPresetPicker({
+  value,
+  onApply,
+}: {
+  value: SearchRangeProfile;
+  onApply: (preset: (typeof BUILT_IN_SEARCH_PRESETS)[number]) => void;
+}) {
+  const active = detectBuiltInSearchPreset(value);
+  return (
+    <div className="field-row">
+      <span>Built-in range preset</span>
+      <div className="mode-toggle">
+        {BUILT_IN_SEARCH_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            className={active === preset.id ? "active" : ""}
+            onClick={() => onApply(preset)}
+            title={preset.note}
+          >
+            {preset.label}
+          </button>
+        ))}
+      </div>
+      <small>
+        {active === "custom"
+          ? "Custom / saved ranges — pick a built-in preset to replace them, or keep editing."
+          : BUILT_IN_SEARCH_PRESETS.find((preset) => preset.id === active)?.note}
+      </small>
+    </div>
+  );
 }
 
 function SavedRangeProfilePicker({ value, onChange, onError }: { value: SearchRangeProfile; onChange: (ranges: SearchRangeProfile) => void; onError: (message: string | null) => void }) {
@@ -3089,6 +3195,7 @@ function DiscoverWorkspace({
         slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
         fallbackSpreadPoints: form.fallbackSpreadPoints,
         validationFraction: form.validationFraction ?? 0.2,
+        sealedFraction: form.sealedFraction ?? 0.2,
         entryConditionCounts: testerCounts,
       });
       setTesterReport(report);
@@ -3352,7 +3459,7 @@ function DiscoverWorkspace({
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
               <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
-              <NumberField label="OOS2 display reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              <NumberField label="OOS2 sealed reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
               <label className="field-row pack-directory-field">
                 <span>FX pack directory (matching-timeframe screen)</span>
                 <input
@@ -3387,9 +3494,22 @@ function DiscoverWorkspace({
                   <NumberField label="Minimum recovery factor" value={form.depositMinimumReturnDrawdown} onChange={(value) => update("depositMinimumReturnDrawdown", value)} min={0} step={0.05} />
                 </div>
               </details>
-              <details className="advanced-settings">
+              <details className="advanced-settings" open>
                 <summary>Search profile</summary>
-                <p className="immutable-note">Load a saved range profile from Settings. Its complete numeric gene space is sealed into this new databank.</p>
+                <p className="immutable-note">Pick a built-in gene-space preset or a saved Settings profile. The chosen ranges are sealed into this new databank; continuation cannot change them.</p>
+                <BuiltInSearchPresetPicker
+                  value={form.searchRanges ?? DEFAULT_SEARCH_RANGES}
+                  onApply={(preset) => {
+                    setForm((current) => ({
+                      ...current,
+                      searchRanges: { ...preset.ranges },
+                      universalGrammar: {
+                        ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR),
+                        maximumShift: preset.maximumShift,
+                      },
+                    }));
+                  }}
+                />
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
@@ -3881,6 +4001,15 @@ function DiscoverContractSummary({
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
         <SummaryLine label="Closed-bar shifts" value={grammar ? `${grammar.minimumShift}–${grammar.maximumShift}` : "—"} />
+        <SummaryLine
+          label="Parameter ranges"
+          value={(() => {
+            const preset = detectBuiltInSearchPreset(form.searchRanges ?? DEFAULT_SEARCH_RANGES);
+            if (preset === "h1_compact") return "H1 compact · periods 10–20";
+            if (preset === "sqx_random") return "SQX random · periods 10–50";
+            return "Custom / saved profile";
+          })()}
+        />
         <SummaryLine label="Fixed risk / trade" value="$1,000" accent />
       </div>
 
@@ -3895,7 +4024,7 @@ function DiscoverContractSummary({
 
       <div className="contract-section">
         <p className="eyebrow">Validation firewall</p>
-        <SummaryLine label="IS / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .1)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .1) * 100, 0)}%`} />
+        <SummaryLine label="IS / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
         <SummaryLine label="OOS1 expectancy" value={`≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× IS`} />
         <SummaryLine label="Robustness" value={`${form.robustnessFolds ?? 0} WFO · ${form.robustnessMonteCarloTrials ?? 0} MC · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
@@ -4910,10 +5039,10 @@ function PartitionEquityChart({
         </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
       <div className="partition-kpis">
-        <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}%`} />
-        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS`} />
+        <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
+        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS · chart split`} />
         <Kpi label="OOS2 expectancy (R)" value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
-        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="IS / OOS1 / OOS2" />
+        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="IS / OOS1 / OOS2 · databank split" />
       </div>
     </section>
   );

@@ -114,6 +114,8 @@ pub struct DatabankWorkspace {
     allow_stop_entries: bool,
     allow_limit_entries: bool,
     max_one_entry_per_day: bool,
+    validation_fraction: f64,
+    sealed_fraction: f64,
     condition_groups: Vec<ConditionCoverage>,
     elites: Vec<EliteRow>,
 }
@@ -677,10 +679,22 @@ pub async fn get_elite_partition_equity(
             loaded.m1_source.clone(),
             loaded.m1_metadata_path.clone(),
             loaded.bank.config.scout.clone(),
+            loaded.validation_fraction,
+            loaded.sealed_fraction,
         )
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let (elite, source, broker_path, metadata_path, m1_source, m1_metadata_path, scout) = snapshot;
+        let (
+            elite,
+            source,
+            broker_path,
+            metadata_path,
+            m1_source,
+            m1_metadata_path,
+            scout,
+            validation_fraction,
+            sealed_fraction,
+        ) = snapshot;
         partition_equity_for_elite(
             &elite,
             &source,
@@ -689,6 +703,8 @@ pub async fn get_elite_partition_equity(
             m1_source.as_deref(),
             m1_metadata_path.as_deref(),
             &scout,
+            validation_fraction,
+            sealed_fraction,
         )
     })
     .await
@@ -1000,6 +1016,8 @@ fn partition_equity_for_elite(
     m1_source: Option<&str>,
     m1_metadata_path: Option<&str>,
     scout: &quantforge_eval::ScoutConfig,
+    validation_fraction: f64,
+    sealed_fraction: f64,
 ) -> Result<PartitionEquityView, String> {
     let loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
@@ -1013,8 +1031,15 @@ fn partition_equity_for_elite(
     // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
     // align with the exported EA and external MT5 backtests.
     let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
-    let plan = quantforge_quality::DataSplitPlan::chronological(&decision_dataset, 0.2, 0.2)
-        .map_err(|error| error.to_string())?;
+    // Use the databank's sealed split, not a hardcoded 20/20. Discover gated this
+    // elite on IS/OOS1 cut with these fractions; a mismatched chart invents a
+    // different OOS1 window and a false retention ratio.
+    let plan = quantforge_quality::DataSplitPlan::chronological(
+        &decision_dataset,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
     let result = quantforge_tick::evaluate_strategy_m1(
         &elite.strategy,
         &decision_dataset,
@@ -1860,6 +1885,8 @@ fn workspace_view(
         allow_stop_entries: bank.config.allow_stop_entries,
         allow_limit_entries: bank.config.allow_limit_entries,
         max_one_entry_per_day: bank.config.max_one_entry_per_day,
+        validation_fraction: manifest_fraction(artifact, "validation_fraction", 0.2),
+        sealed_fraction: manifest_fraction(artifact, "sealed_fraction", 0.2),
         condition_groups: coverage_condition_groups(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
     }

@@ -212,9 +212,12 @@ struct ConditionBakeoffArgs {
     slippage_points_per_side: f64,
     #[arg(long)]
     fallback_spread_points: Option<f64>,
-    /// Chronological OOS1 fraction (sealed unused).
+    /// Chronological OOS1 fraction.
     #[arg(long, default_value_t = 0.2)]
     validation_fraction: f64,
+    /// Chronological OOS2 / sealed fraction.
+    #[arg(long, default_value_t = 0.2)]
+    sealed_fraction: f64,
     #[arg(long)]
     out: PathBuf,
 }
@@ -253,6 +256,8 @@ struct MethodologyResearchArgs {
     fallback_spread_points: Option<f64>,
     #[arg(long, default_value_t = 0.2)]
     validation_fraction: f64,
+    #[arg(long, default_value_t = 0.2)]
+    sealed_fraction: f64,
     #[arg(long)]
     out: PathBuf,
 }
@@ -1409,8 +1414,8 @@ fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn E
     let (m1, _) = load_source(&m1_source)?;
     let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
     broker.validate()?;
-    let search_dataset = development_partition(&dataset, args.validation_fraction, 0.2)?;
-    let oos1 = oos1_partition(&dataset, args.validation_fraction, 0.2)?;
+    let search_dataset = development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
+    let oos1 = oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let mut discover = DiscoverConfig {
         run_mode: DiscoverRunMode::FastScout,
         initial_candidates: args.initial_candidates,
@@ -1478,8 +1483,8 @@ fn methodology_research_command(args: MethodologyResearchArgs) -> Result<(), Box
     let (_m1, _) = load_source(&m1_source)?;
     let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
     broker.validate()?;
-    let search_dataset = development_partition(&dataset, args.validation_fraction, 0.2)?;
-    let oos1 = oos1_partition(&dataset, args.validation_fraction, 0.2)?;
+    let search_dataset = development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
+    let oos1 = oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let mut scout = ScoutConfig::default();
     scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
     scout.costs.adverse_slippage_points_per_side = args.slippage_points_per_side;

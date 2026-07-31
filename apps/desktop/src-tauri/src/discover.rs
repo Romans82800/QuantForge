@@ -298,6 +298,7 @@ pub struct ConditionBakeoffRequest {
     slippage_points_per_side: f64,
     fallback_spread_points: Option<f64>,
     validation_fraction: f64,
+    sealed_fraction: f64,
     /// Entry-condition counts to compare on equal budget. Defaults to 2, 3, 4.
     #[serde(default)]
     entry_condition_counts: Vec<usize>,
@@ -323,7 +324,12 @@ pub fn run_condition_bakeoff(
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
     let validation_fraction = request.validation_fraction.clamp(0.05, 0.4);
-    let sealed_fraction = 0.2;
+    let sealed_fraction = request.sealed_fraction.clamp(0.05, 0.4);
+    if validation_fraction + sealed_fraction >= 0.9 {
+        return Err(format!(
+            "validation ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for IS"
+        ));
+    }
     let search_h1 = development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
     let oos1 = oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
     let m1_is = development_partition(&m1_loaded.dataset, validation_fraction, sealed_fraction)?;
@@ -570,6 +576,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
                 ));
             }
         }
+        let validation = request.validation_fraction.unwrap_or(0.2);
+        let sealed = request.sealed_fraction.unwrap_or(0.2);
+        normalize_split_fractions(validation, sealed)?;
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     if !run_until_stopped && request.generations == 0 {
@@ -707,8 +716,32 @@ fn run_discovery(
     }
 
     let promotion_split = request.promotion_split.unwrap_or(true);
-    let validation_fraction = request.validation_fraction.unwrap_or(0.2);
-    let sealed_fraction = request.sealed_fraction.unwrap_or(0.2);
+    // New runs take the UI split. Continuations must reuse the fractions sealed
+    // into the databank manifest — defaulting to 0.2/0.2 here used to rewrite
+    // checkpoints onto a different IS/OOS1/OOS2 cut than the elites were gated on.
+    let continued_artifact = match request.mode {
+        DiscoverMode::Continue => {
+            let bytes = fs::read(&request.databank_path)
+                .map_err(|error| format!("cannot read databank: {error}"))?;
+            let artifact: EvolveArtifact = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("databank JSON is invalid: {error}"))?;
+            verify_artifact(&artifact).map_err(|error| error.to_string())?;
+            Some(artifact)
+        }
+        DiscoverMode::New => None,
+    };
+    let (validation_fraction, sealed_fraction) = match (&request.mode, &continued_artifact) {
+        (DiscoverMode::Continue, Some(artifact)) => (
+            recipe_fraction(artifact, "validation_fraction", 0.2),
+            recipe_fraction(artifact, "sealed_fraction", 0.2),
+        ),
+        _ => (
+            request.validation_fraction.unwrap_or(0.2),
+            request.sealed_fraction.unwrap_or(0.2),
+        ),
+    };
+    let (validation_fraction, sealed_fraction) =
+        normalize_split_fractions(validation_fraction, sealed_fraction)?;
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| development_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
@@ -763,11 +796,8 @@ fn run_discovery(
             (bank, None, 0u64)
         }
         DiscoverMode::Continue => {
-            let bytes = fs::read(&request.databank_path)
-                .map_err(|error| format!("cannot read databank: {error}"))?;
-            let artifact: EvolveArtifact = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("databank JSON is invalid: {error}"))?;
-            verify_artifact(&artifact).map_err(|error| error.to_string())?;
+            let artifact = continued_artifact
+                .expect("continuation always loads the databank before partitioning");
             let starting_generation = artifact.databank.completed_generations;
             update_bank(
                 job,
@@ -1330,6 +1360,31 @@ fn effective_worker_threads(configured: usize) -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
+}
+
+fn recipe_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
+    artifact
+        .manifest
+        .recipe
+        .config
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..1.0).contains(value))
+        .unwrap_or(fallback)
+}
+
+fn normalize_split_fractions(
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<(f64, f64), String> {
+    let validation = validation_fraction.clamp(0.05, 0.4);
+    let sealed = sealed_fraction.clamp(0.05, 0.4);
+    if validation + sealed >= 0.9 {
+        return Err(format!(
+            "validation ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for IS"
+        ));
+    }
+    Ok((validation, sealed))
 }
 
 fn development_partition(
@@ -1947,6 +2002,14 @@ mod tests {
         assert_eq!(development.bars.len(), plan.development.bar_count);
         assert_eq!(development.data_hash, plan.development.data_hash);
         assert_ne!(development.data_hash, loaded.dataset.data_hash);
+    }
+
+    #[test]
+    fn split_fractions_reject_an_undersized_is_window() {
+        assert!(normalize_split_fractions(0.2, 0.2).is_ok());
+        assert!(normalize_split_fractions(0.2, 0.1).is_ok());
+        let error = normalize_split_fractions(0.5, 0.45).expect_err("IS must remain");
+        assert!(error.contains("less than 10%"));
     }
 
     #[test]

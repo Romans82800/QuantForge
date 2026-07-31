@@ -156,7 +156,16 @@ pub struct SearchRangeProfile {
 }
 
 impl Default for SearchRangeProfile {
+    /// Compact H1/M15 plateau: tight periods (10–20) suited to hourly research.
     fn default() -> Self {
+        Self::h1_compact()
+    }
+}
+
+impl SearchRangeProfile {
+    /// Current QuantForge H1/M15 default — tight indicator periods and modest
+    /// stop/target bands so the search stays on a local plateau.
+    pub fn h1_compact() -> Self {
         Self {
             indicator_period: SearchRange::new(10.0, 20.0, 1.0),
             atr_period: SearchRange::new(14.0, 14.0, 1.0),
@@ -183,9 +192,39 @@ impl Default for SearchRangeProfile {
             liquidity_sweep_threshold: SearchRange::new(0.0, 0.5, 0.5),
         }
     }
-}
 
-impl SearchRangeProfile {
+    /// SQX-style "random periods and parameters within reason": wider gene
+    /// space (indicator periods typically 10–50, free ATR period, broader
+    /// stops/targets). Does not replace H1 compact — callers pick which preset
+    /// to seal into a new databank.
+    pub fn sqx_random() -> Self {
+        Self {
+            indicator_period: SearchRange::new(10.0, 50.0, 1.0),
+            atr_period: SearchRange::new(7.0, 28.0, 1.0),
+            atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.25),
+            atr_target_multiple: SearchRange::new(1.5, 8.0, 0.5),
+            risk_target_multiple: SearchRange::new(1.0, 5.0, 0.25),
+            pending_distance_atr: SearchRange::new(0.25, 3.0, 0.25),
+            pending_expiry_bars: SearchRange::new(1.0, 12.0, 1.0),
+            time_stop_bars: SearchRange::new(2.0, 48.0, 1.0),
+            rsi_upper: SearchRange::new(55.0, 80.0, 1.0),
+            rsi_lower: SearchRange::new(20.0, 45.0, 1.0),
+            adx_threshold: SearchRange::new(15.0, 40.0, 1.0),
+            roc_threshold: SearchRange::new(0.05, 5.0, 0.05),
+            percentile_low: SearchRange::new(5.0, 30.0, 1.0),
+            zscore_threshold: SearchRange::new(0.5, 3.0, 0.1),
+            impulse_body_ratio: SearchRange::new(0.50, 0.85, 0.05),
+            impulse_close_location: SearchRange::new(0.60, 0.95, 0.05),
+            atr_percentile_max: SearchRange::new(10.0, 50.0, 1.0),
+            atr_percentile_lookback: SearchRange::new(20.0, 100.0, 10.0),
+            session_start_hour: SearchRange::new(0.0, 20.0, 1.0),
+            session_range_bars: SearchRange::new(1.0, 6.0, 1.0),
+            swing_bars: SearchRange::new(2.0, 8.0, 1.0),
+            base_bars: SearchRange::new(2.0, 8.0, 1.0),
+            liquidity_sweep_threshold: SearchRange::new(0.0, 1.0, 0.25),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DiscoverError> {
         for (name, range) in [
             ("indicator_period", &self.indicator_period),
@@ -243,6 +282,18 @@ mod search_range_profile_tests {
         let encoded = serde_json::to_value(camel).expect("profile must serialize");
         assert!(encoded.get("indicatorPeriod").is_some());
         assert!(encoded.get("indicator_period").is_none());
+    }
+
+    #[test]
+    fn built_in_presets_validate_and_stay_distinct() {
+        let h1 = SearchRangeProfile::h1_compact();
+        let sqx = SearchRangeProfile::sqx_random();
+        h1.validate().expect("H1 compact must validate");
+        sqx.validate().expect("SQX random must validate");
+        assert_eq!(h1.indicator_period.maximum, 20.0);
+        assert_eq!(sqx.indicator_period.maximum, 50.0);
+        assert!(sqx.atr_period.maximum > h1.atr_period.maximum);
+        assert_eq!(SearchRangeProfile::default(), h1);
     }
 }
 
