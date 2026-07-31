@@ -54,3 +54,13 @@ quantforge databank-filter --elites elites.json --expr "PF > 1.5 AND Drawdown < 
 ```
 
 Desktop Databank has a matching expression box beside search.
+
+## Databank correlation filter
+
+SQX `DatabankFilterByCorrelation` equivalent — greedy keep by evidence, drop peers whose equity-signature correlation exceeds a threshold:
+
+```bash
+quantforge databank-correlate --elites elites.json --max-correlation 0.70
+```
+
+Desktop Databank: **Filter by correlation** beside the sort menu.
