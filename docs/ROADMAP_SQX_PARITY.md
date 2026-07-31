@@ -44,17 +44,20 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 
 ---
 
-## Phase 3 — Discover enables pending / BE / trail with M1 precision islands
+## Phase 3 — Discover enables pending / BE / trail with M1 precision islands (**landed**)
 
-**Scope**
+**Shipped**
 
-- Turn on stop / limit / stop-limit / BE / trail / partials as Discover genes (still opt-in flags).
-- Route enabled execution genes through M1-precision islands.
+- `complex_m1_island_count`: highest-numbered islands sample pending / BE / trail / partials; lower islands stay Selected-TF market-only.
+- Mass Builder sets ~half islands to complex_m1, enables all allow_* flags, keeps global `require_m1_precision=false` (M1 forced on complex promotion).
+- Band-safe island migration (simple↔simple, complex↔complex).
+- CLI / desktop / Tauri: Mass Builder run mode + island / prefilter / complex_m1 knobs.
 
 **Success metrics**
 
-- Feature-flagged runs produce valid IR + export for all enabled entry kinds.
-- Robustness / challenge gates remain green on M1 Judge for promoted elites.
+- Feature-flagged runs produce valid IR + export for enabled entry kinds on complex islands.
+- Simple islands never emit pending/BE/trail/partial genes when mixed profiles are active.
+- Robustness / M1 gates still apply to promoted complex elites.
 
 ---
 

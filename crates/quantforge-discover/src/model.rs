@@ -690,6 +690,11 @@ pub struct DiscoverConfig {
     /// How many top elites each island sends to the next island on migration.
     #[serde(default = "default_migration_elites")]
     pub migration_elites: usize,
+    /// How many of the highest-numbered islands sample pending/BE/trail/partials
+    /// and require M1 precision on promotion. Lower islands stay Selected-TF simple.
+    /// `0` disables mixed profiles (global `simple_exits` / allow_* flags apply).
+    #[serde(default)]
+    pub complex_m1_island_count: usize,
     pub scout: ScoutConfig,
 }
 
@@ -840,6 +845,7 @@ impl Default for DiscoverConfig {
             island_count: default_island_count(),
             migration_interval: default_migration_interval(),
             migration_elites: default_migration_elites(),
+            complex_m1_island_count: 0,
             scout: ScoutConfig::default(),
         }
     }
@@ -896,11 +902,7 @@ impl DiscoverConfig {
             }
             DiscoverRunMode::MassBuilder => {
                 // SQX-scale Builder: cheap reject ≫ full Scout ≫ M1 promotion.
-                if !self.has_complex_execution() {
-                    self.simple_exits = true;
-                } else {
-                    self.simple_exits = false;
-                }
+                // Mix Selected-TF simple islands with complex M1 islands.
                 self.enable_cheap_prefilter = true;
                 self.prefilter_bar_fraction = self.prefilter_bar_fraction.clamp(0.1, 0.5);
                 self.island_count = self.island_count.max(4);
@@ -908,14 +910,31 @@ impl DiscoverConfig {
                     self.migration_interval = 10;
                 }
                 self.migration_elites = self.migration_elites.max(1);
+                // Half the islands (round up) are complex_m1 when unset.
+                if self.complex_m1_island_count == 0 {
+                    self.complex_m1_island_count = (self.island_count + 1) / 2;
+                }
+                self.complex_m1_island_count = self
+                    .complex_m1_island_count
+                    .clamp(1, self.island_count);
+                // Enable complex genes for those islands; simple islands stay market-only.
+                self.allow_market_entries = true;
+                self.allow_stop_entries = true;
+                self.allow_limit_entries = true;
+                self.allow_stop_limit_entries = true;
+                self.allow_break_even = true;
+                self.allow_trailing_stops = true;
+                self.allow_partial_exits = true;
+                // Global require_m1 stays false so simple islands skip M1;
+                // complex islands force M1 at promotion time.
                 self.require_m1_precision = false;
                 self.require_m1_robustness = true;
+                self.simple_exits = false;
                 self.initial_candidates = self.initial_candidates.max(2_000);
                 self.batch_size = self.batch_size.max(500);
                 self.random_fill_fraction = self.random_fill_fraction.max(0.7);
                 self.mutate_after_elites = self.mutate_after_elites.min(40);
                 self.early_stop_pot_elites = None;
-                // Continuous harvest: do not force a small databank quota.
                 self.trial_budget_warning = self.trial_budget_warning.max(50_000);
                 self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.min(100);
                 self.robustness_neighborhood_samples = self.robustness_neighborhood_samples.min(6);
@@ -927,8 +946,29 @@ impl DiscoverConfig {
         self.island_count.max(1)
     }
 
+    pub fn effective_complex_m1_islands(&self) -> usize {
+        self.complex_m1_island_count
+            .min(self.effective_island_count())
+    }
+
+    /// Highest-numbered islands are complex_m1; the rest are Selected-TF simple.
+    pub fn is_complex_m1_island(&self, island_id: u16) -> bool {
+        let complex = self.effective_complex_m1_islands();
+        if complex == 0 {
+            return false;
+        }
+        let total = self.effective_island_count();
+        let first_complex = total.saturating_sub(complex);
+        (island_id as usize) >= first_complex
+    }
+
     pub const fn cheap_prefilter_enabled(&self) -> bool {
         self.enable_cheap_prefilter
+    }
+
+    /// Complex genes are legal when M1 is globally required OR mixed complex_m1 islands exist.
+    pub fn complex_execution_allowed(&self) -> bool {
+        self.require_m1_precision || self.complex_m1_island_count > 0
     }
 
     pub const fn has_complex_execution(&self) -> bool {
@@ -980,9 +1020,14 @@ impl DiscoverConfig {
                 "prefilter_bar_fraction must be within 0.05..=1.0".into(),
             ));
         }
-        if self.has_complex_execution() && !self.require_m1_precision {
+        if self.has_complex_execution() && !self.complex_execution_allowed() {
             return Err(DiscoverError::InvalidConfig(
-                "break-even, trailing, partial and pending-entry genes require M1 precision".into(),
+                "break-even, trailing, partial and pending-entry genes require M1 precision or complex_m1 islands".into(),
+            ));
+        }
+        if self.complex_m1_island_count > self.island_count {
+            return Err(DiscoverError::InvalidConfig(
+                "complex_m1_island_count cannot exceed island_count".into(),
             ));
         }
         if self.initial_candidates == 0 {

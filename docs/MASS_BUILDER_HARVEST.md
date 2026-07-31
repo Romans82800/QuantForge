@@ -35,10 +35,18 @@ Adjust paths to your pack layout. Continue later with `--continue --generations 
 | `enable_cheap_prefilter` | on |
 | `prefilter_bar_fraction` | ~0.25 trailing IS bars |
 | `island_count` | ≥4 |
+| `complex_m1_island_count` | ~half of islands (pending/BE/trail/partials + M1 promote) |
 | `migration_interval` | 10 generations |
 | `migration_elites` | ≥1 per island |
 | `batch_size` | ≥500 |
 | `early_stop_pot_elites` | none (continuous) |
+| allow stop/limit/stop-limit + BE/trail/partial | on (complex islands only sample them) |
+
+Override islands explicitly:
+
+```powershell
+quantforge discover ... --run-mode mass_builder --island-count 8 --complex-m1-island-count 4
+```
 
 ## Telemetry to watch
 

@@ -351,6 +351,20 @@ struct EvolveArgs {
     /// fast_scout | full_harvest | quota_harvest | mass_builder
     #[arg(long, default_value = "full_harvest")]
     run_mode: String,
+    /// Genetic islands (Mass Builder defaults via run mode).
+    #[arg(long)]
+    island_count: Option<usize>,
+    #[arg(long)]
+    migration_interval: Option<u64>,
+    #[arg(long)]
+    migration_elites: Option<usize>,
+    /// Highest-numbered islands that sample pending/BE/trail/partials.
+    #[arg(long)]
+    complex_m1_island_count: Option<usize>,
+    #[arg(long)]
+    enable_cheap_prefilter: Option<bool>,
+    #[arg(long)]
+    prefilter_bar_fraction: Option<f64>,
     #[arg(long)]
     minimum_trades: Option<usize>,
     #[arg(long)]
@@ -4621,12 +4635,13 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
-        enable_cheap_prefilter: false,
-        prefilter_bar_fraction: 0.25,
+        enable_cheap_prefilter: args.enable_cheap_prefilter.unwrap_or(false),
+        prefilter_bar_fraction: args.prefilter_bar_fraction.unwrap_or(0.25),
         prefilter_gates: GateConfig::prefilter_defaults(),
-        island_count: 1,
-        migration_interval: 0,
-        migration_elites: 2,
+        island_count: args.island_count.unwrap_or(1),
+        migration_interval: args.migration_interval.unwrap_or(0),
+        migration_elites: args.migration_elites.unwrap_or(2),
+        complex_m1_island_count: args.complex_m1_island_count.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
