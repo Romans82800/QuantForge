@@ -1,0 +1,20 @@
+property,value
+strategy_fingerprint,61bf99b89a9adc054044ec8c6e0e9a956c66a23e142f19fc3e5c5963bfc1bd5f
+broker_spec_hash,0b53bcb27cf6506a6fabec608496798810c57325fb0b4157d623ddf82cc2da84
+terminal_build,5975
+broker,Raw Trading Ltd
+server,ICMarketsSC-Demo
+symbol,AUDUSD
+timeframe,PERIOD_H1
+magic,42424242
+deviation_points,10
+max_spread_points,0.0
+estimated_slippage_points_per_side,0.0
+commission_per_lot_round_turn,7.0
+risk_budget,500.0
+initial_deposit,100000.0
+account_currency,USD
+broker_timezone,ICMarkets/EST+7
+server_utc_offset_seconds_at_export,0
+started_server_time,2024.01.01 00:00:00
+finished_server_time,2024.01.31 23:58:59

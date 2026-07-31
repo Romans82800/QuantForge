@@ -271,6 +271,8 @@ pub struct EliteDetail {
 pub struct PartitionEquityPoint {
     timestamp_ms: i64,
     equity: f64,
+    balance: f64,
+    drawdown_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -367,7 +369,12 @@ struct TradeRowView {
     exit_timestamp_ms: i64,
     entry_price: f64,
     exit_price: f64,
+    volume: f64,
     net_profit: f64,
+    commission: f64,
+    swap: f64,
+    bars_held: usize,
+    r_multiple: Option<f64>,
     exit_reason: String,
 }
 
@@ -1092,16 +1099,33 @@ fn partition_equity_for_elite(
         .trades
         .iter()
         .take(2_000)
-        .map(|trade| TradeRowView {
-            side: format!("{:?}", trade.side).to_ascii_lowercase(),
-            entry_timestamp_ms: trade.entry_timestamp_ms,
-            exit_timestamp_ms: trade.exit_timestamp_ms,
-            entry_price: trade.entry_price,
-            exit_price: trade.exit_price,
-            net_profit: trade.net_profit,
-            exit_reason: format!("{:?}", trade.exit_reason)
-                .replace('_', " ")
-                .to_ascii_lowercase(),
+        .map(|trade| {
+            let risk = (trade.entry_price - trade.initial_stop_loss).abs();
+            let r_multiple = if risk > 1.0e-12 {
+                let signed = match trade.side {
+                    quantforge_eval::PositionSide::Long => trade.exit_price - trade.entry_price,
+                    quantforge_eval::PositionSide::Short => trade.entry_price - trade.exit_price,
+                };
+                Some(signed / risk)
+            } else {
+                None
+            };
+            TradeRowView {
+                side: format!("{:?}", trade.side).to_ascii_lowercase(),
+                entry_timestamp_ms: trade.entry_timestamp_ms,
+                exit_timestamp_ms: trade.exit_timestamp_ms,
+                entry_price: trade.entry_price,
+                exit_price: trade.exit_price,
+                volume: trade.volume,
+                net_profit: trade.net_profit,
+                commission: trade.commission,
+                swap: trade.swap,
+                bars_held: trade.bars_held,
+                r_multiple,
+                exit_reason: format!("{:?}", trade.exit_reason)
+                    .replace('_', " ")
+                    .to_ascii_lowercase(),
+            }
         })
         .collect();
 
@@ -1197,44 +1221,52 @@ fn downsample_equity(
     if equity.is_empty() {
         return Vec::new();
     }
-    if equity.len() <= target {
-        return equity
-            .iter()
-            .map(|point| PartitionEquityPoint {
+    let mut peak = equity[0].equity;
+    let mapped: Vec<PartitionEquityPoint> = equity
+        .iter()
+        .map(|point| {
+            peak = peak.max(point.equity);
+            let drawdown_percent = if peak > 1.0e-12 {
+                ((peak - point.equity) / peak) * 100.0
+            } else {
+                0.0
+            };
+            PartitionEquityPoint {
                 timestamp_ms: point.timestamp_ms,
                 equity: point.equity,
-            })
-            .collect();
+                balance: point.balance,
+                drawdown_percent,
+            }
+        })
+        .collect();
+    if mapped.len() <= target {
+        return mapped;
     }
     let mut keep = std::collections::BTreeSet::new();
     keep.insert(0);
-    keep.insert(equity.len() - 1);
-    if let Some(index) = equity
+    keep.insert(mapped.len() - 1);
+    if let Some(index) = mapped
         .iter()
         .position(|point| point.timestamp_ms >= is_end)
         .map(|index| index.saturating_sub(1))
     {
         keep.insert(index);
     }
-    if let Some(index) = equity
+    if let Some(index) = mapped
         .iter()
         .position(|point| point.timestamp_ms >= oos1_end)
         .map(|index| index.saturating_sub(1))
     {
         keep.insert(index);
     }
-    let step = ((equity.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
+    let step = ((mapped.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
     let mut cursor = 0.0;
-    while (cursor as usize) < equity.len() {
+    while (cursor as usize) < mapped.len() {
         keep.insert(cursor as usize);
         cursor += step;
     }
     keep.into_iter()
-        .filter_map(|index| equity.get(index))
-        .map(|point| PartitionEquityPoint {
-            timestamp_ms: point.timestamp_ms,
-            equity: point.equity,
-        })
+        .filter_map(|index| mapped.get(index).cloned())
         .collect()
 }
 

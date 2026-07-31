@@ -10,6 +10,7 @@ import {
   entryWindowError,
   entryWindowSummary,
   filterAndSortElites,
+  filterElitesByCorrelation,
   databankFilterError,
   parseDatabankFilter,
   evalDatabankFilter,
@@ -118,6 +119,34 @@ describe("databank view rules", () => {
     expect(databankFilterError("PF >> 1")).toMatch(/operator|column|unexpected/i);
     const node = parseDatabankFilter("grade == 'illuminated'");
     expect(evalDatabankFilter(node, elite({}))).toBe(true);
+  });
+
+  it("filters elites by equity-signature correlation", () => {
+    const report = filterElitesByCorrelation(
+      [
+        elite({
+          fingerprint: "a",
+          strategyId: "a",
+          evidence: 10,
+          equitySignature: [1, 2, 3, 4],
+        }),
+        elite({
+          fingerprint: "b",
+          strategyId: "b",
+          evidence: 9,
+          equitySignature: [1, 2, 3, 4.05],
+        }),
+        elite({
+          fingerprint: "c",
+          strategyId: "c",
+          evidence: 8,
+          equitySignature: [4, 3, 2, 1],
+        }),
+      ],
+      0.95,
+    );
+    expect(report.kept.map((row) => row.fingerprint)).toEqual(["a", "c"]);
+    expect(report.rejectedCount).toBe(1);
   });
 
   it("keeps the inspector inside the visible filtered result", () => {

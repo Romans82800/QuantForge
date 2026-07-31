@@ -40,16 +40,24 @@ DEFAULT_TOLERANCES = {
 }
 
 
-def prepare(out_dir: Path) -> None:
+def prepare(
+    out_dir: Path,
+    *,
+    strategy_ir: Path | None = None,
+    order_kinds: list[str] | None = None,
+    family: str = "stop_limit",
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "schema_version": 1,
         "protocol": "mt5-parity-v2",
         "tag": out_dir.name,
+        "family": family,
         "symbol": "EURNZD",
         "timeframe": "H1",
         "tester_model": "every_tick_real_ticks",
-        "order_kinds": ["buy_stop_limit", "sell_stop_limit"],
+        "order_kinds": order_kinds
+        or ["buy_stop_limit", "sell_stop_limit"],
         "data_pack": "ICMarkets_EST7_2020_present",
         "status": "awaiting_mt5_capture",
         "files": {
@@ -63,9 +71,10 @@ def prepare(out_dir: Path) -> None:
         },
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    if FIXTURE_IR.exists():
-        shutil.copy2(FIXTURE_IR, out_dir / "strategy.ir.json")
-    notes = f"""# Stop-limit EveryTick golden notes
+    source_ir = strategy_ir if strategy_ir and strategy_ir.is_file() else FIXTURE_IR
+    if source_ir.is_file() and not (out_dir / "strategy.ir.json").exists():
+        shutil.copy2(source_ir, out_dir / "strategy.ir.json")
+    notes = f"""# {family} EveryTick golden notes
 
 1. Export `strategy.ir.json` to MQ5 (desktop or `quantforge export`).
 2. Strategy Tester: model **Every tick based on real ticks**, bound symbol/broker.
@@ -547,6 +556,11 @@ def capture(
     symbol: str,
     timeout_seconds: int,
     tester_model: int,
+    strategy_ir: Path | None = None,
+    expert_name: str = "QFStopLimitGolden",
+    work_name: str = "stop-limit-everytick-capture",
+    family: str = "stop_limit",
+    order_kinds: list[str] | None = None,
 ) -> int:
     """Export + compile + Strategy Tester EveryTick capture into out_dir."""
     creds = load_mt5_credentials()
@@ -554,7 +568,12 @@ def capture(
         f"using MT5 demo login={creds['login']} server={creds['server']} (password redacted)",
         flush=True,
     )
-    prepare(out_dir)
+    prepare(
+        out_dir,
+        strategy_ir=strategy_ir,
+        order_kinds=order_kinds,
+        family=family,
+    )
     pack = Path(
         os.environ.get(
             "QUANTFORGE_DATA_PACK",
@@ -572,17 +591,19 @@ def capture(
             raise SystemExit(f"required pack file missing: {path}")
 
     strategy = out_dir / "strategy.ir.json"
-    if not strategy.is_file() and FIXTURE_IR.is_file():
+    if strategy_ir and strategy_ir.is_file():
+        shutil.copy2(strategy_ir, strategy)
+    elif not strategy.is_file() and FIXTURE_IR.is_file():
         shutil.copy2(FIXTURE_IR, strategy)
 
     qf = _find_quantforge()
-    work = ROOT / "runs" / "stop-limit-everytick-capture"
+    work = ROOT / "runs" / work_name
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
     export_dir = work / "export"
     export_dir.mkdir()
-    expert = "QFStopLimitGolden"
+    expert = expert_name
 
     # Slice pack data to the same tester window so Judge and MT5 share the window.
     h1_slice = work / f"{symbol}_H1.tsv"
@@ -896,12 +917,44 @@ def main() -> int:
         default=DEFAULT_DIR,
         help=f"output directory (default {DEFAULT_DIR})",
     )
+    parser.add_argument(
+        "--strategy",
+        type=Path,
+        default=None,
+        help="Strategy IR JSON (default: fixtures/stop_limit_pending_strategy.json)",
+    )
+    parser.add_argument(
+        "--expert-name",
+        default="QFStopLimitGolden",
+        help="Compiled expert basename (no .ex5)",
+    )
+    parser.add_argument(
+        "--work-name",
+        default="stop-limit-everytick-capture",
+        help="runs/<work-name> scratch directory",
+    )
+    parser.add_argument(
+        "--family",
+        default="stop_limit",
+        help="Golden family tag written into manifest",
+    )
+    parser.add_argument(
+        "--order-kinds",
+        default="",
+        help="Comma-separated order kinds for manifest (optional)",
+    )
     args = parser.parse_args()
+    order_kinds = [part.strip() for part in args.order_kinds.split(",") if part.strip()] or None
     if args.write_fixture:
         write_fixture(FIXTURE_DIR if args.out == DEFAULT_DIR else args.out)
         return 0
     if args.prepare:
-        prepare(args.out)
+        prepare(
+            args.out,
+            strategy_ir=args.strategy,
+            order_kinds=order_kinds,
+            family=args.family,
+        )
         return 0
     if args.capture:
         out = (
@@ -916,6 +969,11 @@ def main() -> int:
             symbol=args.symbol,
             timeout_seconds=args.timeout_seconds,
             tester_model=args.tester_model,
+            strategy_ir=args.strategy,
+            expert_name=args.expert_name,
+            work_name=args.work_name,
+            family=args.family,
+            order_kinds=order_kinds,
         )
     if args.compare:
         return compare(Path(args.compare))

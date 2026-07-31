@@ -118,6 +118,79 @@ export function databankFilterError(expression: string): string | null {
   }
 }
 
+/** SQX DatabankFilterByCorrelation — greedy keep by evidence, drop high-corr peers. */
+export function filterElitesByCorrelation(
+  elites: EliteRow[],
+  maximumCorrelation: number,
+): { kept: EliteRow[]; rejectedCount: number; maxPairwise: number } {
+  const threshold = Number.isFinite(maximumCorrelation)
+    ? Math.min(1, Math.max(0, maximumCorrelation))
+    : 0.7;
+  const ordered = [...elites].sort(
+    (left, right) =>
+      right.evidence - left.evidence || left.fingerprint.localeCompare(right.fingerprint),
+  );
+  const kept: EliteRow[] = [];
+  let rejectedCount = 0;
+  let maxPairwise = 0;
+  for (const candidate of ordered) {
+    const signature = candidate.equitySignature ?? [];
+    if (signature.length < 2) {
+      kept.push(candidate);
+      continue;
+    }
+    let blocked = false;
+    for (const existing of kept) {
+      const other = existing.equitySignature ?? [];
+      if (other.length < 2) continue;
+      const corr = equitySignatureCorrelation(signature, other);
+      maxPairwise = Math.max(maxPairwise, corr);
+      if (corr > threshold + 1e-12) {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) rejectedCount += 1;
+    else kept.push(candidate);
+  }
+  let keptMax = 0;
+  for (let left = 0; left < kept.length; left += 1) {
+    for (let right = left + 1; right < kept.length; right += 1) {
+      keptMax = Math.max(
+        keptMax,
+        equitySignatureCorrelation(kept[left].equitySignature ?? [], kept[right].equitySignature ?? []),
+      );
+    }
+  }
+  return {
+    kept,
+    rejectedCount,
+    maxPairwise: kept.length >= 2 ? keptMax : maxPairwise,
+  };
+}
+
+function equitySignatureCorrelation(left: number[], right: number[]): number {
+  const length = Math.min(left.length, right.length);
+  if (length < 2) return 0;
+  const a = left.slice(0, length);
+  const b = right.slice(0, length);
+  const meanA = a.reduce((sum, value) => sum + value, 0) / length;
+  const meanB = b.reduce((sum, value) => sum + value, 0) / length;
+  let covariance = 0;
+  let varA = 0;
+  let varB = 0;
+  for (let index = 0; index < length; index += 1) {
+    const da = a[index] - meanA;
+    const db = b[index] - meanB;
+    covariance += da * db;
+    varA += da * da;
+    varB += db * db;
+  }
+  const denom = Math.sqrt(varA * varB);
+  if (denom <= Number.EPSILON) return 0;
+  return Math.max(0, Math.min(1, Math.max(-1, covariance / denom)));
+}
+
 function columnValue(elite: EliteRow, raw: string): number | string | boolean | null {
   const key = canonicalizeFilterColumn(raw);
   const map: Record<string, number | string | boolean | null> = {

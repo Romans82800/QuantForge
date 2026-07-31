@@ -35,7 +35,7 @@ use quantforge_quality::{
     WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
     run_incubation, run_sealed_final, run_task_graph, run_walk_forward_matrix,
     example_retester_graph, filter_rows, row_from_value, render_results_html_from_json, TaskGraph,
-    TaskRunOptions,
+    TaskRunOptions, candidates_from_values, filter_by_correlation,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -160,6 +160,8 @@ enum Command {
     WfMatrix(WfMatrixArgs),
     /// Filter a databank / elite JSON list with an SQX-like expression.
     DatabankFilter(DatabankFilterArgs),
+    /// Keep a diverse elite subset by equity-signature correlation (SQX DatabankFilterByCorrelation).
+    DatabankCorrelate(DatabankCorrelateArgs),
     /// Execute (or dry-run) a QuantForge Retester task graph JSON end-to-end.
     TaskRun(TaskRunArgs),
     /// Render an SQX SaverHTML-style results report from Scout/Judge JSON.
@@ -873,6 +875,18 @@ struct DatabankFilterArgs {
 }
 
 #[derive(Debug, Args)]
+struct DatabankCorrelateArgs {
+    /// Elite list JSON with `fingerprint` + `equity_signature` (or camelCase).
+    #[arg(long)]
+    elites: PathBuf,
+    /// Maximum allowed pairwise correlation in [0, 1] (default 0.70).
+    #[arg(long, default_value_t = 0.70)]
+    max_correlation: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct TaskRunArgs {
     /// QuantForge task graph JSON (`*.qf-task.json`).
     #[arg(long)]
@@ -1571,6 +1585,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Negate(args) => negate_command(args)?,
         Command::WfMatrix(args) => wf_matrix_command(args)?,
         Command::DatabankFilter(args) => databank_filter_command(args)?,
+        Command::DatabankCorrelate(args) => databank_correlate_command(args)?,
         Command::TaskRun(args) => task_run_command(args)?,
         Command::ExportHtml(args) => export_html_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
@@ -1957,6 +1972,32 @@ fn databank_filter_command(args: DatabankFilterArgs) -> Result<(), Box<dyn Error
             out.display(),
             report.matched,
             report.total
+        );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn databank_correlate_command(args: DatabankCorrelateArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.elites)?;
+    let list = if let Some(arr) = raw.as_array() {
+        arr.clone()
+    } else if let Some(arr) = raw.get("elites").and_then(|v| v.as_array()) {
+        arr.clone()
+    } else {
+        return Err("elites JSON must be an array or an object with an `elites` array".into());
+    };
+    let candidates = candidates_from_values(&list)?;
+    let report = filter_by_correlation(&candidates, args.max_correlation)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} (kept {} / {}, max pairwise {:.4})",
+            out.display(),
+            report.kept_count,
+            report.input_count,
+            report.maximum_observed_pairwise_correlation
         );
     } else {
         print_json(&report)?;

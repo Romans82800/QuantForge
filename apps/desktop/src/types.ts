@@ -59,6 +59,8 @@ export interface SymbolPack {
 export interface PartitionEquityPoint {
   timestampMs: number;
   equity: number;
+  balance: number;
+  drawdownPercent: number;
 }
 
 export interface PartitionEquityView {
@@ -101,7 +103,12 @@ export interface TradeRowView {
   exitTimestampMs: number;
   entryPrice: number;
   exitPrice: number;
+  volume: number;
   netProfit: number;
+  commission: number;
+  swap: number;
+  barsHeld: number;
+  rMultiple: number | null;
   exitReason: string;
 }
 

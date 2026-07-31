@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": "MetaTrader 5",
+  "strategy_fingerprint": "61bf99b89a9adc054044ec8c6e0e9a956c66a23e142f19fc3e5c5963bfc1bd5f",
+  "broker_spec_hash": "0b53bcb27cf6506a6fabec608496798810c57325fb0b4157d623ddf82cc2da84",
+  "source_hash": "4321a575a89b93aa4a870a12204d45fe948038c8c7cb4fd6f259be8d2ce0708b",
+  "strategy_ir_version": 1,
+  "expert_name": "QFStopGolden",
+  "symbol": "AUDUSD",
+  "timeframe": "H1",
+  "live_trading_default": false,
+  "mandatory_stop_loss": true,
+  "mandatory_take_profit": true,
+  "parity_deals_file": "QuantForge\\QF_61bf99b89a9a_deals.csv",
+  "parity_equity_file": "QuantForge\\QF_61bf99b89a9a_equity.csv",
+  "parity_metadata_file": "QuantForge\\QF_61bf99b89a9a_metadata.csv",
+  "export_style": "sqx",
+  "config": {
+    "expert_name": "QFStopGolden",
+    "expert_directory": "QuantForge",
+    "timeframe": "H1",
+    "magic": 42424242,
+    "deviation_points": 10,
+    "max_spread_points": null,
+    "estimated_slippage_points_per_side": 0.0,
+    "commission_per_lot_round_turn": 7.0,
+    "allow_live_trading_default": false,
+    "export_style": "sqx",
+    "entry_window_start_hour": 2,
+    "entry_window_end_hour": 19,
+    "tester": {
+      "from_date": "2024.01.01",
+      "to_date": "2024.02.01",
+      "deposit": 100000.0,
+      "currency": "USD",
+      "leverage": 100,
+      "model": 4
+    }
+  }
+}

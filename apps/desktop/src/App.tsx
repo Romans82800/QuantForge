@@ -112,6 +112,7 @@ import {
   discoverProgressLabel,
   filterAndSortElites,
   databankFilterError,
+  filterElitesByCorrelation,
   formatDateRange,
   conditionLabel,
   formatNumber,
@@ -296,6 +297,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [filterExpression, setFilterExpression] = useState("");
+  const [correlationMax, setCorrelationMax] = useState(0.7);
+  const [correlationActive, setCorrelationActive] = useState(false);
+  const [correlationNote, setCorrelationNote] = useState<string | null>(null);
   const [entryFilter, setEntryFilter] = useState("all");
   const [entryOrderFilter, setEntryOrderFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
@@ -524,13 +528,28 @@ function App() {
     await selectElite(fingerprint);
   }
 
-  const filtered = useMemo(
-    () =>
-      workspace
-        ? filterAndSortElites(workspace.elites, query, entryFilter, sort, entryOrderFilter, filterExpression)
-        : [],
-    [workspace, query, entryFilter, entryOrderFilter, sort, filterExpression],
-  );
+  const filtered = useMemo(() => {
+    if (!workspace) return [];
+    const base = filterAndSortElites(
+      workspace.elites,
+      query,
+      entryFilter,
+      sort,
+      entryOrderFilter,
+      filterExpression,
+    );
+    if (!correlationActive) return base;
+    return filterElitesByCorrelation(base, correlationMax).kept;
+  }, [
+    workspace,
+    query,
+    entryFilter,
+    entryOrderFilter,
+    sort,
+    filterExpression,
+    correlationActive,
+    correlationMax,
+  ]);
   const filterExprError = useMemo(() => databankFilterError(filterExpression), [filterExpression]);
 
   useEffect(() => {
@@ -855,6 +874,7 @@ function App() {
                     <div>
                       <p className="eyebrow">Archive champions</p>
                       <h2>{filtered.length} elites</h2>
+                      {correlationNote ? <small className="correlation-note">{correlationNote}</small> : null}
                     </div>
                     <div className="table-controls">
                       <input
@@ -908,6 +928,44 @@ function App() {
                         <option value="entryConditions">Entry conditions</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
+                      <label className="correlation-control" title="SQX DatabankFilterByCorrelation">
+                        Corr ≤
+                        <input
+                          aria-label="Maximum pairwise equity correlation"
+                          max={1}
+                          min={0}
+                          step={0.05}
+                          type="number"
+                          value={correlationMax}
+                          onChange={(event) => setCorrelationMax(Number(event.target.value) || 0)}
+                        />
+                      </label>
+                      <button
+                        className={correlationActive ? "primary" : "secondary"}
+                        onClick={() => {
+                          if (!workspace) return;
+                          const base = filterAndSortElites(
+                            workspace.elites,
+                            query,
+                            entryFilter,
+                            sort,
+                            entryOrderFilter,
+                            filterExpression,
+                          );
+                          const next = !correlationActive;
+                          setCorrelationActive(next);
+                          if (next) {
+                            const report = filterElitesByCorrelation(base, correlationMax);
+                            setCorrelationNote(
+                              `Kept ${report.kept.length}/${base.length}; dropped ${report.rejectedCount} (max pairwise ${report.maxPairwise.toFixed(3)})`,
+                            );
+                          } else {
+                            setCorrelationNote(null);
+                          }
+                        }}
+                      >
+                        {correlationActive ? "Clear correlation" : "Filter by correlation"}
+                      </button>
                     </div>
                     <div className="batch-controls">
                       <label>
@@ -5476,24 +5534,36 @@ function PartitionEquityChart({
   const height = large ? 340 : 300;
   const pad = 18;
   const equities = chartPoints.map((point) => point.equity);
-  const min = Math.min(...equities);
-  const max = Math.max(...equities);
+  const balances = chartPoints.map((point) => point.balance ?? point.equity);
+  const drawdowns = chartPoints.map((point) => point.drawdownPercent ?? 0);
+  const min = Math.min(...equities, ...balances);
+  const max = Math.max(...equities, ...balances);
   const span = Math.max(max - min, 1e-9);
+  const maxDd = Math.max(...drawdowns, 1e-9);
   const t0 = chartPoints[0].timestampMs;
   const t1 = chartPoints[chartPoints.length - 1].timestampMs;
   const tSpan = Math.max(t1 - t0, 1);
   const xAt = (timestamp: number) => pad + ((timestamp - t0) / tSpan) * (width - pad * 2);
   const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
+  const yDd = (dd: number) => pad + (dd / maxDd) * (height - pad * 2) * 0.28;
   const path = chartPoints
     .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
+    .join(" ");
+  const balancePath = chartPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.balance ?? point.equity).toFixed(1)}`)
+    .join(" ");
+  const ddPath = chartPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yDd(point.drawdownPercent ?? 0).toFixed(1)}`)
     .join(" ");
   const firstX = xAt(chartPoints[0].timestampMs);
   const lastX = xAt(chartPoints.at(-1)!.timestampMs);
   const chartBottom = height - pad;
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
+  const ddArea = `${ddPath} L${lastX.toFixed(1)} ${pad.toFixed(1)} L${firstX.toFixed(1)} ${pad.toFixed(1)} Z`;
   const isX = xAt(view.isEndTimestampMs);
   const oos1X = xAt(view.oos1EndTimestampMs);
   const gradientId = large ? "equity-area-large" : "equity-area-small";
+  const ddGradientId = large ? "dd-area-large" : "dd-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
 
@@ -5523,9 +5593,13 @@ function PartitionEquityChart({
       <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve">
         <defs>
           <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#35d4bd" stopOpacity=".30" />
-            <stop offset="68%" stopColor="#1eae9a" stopOpacity=".08" />
-            <stop offset="100%" stopColor="#1eae9a" stopOpacity="0" />
+            <stop offset="0%" stopColor="var(--accent)" stopOpacity=".30" />
+            <stop offset="68%" stopColor="var(--accent-deep)" stopOpacity=".08" />
+            <stop offset="100%" stopColor="var(--accent-deep)" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id={ddGradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--red)" stopOpacity=".22" />
+            <stop offset="100%" stopColor="var(--red)" stopOpacity="0" />
           </linearGradient>
         </defs>
         {horizontalGuides.map((guide) => {
@@ -5557,7 +5631,10 @@ function PartitionEquityChart({
           <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
         </>}
         <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
+        <path d={ddArea} fill={`url(#${ddGradientId})`} className="drawdown-area" />
+        <path d={balancePath} className="balance-path" />
         <path d={path} className="equity-path" />
+        <path d={ddPath} className="drawdown-path" />
         <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
         {sample === "full" ? <>
           <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
@@ -5565,6 +5642,12 @@ function PartitionEquityChart({
           <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
         </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
+      <div className="partition-equity-legend">
+        <span className="legend-equity">Equity</span>
+        <span className="legend-balance">Balance</span>
+        <span className="legend-dd">Drawdown (top band)</span>
+        <span>Peak DD {formatNumber(Math.max(...drawdowns), 2)}%</span>
+      </div>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
         <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS · chart split`} />
@@ -5664,12 +5747,27 @@ function EliteDetailModal({
 }
 
 function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolean }) {
+  const wins = trades.filter((trade) => trade.netProfit > 0);
+  const losses = trades.filter((trade) => trade.netProfit < 0);
+  const avgWin = wins.length ? wins.reduce((sum, trade) => sum + trade.netProfit, 0) / wins.length : 0;
+  const avgLoss = losses.length ? losses.reduce((sum, trade) => sum + trade.netProfit, 0) / losses.length : 0;
+  const expectancy = trades.length
+    ? trades.reduce((sum, trade) => sum + trade.netProfit, 0) / trades.length
+    : 0;
   return (
     <aside className="trade-list-panel">
       <header>
         <p className="eyebrow">Trade list</p>
         <p>{busy ? "Replaying M1 chronology…" : `${formatNumber(trades.length)} trades (full run)`}</p>
       </header>
+      {trades.length > 0 ? (
+        <div className="trade-analysis-strip">
+          <span>Win {formatNumber((wins.length / trades.length) * 100, 1)}%</span>
+          <span>Avg W {avgWin >= 0 ? "+" : ""}{avgWin.toFixed(2)}</span>
+          <span>Avg L {avgLoss.toFixed(2)}</span>
+          <span>Exp {expectancy >= 0 ? "+" : ""}{expectancy.toFixed(2)}</span>
+        </div>
+      ) : null}
       <div className="trade-list-scroll">
         {trades.length === 0 ? (
           <p className="empty-inline">{busy ? "Loading…" : "No trades in replay."}</p>
@@ -5680,7 +5778,11 @@ function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolea
                 <th>Side</th>
                 <th>Entry</th>
                 <th>Exit</th>
+                <th>Vol</th>
+                <th>Bars</th>
+                <th>R</th>
                 <th>Net</th>
+                <th>Comm</th>
                 <th>Reason</th>
               </tr>
             </thead>
@@ -5690,9 +5792,13 @@ function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolea
                   <td>{trade.side}</td>
                   <td>{formatTradeTimestamp(trade.entryTimestampMs)} @ {trade.entryPrice.toFixed(5)}</td>
                   <td>{formatTradeTimestamp(trade.exitTimestampMs)} @ {trade.exitPrice.toFixed(5)}</td>
+                  <td>{trade.volume.toFixed(2)}</td>
+                  <td>{formatNumber(trade.barsHeld)}</td>
+                  <td>{trade.rMultiple === null || trade.rMultiple === undefined ? "—" : trade.rMultiple.toFixed(2)}</td>
                   <td className={trade.netProfit >= 0 ? "profit" : "loss"}>
                     {trade.netProfit >= 0 ? "+" : ""}{trade.netProfit.toFixed(2)}
                   </td>
+                  <td>{trade.commission.toFixed(2)}</td>
                   <td>{trade.exitReason}</td>
                 </tr>
               ))}

@@ -1,0 +1,87 @@
+{
+  "id": "stop-pending-fixture",
+  "version": 1,
+  "entry": {
+    "long": {
+      "operator": "cross_above",
+      "left": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 12,
+          "shift": 1
+        }
+      },
+      "right": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 48,
+          "shift": 1
+        }
+      }
+    },
+    "short": {
+      "operator": "cross_below",
+      "left": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 12,
+          "shift": 1
+        }
+      },
+      "right": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 48,
+          "shift": 1
+        }
+      }
+    },
+    "order": {
+      "kind": "stop",
+      "distance": {
+        "kind": "atr_multiple",
+        "period": 14,
+        "multiplier": 0.75
+      },
+      "expiry_bars": 4
+    }
+  },
+  "exit": null,
+  "filters": [],
+  "side": "both",
+  "risk": {
+    "kind": "percent_balance",
+    "percent": 0.5
+  },
+  "stops": {
+    "stop_loss": {
+      "kind": "atr_multiple",
+      "period": 14,
+      "multiplier": 2.0
+    },
+    "take_profit": {
+      "kind": "risk_multiple",
+      "multiple": 2.5
+    }
+  },
+  "manage": {
+    "break_even_at_r": null,
+    "trailing": null,
+    "time_stop_bars": 36,
+    "partial_exits": [],
+    "flatten_end_of_day": false
+  },
+  "meta": {
+    "thesis_hint": "BuyStop/SellStop pending EveryTick parity fixture",
+    "complexity": 0,
+    "export_safe": true
+  }
+}

@@ -1,6 +1,7 @@
 //! Statistical evidence, sealed data partitions and non-bypassable promotion gates.
 
 mod challenge;
+mod databank_correlation;
 mod databank_filter;
 mod incubation;
 mod negate;
@@ -18,6 +19,10 @@ pub use challenge::{
     deflated_trade_sharpe, expected_max_lucky_sharpe, monte_carlo_from_trade_profits,
     monte_carlo_trade_resampling_with_skip,
     perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
+};
+pub use databank_correlation::{
+    DATABANK_CORRELATION_PROTOCOL, CorrelationCandidate, CorrelationFilterError,
+    CorrelationFilterReport, RejectedPair, candidates_from_values, filter_by_correlation,
 };
 pub use databank_filter::{
     DATABANK_FILTER_PROTOCOL, CompareOp, FilterError, FilterExpr, FilterReport, FilterValue,
