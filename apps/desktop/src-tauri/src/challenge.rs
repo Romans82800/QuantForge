@@ -260,6 +260,7 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
             abandon_above_drawdown_percent: None,
             position_accounting: Default::default(),
             max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         folds: request.folds,
         monte_carlo_trials: request.monte_carlo_trials,

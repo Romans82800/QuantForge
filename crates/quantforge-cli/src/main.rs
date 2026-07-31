@@ -1319,6 +1319,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 abandon_above_drawdown_percent: None,
                 position_accounting: Default::default(),
                 max_open_positions: 1,
+            enable_tick_file_replay: false,
             };
             let result = evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?;
 
@@ -1751,6 +1752,7 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
             abandon_above_drawdown_percent: None,
             position_accounting: Default::default(),
             max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         folds: args.folds,
         purge_bars: args.purge_bars,
@@ -1953,6 +1955,7 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
             abandon_above_drawdown_percent: None,
             position_accounting: Default::default(),
             max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         minimum_trades: args.minimum_trades,
         minimum_return_percent: args.minimum_return_percent,
@@ -4672,6 +4675,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             abandon_above_drawdown_percent: None,
             position_accounting: Default::default(),
             max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
     })
 }

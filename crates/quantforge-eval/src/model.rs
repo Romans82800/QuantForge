@@ -123,6 +123,10 @@ pub struct ScoutConfig {
     /// Cap for [`PositionAccounting::HedgedStack`] (ignored for single/netting).
     #[serde(default = "default_max_open_positions")]
     pub max_open_positions: usize,
+    /// When true (and a tick dataset is supplied to evaluate), protective
+    /// same-bar collisions walk real tick bids/asks inside each bar window.
+    #[serde(default)]
+    pub enable_tick_file_replay: bool,
 }
 
 fn default_max_open_positions() -> usize {
@@ -140,6 +144,7 @@ impl Default for ScoutConfig {
             abandon_above_drawdown_percent: None,
             position_accounting: PositionAccounting::HedgedSingle,
             max_open_positions: 1,
+            enable_tick_file_replay: false,
         }
     }
 }
@@ -373,6 +378,9 @@ pub struct ScoutTelemetry {
     pub partial_entry_fills: usize,
     #[serde(default)]
     pub netting_closes: usize,
+    /// Opens that landed while at least one other position was already open.
+    #[serde(default)]
+    pub stacked_opens: usize,
     pub partial_exits_executed: usize,
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,

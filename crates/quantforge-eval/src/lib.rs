@@ -5,11 +5,13 @@ mod engine;
 mod features;
 mod management;
 mod model;
+mod position_book;
 mod tick_path;
 
 pub use costs::{ResolvedSpread, SpreadSource, SwapAccrual, accrue_swap, resolve_spread};
 pub use engine::{
     equity_sharpe_ratio, evaluate_strategy, evaluate_strategy_cached, evaluate_strategy_from,
+    evaluate_strategy_with_ticks,
 };
 pub use features::{
     DEFAULT_INDICATOR_CACHE_BYTES, FeatureCache, IndicatorBufferCache, calculate_indicator_series,
@@ -25,6 +27,9 @@ pub use model::{
     PositionSide, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry, Trade,
     in_mandatory_entry_window, IndicatorEngine,
 };
-pub use tick_path::{SyntheticTick, everytick_stop_hit_first, ohlc_everytick_path};
+pub use tick_path::{
+    SyntheticTick, Tick, TickDataset, everytick_stop_hit_first, load_tick_csv, parse_tick_csv,
+    ohlc_everytick_path, tick_file_stop_hit_first, ticks_in_bar_window,
+};
 
 pub const ENGINE_TIER: &str = "ohlc-scout";

@@ -84,7 +84,7 @@ pub fn evaluate_strategy(
     broker: &SymbolSpecification,
     config: &ScoutConfig,
 ) -> Result<ScoutResult, EvalError> {
-    evaluate_strategy_inner(strategy, dataset, broker, config, None, None)
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, None, None)
 }
 
 /// Same as [`evaluate_strategy`], reusing indicator buffers across candidates.
@@ -99,7 +99,7 @@ pub fn evaluate_strategy_cached(
     config: &ScoutConfig,
     cache: &IndicatorBufferCache,
 ) -> Result<ScoutResult, EvalError> {
-    evaluate_strategy_inner(strategy, dataset, broker, config, None, Some(cache))
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, Some(cache), None)
 }
 
 /// Evaluates a strategy with all earlier bars available as indicator warm-up,
@@ -130,6 +130,27 @@ pub fn evaluate_strategy_from(
         config,
         Some(entry_start_timestamp_ms),
         None,
+        None,
+    )
+}
+
+/// Like [`evaluate_strategy`], optionally walking a tick file for same-bar
+/// protective collisions when [`ScoutConfig::enable_tick_file_replay`] is set.
+pub fn evaluate_strategy_with_ticks(
+    strategy: &StrategyIr,
+    dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &ScoutConfig,
+    ticks: &crate::TickDataset,
+) -> Result<ScoutResult, EvalError> {
+    evaluate_strategy_inner(
+        strategy,
+        dataset,
+        broker,
+        config,
+        None,
+        None,
+        Some(ticks),
     )
 }
 
@@ -140,6 +161,7 @@ fn evaluate_strategy_inner(
     config: &ScoutConfig,
     entry_start_timestamp_ms: Option<i64>,
     indicator_cache: Option<&IndicatorBufferCache>,
+    ticks: Option<&crate::TickDataset>,
 ) -> Result<ScoutResult, EvalError> {
     if dataset.bars.len() < 2 {
         return Err(EvalError::InsufficientBars);
@@ -174,7 +196,7 @@ fn evaluate_strategy_inner(
         indicator_cache,
     )?;
     let mut balance = config.initial_balance;
-    let mut position: Option<OpenPosition> = None;
+    let mut positions: Vec<OpenPosition> = Vec::new();
     let mut pending: Option<PendingOrder> = None;
     let mut trades = Vec::new();
     let mut equity = Vec::with_capacity(bars.len() - 1);
@@ -184,6 +206,11 @@ fn evaluate_strategy_inner(
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
     let mut signal_taken_today = false;
+    let stack_mode = matches!(
+        config.position_accounting,
+        crate::PositionAccounting::HedgedStack
+    );
+    let tick_replay = config.enable_tick_file_replay && ticks.is_some_and(|t| !t.is_empty());
 
     for (index, bar) in bars.iter().enumerate().skip(1) {
         let spread = resolve_spread(bar, broker, &config.costs)?;
@@ -207,6 +234,14 @@ fn evaluate_strategy_inner(
         }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
+        let mut opened_slot: Option<usize> = None;
+        let tick_window = if tick_replay {
+            ticks.map(|dataset| {
+                crate::ticks_in_bar_window(dataset, previous_bar, bar)
+            })
+        } else {
+            None
+        };
 
         if strategy.manage.flatten_end_of_day && in_close_blackout {
             // The 22:00 broker-time bar is reserved for flatten/cancellation.
@@ -215,7 +250,7 @@ fn evaluate_strategy_inner(
             if pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
             }
-            if let Some(open) = position.take() {
+            while let Some(open) = positions.pop() {
                 let event = ExitEvent {
                     base_price: market_exit_base(open.side, bar.open, spread_price),
                     reason: ExitReason::EndOfDay,
@@ -239,97 +274,123 @@ fn evaluate_strategy_inner(
             }
         }
 
-        if !closed_this_bar && let Some(open) = position.as_mut() {
-            let accrual = accrue_swap(
-                open.side,
-                open.volume,
-                open.entry_price,
-                bar.open,
-                bars[index - 1].timestamp_ms,
-                bar.timestamp_ms,
-                broker,
-            )?;
-            open.swap += accrual.cash;
-            balance += accrual.cash;
-            telemetry.swap_rollover_events += accrual.rollover_events;
-            telemetry.swap_effective_days += accrual.effective_days;
-        }
-
-        if !closed_this_bar && let Some(open) = position.as_mut() {
-            apply_completed_bar_management(
-                open,
-                &strategy,
-                previous_bar,
-                previous_spread_price,
-                index,
-                bar,
-                spread_price,
-                broker,
-                config,
-                &mut features,
-                &mut balance,
-                &mut telemetry,
-            )?;
-            if open.volume <= 1.0e-12 {
-                let open = position.take().expect("managed position exists");
-                let side = open.side;
-                close_position(
-                    open,
-                    ExitEvent {
-                        base_price: market_exit_base(side, bar.open, spread_price),
-                        reason: ExitReason::PartialExit,
-                    },
-                    index,
+        if !closed_this_bar {
+            for open in positions.iter_mut() {
+                let accrual = accrue_swap(
+                    open.side,
+                    open.volume,
+                    open.entry_price,
+                    bar.open,
+                    bars[index - 1].timestamp_ms,
                     bar.timestamp_ms,
                     broker,
-                    config,
-                    &mut balance,
-                    &mut trades,
-                );
-                closed_this_bar = true;
+                )?;
+                open.swap += accrual.cash;
+                balance += accrual.cash;
+                telemetry.swap_rollover_events += accrual.rollover_events;
+                telemetry.swap_effective_days += accrual.effective_days;
             }
         }
 
-        if !closed_this_bar && let Some(open) = position.as_ref() {
-            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker)
-            {
-                Some(event)
-            } else if let Some(exit) = match open.side {
-                PositionSide::Long => strategy.long_exit(),
-                PositionSide::Short => strategy.short_exit(),
-            }
-                && features.evaluate_bool(exit, index)?
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(open.side, bar.open, spread_price),
-                    reason: ExitReason::Indicator,
-                })
-            } else if strategy
-                .manage
-                .time_stop_bars
-                .is_some_and(|limit| index - open.entry_index >= limit as usize)
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(open.side, bar.open, spread_price),
-                    reason: ExitReason::TimeStop,
-                })
-            } else {
-                protective_intrabar_exit(open, bar, spread_price, broker, config.same_bar_policy)
-            };
-
-            if let Some(event) = event {
-                let open = position.take().expect("position was checked above");
-                close_position(
-                    open,
-                    event,
+        if !closed_this_bar {
+            let mut i = 0;
+            while i < positions.len() {
+                apply_completed_bar_management(
+                    &mut positions[i],
+                    &strategy,
+                    previous_bar,
+                    previous_spread_price,
                     index,
-                    bar.timestamp_ms,
+                    bar,
+                    spread_price,
                     broker,
                     config,
+                    &mut features,
                     &mut balance,
-                    &mut trades,
-                );
-                closed_this_bar = true;
+                    &mut telemetry,
+                )?;
+                if positions[i].volume <= 1.0e-12 {
+                    let open = positions.remove(i);
+                    let side = open.side;
+                    close_position(
+                        open,
+                        ExitEvent {
+                            base_price: market_exit_base(side, bar.open, spread_price),
+                            reason: ExitReason::PartialExit,
+                        },
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    );
+                    if !stack_mode {
+                        closed_this_bar = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if !closed_this_bar {
+            let mut i = 0;
+            while i < positions.len() {
+                let open = &positions[i];
+                let event = if let Some(event) =
+                    protective_gap_exit(open, bar, spread_price, broker)
+                {
+                    Some(event)
+                } else if let Some(exit) = match open.side {
+                    PositionSide::Long => strategy.long_exit(),
+                    PositionSide::Short => strategy.short_exit(),
+                } && features.evaluate_bool(exit, index)?
+                {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::Indicator,
+                    })
+                } else if strategy
+                    .manage
+                    .time_stop_bars
+                    .is_some_and(|limit| index - open.entry_index >= limit as usize)
+                {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::TimeStop,
+                    })
+                } else {
+                    protective_intrabar_exit(
+                        open,
+                        bar,
+                        spread_price,
+                        broker,
+                        config.same_bar_policy,
+                        tick_window,
+                    )
+                };
+
+                if let Some(event) = event {
+                    let open = positions.remove(i);
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    );
+                    if !stack_mode {
+                        closed_this_bar = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
             }
         }
 
@@ -342,8 +403,8 @@ fn evaluate_strategy_inner(
         }
 
         // OCO-lite / re-entry: cancel a working pending before the place gate.
-        if position.is_none()
-            && pending.is_some()
+        // Pending is managed even while stacked positions are open.
+        if pending.is_some()
             && !closed_this_bar
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
             && index >= signal_warmup_bars
@@ -419,7 +480,7 @@ fn evaluate_strategy_inner(
         if matches!(
             config.position_accounting,
             crate::PositionAccounting::Netting
-        ) && position.is_some()
+        ) && positions.len() == 1
             && pending.is_none()
             && !closed_this_bar
             && index >= signal_warmup_bars
@@ -446,7 +507,7 @@ fn evaluate_strategy_inner(
                     .map(|entry| features.evaluate_bool(entry, index))
                     .transpose()?
                     .unwrap_or(false);
-                let open_side = position.as_ref().map(|open| open.side);
+                let open_side = positions.first().map(|open| open.side);
                 let opposite = match (open_side, long_signal, short_signal) {
                     (Some(PositionSide::Long), false, true)
                     | (Some(PositionSide::Short), true, false) => true,
@@ -456,7 +517,7 @@ fn evaluate_strategy_inner(
                     && in_entry_window
                     && broker.is_trading_at(bar.timestamp_ms)?
                 {
-                    let open = position.take().expect("checked");
+                    let open = positions.pop().expect("checked");
                     let event = ExitEvent {
                         base_price: market_exit_base(open.side, bar.open, spread_price),
                         reason: ExitReason::Indicator,
@@ -476,7 +537,7 @@ fn evaluate_strategy_inner(
             }
         }
 
-        if position.is_none()
+        if crate::position_book::can_open_another(positions.len(), config)
             && pending.is_none()
             && !closed_this_bar
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
@@ -545,9 +606,11 @@ fn evaluate_strategy_inner(
                                     &mut telemetry,
                                 )? {
                                     balance -= open.entry_commission;
-                                    position = Some(open);
+                                    positions.push(open);
                                     opened_this_bar = true;
+                                    opened_slot = Some(positions.len() - 1);
                                     signal_taken_today = true;
+                                    telemetry.stacked_opens += usize::from(positions.len() > 1);
                                 }
                             }
                             EntryOrderPolicy::Stop { .. }
@@ -575,7 +638,7 @@ fn evaluate_strategy_inner(
             }
         }
 
-        if position.is_none()
+        if crate::position_book::can_open_another(positions.len(), config)
             && !closed_this_bar
             && in_entry_window
             && let Some(fill_price) = pending
@@ -593,10 +656,12 @@ fn evaluate_strategy_inner(
                 config,
             );
             balance -= open.entry_commission;
-            position = Some(open);
+            positions.push(open);
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
+            opened_slot = Some(positions.len() - 1);
             signal_taken_today = true;
+            telemetry.stacked_opens += usize::from(positions.len() > 1);
         }
 
         // MetaTrader 5 hedged model: an attached stop/target is live from the fill,
@@ -606,29 +671,38 @@ fn evaluate_strategy_inner(
         // These trades open and close on one bar, so `ambiguous_trade_fraction` counts
         // them and dismisses strategies that lean on the assumption.
         if opened_this_bar {
-            let event = position
-                .as_ref()
-                .and_then(|open| {
-                    protective_intrabar_exit(open, bar, spread_price, broker, config.same_bar_policy)
+            if let Some(slot) = opened_slot {
+                let event = positions.get(slot).and_then(|open| {
+                    protective_intrabar_exit(
+                        open,
+                        bar,
+                        spread_price,
+                        broker,
+                        config.same_bar_policy,
+                        tick_window,
+                    )
                 });
-            if let Some(event) = event {
-                let open = position.take().expect("position was just opened");
-                close_position(
-                    open,
-                    event,
-                    index,
-                    bar.timestamp_ms,
-                    broker,
-                    config,
-                    &mut balance,
-                    &mut trades,
-                );
+                if let Some(event) = event {
+                    let open = positions.remove(slot);
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    );
+                }
             }
         }
 
-        let marked_equity = position.as_ref().map_or(balance, |open| {
-            liquidation_equity(open, bar, spread_price, balance, broker, config)
-        });
+        let mut marked_equity = balance;
+        for open in &positions {
+            marked_equity =
+                liquidation_equity(open, bar, spread_price, marked_equity, broker, config);
+        }
         equity.push(EquityPoint {
             timestamp_ms: bar.timestamp_ms,
             balance,
@@ -644,7 +718,7 @@ fn evaluate_strategy_inner(
         }
     }
 
-    if let Some(open) = position.take() {
+    while let Some(open) = positions.pop() {
         // Equity gains one point per replayed bar starting at index 1, so this is
         // the last bar reached — the final bar normally, earlier when abandoned.
         let final_index = equity.len().min(bars.len() - 1);
@@ -1432,6 +1506,7 @@ fn protective_intrabar_exit(
     spread_price: f64,
     broker: &SymbolSpecification,
     policy: crate::SameBarPolicy,
+    tick_window: Option<&[crate::Tick]>,
 ) -> Option<ExitEvent> {
     let (stop_touched, target_touched) = match position.side {
         PositionSide::Long => (
@@ -1447,6 +1522,28 @@ fn protective_intrabar_exit(
         return None;
     }
     if stop_touched && target_touched {
+        // Prefer real tick order when file replay is active for this bar.
+        if let Some(window) = tick_window.filter(|w| !w.is_empty()) {
+            match crate::tick_file_stop_hit_first(
+                position.side,
+                position.stop_loss,
+                position.take_profit,
+                window,
+            ) {
+                Some(true) | None => {
+                    return Some(ExitEvent {
+                        base_price: position.stop_loss,
+                        reason: ExitReason::StopLoss,
+                    });
+                }
+                Some(false) => {
+                    return Some(ExitEvent {
+                        base_price: position.take_profit,
+                        reason: ExitReason::TakeProfit,
+                    });
+                }
+            }
+        }
         match policy {
             crate::SameBarPolicy::Conservative => {
                 return Some(ExitEvent {
@@ -2523,6 +2620,131 @@ mod tests {
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.telemetry.synthetic_spread_bars, 1);
         assert_eq!(result.telemetry.fallback_spread_bars, 0);
+    }
+
+    #[test]
+    fn hedged_stack_allows_multiple_concurrent_positions() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        // Wide TP so positions stay open across subsequent signal bars.
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(10);
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            // Open #1 at 100; range never hits SL 98 / far TP.
+            bar(60_000, 100.0, 101.0, 99.0, 100.5),
+            // Open #2 while #1 still live.
+            bar(120_000, 100.5, 101.5, 99.5, 101.0),
+            // Open #3.
+            bar(180_000, 101.0, 102.0, 100.0, 101.5),
+            // Cap hit — no fourth open; flatten at end.
+            bar(240_000, 101.5, 102.5, 100.5, 102.0),
+        ]);
+        let config = ScoutConfig {
+            initial_balance: 10_000.0,
+            position_accounting: crate::PositionAccounting::HedgedStack,
+            max_open_positions: 3,
+            ..ScoutConfig::default()
+        };
+        let stacked = evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
+        assert!(
+            stacked.telemetry.stacked_opens >= 1,
+            "expected at least one stacked open, got {}",
+            stacked.telemetry.stacked_opens
+        );
+        assert_eq!(stacked.trades.len(), 3);
+
+        let single = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                position_accounting: crate::PositionAccounting::HedgedSingle,
+                max_open_positions: 8,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(single.trades.len(), 1);
+        assert_eq!(single.telemetry.stacked_opens, 0);
+    }
+
+    #[test]
+    fn hedged_stack_respects_max_open_positions_cap() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(20);
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 101.0, 99.0, 100.5),
+            bar(120_000, 100.5, 101.5, 99.5, 101.0),
+            bar(180_000, 101.0, 102.0, 100.0, 101.5),
+            bar(240_000, 101.5, 102.5, 100.5, 102.0),
+        ]);
+        let capped = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                position_accounting: crate::PositionAccounting::HedgedStack,
+                max_open_positions: 2,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.trades.len(), 2);
+    }
+
+    #[test]
+    fn tick_file_replay_resolves_same_bar_collision_by_tick_order() {
+        let strategy = strategy();
+        // SL 2 pts below entry 100 → 98; TP 4 pts above → 104.
+        // Bar range touches both; ticks hit TP first.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 105.0, 97.0, 103.0),
+        ]);
+        let ticks = crate::TickDataset {
+            ticks: vec![
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 30_000,
+                    bid: 100.0,
+                    ask: 100.0,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 20_000,
+                    bid: 104.5,
+                    ask: 104.5,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 10_000,
+                    bid: 97.5,
+                    ask: 97.5,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000,
+                    bid: 103.0,
+                    ask: 103.0,
+                },
+            ],
+        };
+        let config = ScoutConfig {
+            initial_balance: 100.0,
+            same_bar_policy: crate::SameBarPolicy::Conservative,
+            enable_tick_file_replay: true,
+            ..ScoutConfig::default()
+        };
+        let with_ticks =
+            evaluate_strategy_with_ticks(&strategy, &data, &broker(), &config, &ticks).unwrap();
+        assert_eq!(with_ticks.trades.len(), 1);
+        assert_eq!(with_ticks.trades[0].exit_reason, ExitReason::TakeProfit);
+
+        let conservative =
+            evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
+        assert_eq!(conservative.trades[0].exit_reason, ExitReason::StopLoss);
     }
 
     fn timed_bar(timestamp: &str) -> Bar {

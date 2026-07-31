@@ -68,6 +68,7 @@ impl JudgeConfig {
             abandon_above_drawdown_percent: None,
             position_accounting: Default::default(),
             max_open_positions: 1,
+        enable_tick_file_replay: false,
         }
         .validate()?;
         Ok(())
