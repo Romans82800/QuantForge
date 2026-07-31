@@ -9,7 +9,7 @@ use crate::model::{
     ScoutTelemetry, Trade,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
-use chrono::Timelike;
+use chrono::{Datelike, Timelike, Weekday};
 use quantforge_broker::{BrokerClock, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
@@ -205,7 +205,7 @@ fn evaluate_strategy_inner(
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
-    let mut signal_taken_today = false;
+    let mut entries_today: u16 = 0;
     let stack_mode = matches!(
         config.position_accounting,
         crate::PositionAccounting::HedgedStack
@@ -230,7 +230,7 @@ fn evaluate_strategy_inner(
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
             active_entry_day = Some(day_key);
-            signal_taken_today = false;
+            entries_today = 0;
         }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
@@ -243,9 +243,17 @@ fn evaluate_strategy_inner(
             None
         };
 
-        if strategy.manage.flatten_end_of_day && in_close_blackout {
+        let weekday = current_local.weekday();
+        let friday_flatten = strategy.manage.exit_on_friday
+            && weekday == Weekday::Fri
+            && current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let session_flatten = (strategy.manage.flatten_end_of_day && in_close_blackout)
+            || friday_flatten;
+
+        if session_flatten {
             // The 22:00 broker-time bar is reserved for flatten/cancellation.
             // The entry gate below keeps the strategy flat through 23:59.
+            // Friday exit uses the same end_of_day_hour when exit_on_friday is set.
             closed_this_bar = true;
             if pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
@@ -266,6 +274,9 @@ fn evaluate_strategy_inner(
                     &mut trades,
                 );
                 telemetry.end_of_day_flattens += 1;
+                if friday_flatten {
+                    telemetry.friday_exits += 1;
+                }
             }
         } else if !in_entry_window {
             // Hard session: cancel unfilled pending outside [02:00, 19:00).
@@ -407,6 +418,9 @@ fn evaluate_strategy_inner(
         if pending.is_some()
             && !closed_this_bar
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && !(strategy.manage.exit_on_friday
+                && current_local.weekday() == Weekday::Fri
+                && current_local.hour() >= strategy.manage.end_of_day_hour as u32)
             && index >= signal_warmup_bars
             && (strategy.manage.cancel_pending_on_opposite
                 || strategy.manage.replace_pending_on_reentry
@@ -540,7 +554,7 @@ fn evaluate_strategy_inner(
         if crate::position_book::can_open_another(positions.len(), config)
             && pending.is_none()
             && !closed_this_bar
-            && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && !session_flatten
             && index >= signal_warmup_bars
             && entry_start_timestamp_ms.is_none_or(|start| bar.timestamp_ms >= start)
         {
@@ -578,8 +592,17 @@ fn evaluate_strategy_inner(
                 };
 
                 if let Some(side) = side {
+                    let day_cap = if strategy.manage.max_one_entry_per_day {
+                        Some(1u16)
+                    } else {
+                        strategy.manage.max_trades_per_day
+                    };
+                    let weekend_block = strategy.manage.dont_trade_on_weekends
+                        && matches!(weekday, Weekday::Sat | Weekday::Sun);
                     if !broker.is_trading_at(bar.timestamp_ms)? {
                         telemetry.skipped_outside_session += 1;
+                    } else if weekend_block {
+                        telemetry.skipped_weekend_entries += 1;
                     } else if !in_entry_window {
                         telemetry.skipped_outside_entry_window += 1;
                     } else if config
@@ -588,7 +611,7 @@ fn evaluate_strategy_inner(
                         .is_some_and(|maximum| spread.points > maximum)
                     {
                         telemetry.skipped_for_spread += 1;
-                    } else if strategy.manage.max_one_entry_per_day && signal_taken_today {
+                    } else if day_cap.is_some_and(|cap| entries_today >= cap) {
                         telemetry.skipped_max_one_entry_per_day += 1;
                     } else {
                         match &strategy.entry.order {
@@ -609,7 +632,7 @@ fn evaluate_strategy_inner(
                                     positions.push(open);
                                     opened_this_bar = true;
                                     opened_slot = Some(positions.len() - 1);
-                                    signal_taken_today = true;
+                                    entries_today = entries_today.saturating_add(1);
                                     telemetry.stacked_opens += usize::from(positions.len() > 1);
                                 }
                             }
@@ -660,7 +683,7 @@ fn evaluate_strategy_inner(
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
             opened_slot = Some(positions.len() - 1);
-            signal_taken_today = true;
+            entries_today = entries_today.saturating_add(1);
             telemetry.stacked_opens += usize::from(positions.len() > 1);
         }
 
@@ -779,10 +802,6 @@ fn open_position(
         return Ok(None);
     }
 
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -791,8 +810,16 @@ fn open_position(
     } else {
         0.0
     };
-    let raw_volume = risk_budget / (price_risk_per_lot + cost_risk_per_lot);
-    let Some(mut volume) = normalize_volume(raw_volume, broker) else {
+    let Some(mut volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -987,10 +1014,6 @@ fn place_pending_order(
     if normalized_stop_distance <= 0.0 {
         return Ok(None);
     }
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = normalized_stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -999,10 +1022,16 @@ fn place_pending_order(
     } else {
         0.0
     };
-    let Some(volume) = normalize_volume(
-        risk_budget / (price_risk_per_lot + cost_risk_per_lot),
-        broker,
-    ) else {
+    let Some(volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -1662,7 +1691,7 @@ fn liquidation_equity(
     balance + gross - exit_commission
 }
 
-fn calculate_metrics(
+pub fn calculate_metrics(
     initial_balance: f64,
     ending_balance: f64,
     trades: &[Trade],
@@ -1768,7 +1797,8 @@ mod tests {
     use quantforge_core::{ContentHash, STRATEGY_IR_VERSION};
     use quantforge_ir::{
         BoolExpr, ComparisonOp, EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy,
-        NumericExpr, PartialExit, PriceField, ProtectiveStops, Side, StrategyMeta, TrailingPolicy,
+        NumericExpr, PartialExit, PriceField, ProtectiveStops, RiskPolicy, Side, StrategyMeta,
+        TrailingPolicy,
     };
 
     fn broker() -> SymbolSpecification {
@@ -2745,6 +2775,47 @@ mod tests {
         let conservative =
             evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
         assert_eq!(conservative.trades[0].exit_reason, ExitReason::StopLoss);
+    }
+
+    #[test]
+    fn fixed_lots_risk_sizes_to_requested_volume() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::FixedLots { lots: 3.0 };
+        let result = evaluate_strategy(
+            &strategy,
+            &dataset(99.0),
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 100.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.trades[0].volume, 3.0);
+    }
+
+    #[test]
+    fn weekend_filter_blocks_saturday_entries() {
+        let mut strategy = strategy();
+        strategy.manage.dont_trade_on_weekends = true;
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(1);
+        // 2024-01-06 is Saturday.
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-06T10:00:00Z"),
+            timed_bar("2024-01-06T11:00:00Z"),
+            timed_bar("2024-01-08T10:00:00Z"), // Monday
+            timed_bar("2024-01-08T11:00:00Z"),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert!(result.telemetry.skipped_weekend_entries > 0);
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(
+            result.trades[0].entry_timestamp_ms,
+            timed_bar("2024-01-08T10:00:00Z").timestamp_ms
+        );
     }
 
     fn timed_bar(timestamp: &str) -> Bar {

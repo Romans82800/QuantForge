@@ -787,10 +787,6 @@ fn open_position(
         return Ok(None);
     }
 
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -799,8 +795,16 @@ fn open_position(
     } else {
         0.0
     };
-    let raw_volume = risk_budget / (price_risk_per_lot + cost_risk_per_lot);
-    let Some(volume) = normalize_volume(raw_volume, broker) else {
+    let Some(volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -966,10 +970,6 @@ fn place_pending_order(
     if normalized_stop_distance <= 0.0 {
         return Ok(None);
     }
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = normalized_stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -978,10 +978,16 @@ fn place_pending_order(
     } else {
         0.0
     };
-    let Some(volume) = normalize_volume(
-        risk_budget / (price_risk_per_lot + cost_risk_per_lot),
-        broker,
-    ) else {
+    let Some(volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };

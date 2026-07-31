@@ -3,6 +3,7 @@
 mod challenge;
 mod incubation;
 mod sealed;
+mod what_if;
 
 pub use challenge::{
     CHALLENGE_REPORT_SCHEMA_VERSION, ChallengeBlocker, ChallengeConfig, ChallengeError,
@@ -19,6 +20,9 @@ pub use incubation::{
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,
     SealedFinalReport, run_sealed_final,
+};
+pub use what_if::{
+    WHAT_IF_PROTOCOL_VERSION, WhatIfError, WhatIfFilter, WhatIfReport, apply_what_if,
 };
 
 use quantforge_core::{ContentHash, HashError, stable_json_hash};

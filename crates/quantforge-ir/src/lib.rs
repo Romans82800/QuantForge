@@ -521,6 +521,8 @@ pub enum Side {
 pub enum RiskPolicy {
     FixedCurrency { amount: f64 },
     PercentBalance { percent: f64 },
+    /// SQX-style fixed lot size (ignores stop-distance risk budget for sizing).
+    FixedLots { lots: f64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -597,6 +599,17 @@ pub struct ManagePolicy {
     /// re-signals (MT5 OrderModify semantics). Preferred over cancel+replace.
     #[serde(default = "default_true")]
     pub modify_pending_on_reentry: bool,
+    /// Block new entries on Saturday/Sunday (SQX DontTradeOnWeekends).
+    #[serde(default)]
+    pub dont_trade_on_weekends: bool,
+    /// Flatten open positions / cancel pendings on Friday at `end_of_day_hour`
+    /// (SQX ExitOnFriday). Independent of `flatten_end_of_day`.
+    #[serde(default)]
+    pub exit_on_friday: bool,
+    /// Cap fills per broker-local day. `None` means unlimited unless
+    /// `max_one_entry_per_day` is set (which behaves as a cap of 1).
+    #[serde(default)]
+    pub max_trades_per_day: Option<u16>,
 }
 
 fn default_true() -> bool {
@@ -616,6 +629,9 @@ impl Default for ManagePolicy {
             cancel_pending_on_opposite: true,
             replace_pending_on_reentry: false,
             modify_pending_on_reentry: true,
+            dont_trade_on_weekends: false,
+            exit_on_friday: false,
+            max_trades_per_day: None,
         }
     }
 }
@@ -1046,6 +1062,7 @@ fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
             }
             Ok(())
         }
+        RiskPolicy::FixedLots { lots } => require_positive("risk.lots", *lots),
     }
 }
 
@@ -1285,6 +1302,7 @@ fn canonicalize_risk(risk: &mut RiskPolicy, policy: FloatPolicy) -> Result<(), I
     match risk {
         RiskPolicy::FixedCurrency { amount } => *amount = q(*amount, policy)?,
         RiskPolicy::PercentBalance { percent } => *percent = q(*percent, policy)?,
+        RiskPolicy::FixedLots { lots } => *lots = q(*lots, policy)?,
     }
     Ok(())
 }

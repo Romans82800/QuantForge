@@ -31,8 +31,8 @@ use quantforge_quality::{
     ExternalParityEvidence, ILLUMINATION_PROTOCOL, INCUBATION_PROTOCOL, INDICATOR_PARITY_PROTOCOL,
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
-    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, evaluate_certification,
-    run_challenge, run_incubation, run_sealed_final,
+    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, WhatIfFilter, apply_what_if,
+    evaluate_certification, run_challenge, run_incubation, run_sealed_final,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -149,6 +149,8 @@ enum Command {
     IncubationFinalize(IncubationFinalizeArgs),
     /// Materialize the exact parity-passed EA from a Certified Vault entry.
     Deploy(DeployArgs),
+    /// Run SQX-style What-If trade filters on a Scout/Judge trade blotter.
+    WhatIf(WhatIfArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -813,6 +815,33 @@ struct IncubationFinalizeArgs {
 }
 
 #[derive(Debug, Args)]
+struct WhatIfArgs {
+    /// Scout or Judge JSON artifact containing `result.trades` (or a bare trades array).
+    #[arg(long)]
+    trades: PathBuf,
+    /// Initial balance used to rebuild filtered equity metrics.
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    /// Drop top percent of trades by net profit (best winners).
+    #[arg(long)]
+    exclude_pct_biggest_pl: Option<f64>,
+    /// Drop bottom percent of trades by net profit (worst losers).
+    #[arg(long)]
+    exclude_pct_lowest_pl: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    exclude_short_trades: bool,
+    #[arg(long, default_value_t = false)]
+    exclude_long_trades: bool,
+    /// Keep every Nth trade (1-based SQX "every second" ⇒ `--take-every-nth-trade 2`).
+    #[arg(long)]
+    take_every_nth_trade: Option<usize>,
+    #[arg(long)]
+    take_max_trades_per_day: Option<usize>,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct ChallengeArgs {
     /// Broker-local hour from which entries may be placed (inclusive).
     #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_START_HOUR)]
@@ -1447,6 +1476,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::IncubationRecord(args) => incubation_record_command(args)?,
         Command::IncubationFinalize(args) => incubation_finalize_command(args)?,
         Command::Deploy(args) => deploy_command(args)?,
+        Command::WhatIf(args) => what_if_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1758,6 +1788,52 @@ fn split_plan_command(args: SplitPlanArgs) -> Result<(), Box<dyn Error>> {
         artifact.plan.validation.bar_count,
         artifact.plan.sealed_final.bar_count
     );
+    Ok(())
+}
+
+fn what_if_command(args: WhatIfArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.trades)?;
+    let trades: Vec<quantforge_eval::Trade> = if let Some(_arr) = raw.as_array() {
+        serde_json::from_value(raw.clone())?
+    } else if let Some(result) = raw.get("result") {
+        serde_json::from_value(result.get("trades").cloned().unwrap_or(json!([])))?
+    } else if raw.get("trades").is_some() {
+        serde_json::from_value(raw.get("trades").cloned().unwrap_or(json!([])))?
+    } else {
+        return Err("what-if input must be a trades array or Scout/Judge artifact".into());
+    };
+    let mut filters = Vec::new();
+    if let Some(percent) = args.exclude_pct_biggest_pl {
+        filters.push(WhatIfFilter::ExcludePctBiggestPl { percent });
+    }
+    if let Some(percent) = args.exclude_pct_lowest_pl {
+        filters.push(WhatIfFilter::ExcludePctLowestPl { percent });
+    }
+    if args.exclude_short_trades {
+        filters.push(WhatIfFilter::ExcludeShortTrades);
+    }
+    if args.exclude_long_trades {
+        filters.push(WhatIfFilter::ExcludeLongTrades);
+    }
+    if let Some(n) = args.take_every_nth_trade {
+        filters.push(WhatIfFilter::TakeEveryNthTrade { n });
+    }
+    if let Some(max) = args.take_max_trades_per_day {
+        filters.push(WhatIfFilter::TakeMaxTradesPerDay { max });
+    }
+    if filters.is_empty() {
+        return Err("specify at least one what-if filter flag".into());
+    }
+    let report = apply_what_if(&trades, args.initial_balance, &filters)?;
+    if let Some(out) = args.out {
+        let backup = write_json_versioned(&out, &report)?;
+        println!("wrote {}", out.display());
+        if let Some(backup) = backup {
+            println!("preserved previous report as {}", backup.display());
+        }
+    } else {
+        print_json(&report)?;
+    }
     Ok(())
 }
 

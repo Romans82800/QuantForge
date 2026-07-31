@@ -301,6 +301,16 @@ double QFRiskBudget()
    return @@RISK_BUDGET@@;
 }
 
+int QFVolumeMode()
+{
+   return @@VOLUME_MODE@@;
+}
+
+double QFFixedLots()
+{
+   return @@FIXED_LOTS@@;
+}
+
 int QFEntryOrderKind()
 {
    return @@ENTRY_ORDER_KIND@@;
@@ -351,6 +361,21 @@ bool QFMaxOneEntryPerDay()
    return @@MAX_ONE_ENTRY_PER_DAY@@;
 }
 
+int QFMaxTradesPerDay()
+{
+   return @@MAX_TRADES_PER_DAY@@;
+}
+
+bool QFDontTradeOnWeekends()
+{
+   return @@DONT_TRADE_WEEKENDS@@;
+}
+
+bool QFExitOnFriday()
+{
+   return @@EXIT_ON_FRIDAY@@;
+}
+
 int QFBrokerDayKey(const datetime bar_time)
 {
    MqlDateTime current;
@@ -379,16 +404,39 @@ void QFSyncEntryDay(const datetime bar_time)
 
 bool QFEntryDayExhausted(const datetime bar_time)
 {
-   if(!QFMaxOneEntryPerDay())
-      return false;
    QFSyncEntryDay(bar_time);
-   return g_entries_today>=1;
+   int cap=0;
+   if(QFMaxOneEntryPerDay())
+      cap=1;
+   else if(QFMaxTradesPerDay()>0)
+      cap=QFMaxTradesPerDay();
+   if(cap<=0)
+      return false;
+   return g_entries_today>=cap;
 }
 
 void QFMarkEntrySignalTaken(const datetime bar_time)
 {
    QFSyncEntryDay(bar_time);
-   g_entries_today=1;
+   g_entries_today++;
+}
+
+bool QFWeekendBlocked(const datetime bar_time)
+{
+   if(!QFDontTradeOnWeekends())
+      return false;
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.day_of_week==0 || current.day_of_week==6;
+}
+
+bool QFFridayFlattenHour(const datetime bar_time)
+{
+   if(!QFExitOnFriday())
+      return false;
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.day_of_week==5 && current.hour>=@@EOD_HOUR@@;
 }
 
 int QFPartialCount()
@@ -506,7 +554,9 @@ bool QFOpenOrder(const bool buy)
    const double risk_per_lot=loss_per_lot+InpCommissionPerLotRoundTurn+slippage_cost;
    if(risk_per_lot<=0.0)
       return false;
-   const double volume=QFNormalizeVolume(QFRiskBudget()/risk_per_lot);
+   const double volume=(QFVolumeMode()==1)
+      ? QFNormalizeVolume(QFFixedLots())
+      : QFNormalizeVolume(QFRiskBudget()/risk_per_lot);
    if(volume<=0.0)
       return false;
 
@@ -963,7 +1013,7 @@ void OnTick()
    if(_sqIsBarOpen)
       g_decision_bars_seen++;
 
-   if(QFFlattenEndOfDay() && QFInCloseBlackout())
+   if((QFFlattenEndOfDay() && QFInCloseBlackout()) || QFFridayFlattenHour(current_bar))
    {
       QFCancelOwnOrders();
       if(QFOwnPosition()
@@ -993,6 +1043,11 @@ void OnTick()
       return;
    }
    if(g_last_exit_bar==current_bar)
+   {
+      QFRecordEquity(current_bar);
+      return;
+   }
+   if(QFWeekendBlocked(current_bar))
    {
       QFRecordEquity(current_bar);
       return;

@@ -10,8 +10,8 @@ mod tick_path;
 
 pub use costs::{ResolvedSpread, SpreadSource, SwapAccrual, accrue_swap, resolve_spread};
 pub use engine::{
-    equity_sharpe_ratio, evaluate_strategy, evaluate_strategy_cached, evaluate_strategy_from,
-    evaluate_strategy_with_ticks,
+    calculate_metrics, equity_sharpe_ratio, evaluate_strategy, evaluate_strategy_cached,
+    evaluate_strategy_from, evaluate_strategy_with_ticks,
 };
 pub use features::{
     DEFAULT_INDICATOR_CACHE_BYTES, FeatureCache, IndicatorBufferCache, calculate_indicator_series,

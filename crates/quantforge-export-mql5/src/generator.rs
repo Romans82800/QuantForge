@@ -127,6 +127,8 @@ pub fn generate_bundle(
         ("@@STOP_DISTANCE@@", stop_distance(&strategy)),
         ("@@TARGET_DISTANCE@@", target_distance(&strategy)),
         ("@@RISK_BUDGET@@", risk_budget(&strategy)),
+        ("@@VOLUME_MODE@@", volume_mode(&strategy).to_string()),
+        ("@@FIXED_LOTS@@", fixed_lots(&strategy)),
         ("@@ENTRY_ORDER_KIND@@", entry_order_kind(&strategy).to_string()),
         ("@@ENTRY_DISTANCE@@", entry_distance(&strategy)),
         ("@@ENTRY_LIMIT_OFFSET@@", entry_limit_offset(&strategy)),
@@ -153,6 +155,30 @@ pub fn generate_bundle(
         (
             "@@MAX_ONE_ENTRY_PER_DAY@@",
             if strategy.manage.max_one_entry_per_day {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        (
+            "@@MAX_TRADES_PER_DAY@@",
+            strategy
+                .manage
+                .max_trades_per_day
+                .unwrap_or(0)
+                .to_string(),
+        ),
+        (
+            "@@DONT_TRADE_WEEKENDS@@",
+            if strategy.manage.dont_trade_on_weekends {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        (
+            "@@EXIT_ON_FRIDAY@@",
+            if strategy.manage.exit_on_friday {
                 "true".into()
             } else {
                 "false".into()
@@ -715,6 +741,22 @@ fn risk_budget(strategy: &StrategyIr) -> String {
             "AccountInfoDouble(ACCOUNT_BALANCE)*{}/100.0",
             mql_double(percent)
         ),
+        // Unused when volume mode is fixed lots; keep a positive placeholder.
+        RiskPolicy::FixedLots { .. } => "0.0".into(),
+    }
+}
+
+fn volume_mode(strategy: &StrategyIr) -> u8 {
+    match strategy.risk {
+        RiskPolicy::FixedLots { .. } => 1,
+        _ => 0,
+    }
+}
+
+fn fixed_lots(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::FixedLots { lots } => mql_double(lots),
+        _ => "0.0".into(),
     }
 }
 

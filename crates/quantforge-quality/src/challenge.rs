@@ -994,6 +994,7 @@ fn perturb_strategy(
         // Fixed-dollar risk is a research invariant, not a tunable parameter.
         RiskPolicy::FixedCurrency { .. } => {}
         RiskPolicy::PercentBalance { percent } => perturb_positive(percent, fraction, 0.01, rng),
+        RiskPolicy::FixedLots { lots } => perturb_positive(lots, fraction, 0.01, rng),
     }
     match &mut neighbor.stops.stop_loss {
         StopLossPolicy::FixedPoints { points } => perturb_positive(points, fraction, 0.01, rng),

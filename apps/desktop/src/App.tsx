@@ -3445,7 +3445,7 @@ function DiscoverWorkspace({
                 )}
                 {form.runMode === "mass_builder" && (
                   <p className="recipe-summary">
-                    Cheap prefilter + genetic islands. Lower islands stay Selected-TF market-only; highest islands sample pending / BE / trail / partials and force M1 on promotion. Scout book defaults remain hedged-single; use CLI `--position-accounting hedged_stack` / `--tick-file` for multi-slot and tick replay.
+                    Cheap prefilter + genetic islands. Lower islands stay Selected-TF market-only; highest islands sample pending / BE / trail / partials and force M1 on promotion. Scout book defaults remain hedged-single; use CLI `--position-accounting hedged_stack` / `--tick-file` for multi-slot and tick replay. Money management FixedLots / weekend+Friday exits / What-If cross-checks are available via IR and `quantforge what-if`.
                   </p>
                 )}
                 {(form.runMode === "mass_builder" || (form.islandCount ?? 1) > 1) && (

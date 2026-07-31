@@ -2380,6 +2380,13 @@ fn random_manage(rng: &mut ChaCha8Rng) -> ManagePolicy {
         // Production applies these as immutable job policies, never genes.
         flatten_end_of_day: false,
         max_one_entry_per_day: false,
+        dont_trade_on_weekends: rng.gen_bool(0.15),
+        exit_on_friday: rng.gen_bool(0.12),
+        max_trades_per_day: if rng.gen_bool(0.2) {
+            Some(rng.gen_range(1..=3))
+        } else {
+            None
+        },
         ..Default::default()
     }
 }

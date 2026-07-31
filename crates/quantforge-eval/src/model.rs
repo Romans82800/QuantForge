@@ -387,6 +387,10 @@ pub struct ScoutTelemetry {
     pub end_of_day_flattens: usize,
     #[serde(default)]
     pub skipped_max_one_entry_per_day: usize,
+    #[serde(default)]
+    pub skipped_weekend_entries: usize,
+    #[serde(default)]
+    pub friday_exits: usize,
     pub synthetic_spread_bars: usize,
     pub fallback_spread_bars: usize,
     pub swap_rollover_events: usize,
