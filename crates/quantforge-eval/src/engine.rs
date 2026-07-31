@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
 use chrono::Timelike;
-use quantforge_broker::{BrokerClock, SwapMode, SymbolSpecification, TradeMode};
+use quantforge_broker::{BrokerClock, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
 use quantforge_ir::{
