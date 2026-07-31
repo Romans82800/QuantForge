@@ -68,14 +68,14 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | Market / Stop / Limit entries | Present | IR + Scout + Judge + export |
 | BuyStopLimit / SellStopLimit | Phase 1 | Two-price pending FSM + MQL5 StopLimit |
 | Swap / reopen modes | Present | Cash modes + reopen treated as points-equivalent rollover |
-| EveryTick vs M1 same-bar fill path | Partial | Conservative same-bar; not true tick replay |
+| EveryTick vs M1 same-bar fill path | Partial | `EveryTickOhlc` + optional tick-file replay (`enable_tick_file_replay`) |
 | Filling modes (FOK/IOC/RETURN) | Present | Export prefers broker `filling_modes`, falls back to symbol autodetection |
-| Netting vs hedging | Partial | Engines assume hedged single-position model |
-| Partial fills / requotes | Missing | Idealized fills + adverse slippage points |
-| Pending modification / OCO | Present | OrderModify-in-place on same-side re-signal + OCO-lite cancel-on-opposite |
-| Position accounting | Partial | Netting close-on-opposite + HedgedStack enum; multi-slot stack book TBD |
+| Netting vs hedging | Present | Netting close-on-opposite; HedgedSingle; multi-slot HedgedStack |
 | Partial fills / requotes | Present | `FillSimulation` on `CostModel` (fraction + deterministic requote) |
-| EveryTick foundation | Present | `SameBarPolicy::EveryTickOhlc` + `tick_path` OHLC walk (true tick files later) |
+| Pending modification / OCO | Present | OrderModify-in-place on same-side re-signal + OCO-lite cancel-on-opposite |
+| Position accounting | Present | HedgedSingle / HedgedStack (`max_open_positions`) / Netting |
+| EveryTick foundation | Present | OHLC path + tick CSV ingest into Scout protective exits |
+| StopLimit EveryTick goldens | Partial | Numeric `--compare` + CI fixture; live MT5 capture still external |
 
 Protocol: `mt5-parity-v2` in `crates/quantforge-parity`. Probes: `mql5/QuantForge/`, `scripts/family_mt5_parity.py`.
 

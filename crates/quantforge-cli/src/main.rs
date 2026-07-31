@@ -99,6 +99,21 @@ enum Command {
         /// Broker-local hour from which entries stop being placed (exclusive).
         #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
         entry_window_end_hour: u32,
+        /// Same-bar SL/TP policy: `conservative` or `every_tick_ohlc`.
+        #[arg(long, default_value = "conservative")]
+        same_bar_policy: String,
+        /// Position book: `hedged_single`, `hedged_stack`, or `netting`.
+        #[arg(long, default_value = "hedged_single")]
+        position_accounting: String,
+        /// Cap for hedged_stack (ignored for single/netting).
+        #[arg(long, default_value_t = 1)]
+        max_open_positions: usize,
+        /// Tick CSV (`timestamp_ms,bid,ask`) for EveryTick file replay.
+        #[arg(long)]
+        tick_file: Option<PathBuf>,
+        /// Walk tick file bids/asks for same-bar protective collisions.
+        #[arg(long, default_value_t = false)]
+        enable_tick_file_replay: bool,
         /// Allow a data-quality Fail and record the override in the manifest.
         #[arg(long)]
         allow_failed_data: bool,
@@ -1282,6 +1297,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             initial_balance,
             entry_window_start_hour,
             entry_window_end_hour,
+            same_bar_policy,
+            position_accounting,
+            max_open_positions,
+            tick_file,
+            enable_tick_file_replay,
             allow_failed_data,
             out,
         } => {
@@ -1300,9 +1320,41 @@ fn main() -> Result<(), Box<dyn Error>> {
             let broker_hash = broker_spec.content_hash()?;
             let strategy_fingerprint =
                 strategy_ir.structural_fingerprint(quantforge_core::FloatPolicy::default())?;
+            let same_bar_policy = match same_bar_policy.to_ascii_lowercase().as_str() {
+                "conservative" => quantforge_eval::SameBarPolicy::Conservative,
+                "every_tick_ohlc" | "everytick_ohlc" | "ohlc" => {
+                    quantforge_eval::SameBarPolicy::EveryTickOhlc
+                }
+                other => {
+                    return Err(format!(
+                        "unknown same_bar_policy '{other}' (expected conservative|every_tick_ohlc)"
+                    )
+                    .into());
+                }
+            };
+            let position_accounting = match position_accounting.to_ascii_lowercase().as_str() {
+                "hedged_single" | "single" => quantforge_eval::PositionAccounting::HedgedSingle,
+                "hedged_stack" | "stack" => quantforge_eval::PositionAccounting::HedgedStack,
+                "netting" => quantforge_eval::PositionAccounting::Netting,
+                other => {
+                    return Err(format!(
+                        "unknown position_accounting '{other}' (expected hedged_single|hedged_stack|netting)"
+                    )
+                    .into());
+                }
+            };
+            let tick_dataset = match &tick_file {
+                Some(path) => Some(quantforge_eval::load_tick_csv(path, Some(broker_spec.point))?),
+                None => None,
+            };
+            if enable_tick_file_replay && tick_dataset.is_none() {
+                return Err(
+                    "--enable-tick-file-replay requires --tick-file <path>".into(),
+                );
+            }
             let config = ScoutConfig {
                 initial_balance,
-                same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
+                same_bar_policy,
                 costs: CostModel {
                     fallback_spread_points,
                     adverse_slippage_points_per_side: slippage_points_per_side,
@@ -1317,11 +1369,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     entry_window_end_hour,
                 ),
                 abandon_above_drawdown_percent: None,
-                position_accounting: Default::default(),
-                max_open_positions: 1,
-            enable_tick_file_replay: false,
+                position_accounting,
+                max_open_positions,
+                enable_tick_file_replay,
             };
-            let result = evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?;
+            let result = if let Some(ticks) = &tick_dataset {
+                quantforge_eval::evaluate_strategy_with_ticks(
+                    &strategy_ir,
+                    &dataset,
+                    &broker_spec,
+                    &config,
+                    ticks,
+                )?
+            } else {
+                evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?
+            };
 
             let mut manifest_config = BTreeMap::<String, Value>::from([
                 ("source".into(), json!(display_path(&source.path))),

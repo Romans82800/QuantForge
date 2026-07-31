@@ -1,0 +1,34 @@
+{
+  "protocol_version": "mt5-parity-v2",
+  "mode": "inline_metrics",
+  "passed": true,
+  "trade_count_delta": 0,
+  "allowed_trade_count_delta": 3,
+  "trade_count_passed": true,
+  "net_profit_delta": 0.0,
+  "net_profit_delta_relative": 0.0,
+  "net_profit_passed": true,
+  "max_drawdown_delta": 0.0,
+  "max_drawdown_delta_relative": 0.0,
+  "max_drawdown_passed": true,
+  "max_equity_path_divergence": 0.0,
+  "max_equity_path_divergence_percent": 0.0,
+  "equity_path_passed": true,
+  "tolerances": {
+    "trade_count_relative": 0.1,
+    "trade_count_absolute": 3,
+    "net_profit_relative": 0.15,
+    "max_drawdown_relative": 0.15,
+    "max_equity_divergence_percent": 5.0
+  },
+  "reference": {
+    "trade_count": 4,
+    "net_profit": 1250.0,
+    "max_drawdown": 320.0
+  },
+  "external": {
+    "trade_count": 4,
+    "net_profit": 1250.0,
+    "max_drawdown": 320.0
+  }
+}

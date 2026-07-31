@@ -1,0 +1,6 @@
+# Sample tick CSV for Scout --tick-file / enable_tick_file_replay demos.
+# timestamp_ms,bid,ask
+1609459200000,1.10000,1.10020
+1609459201000,1.10010,1.10030
+1609459202000,1.09980,1.10000
+1609459203000,1.10050,1.10070

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "protocol": "mt5-parity-v2",
-  "tag": "golden_stub",
+  "tag": "golden_numeric_fixture",
   "symbol": "EURNZD",
   "timeframe": "H1",
   "tester_model": "every_tick_real_ticks",
@@ -10,7 +10,7 @@
     "sell_stop_limit"
   ],
   "data_pack": "ICMarkets_EST7_2020_present",
-  "status": "awaiting_mt5_capture",
+  "status": "numeric_fixture_ready",
   "files": {
     "ir": "strategy.ir.json",
     "deals": "mt5_deals.csv",
