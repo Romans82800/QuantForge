@@ -4,7 +4,7 @@
 //! protective gaps and stop/target chronology are replayed on M1 bars.
 
 use chrono::Timelike;
-use quantforge_broker::{BrokerClock, BrokerSpecError, SymbolSpecification, TradeMode};
+use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
 use quantforge_eval::{
