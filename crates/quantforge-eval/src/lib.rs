@@ -28,7 +28,7 @@ pub use model::{
     PositionSide, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry, Trade,
     in_mandatory_entry_window, IndicatorEngine,
 };
-pub use sizing::martingale_lots;
+pub use sizing::{atr_risk_lots, martingale_lots};
 pub use tick_path::{
     SyntheticTick, Tick, TickDataset, everytick_stop_hit_first, load_tick_csv, parse_tick_csv,
     ohlc_everytick_path, tick_file_stop_hit_first, ticks_in_bar_window,

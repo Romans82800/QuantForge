@@ -534,6 +534,16 @@ pub enum RiskPolicy {
         #[serde(default = "default_martingale_max_steps")]
         max_steps: u8,
     },
+    /// SQX ATRRiskBasedSizing: risk a percent of balance against ATR×multiplier
+    /// as the sizing stop distance (independent of the strategy SL gene).
+    AtrRiskPercent {
+        percent: f64,
+        atr_period: u16,
+        #[serde(default = "default_atr_risk_multiplier")]
+        atr_multiplier: f64,
+        #[serde(default)]
+        max_lots: Option<f64>,
+    },
 }
 
 fn default_martingale_multiplier() -> f64 {
@@ -542,6 +552,10 @@ fn default_martingale_multiplier() -> f64 {
 
 fn default_martingale_max_steps() -> u8 {
     5
+}
+
+fn default_atr_risk_multiplier() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1117,6 +1131,31 @@ fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
             }
             Ok(())
         }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            require_positive("risk.percent", *percent)?;
+            if *percent > 100.0 {
+                return Err(IrError::Invalid {
+                    path: "risk.percent".into(),
+                    reason: "must not exceed 100".into(),
+                });
+            }
+            if *atr_period == 0 {
+                return Err(IrError::Invalid {
+                    path: "risk.atr_period".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            require_positive("risk.atr_multiplier", *atr_multiplier)?;
+            if let Some(max) = max_lots {
+                require_positive("risk.max_lots", *max)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1364,6 +1403,18 @@ fn canonicalize_risk(risk: &mut RiskPolicy, policy: FloatPolicy) -> Result<(), I
         } => {
             *base_lots = q(*base_lots, policy)?;
             *multiplier = q(*multiplier, policy)?;
+        }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_multiplier,
+            max_lots,
+            ..
+        } => {
+            *percent = q(*percent, policy)?;
+            *atr_multiplier = q(*atr_multiplier, policy)?;
+            if let Some(max) = max_lots {
+                *max = q(*max, policy)?;
+            }
         }
     }
     Ok(())

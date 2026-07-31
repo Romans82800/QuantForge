@@ -328,6 +328,29 @@ double QFMartingaleLots()
    return QFFixedLots()*MathPow(QFMartingaleMultiplier(),steps);
 }
 
+
+int QFAtrRiskPeriod()
+{
+   return @@ATR_RISK_PERIOD@@;
+}
+
+double QFAtrRiskMultiplier()
+{
+   return @@ATR_RISK_MULTIPLIER@@;
+}
+
+double QFAtrRiskMaxLots()
+{
+   return @@ATR_RISK_MAX_LOTS@@;
+}
+
+double QFAtrRiskDistance()
+{
+   const double atr=QFATR(QFAtrRiskPeriod(),1);
+   if(!QFValid(atr) || atr<=0.0)
+      return 0.0;
+   return atr*QFAtrRiskMultiplier();
+}
 double QFResolveVolume(const double risk_per_lot)
 {
    const int mode=QFVolumeMode();
@@ -335,6 +358,24 @@ double QFResolveVolume(const double risk_per_lot)
       return QFFixedLots();
    if(mode==2)
       return QFMartingaleLots();
+   if(mode==3)
+   {
+      const double atr_distance=QFAtrRiskDistance();
+      if(atr_distance<=0.0)
+         return 0.0;
+      const double tick_size=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      const double tick_value=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      if(tick_size<=0.0 || tick_value<=0.0)
+         return 0.0;
+      const double atr_risk_per_lot=atr_distance/tick_size*tick_value;
+      if(atr_risk_per_lot<=0.0)
+         return 0.0;
+      double lots=QFRiskBudget()/atr_risk_per_lot;
+      const double max_lots=QFAtrRiskMaxLots();
+      if(max_lots>0.0)
+         lots=MathMin(lots,max_lots);
+      return lots;
+   }
    if(risk_per_lot<=0.0)
       return 0.0;
    return QFRiskBudget()/risk_per_lot;

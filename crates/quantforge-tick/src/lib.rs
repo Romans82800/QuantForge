@@ -814,6 +814,36 @@ fn open_position(
             quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
             broker,
         ),
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            normalize_volume(
+                quantforge_eval::atr_risk_lots(
+                    balance,
+                    percent,
+                    atr_value,
+                    atr_multiplier,
+                    broker.tick_size,
+                    broker.tick_value,
+                    cost_risk_per_lot,
+                    max_lots,
+                ),
+                broker,
+            )
+        }
         RiskPolicy::FixedCurrency { amount } => {
             normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
         }
@@ -1006,6 +1036,36 @@ fn place_pending_order(
             quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
             broker,
         ),
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            normalize_volume(
+                quantforge_eval::atr_risk_lots(
+                    balance,
+                    percent,
+                    atr_value,
+                    atr_multiplier,
+                    broker.tick_size,
+                    broker.tick_value,
+                    cost_risk_per_lot,
+                    max_lots,
+                ),
+                broker,
+            )
+        }
         RiskPolicy::FixedCurrency { amount } => {
             normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
         }

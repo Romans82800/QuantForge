@@ -131,6 +131,9 @@ pub fn generate_bundle(
         ("@@FIXED_LOTS@@", fixed_lots(&strategy)),
         ("@@MARTINGALE_MULTIPLIER@@", martingale_multiplier(&strategy)),
         ("@@MARTINGALE_MAX_STEPS@@", martingale_max_steps(&strategy)),
+        ("@@ATR_RISK_PERIOD@@", atr_risk_period(&strategy)),
+        ("@@ATR_RISK_MULTIPLIER@@", atr_risk_multiplier(&strategy)),
+        ("@@ATR_RISK_MAX_LOTS@@", atr_risk_max_lots(&strategy)),
         ("@@ENTRY_ORDER_KIND@@", entry_order_kind(&strategy).to_string()),
         ("@@ENTRY_DISTANCE@@", entry_distance(&strategy)),
         ("@@ENTRY_LIMIT_OFFSET@@", entry_limit_offset(&strategy)),
@@ -739,7 +742,8 @@ fn target_distance(strategy: &StrategyIr) -> String {
 fn risk_budget(strategy: &StrategyIr) -> String {
     match strategy.risk {
         RiskPolicy::FixedCurrency { amount } => mql_double(amount),
-        RiskPolicy::PercentBalance { percent } => format!(
+        RiskPolicy::PercentBalance { percent }
+        | RiskPolicy::AtrRiskPercent { percent, .. } => format!(
             "AccountInfoDouble(ACCOUNT_BALANCE)*{}/100.0",
             mql_double(percent)
         ),
@@ -751,6 +755,7 @@ fn volume_mode(strategy: &StrategyIr) -> u8 {
     match strategy.risk {
         RiskPolicy::FixedLots { .. } => 1,
         RiskPolicy::Martingale { .. } => 2,
+        RiskPolicy::AtrRiskPercent { .. } => 3,
         _ => 0,
     }
 }
@@ -774,6 +779,30 @@ fn martingale_max_steps(strategy: &StrategyIr) -> String {
     match strategy.risk {
         RiskPolicy::Martingale { max_steps, .. } => max_steps.to_string(),
         _ => "5".into(),
+    }
+}
+
+fn atr_risk_period(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent { atr_period, .. } => atr_period.to_string(),
+        _ => "14".into(),
+    }
+}
+
+fn atr_risk_multiplier(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent { atr_multiplier, .. } => mql_double(atr_multiplier),
+        _ => "1.0".into(),
+    }
+}
+
+fn atr_risk_max_lots(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent {
+            max_lots: Some(max),
+            ..
+        } => mql_double(max),
+        _ => "0.0".into(),
     }
 }
 

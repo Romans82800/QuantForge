@@ -827,7 +827,10 @@ fn open_position(
         cost_risk_per_lot,
         loss_streak,
         broker,
-    ) else {
+        index,
+        features,
+    )?
+    else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -1038,7 +1041,10 @@ fn place_pending_order(
         cost_risk_per_lot,
         loss_streak,
         broker,
-    ) else {
+        index,
+        features,
+    )?
+    else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -1317,7 +1323,9 @@ fn resolve_entry_volume(
     cost_risk_per_lot: f64,
     loss_streak: u8,
     broker: &SymbolSpecification,
-) -> Option<f64> {
+    decision_index: usize,
+    features: &mut FeatureCache<'_>,
+) -> Result<Option<f64>, EvalError> {
     let raw = match strategy.risk {
         RiskPolicy::FixedLots { lots } => lots,
         RiskPolicy::Martingale {
@@ -1331,8 +1339,35 @@ fn resolve_entry_volume(
         RiskPolicy::PercentBalance { percent } => {
             (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot)
         }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            crate::atr_risk_lots(
+                balance,
+                percent,
+                atr_value,
+                atr_multiplier,
+                broker.tick_size,
+                broker.tick_value,
+                cost_risk_per_lot,
+                max_lots,
+            )
+        }
     };
-    normalize_volume(raw, broker)
+    Ok(normalize_volume(raw, broker))
 }
 
 fn note_closed_trade_streak(trades: &[Trade], loss_streak: &mut u8) {
@@ -2905,6 +2940,37 @@ mod tests {
         assert_eq!(result.trades[1].volume, 2.0);
         assert_eq!(result.trades[2].volume, 4.0);
         assert!(result.trades.iter().all(|t| t.exit_reason == ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn atr_risk_percent_sizes_from_atr_not_stop_distance() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::AtrRiskPercent {
+            percent: 1.0,
+            atr_period: 2,
+            atr_multiplier: 1.0,
+            max_lots: Some(10.0),
+        };
+        // Enough bars for ATR(2) to warm; stop is 2 points but ATR path should drive size.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 102.0, 98.0, 100.0),
+            bar(60_000, 100.0, 103.0, 97.0, 101.0),
+            bar(120_000, 100.0, 104.0, 96.0, 100.0),
+            bar(180_000, 100.0, 105.0, 99.0, 104.0),
+        ]);
+        let result = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(!result.trades.is_empty());
+        assert!(result.trades[0].volume > 0.0);
+        assert!(result.trades[0].volume <= 10.0);
     }
 
     #[test]

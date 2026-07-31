@@ -1003,6 +1003,18 @@ fn perturb_strategy(
             perturb_positive(base_lots, fraction, 0.01, rng);
             perturb_positive(multiplier, fraction, 1.0, rng);
         }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_multiplier,
+            max_lots,
+            ..
+        } => {
+            perturb_positive(percent, fraction, 0.01, rng);
+            perturb_positive(atr_multiplier, fraction, 0.01, rng);
+            if let Some(max) = max_lots {
+                perturb_positive(max, fraction, 0.01, rng);
+            }
+        }
     }
     match &mut neighbor.stops.stop_loss {
         StopLossPolicy::FixedPoints { points } => perturb_positive(points, fraction, 0.01, rng),
