@@ -125,12 +125,21 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
-    /// `fast_scout`, `full_harvest`, or `quota_harvest`.
+    /// `fast_scout`, `full_harvest`, `quota_harvest`, or `mass_builder`.
     run_mode: Option<String>,
     /// Early-stop when accepted pot reaches this size (Fast Scout / Quota).
     early_stop_pot_elites: Option<usize>,
     /// Early-stop when databank reaches this many elites (Quota Harvest default 20).
     target_databank_elites: Option<usize>,
+    /// Cheap trailing-window Scout before full Selected-TF eval (Mass Builder).
+    enable_cheap_prefilter: Option<bool>,
+    prefilter_bar_fraction: Option<f64>,
+    /// Genetic island count (`1` = single population).
+    island_count: Option<usize>,
+    migration_interval: Option<u64>,
+    migration_elites: Option<usize>,
+    /// Highest-numbered islands that sample pending/BE/trail/partials (M1 on promote).
+    complex_m1_island_count: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
@@ -187,6 +196,8 @@ pub struct DiscoverJobView {
     rejected_correlated: u64,
     rejected_niche_not_improved: u64,
     rejected_evaluation: u64,
+    rejected_prefilter: u64,
+    island_migrations: u64,
     rejected_total: u64,
     evaluations_per_hour: f64,
     accepts_per_hour: f64,
@@ -268,6 +279,8 @@ impl DiscoverJobView {
             rejected_correlated: 0,
             rejected_niche_not_improved: 0,
             rejected_evaluation: 0,
+            rejected_prefilter: 0,
+            island_migrations: 0,
             rejected_total: 0,
             evaluations_per_hour: 0.0,
             accepts_per_hour: 0.0,
@@ -426,6 +439,8 @@ pub fn start_discover(
         rejected_correlated: 0,
         rejected_niche_not_improved: 0,
         rejected_evaluation: 0,
+        rejected_prefilter: 0,
+        island_migrations: 0,
         rejected_total: 0,
         evaluations_per_hour: 0.0,
         accepts_per_hour: 0.0,
@@ -1529,6 +1544,9 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
         "quota_harvest" | "quotaharvest" | "quota" => {
             Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
         }
+        "mass_builder" | "builder" | "mass" => {
+            Some(quantforge_discover::DiscoverRunMode::MassBuilder)
+        }
         _ => None,
     }
 }
@@ -1605,12 +1623,13 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
-        enable_cheap_prefilter: false,
-        prefilter_bar_fraction: 0.25,
+        enable_cheap_prefilter: request.enable_cheap_prefilter.unwrap_or(false),
+        prefilter_bar_fraction: request.prefilter_bar_fraction.unwrap_or(0.25),
         prefilter_gates: GateConfig::prefilter_defaults(),
-        island_count: 1,
-        migration_interval: 0,
-        migration_elites: 2,
+        island_count: request.island_count.unwrap_or(1),
+        migration_interval: request.migration_interval.unwrap_or(0),
+        migration_elites: request.migration_elites.unwrap_or(2),
+        complex_m1_island_count: request.complex_m1_island_count.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -1744,6 +1763,7 @@ fn update_bank(
         + telemetry.rejected_param_neighborhood
         + telemetry.rejected_multi_symbol
         + telemetry.rejected_deflated_sharpe
+        + telemetry.rejected_prefilter
         + telemetry.rejected_evaluation;
     let hours = clock.active_hours();
     let risk = quantforge_discover::FIXED_RISK_PER_TRADE;
@@ -1851,6 +1871,8 @@ fn update_bank(
     view.rejected_correlated = telemetry.rejected_correlated;
     view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
     view.rejected_evaluation = telemetry.rejected_evaluation;
+    view.rejected_prefilter = telemetry.rejected_prefilter;
+    view.island_migrations = telemetry.island_migrations;
     view.rejected_total = rejected_total;
     view.evaluations_per_hour = bank.evaluation_count as f64 / hours;
     view.accepts_per_hour = accepted_total as f64 / hours;

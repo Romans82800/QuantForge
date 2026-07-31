@@ -2845,6 +2845,12 @@ function DiscoverWorkspace({
     runMode: "full_harvest" as DiscoverRunModeId,
     earlyStopPotElites: null,
     targetDatabankElites: null,
+    enableCheapPrefilter: false,
+    prefilterBarFraction: 0.25,
+    islandCount: 1,
+    migrationInterval: 0,
+    migrationElites: 2,
+    complexM1IslandCount: 0,
     searchRanges: DEFAULT_SEARCH_RANGES,
     minimumTrades: 10,
     maximumDrawdownPercent: 40,
@@ -2866,6 +2872,7 @@ function DiscoverWorkspace({
     allowMarketEntries: true,
     allowStopEntries: false,
     allowLimitEntries: false,
+    allowStopLimitEntries: false,
     flattenAt22: false,
     endOfDayHour: 23,
     entryWindowStartHour: 2,
@@ -3090,6 +3097,12 @@ function DiscoverWorkspace({
             runMode: null,
             earlyStopPotElites: null,
             targetDatabankElites: null,
+            enableCheapPrefilter: null,
+            prefilterBarFraction: null,
+            islandCount: null,
+            migrationInterval: null,
+            migrationElites: null,
+            complexM1IslandCount: null,
             searchRanges: null,
             minimumTrades: null,
             maximumDrawdownPercent: null,
@@ -3111,6 +3124,7 @@ function DiscoverWorkspace({
             allowMarketEntries: null,
             allowStopEntries: null,
             allowLimitEntries: null,
+            allowStopLimitEntries: null,
             flattenAt22: null,
             entryWindowStartHour: null,
             entryWindowEndHour: null,
@@ -3367,16 +3381,111 @@ function DiscoverWorkspace({
                         minimumNeighborhoodSurvivalFraction: 0.5,
                         requireM1Robustness: true,
                         simpleExits: true,
+                        enableCheapPrefilter: false,
+                        islandCount: 1,
+                        complexM1IslandCount: 0,
                       }))
                     }
                   >
                     Quota (20)
+                  </button>
+                  <button
+                    type="button"
+                    className={form.runMode === "mass_builder" ? "active" : ""}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "mass_builder",
+                        mutateAfterElites: 300,
+                        earlyStopPotElites: null,
+                        targetDatabankElites: null,
+                        initialCandidates: Math.max(current.initialCandidates ?? 500, 2000),
+                        batchSize: Math.max(current.batchSize ?? 200, 500),
+                        enableCheapPrefilter: true,
+                        prefilterBarFraction: 0.25,
+                        islandCount: 8,
+                        migrationInterval: 10,
+                        migrationElites: 2,
+                        complexM1IslandCount: 4,
+                        requireM1Robustness: true,
+                        requireM1Precision: false,
+                        simpleExits: false,
+                        allowBreakEven: true,
+                        allowTrailingStops: true,
+                        allowPartialExits: true,
+                        allowMarketEntries: true,
+                        allowStopEntries: true,
+                        allowLimitEntries: true,
+                        allowStopLimitEntries: true,
+                        robustnessMonteCarloTrials: 250,
+                        robustnessNeighborhoodSamples: 8,
+                        minimumNeighborhoodSurvivalFraction: 0.7,
+                      }))
+                    }
+                  >
+                    Mass Builder
                   </button>
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <p className="recipe-summary">
                     Stops at 20 databank elites. Softer ±param gate (50% of 5). Pot is only a breeding bag — not the goal.
                   </p>
+                )}
+                {form.runMode === "mass_builder" && (
+                  <p className="recipe-summary">
+                    Cheap prefilter + genetic islands. Lower islands stay Selected-TF market-only; highest islands sample pending / BE / trail / partials and force M1 on promotion.
+                  </p>
+                )}
+                {(form.runMode === "mass_builder" || (form.islandCount ?? 1) > 1) && (
+                  <div className="form-grid universal-grammar-grid">
+                    <label className="check-field discover-split">
+                      <input
+                        type="checkbox"
+                        checked={form.enableCheapPrefilter ?? false}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            enableCheapPrefilter: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Cheap trailing-window prefilter</span>
+                    </label>
+                    <NumberField
+                      label="Prefilter bar fraction"
+                      value={form.prefilterBarFraction ?? 0.25}
+                      onChange={(value) => update("prefilterBarFraction", value ?? 0.25)}
+                      min={0.05}
+                      max={1}
+                      step={0.05}
+                    />
+                    <NumberField
+                      label="Islands"
+                      value={form.islandCount ?? 1}
+                      onChange={(value) => update("islandCount", value ?? 1)}
+                      min={1}
+                      max={64}
+                    />
+                    <NumberField
+                      label="Complex M1 islands"
+                      value={form.complexM1IslandCount ?? 0}
+                      onChange={(value) => update("complexM1IslandCount", value ?? 0)}
+                      min={0}
+                      max={64}
+                    />
+                    <NumberField
+                      label="Migration interval"
+                      value={form.migrationInterval ?? 0}
+                      onChange={(value) => update("migrationInterval", value ?? 0)}
+                      min={0}
+                    />
+                    <NumberField
+                      label="Migration elites"
+                      value={form.migrationElites ?? 2}
+                      onChange={(value) => update("migrationElites", value ?? 2)}
+                      min={0}
+                    />
+                  </div>
                 )}
               </div>
             </>
@@ -3565,6 +3674,7 @@ function DiscoverWorkspace({
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false, requireM1Precision: event.target.checked ? current.requireM1Precision : true }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop / sell-stop entry <small>(experimental; weaker in current OOS screen)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-limit / sell-limit entry <small>(test independently; preferred over stops in current screen)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop-limit / sell-stop-limit entry <small>(two-price pending; needs M1 or complex islands)</small></span></label>
               {entryOrderError(form) && <p className="field-error">{entryOrderError(form)}</p>}
             </details>
             <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day)</span></label>
@@ -3654,12 +3764,14 @@ function DiscoverWorkspace({
             <p className="eyebrow">Reject reasons</p>
             <p className="funnel-group-label">Pot gates — Selected-TF only</p>
             <ul>
+              <li><span>Cheap prefilter</span><strong>{formatNumber(job?.rejectedPrefilter ?? 0)}</strong></li>
               <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
               <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
               <li><span>Ambiguous same-bar</span><strong>{formatNumber(job?.rejectedAmbiguous ?? 0)}</strong></li>
               <li><span>Clone</span><strong>{formatNumber(job?.rejectedClone ?? 0)}</strong></li>
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
+              <li><span>Island migrations</span><strong>{formatNumber(job?.islandMigrations ?? 0)}</strong></li>
             </ul>
             <p className="funnel-group-label">Databank gates — run after the pot deposit</p>
             <ul>
@@ -3966,6 +4078,7 @@ function DiscoverContractSummary({
     (form.allowMarketEntries ?? true) ? "Market entries" : null,
     form.allowStopEntries ? "Stop entries" : null,
     form.allowLimitEntries ? "Limit entries" : null,
+    form.allowStopLimitEntries ? "Stop-limit entries" : null,
     form.allowBreakEven ? "Break-even" : null,
     form.allowTrailingStops ? "Trailing stop" : null,
     form.allowPartialExits ? "Partial exits" : null,
@@ -3996,7 +4109,7 @@ function DiscoverContractSummary({
         <p className="eyebrow">Hypothesis</p>
         <div className="contract-hero">
           <strong>{form.decisionTimeframe ?? "—"}</strong>
-          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : "Full harvest"}</span>
+          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : form.runMode === "mass_builder" ? "Mass Builder" : "Full harvest"}</span>
         </div>
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />

@@ -397,7 +397,7 @@ export interface UniversalGrammarConfig {
   maximumShift: number;
 }
 
-export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest";
+export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest" | "mass_builder";
 
 export interface ConditionBakeoffRow {
   entryConditions: number;
@@ -458,6 +458,12 @@ export interface DiscoverRequest {
   runMode: DiscoverRunModeId | null;
   earlyStopPotElites: number | null;
   targetDatabankElites: number | null;
+  enableCheapPrefilter: boolean | null;
+  prefilterBarFraction: number | null;
+  islandCount: number | null;
+  migrationInterval: number | null;
+  migrationElites: number | null;
+  complexM1IslandCount: number | null;
   searchRanges: SearchRangeProfile | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
@@ -479,6 +485,7 @@ export interface DiscoverRequest {
   allowMarketEntries: boolean | null;
   allowStopEntries: boolean | null;
   allowLimitEntries: boolean | null;
+  allowStopLimitEntries: boolean | null;
   flattenAt22: boolean | null;
   endOfDayHour: number | null;
   entryWindowStartHour: number | null;
@@ -627,6 +634,8 @@ export interface DiscoverJobView {
   rejectedCorrelated: number;
   rejectedNicheNotImproved: number;
   rejectedEvaluation: number;
+  rejectedPrefilter: number;
+  islandMigrations: number;
   rejectedTotal: number;
   evaluationsPerHour: number;
   acceptsPerHour: number;
