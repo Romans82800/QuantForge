@@ -610,6 +610,16 @@ pub struct ManagePolicy {
     /// `max_one_entry_per_day` is set (which behaves as a cap of 1).
     #[serde(default)]
     pub max_trades_per_day: Option<u16>,
+    /// Optional SL distance clamps in price points (SQX MinMaxSLPT).
+    #[serde(default)]
+    pub min_stop_points: Option<f64>,
+    #[serde(default)]
+    pub max_stop_points: Option<f64>,
+    /// Optional TP distance clamps in price points.
+    #[serde(default)]
+    pub min_take_profit_points: Option<f64>,
+    #[serde(default)]
+    pub max_take_profit_points: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -632,6 +642,10 @@ impl Default for ManagePolicy {
             dont_trade_on_weekends: false,
             exit_on_friday: false,
             max_trades_per_day: None,
+            min_stop_points: None,
+            max_stop_points: None,
+            min_take_profit_points: None,
+            max_take_profit_points: None,
         }
     }
 }

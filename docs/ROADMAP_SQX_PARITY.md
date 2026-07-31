@@ -85,6 +85,8 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | Fill simulation | Present | Partial volume + deterministic requote |
 | Pending modify / OCO-lite | Present | OrderModify + cancel-on-opposite |
 | What-If cross-checks | Present | Biggest/lowest PnL, every Nth, side filters, max/day |
+| Strategy Negater | Present | `quantforge negate` flips long/short trees |
+| MinMax SL/PT clamps | Present | ManagePolicy min/max stop & TP points |
 | Classic parameter optimizer UI | Missing | Neighborhood exists; no SQX AppOptimizer clone |
 | Dedicated Retester app | Missing | Challenge/Judge cover rigor; no task graph UI |
 | Walk-forward *matrix* UI | Missing | Folds exist; matrix visualization not ported |

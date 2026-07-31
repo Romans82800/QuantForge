@@ -1264,6 +1264,14 @@ fn stop_distance(
                 .map(|range| range * multiplier)
         }
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_stop_points,
+            strategy.manage.max_stop_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
 }
@@ -1282,8 +1290,32 @@ fn target_distance(
             .indicator_at_decision(&IndicatorExpr::Atr { period, shift: 1 }, decision_index)?
             .map(|atr| atr * multiplier),
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_take_profit_points,
+            strategy.manage.max_take_profit_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
+}
+
+fn clamp_distance_points(
+    distance: f64,
+    point: f64,
+    min_points: Option<f64>,
+    max_points: Option<f64>,
+) -> f64 {
+    let mut out = distance;
+    if let Some(min) = min_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.max(min * point);
+    }
+    if let Some(max) = max_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.min(max * point);
+    }
+    out
 }
 
 fn average_completed_range(bars: &[Bar], decision_index: usize, period: usize) -> Option<f64> {

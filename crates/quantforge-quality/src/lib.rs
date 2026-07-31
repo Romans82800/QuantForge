@@ -2,6 +2,7 @@
 
 mod challenge;
 mod incubation;
+mod negate;
 mod sealed;
 mod what_if;
 
@@ -16,6 +17,9 @@ pub use challenge::{
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,
     IncubationObservation, IncubationReport, IncubationStart, run_incubation,
+};
+pub use negate::{
+    NEGATE_PROTOCOL_VERSION, NegateError, NegateMode, NegateReport, negate_strategy,
 };
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,

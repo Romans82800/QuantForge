@@ -31,8 +31,9 @@ use quantforge_quality::{
     ExternalParityEvidence, ILLUMINATION_PROTOCOL, INCUBATION_PROTOCOL, INDICATOR_PARITY_PROTOCOL,
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
-    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, WhatIfFilter, apply_what_if,
-    evaluate_certification, run_challenge, run_incubation, run_sealed_final,
+    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, NegateMode, WhatIfFilter,
+    apply_what_if, evaluate_certification, negate_strategy, run_challenge, run_incubation,
+    run_sealed_final,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -151,6 +152,8 @@ enum Command {
     Deploy(DeployArgs),
     /// Run SQX-style What-If trade filters on a Scout/Judge trade blotter.
     WhatIf(WhatIfArgs),
+    /// Flip long/short sides of a strategy IR (SQX Negater cross-check).
+    Negate(NegateArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -812,6 +815,14 @@ struct IncubationFinalizeArgs {
     /// The immutable `incubation-start.json` artifact.
     #[arg(long)]
     start: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct NegateArgs {
+    #[arg(long)]
+    strategy: PathBuf,
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1477,6 +1488,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::IncubationFinalize(args) => incubation_finalize_command(args)?,
         Command::Deploy(args) => deploy_command(args)?,
         Command::WhatIf(args) => what_if_command(args)?,
+        Command::Negate(args) => negate_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1788,6 +1800,21 @@ fn split_plan_command(args: SplitPlanArgs) -> Result<(), Box<dyn Error>> {
         artifact.plan.validation.bar_count,
         artifact.plan.sealed_final.bar_count
     );
+    Ok(())
+}
+
+fn negate_command(args: NegateArgs) -> Result<(), Box<dyn Error>> {
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let report = negate_strategy(&strategy, NegateMode::FlipSides)?;
+    if let Some(out) = args.out {
+        let backup = write_json_versioned(&out, &report)?;
+        println!("wrote {}", out.display());
+        if let Some(backup) = backup {
+            println!("preserved previous report as {}", backup.display());
+        }
+    } else {
+        print_json(&report)?;
+    }
     Ok(())
 }
 
