@@ -122,10 +122,10 @@ pub fn accrue_swap(
         }
         SwapMode::InterestCurrent => annual_interest_cash(rate, current_price, broker),
         SwapMode::InterestOpen => annual_interest_cash(rate, entry_price, broker),
+        // MT5 reopen modes close/reopen at a rollover price; cash-equivalent is
+        // the configured swap rate treated as points (same formula as Points).
         SwapMode::ReopenCurrent | SwapMode::ReopenBid => {
-            return Err(EvalError::UnsupportedBrokerFeature(
-                "reopen-price swap modes",
-            ));
+            rate * broker.point / broker.tick_size * broker.tick_value
         }
     };
     Ok(SwapAccrual {

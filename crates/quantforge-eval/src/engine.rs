@@ -147,14 +147,6 @@ fn evaluate_strategy_inner(
     broker.validate()?;
     config.validate()?;
     strategy.validate_export_safe(IrLimits::default())?;
-    if matches!(
-        broker.swap_mode,
-        SwapMode::ReopenCurrent | SwapMode::ReopenBid
-    ) {
-        return Err(EvalError::UnsupportedBrokerFeature(
-            "reopen-price swap modes",
-        ));
-    }
     match (broker.trade_mode, strategy.side) {
         (TradeMode::Disabled | TradeMode::CloseOnly, _)
         | (TradeMode::LongOnly, quantforge_ir::Side::ShortOnly | quantforge_ir::Side::Both)

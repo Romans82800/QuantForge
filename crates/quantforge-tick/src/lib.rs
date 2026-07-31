@@ -4,7 +4,7 @@
 //! protective gaps and stop/target chronology are replayed on M1 bars.
 
 use chrono::Timelike;
-use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
+use quantforge_broker::{BrokerClock, BrokerSpecError, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
 use quantforge_eval::{
@@ -738,14 +738,6 @@ fn validate_broker_compatibility(
     strategy: &StrategyIr,
     broker: &SymbolSpecification,
 ) -> Result<(), JudgeError> {
-    if matches!(
-        broker.swap_mode,
-        SwapMode::ReopenCurrent | SwapMode::ReopenBid
-    ) {
-        return Err(JudgeError::UnsupportedBrokerFeature(
-            "reopen-price swap modes",
-        ));
-    }
     match (broker.trade_mode, strategy.side) {
         (TradeMode::Disabled | TradeMode::CloseOnly, _)
         | (TradeMode::LongOnly, quantforge_ir::Side::ShortOnly | quantforge_ir::Side::Both)

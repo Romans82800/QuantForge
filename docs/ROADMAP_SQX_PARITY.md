@@ -67,7 +67,7 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 |-----|--------|-------|
 | Market / Stop / Limit entries | Present | IR + Scout + Judge + export |
 | BuyStopLimit / SellStopLimit | Phase 1 | Two-price pending FSM + MQL5 StopLimit |
-| Swap / reopen modes | Partial | Cash swap modes present; ReopenCurrent / ReopenBid still hard-error |
+| Swap / reopen modes | Present | Cash modes + reopen treated as points-equivalent rollover |
 | EveryTick vs M1 same-bar fill path | Partial | Conservative same-bar; not true tick replay |
 | Filling modes (FOK/IOC/RETURN) | Present | Export prefers broker `filling_modes`, falls back to symbol autodetection |
 | Netting vs hedging | Partial | Engines assume hedged single-position model |
