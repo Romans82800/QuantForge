@@ -72,7 +72,10 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 | Filling modes (FOK/IOC/RETURN) | Present | Export prefers broker `filling_modes`, falls back to symbol autodetection |
 | Netting vs hedging | Partial | Engines assume hedged single-position model |
 | Partial fills / requotes | Missing | Idealized fills + adverse slippage points |
-| Pending modification / OCO | Partial | OCO-lite cancel-on-opposite + optional same-side replace (IR flags) |
+| Pending modification / OCO | Present | OrderModify-in-place on same-side re-signal + OCO-lite cancel-on-opposite |
+| Position accounting | Partial | Netting close-on-opposite + HedgedStack enum; multi-slot stack book TBD |
+| Partial fills / requotes | Present | `FillSimulation` on `CostModel` (fraction + deterministic requote) |
+| EveryTick foundation | Present | `SameBarPolicy::EveryTickOhlc` + `tick_path` OHLC walk (true tick files later) |
 
 Protocol: `mt5-parity-v2` in `crates/quantforge-parity`. Probes: `mql5/QuantForge/`, `scripts/family_mt5_parity.py`.
 

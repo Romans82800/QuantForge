@@ -314,7 +314,7 @@ fn evaluate_strategy_inner(
                     reason: ExitReason::TimeStop,
                 })
             } else {
-                protective_intrabar_exit(open, bar, spread_price, broker)
+                protective_intrabar_exit(open, bar, spread_price, broker, config.same_bar_policy)
             };
 
             if let Some(event) = event {
@@ -348,7 +348,8 @@ fn evaluate_strategy_inner(
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
             && index >= signal_warmup_bars
             && (strategy.manage.cancel_pending_on_opposite
-                || strategy.manage.replace_pending_on_reentry)
+                || strategy.manage.replace_pending_on_reentry
+                || strategy.manage.modify_pending_on_reentry)
         {
             let mut filters_pass = true;
             for filter in &strategy.filters {
@@ -383,12 +384,94 @@ fn evaluate_strategy_inner(
                     }
                     (Some(PositionSide::Long), true, false)
                     | (Some(PositionSide::Short), false, true)
+                        if strategy.manage.modify_pending_on_reentry =>
+                    {
+                        if let Some(order) = pending.as_mut() {
+                            if modify_pending_order(
+                                order,
+                                index,
+                                bar,
+                                spread_price,
+                                balance,
+                                &strategy,
+                                broker,
+                                config,
+                                &mut features,
+                                &mut telemetry,
+                            )? {
+                                telemetry.pending_orders_modified += 1;
+                            }
+                        }
+                    }
+                    (Some(PositionSide::Long), true, false)
+                    | (Some(PositionSide::Short), false, true)
                         if strategy.manage.replace_pending_on_reentry =>
                     {
                         pending = None;
                         telemetry.pending_orders_replaced += 1;
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Netting pre-pass: close on opposite signal so the entry gate below can open.
+        if matches!(
+            config.position_accounting,
+            crate::PositionAccounting::Netting
+        ) && position.is_some()
+            && pending.is_none()
+            && !closed_this_bar
+            && index >= signal_warmup_bars
+        {
+            let mut filters_pass = true;
+            for filter in &strategy.filters {
+                if !features.evaluate_bool(filter, index)? {
+                    filters_pass = false;
+                    break;
+                }
+            }
+            if filters_pass {
+                let long_signal = strategy
+                    .entry
+                    .long
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let short_signal = strategy
+                    .entry
+                    .short
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let open_side = position.as_ref().map(|open| open.side);
+                let opposite = match (open_side, long_signal, short_signal) {
+                    (Some(PositionSide::Long), false, true)
+                    | (Some(PositionSide::Short), true, false) => true,
+                    _ => false,
+                };
+                if opposite
+                    && in_entry_window
+                    && broker.is_trading_at(bar.timestamp_ms)?
+                {
+                    let open = position.take().expect("checked");
+                    let event = ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::Indicator,
+                    };
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    );
+                    telemetry.netting_closes += 1;
                 }
             }
         }
@@ -525,7 +608,9 @@ fn evaluate_strategy_inner(
         if opened_this_bar {
             let event = position
                 .as_ref()
-                .and_then(|open| protective_intrabar_exit(open, bar, spread_price, broker));
+                .and_then(|open| {
+                    protective_intrabar_exit(open, bar, spread_price, broker, config.same_bar_policy)
+                });
             if let Some(event) = event {
                 let open = position.take().expect("position was just opened");
                 close_position(
@@ -633,12 +718,41 @@ fn open_position(
         0.0
     };
     let raw_volume = risk_budget / (price_risk_per_lot + cost_risk_per_lot);
-    let Some(volume) = normalize_volume(raw_volume, broker) else {
+    let Some(mut volume) = normalize_volume(raw_volume, broker) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
 
-    let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
+    let fill = &config.costs.fill_simulation;
+    // Deterministic requote: hash bar timestamp into [0,1).
+    let requote_roll = {
+        let mut hash = bar.timestamp_ms.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64) as u64;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        (hash as f64) / (u64::MAX as f64)
+    };
+    let mut slippage = config.costs.adverse_slippage_points_per_side * broker.point;
+    if fill.requote_probability > 0.0 && requote_roll < fill.requote_probability {
+        telemetry.entry_requotes += 1;
+        if fill.requote_rejects {
+            telemetry.entry_requote_rejects += 1;
+            return Ok(None);
+        }
+        slippage += fill.requote_extra_slippage_points * broker.point;
+    }
+    if fill.fill_volume_fraction < 1.0 - f64::EPSILON {
+        let scaled = volume * fill.fill_volume_fraction;
+        let Some(partial) = normalize_volume(scaled, broker) else {
+            telemetry.skipped_below_minimum_volume += 1;
+            return Ok(None);
+        };
+        if (partial - volume).abs() > f64::EPSILON {
+            telemetry.partial_entry_fills += 1;
+        }
+        volume = partial;
+    }
+
     // Match MT5 NormalizeDouble on entry/SL/TP before risk geometry locks in.
     let intended_entry_price = normalize_price(
         match side {
@@ -830,6 +944,63 @@ fn place_pending_order(
         stop_distance: normalized_stop_distance,
         volume,
     }))
+}
+
+/// MT5-style OrderModify for a working pending: refresh price, SL, TP, expiry
+/// in place without canceling the ticket.
+#[allow(clippy::too_many_arguments)]
+fn modify_pending_order(
+    order: &mut PendingOrder,
+    index: usize,
+    bar: &Bar,
+    spread_price: f64,
+    balance: f64,
+    strategy: &StrategyIr,
+    broker: &SymbolSpecification,
+    config: &ScoutConfig,
+    features: &mut FeatureCache<'_>,
+    telemetry: &mut ScoutTelemetry,
+) -> Result<bool, EvalError> {
+    let Some(fresh) = place_pending_order(
+        order.side,
+        index,
+        bar,
+        spread_price,
+        balance,
+        strategy,
+        broker,
+        config,
+        features,
+        telemetry,
+    )?
+    else {
+        return Ok(false);
+    };
+    let changed = order.activation_price != fresh.activation_price
+        || order.limit_price != fresh.limit_price
+        || order.stop_loss != fresh.stop_loss
+        || order.take_profit != fresh.take_profit
+        || order.expiry_index != fresh.expiry_index
+        || order.volume != fresh.volume;
+    if !changed {
+        return Ok(false);
+    }
+    // Preserve stop-limit trigger state when the stop price is unchanged.
+    let keep_trigger = order.kind == PendingKind::StopLimit
+        && order.stop_triggered
+        && order.activation_price == fresh.activation_price;
+    order.activation_price = fresh.activation_price;
+    order.limit_price = fresh.limit_price;
+    order.stop_loss = fresh.stop_loss;
+    order.take_profit = fresh.take_profit;
+    order.stop_distance = fresh.stop_distance;
+    order.volume = fresh.volume;
+    order.expiry_index = fresh.expiry_index;
+    order.kind = fresh.kind;
+    if !keep_trigger {
+        order.stop_triggered = false;
+    }
+    Ok(true)
 }
 
 fn entry_distance(
@@ -1260,6 +1431,7 @@ fn protective_intrabar_exit(
     bar: &Bar,
     spread_price: f64,
     broker: &SymbolSpecification,
+    policy: crate::SameBarPolicy,
 ) -> Option<ExitEvent> {
     let (stop_touched, target_touched) = match position.side {
         PositionSide::Long => (
@@ -1271,20 +1443,51 @@ fn protective_intrabar_exit(
             price_reaches_from_above(bar.low + spread_price, position.take_profit, broker),
         ),
     };
+    if !(stop_touched || target_touched) {
+        return None;
+    }
+    if stop_touched && target_touched {
+        match policy {
+            crate::SameBarPolicy::Conservative => {
+                return Some(ExitEvent {
+                    base_price: position.stop_loss,
+                    reason: ExitReason::StopLoss,
+                });
+            }
+            crate::SameBarPolicy::EveryTickOhlc => {
+                match crate::everytick_stop_hit_first(
+                    position.side,
+                    position.stop_loss,
+                    position.take_profit,
+                    bar,
+                    spread_price,
+                ) {
+                    Some(true) | None => {
+                        return Some(ExitEvent {
+                            base_price: position.stop_loss,
+                            reason: ExitReason::StopLoss,
+                        });
+                    }
+                    Some(false) => {
+                        return Some(ExitEvent {
+                            base_price: position.take_profit,
+                            reason: ExitReason::TakeProfit,
+                        });
+                    }
+                }
+            }
+        }
+    }
     if stop_touched {
-        // Conservative is the only v1 policy: it also resolves bars touching
-        // both levels without fabricating an intrabar path.
         Some(ExitEvent {
             base_price: position.stop_loss,
             reason: ExitReason::StopLoss,
         })
-    } else if target_touched {
+    } else {
         Some(ExitEvent {
             base_price: position.take_profit,
             reason: ExitReason::TakeProfit,
         })
-    } else {
-        None
     }
 }
 

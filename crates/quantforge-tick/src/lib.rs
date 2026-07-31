@@ -4,7 +4,9 @@
 //! protective gaps and stop/target chronology are replayed on M1 bars.
 
 use chrono::Timelike;
-use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
+use quantforge_broker::{BrokerClock, BrokerSpecError, SymbolSpecification, TradeMode};
+#[cfg(test)]
+use quantforge_broker::SwapMode;
 use quantforge_core::FloatPolicy;
 use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
 use quantforge_eval::{
@@ -64,6 +66,8 @@ impl JudgeConfig {
             entry_window: self.entry_window,
             // The judge always replays in full; its metrics are the promotion evidence.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
         }
         .validate()?;
         Ok(())
@@ -463,7 +467,8 @@ pub fn evaluate_strategy_m1(
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
             && decision_index >= signal_warmup_bars
             && (strategy.manage.cancel_pending_on_opposite
-                || strategy.manage.replace_pending_on_reentry)
+                || strategy.manage.replace_pending_on_reentry
+                || strategy.manage.modify_pending_on_reentry)
         {
             let filters_pass = strategy
                 .filters
@@ -498,10 +503,16 @@ pub fn evaluate_strategy_m1(
                     }
                     (Some(PositionSide::Long), true, false)
                     | (Some(PositionSide::Short), false, true)
-                        if strategy.manage.replace_pending_on_reentry =>
+                        if strategy.manage.modify_pending_on_reentry
+                            || strategy.manage.replace_pending_on_reentry =>
                     {
+                        // Judge: cancel so the place gate re-quotes (OrderModify equiv).
                         pending = None;
-                        telemetry.pending_orders_replaced += 1;
+                        if strategy.manage.modify_pending_on_reentry {
+                            telemetry.pending_orders_replaced += 1;
+                        } else {
+                            telemetry.pending_orders_replaced += 1;
+                        }
                     }
                     _ => {}
                 }

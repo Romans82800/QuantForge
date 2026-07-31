@@ -5,6 +5,7 @@ mod engine;
 mod features;
 mod management;
 mod model;
+mod tick_path;
 
 pub use costs::{ResolvedSpread, SpreadSource, SwapAccrual, accrue_swap, resolve_spread};
 pub use engine::{
@@ -19,9 +20,11 @@ pub use management::{
     ratchet_favorable_peak, stop_would_trigger_at_open,
 };
 pub use model::{
-    BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason,
-    MANDATORY_ENTRY_WINDOW_END_HOUR, MANDATORY_ENTRY_WINDOW_START_HOUR, PositionSide, SameBarPolicy,
-    ScoutConfig, ScoutResult, ScoutTelemetry, Trade, in_mandatory_entry_window, IndicatorEngine,
+    BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason, FillSimulation,
+    MANDATORY_ENTRY_WINDOW_END_HOUR, MANDATORY_ENTRY_WINDOW_START_HOUR, PositionAccounting,
+    PositionSide, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry, Trade,
+    in_mandatory_entry_window, IndicatorEngine,
 };
+pub use tick_path::{SyntheticTick, everytick_stop_hit_first, ohlc_everytick_path};
 
 pub const ENGINE_TIER: &str = "ohlc-scout";

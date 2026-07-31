@@ -593,6 +593,10 @@ pub struct ManagePolicy {
     /// Cancel and re-place a working pending when the same side re-signals.
     #[serde(default)]
     pub replace_pending_on_reentry: bool,
+    /// Recalculate price/SL/TP/expiry on a working pending when the same side
+    /// re-signals (MT5 OrderModify semantics). Preferred over cancel+replace.
+    #[serde(default = "default_true")]
+    pub modify_pending_on_reentry: bool,
 }
 
 fn default_true() -> bool {
@@ -611,6 +615,7 @@ impl Default for ManagePolicy {
             max_one_entry_per_day: false,
             cancel_pending_on_opposite: true,
             replace_pending_on_reentry: false,
+            modify_pending_on_reentry: true,
         }
     }
 }

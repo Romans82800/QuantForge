@@ -1309,6 +1309,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     commission_per_lot_round_turn,
                     max_spread_points,
                     include_costs_in_risk: true,
+                    fill_simulation: Default::default(),
                 },
                 indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
                 entry_window: quantforge_eval::EntryWindow::new(
@@ -1316,6 +1317,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     entry_window_end_hour,
                 ),
                 abandon_above_drawdown_percent: None,
+                position_accounting: Default::default(),
+                max_open_positions: 1,
             };
             let result = evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?;
 
@@ -1738,6 +1741,7 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 commission_per_lot_round_turn: args.commission_per_lot_round_turn,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -1745,6 +1749,8 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 args.entry_window_end_hour,
             ),
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
         },
         folds: args.folds,
         purge_bars: args.purge_bars,
@@ -1937,6 +1943,7 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 commission_per_lot_round_turn: args.commission_per_lot_round_turn,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -1944,6 +1951,8 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 args.entry_window_end_hour,
             ),
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
         },
         minimum_trades: args.minimum_trades,
         minimum_return_percent: args.minimum_return_percent,
@@ -3370,6 +3379,7 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
             commission_per_lot_round_turn: args.commission_per_lot_round_turn,
             max_spread_points: args.max_spread_points,
             include_costs_in_risk: true,
+            fill_simulation: Default::default(),
         },
         allow_execution_gaps: args.allow_execution_gaps,
         indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
@@ -4651,6 +4661,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
                 commission_per_lot_round_turn: commission,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -4659,6 +4670,8 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             ),
             // Search overrides this per batch; the CLI default keeps full metrics.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
         },
     })
 }

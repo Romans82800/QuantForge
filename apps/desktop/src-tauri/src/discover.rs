@@ -1639,6 +1639,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
                 commission_per_lot_round_turn: commission,
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: entry_window(
@@ -1647,6 +1648,8 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             ),
             // Search sets this per batch from the drawdown gate.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
         },
     })
 }
