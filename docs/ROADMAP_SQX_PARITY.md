@@ -67,12 +67,12 @@ Legal: SQX at `C:\StrategyQuantX144` is a **behavioral reference only**. Reimple
 |-----|--------|-------|
 | Market / Stop / Limit entries | Present | IR + Scout + Judge + export |
 | BuyStopLimit / SellStopLimit | Phase 1 | Two-price pending FSM + MQL5 StopLimit |
-| Swap / reopen modes | Missing | Not in IR |
+| Swap / reopen modes | Partial | Cash swap modes present; ReopenCurrent / ReopenBid still hard-error |
 | EveryTick vs M1 same-bar fill path | Partial | Conservative same-bar; not true tick replay |
-| Filling modes (FOK/IOC/RETURN) | Partial | Export uses `SetTypeFillingBySymbol` |
+| Filling modes (FOK/IOC/RETURN) | Present | Export prefers broker `filling_modes`, falls back to symbol autodetection |
 | Netting vs hedging | Partial | Engines assume hedged single-position model |
 | Partial fills / requotes | Missing | Idealized fills + adverse slippage points |
-| Pending modification / OCO | Missing | Place + expire + fill only |
+| Pending modification / OCO | Partial | OCO-lite cancel-on-opposite + optional same-side replace (IR flags) |
 
 Protocol: `mt5-parity-v2` in `crates/quantforge-parity`. Probes: `mql5/QuantForge/`, `scripts/family_mt5_parity.py`.
 

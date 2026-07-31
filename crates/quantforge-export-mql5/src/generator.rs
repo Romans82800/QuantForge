@@ -62,6 +62,7 @@ pub fn generate_bundle(
         source = source.replace("@@SQX_RUNTIME@@", &sqx_runtime_inline());
     }
     source = source.replace("@@QF_EXTENDED_INDICATORS@@", EXTENDED_INDICATORS);
+    let (filling_modes, filling_mode_count) = filling_modes_mql(broker);
     for (placeholder, value) in [
         ("@@EXPERT_NAME@@", config.expert_name.clone()),
         ("@@ALLOW_LIVE@@", "false".into()),
@@ -168,6 +169,8 @@ pub fn generate_bundle(
             strategy.manage.time_stop_bars.unwrap_or(0).to_string(),
         ),
         ("@@FINGERPRINT_SHORT@@", fingerprint_short.into()),
+        ("@@FILLING_MODES@@", filling_modes),
+        ("@@FILLING_MODE_COUNT@@", filling_mode_count.to_string()),
         ("@@SYMBOL@@", mql_string(&broker.symbol)),
         ("@@BROKER_TIMEZONE@@", broker.timezone.clone()),
     ] {
@@ -722,6 +725,30 @@ fn entry_order_kind(strategy: &StrategyIr) -> u8 {
         EntryOrderPolicy::Limit { .. } => 2,
         EntryOrderPolicy::StopLimit { .. } => 3,
     }
+}
+
+/// Preferred MT5 filling enums from the bound broker profile.
+/// Returns `(modes_csv, count)` — when count is 0 the EA falls back to symbol autodetection.
+fn filling_modes_mql(broker: &quantforge_broker::SymbolSpecification) -> (String, usize) {
+    use quantforge_broker::FillingMode;
+    let modes: Vec<&'static str> = broker
+        .filling_modes
+        .iter()
+        .filter_map(|mode| match mode {
+            FillingMode::FillOrKill => Some("ORDER_FILLING_FOK"),
+            FillingMode::ImmediateOrCancel => Some("ORDER_FILLING_IOC"),
+            FillingMode::Return => Some("ORDER_FILLING_RETURN"),
+            FillingMode::BookOrCancel => None,
+        })
+        .collect();
+    let count = modes.len();
+    // Array initializer must stay non-empty for MQL5 compile; count gates use.
+    let csv = if modes.is_empty() {
+        "ORDER_FILLING_FOK".into()
+    } else {
+        modes.join(", ")
+    };
+    (csv, count)
 }
 
 fn entry_distance(strategy: &StrategyIr) -> String {

@@ -587,6 +587,16 @@ pub struct ManagePolicy {
     /// Production Discover stamps this from job config; it is not an evolvable gene.
     #[serde(default)]
     pub max_one_entry_per_day: bool,
+    /// Cancel a working pending when the opposite side signals (SQX-style OCO-lite).
+    #[serde(default = "default_true")]
+    pub cancel_pending_on_opposite: bool,
+    /// Cancel and re-place a working pending when the same side re-signals.
+    #[serde(default)]
+    pub replace_pending_on_reentry: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ManagePolicy {
@@ -599,6 +609,8 @@ impl Default for ManagePolicy {
             flatten_end_of_day: false,
             end_of_day_hour: default_end_of_day_hour(),
             max_one_entry_per_day: false,
+            cancel_pending_on_opposite: true,
+            replace_pending_on_reentry: false,
         }
     }
 }

@@ -205,6 +205,9 @@ struct EliteRow {
     strategy_id: String,
     entry_conditions: usize,
     exit_conditions: usize,
+    island_id: u16,
+    entry_order: String,
+    management: String,
     evidence: f64,
     novelty: f64,
     trades: usize,
@@ -1995,6 +1998,9 @@ fn elite_row(elite: &Elite) -> EliteRow {
         strategy_id: elite.strategy.id.clone(),
         entry_conditions: elite.niche.entry_conditions,
         exit_conditions: elite.descriptor.exit_conditions,
+        island_id: elite.island_id,
+        entry_order: entry_order_label(&elite.strategy.entry.order).into(),
+        management: management_label(&elite.strategy.manage),
         evidence: elite.evidence.total,
         novelty: elite.novelty,
         trades: elite.metrics.trade_count,
@@ -2011,6 +2017,34 @@ fn elite_row(elite: &Elite) -> EliteRow {
         grade: "illuminated",
         parity: "unknown",
         equity_signature: elite.equity_signature.clone(),
+    }
+}
+
+fn entry_order_label(order: &quantforge_ir::EntryOrderPolicy) -> &'static str {
+    use quantforge_ir::EntryOrderPolicy;
+    match order {
+        EntryOrderPolicy::Market => "market",
+        EntryOrderPolicy::Stop { .. } => "stop",
+        EntryOrderPolicy::Limit { .. } => "limit",
+        EntryOrderPolicy::StopLimit { .. } => "stop_limit",
+    }
+}
+
+fn management_label(manage: &quantforge_ir::ManagePolicy) -> String {
+    let mut parts = Vec::new();
+    if manage.break_even_at_r.is_some() {
+        parts.push("BE");
+    }
+    if manage.trailing.is_some() {
+        parts.push("trail");
+    }
+    if !manage.partial_exits.is_empty() {
+        parts.push("partial");
+    }
+    if parts.is_empty() {
+        "—".into()
+    } else {
+        parts.join("+")
     }
 }
 

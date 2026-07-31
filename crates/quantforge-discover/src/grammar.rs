@@ -2241,6 +2241,20 @@ fn extended_entry_atoms(rng: &mut ChaCha8Rng) -> Vec<(BoolExpr, BoolExpr)> {
 }
 
 fn session_filter(rng: &mut ChaCha8Rng) -> BoolExpr {
+    // Mix hour-of-day windows with weekday filters (SQX-style session genes).
+    if rng.gen_bool(0.35) {
+        // 1=Mon … 5=Fri in broker-local weekday encoding used by ContextValue::DayOfWeek.
+        let lower = rng.gen_range(1..=4) as f64;
+        let upper = rng.gen_range((lower as u16)..=5) as f64;
+        return BoolExpr::Between {
+            value: NumericExpr::Context {
+                value: ContextValue::DayOfWeek,
+                shift: 1,
+            },
+            lower: NumericExpr::Constant { value: lower },
+            upper: NumericExpr::Constant { value: upper },
+        };
+    }
     let lower = rng.gen_range(0..=12) as f64;
     let upper = rng.gen_range((lower as u16 + 6).min(23)..=23) as f64;
     BoolExpr::Between {

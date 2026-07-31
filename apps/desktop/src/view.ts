@@ -18,15 +18,19 @@ export function filterAndSortElites(
   query: string,
   entryConditions: string,
   sort: EliteSort,
+  entryOrder = "all",
 ): EliteRow[] {
   const needle = query.trim().toLowerCase();
   return elites
     .filter(
       (elite) =>
         (entryConditions === "all" || String(elite.entryConditions) === entryConditions) &&
+        (entryOrder === "all" || (elite.entryOrder ?? "market") === entryOrder) &&
         (needle.length === 0 ||
           elite.strategyId.toLowerCase().includes(needle) ||
-          elite.fingerprint.toLowerCase().includes(needle)),
+          elite.fingerprint.toLowerCase().includes(needle) ||
+          (elite.management ?? "").toLowerCase().includes(needle) ||
+          String(elite.islandId ?? "").includes(needle)),
     )
     .sort((left, right) => {
       if (sort === "entryConditions") {
@@ -158,7 +162,7 @@ export function entryWindowError(
 
 type EntryOrderToggles = Pick<
   DiscoverRequest,
-  "allowMarketEntries" | "allowStopEntries" | "allowLimitEntries"
+  "allowMarketEntries" | "allowStopEntries" | "allowLimitEntries" | "allowStopLimitEntries"
 >;
 
 function enabledEntryOrders(request: EntryOrderToggles): string[] {
@@ -166,6 +170,7 @@ function enabledEntryOrders(request: EntryOrderToggles): string[] {
     (request.allowMarketEntries ?? true) ? "market" : null,
     request.allowStopEntries ? "stop" : null,
     request.allowLimitEntries ? "limit" : null,
+    request.allowStopLimitEntries ? "stop_limit" : null,
   ].filter((value): value is string => value !== null);
 }
 
@@ -185,7 +190,7 @@ export function entryOrderSummary(request: EntryOrderToggles): string {
 
 export function entryOrderError(request: EntryOrderToggles): string | null {
   if (enabledEntryOrders(request).length === 0) {
-    return "Enable at least one entry order type: market, stop or limit.";
+    return "Enable at least one entry order type: market, stop, limit or stop-limit.";
   }
   return null;
 }

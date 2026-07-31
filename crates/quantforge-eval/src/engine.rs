@@ -349,6 +349,58 @@ fn evaluate_strategy_inner(
             telemetry.pending_orders_expired += 1;
         }
 
+        // OCO-lite / re-entry: cancel a working pending before the place gate.
+        if position.is_none()
+            && pending.is_some()
+            && !closed_this_bar
+            && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && index >= signal_warmup_bars
+            && (strategy.manage.cancel_pending_on_opposite
+                || strategy.manage.replace_pending_on_reentry)
+        {
+            let mut filters_pass = true;
+            for filter in &strategy.filters {
+                if !features.evaluate_bool(filter, index)? {
+                    filters_pass = false;
+                    break;
+                }
+            }
+            if filters_pass {
+                let long_signal = strategy
+                    .entry
+                    .long
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let short_signal = strategy
+                    .entry
+                    .short
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let pending_side = pending.as_ref().map(|order| order.side);
+                match (pending_side, long_signal, short_signal) {
+                    (Some(PositionSide::Long), false, true)
+                    | (Some(PositionSide::Short), true, false)
+                        if strategy.manage.cancel_pending_on_opposite =>
+                    {
+                        pending = None;
+                        telemetry.pending_orders_cancelled_opposite += 1;
+                    }
+                    (Some(PositionSide::Long), true, false)
+                    | (Some(PositionSide::Short), false, true)
+                        if strategy.manage.replace_pending_on_reentry =>
+                    {
+                        pending = None;
+                        telemetry.pending_orders_replaced += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if position.is_none()
             && pending.is_none()
             && !closed_this_bar

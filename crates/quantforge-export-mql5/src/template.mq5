@@ -679,6 +679,32 @@ double QFNormalizeVolume(const double requested)
    return NormalizeDouble(volume,digits);
 }
 
+bool QFApplyPreferredFilling()
+{
+   // Broker profile preferred modes; count 0 → symbol autodetection.
+   ENUM_ORDER_TYPE_FILLING preferred[]={@@FILLING_MODES@@};
+   const int count=@@FILLING_MODE_COUNT@@;
+   if(count<=0)
+      return g_trade.SetTypeFillingBySymbol(_Symbol);
+   const long allowed=SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   for(int i=0;i<count && i<ArraySize(preferred);i++)
+   {
+      long flag=0;
+      if(preferred[i]==ORDER_FILLING_FOK)
+         flag=SYMBOL_FILLING_FOK;
+      else if(preferred[i]==ORDER_FILLING_IOC)
+         flag=SYMBOL_FILLING_IOC;
+      else if(preferred[i]==ORDER_FILLING_RETURN)
+         flag=SYMBOL_FILLING_RETURN;
+      if(flag!=0 && (allowed&flag)==flag)
+      {
+         g_trade.SetTypeFilling(preferred[i]);
+         return true;
+      }
+   }
+   return g_trade.SetTypeFillingBySymbol(_Symbol);
+}
+
 bool QFOpenOrder(const bool buy)
 {
    MqlTick tick;
@@ -739,7 +765,7 @@ bool QFOpenOrder(const bool buy)
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(InpDeviationPoints);
-   g_trade.SetTypeFillingBySymbol(_Symbol);
+   QFApplyPreferredFilling();
    const string comment="QF-@@FINGERPRINT_SHORT@@";
    bool sent=false;
    if(entry_kind==0)
@@ -1052,7 +1078,7 @@ int OnInit()
    }
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(InpDeviationPoints);
-   g_trade.SetTypeFillingBySymbol(_Symbol);
+   QFApplyPreferredFilling();
    ArrayResize(g_partial_done,QFPartialCount());
    QFResetPositionState();
    g_last_bar=iTime(_Symbol,_Period,0);

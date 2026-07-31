@@ -125,6 +125,9 @@ export interface EliteRow {
   strategyId: string;
   entryConditions: number;
   exitConditions: number;
+  islandId: number;
+  entryOrder: string;
+  management: string;
   evidence: number;
   novelty: number;
   trades: number;
@@ -178,6 +181,7 @@ export interface DatabankWorkspace {
   allowMarketEntries: boolean;
   allowStopEntries: boolean;
   allowLimitEntries: boolean;
+  allowStopLimitEntries: boolean;
   maxOneEntryPerDay: boolean;
   validationFraction: number;
   sealedFraction: number;

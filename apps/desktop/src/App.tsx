@@ -279,6 +279,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [entryFilter, setEntryFilter] = useState("all");
+  const [entryOrderFilter, setEntryOrderFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
   const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
@@ -508,9 +509,9 @@ function App() {
   const filtered = useMemo(
     () =>
       workspace
-        ? filterAndSortElites(workspace.elites, query, entryFilter, sort)
+        ? filterAndSortElites(workspace.elites, query, entryFilter, sort, entryOrderFilter)
         : [],
-    [workspace, query, entryFilter, sort],
+    [workspace, query, entryFilter, entryOrderFilter, sort],
   );
 
   useEffect(() => {
@@ -852,6 +853,17 @@ function App() {
                             {item.label}
                           </option>
                         ))}
+                      </select>
+                      <select
+                        aria-label="Filter entry order"
+                        onChange={(event) => setEntryOrderFilter(event.target.value)}
+                        value={entryOrderFilter}
+                      >
+                        <option value="all">All orders</option>
+                        <option value="market">Market</option>
+                        <option value="stop">Stop</option>
+                        <option value="limit">Limit</option>
+                        <option value="stop_limit">Stop-limit</option>
                       </select>
                       <select
                         aria-label="Sort elites"
@@ -4785,6 +4797,9 @@ function EliteTable({
       <div className="elite-row elite-header">
         {showBatch && <span>Select</span>}
         <span>Strategy</span>
+        <span>Isle</span>
+        <span>Order</span>
+        <span>Mgmt</span>
         <span>Entry/Exit</span>
         <span>Evidence</span>
         <span>Novelty</span>
@@ -4827,6 +4842,9 @@ function EliteTable({
                 </span>
               )}
               <span className="strategy-cell"><strong>{row.strategyId}</strong><small>{row.fingerprint.slice(0, 10)}</small></span>
+              <span title={`Island ${row.islandId ?? 0}`}>{row.islandId ?? 0}</span>
+              <span>{row.entryOrder ?? "market"}</span>
+              <span>{row.management ?? "—"}</span>
               <span>{conditionLabel(row.entryConditions, row.exitConditions)}</span>
               <span>{row.evidence.toFixed(2)}</span>
               <span>{row.novelty.toFixed(3)}</span>

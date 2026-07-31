@@ -272,6 +272,8 @@ pub struct ScoutTelemetry {
     pub pending_orders_placed: usize,
     pub pending_orders_filled: usize,
     pub pending_orders_expired: usize,
+    pub pending_orders_cancelled_opposite: usize,
+    pub pending_orders_replaced: usize,
     pub partial_exits_executed: usize,
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,
