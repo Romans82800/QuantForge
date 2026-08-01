@@ -50,6 +50,17 @@ impl GateConfig {
             minimum_recovery_factor: 0.0,
         }
     }
+
+    /// Ultra-loose gates for the cheap trailing-window prefilter (reject no-trades / trash PF).
+    pub fn prefilter_defaults() -> Self {
+        Self {
+            minimum_trades: 1,
+            maximum_drawdown_percent: 80.0,
+            minimum_return_percent: -100.0,
+            minimum_profit_factor: 0.5,
+            minimum_recovery_factor: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,7 +527,8 @@ pub struct SearchFamilySpec {
 }
 
 /// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates;
-/// Quota Harvest = ~20 databank elites per family without chasing pot 300.
+/// Quota Harvest = ~20 databank elites per family without chasing pot 300;
+/// Mass Builder = SQX-scale funnel (cheap prefilter + genetic islands + continuous harvest).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverRunMode {
@@ -525,6 +537,8 @@ pub enum DiscoverRunMode {
     FullHarvest,
     /// Seed-heavy, softer param neighborhood, stop when databank hits quota.
     QuotaHarvest,
+    /// Long continuous harvest: prefilter → islanded breeding → databank promotion.
+    MassBuilder,
 }
 
 /// Named gate outcome persisted on elites for evidence-first promotion.
@@ -601,6 +615,10 @@ pub struct DiscoverConfig {
     pub allow_stop_entries: bool,
     #[serde(default)]
     pub allow_limit_entries: bool,
+    /// Stop-limit entries (BuyStopLimit / SellStopLimit). Off by default until
+    /// Phase 3 Discover islands opt in; Phase 1 wires IR/Scout/Judge/export.
+    #[serde(default)]
+    pub allow_stop_limit_entries: bool,
     /// Mandatory portfolio protection applied to every generated strategy.
     /// When enabled, exposure is flattened at `end_of_day_hour` broker time.
     pub flatten_at_22: bool,
@@ -639,6 +657,11 @@ pub struct DiscoverConfig {
     /// local plateau. `0.20` matches the SQX parameter-sensitivity default.
     #[serde(default = "default_robustness_perturbation_fraction")]
     pub robustness_perturbation_fraction: f64,
+    /// Probability that each eligible parameter group is changed in a
+    /// neighbourhood sample. This separates change frequency from the
+    /// maximum relative move applied to a selected parameter.
+    #[serde(default = "default_robustness_parameter_change_probability")]
+    pub robustness_parameter_change_probability: f64,
     /// Fraction of ±param neighbors that must survive for databank promotion.
     #[serde(default = "default_minimum_neighborhood_survival_fraction")]
     pub minimum_neighborhood_survival_fraction: f64,
@@ -654,6 +677,29 @@ pub struct DiscoverConfig {
     /// symbols before M1 work. `0` disables the multi-symbol screen.
     #[serde(default = "default_multi_symbol_minimum_pass")]
     pub multi_symbol_minimum_pass: usize,
+    /// When true, run a cheap trailing-window Scout before the full IS replay.
+    #[serde(default)]
+    pub enable_cheap_prefilter: bool,
+    /// Fraction of IS bars used by the cheap prefilter (trailing window).
+    #[serde(default = "default_prefilter_bar_fraction")]
+    pub prefilter_bar_fraction: f64,
+    /// Loose gates applied only on the cheap prefilter window.
+    #[serde(default = "GateConfig::prefilter_defaults")]
+    pub prefilter_gates: GateConfig,
+    /// Number of isolated breeding islands (`1` = classic single-population breed).
+    #[serde(default = "default_island_count")]
+    pub island_count: usize,
+    /// Migrate elites between islands every N completed generations (`0` = never).
+    #[serde(default = "default_migration_interval")]
+    pub migration_interval: u64,
+    /// How many top elites each island sends to the next island on migration.
+    #[serde(default = "default_migration_elites")]
+    pub migration_elites: usize,
+    /// How many of the highest-numbered islands sample pending/BE/trail/partials
+    /// and require M1 precision on promotion. Lower islands stay Selected-TF simple.
+    /// `0` disables mixed profiles (global `simple_exits` / allow_* flags apply).
+    #[serde(default)]
+    pub complex_m1_island_count: usize,
     pub scout: ScoutConfig,
 }
 
@@ -720,6 +766,10 @@ fn default_robustness_perturbation_fraction() -> f64 {
     crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION
 }
 
+fn default_robustness_parameter_change_probability() -> f64 {
+    0.5
+}
+
 fn default_minimum_neighborhood_survival_fraction() -> f64 {
     0.7
 }
@@ -735,6 +785,22 @@ fn default_minimum_deflated_trade_sharpe() -> Option<f64> {
 
 fn default_multi_symbol_minimum_pass() -> usize {
     0
+}
+
+fn default_prefilter_bar_fraction() -> f64 {
+    0.25
+}
+
+fn default_island_count() -> usize {
+    1
+}
+
+fn default_migration_interval() -> u64 {
+    0
+}
+
+fn default_migration_elites() -> usize {
+    2
 }
 
 impl Default for DiscoverConfig {
@@ -765,6 +831,7 @@ impl Default for DiscoverConfig {
             allow_market_entries: default_allow_market_entries(),
             allow_stop_entries: false,
             allow_limit_entries: false,
+            allow_stop_limit_entries: false,
             flatten_at_22: false,
             end_of_day_hour: default_end_of_day_hour(),
             max_one_entry_per_day: default_max_one_entry_per_day(),
@@ -776,18 +843,27 @@ impl Default for DiscoverConfig {
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
             robustness_neighborhood_samples: default_robustness_neighborhood_samples(),
             robustness_perturbation_fraction: default_robustness_perturbation_fraction(),
+            robustness_parameter_change_probability:
+                default_robustness_parameter_change_probability(),
             minimum_neighborhood_survival_fraction: default_minimum_neighborhood_survival_fraction(
             ),
             calendar_year_folds: default_calendar_year_folds(),
             minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
             multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
+            enable_cheap_prefilter: false,
+            prefilter_bar_fraction: default_prefilter_bar_fraction(),
+            prefilter_gates: GateConfig::prefilter_defaults(),
+            island_count: default_island_count(),
+            migration_interval: default_migration_interval(),
+            migration_elites: default_migration_elites(),
+            complex_m1_island_count: 0,
             scout: ScoutConfig::default(),
         }
     }
 }
 
 impl DiscoverConfig {
-    /// Apply Fast Scout, Full Harvest, or Quota Harvest presets.
+    /// Apply Fast Scout, Full Harvest, Quota Harvest, or Mass Builder presets.
     pub fn apply_run_mode(&mut self) {
         match self.run_mode {
             DiscoverRunMode::FastScout => {
@@ -835,7 +911,75 @@ impl DiscoverConfig {
                 self.minimum_neighborhood_survival_fraction =
                     self.minimum_neighborhood_survival_fraction.min(0.5);
             }
+            DiscoverRunMode::MassBuilder => {
+                // SQX-scale Builder: cheap reject ≫ full Scout ≫ M1 promotion.
+                // Mix Selected-TF simple islands with complex M1 islands.
+                self.enable_cheap_prefilter = true;
+                self.prefilter_bar_fraction = self.prefilter_bar_fraction.clamp(0.1, 0.5);
+                self.island_count = self.island_count.max(4);
+                if self.migration_interval == 0 {
+                    self.migration_interval = 10;
+                }
+                self.migration_elites = self.migration_elites.max(1);
+                // Half the islands (round up) are complex_m1 when unset.
+                if self.complex_m1_island_count == 0 {
+                    self.complex_m1_island_count = (self.island_count + 1) / 2;
+                }
+                self.complex_m1_island_count = self
+                    .complex_m1_island_count
+                    .clamp(1, self.island_count);
+                // Enable complex genes for those islands; simple islands stay market-only.
+                self.allow_market_entries = true;
+                self.allow_stop_entries = true;
+                self.allow_limit_entries = true;
+                self.allow_stop_limit_entries = true;
+                self.allow_break_even = true;
+                self.allow_trailing_stops = true;
+                self.allow_partial_exits = true;
+                // Global require_m1 stays false so simple islands skip M1;
+                // complex islands force M1 at promotion time.
+                self.require_m1_precision = false;
+                self.require_m1_robustness = true;
+                self.simple_exits = false;
+                self.initial_candidates = self.initial_candidates.max(2_000);
+                self.batch_size = self.batch_size.max(500);
+                self.random_fill_fraction = self.random_fill_fraction.max(0.7);
+                self.mutate_after_elites = self.mutate_after_elites.min(40);
+                self.early_stop_pot_elites = None;
+                self.trial_budget_warning = self.trial_budget_warning.max(50_000);
+                self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.min(100);
+                self.robustness_neighborhood_samples = self.robustness_neighborhood_samples.min(6);
+            }
         }
+    }
+
+    pub fn effective_island_count(&self) -> usize {
+        self.island_count.max(1)
+    }
+
+    pub fn effective_complex_m1_islands(&self) -> usize {
+        self.complex_m1_island_count
+            .min(self.effective_island_count())
+    }
+
+    /// Highest-numbered islands are complex_m1; the rest are Selected-TF simple.
+    pub fn is_complex_m1_island(&self, island_id: u16) -> bool {
+        let complex = self.effective_complex_m1_islands();
+        if complex == 0 {
+            return false;
+        }
+        let total = self.effective_island_count();
+        let first_complex = total.saturating_sub(complex);
+        (island_id as usize) >= first_complex
+    }
+
+    pub const fn cheap_prefilter_enabled(&self) -> bool {
+        self.enable_cheap_prefilter
+    }
+
+    /// Complex genes are legal when M1 is globally required OR mixed complex_m1 islands exist.
+    pub fn complex_execution_allowed(&self) -> bool {
+        self.require_m1_precision || self.complex_m1_island_count > 0
     }
 
     pub const fn has_complex_execution(&self) -> bool {
@@ -844,13 +988,17 @@ impl DiscoverConfig {
             || self.allow_partial_exits
             || self.allow_stop_entries
             || self.allow_limit_entries
+            || self.allow_stop_limit_entries
             || !self.allow_market_entries
     }
 
     /// True when the search may only ever place market orders, so seeding never
     /// samples pending distances that `enforce_execution_feature_flags` discards.
     pub const fn market_entries_only(&self) -> bool {
-        self.simple_exits || !(self.allow_stop_entries || self.allow_limit_entries)
+        self.simple_exits
+            || !(self.allow_stop_entries
+                || self.allow_limit_entries
+                || self.allow_stop_limit_entries)
     }
 
     /// Planned evaluations for honesty UI: initial + batch × generations.
@@ -864,14 +1012,33 @@ impl DiscoverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
-        if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
+        if !(self.allow_market_entries
+            || self.allow_stop_entries
+            || self.allow_limit_entries
+            || self.allow_stop_limit_entries)
+        {
             return Err(DiscoverError::InvalidConfig(
-                "enable at least one entry order kind: market, stop or limit".into(),
+                "enable at least one entry order kind: market, stop, limit or stop_limit".into(),
             ));
         }
-        if self.has_complex_execution() && !self.require_m1_precision {
+        if self.island_count == 0 {
             return Err(DiscoverError::InvalidConfig(
-                "break-even, trailing, partial and pending-entry genes require M1 precision".into(),
+                "island_count must be at least 1".into(),
+            ));
+        }
+        if !(0.05..=1.0).contains(&self.prefilter_bar_fraction) {
+            return Err(DiscoverError::InvalidConfig(
+                "prefilter_bar_fraction must be within 0.05..=1.0".into(),
+            ));
+        }
+        if self.has_complex_execution() && !self.complex_execution_allowed() {
+            return Err(DiscoverError::InvalidConfig(
+                "break-even, trailing, partial and pending-entry genes require M1 precision or complex_m1 islands".into(),
+            ));
+        }
+        if self.complex_m1_island_count > self.island_count {
+            return Err(DiscoverError::InvalidConfig(
+                "complex_m1_island_count cannot exceed island_count".into(),
             ));
         }
         if self.initial_candidates == 0 {
@@ -974,6 +1141,14 @@ impl DiscoverConfig {
             {
                 return Err(DiscoverError::InvalidConfig(
                     "robustness_perturbation_fraction must be finite and between 0.01 and 1".into(),
+                ));
+            }
+            if !self.robustness_parameter_change_probability.is_finite()
+                || !(0.01..=1.0).contains(&self.robustness_parameter_change_probability)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_parameter_change_probability must be finite and between 0.01 and 1"
+                        .into(),
                 ));
             }
         }
@@ -1134,6 +1309,9 @@ pub struct ParameterNeighborhoodSample {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParameterNeighborhoodEvidence {
     pub perturbation_fraction: f64,
+    /// Probability that an eligible parameter group was changed per sample.
+    #[serde(default = "default_robustness_parameter_change_probability")]
+    pub change_probability: f64,
     pub samples_requested: usize,
     /// Samples that produced a canonical, evaluable neighbour.
     pub samples_evaluated: usize,
@@ -1205,6 +1383,9 @@ pub struct Elite {
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
+    /// Breeding island this elite belongs to (`0` when islands are disabled).
+    #[serde(default)]
+    pub island_id: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1239,6 +1420,8 @@ pub enum DepositDecision {
     RejectedMultiSymbol,
     RejectedDeflatedSharpe,
     RejectedEvaluation,
+    /// Cheap trailing-window Scout rejected the candidate before full IS replay.
+    RejectedPrefilter,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1280,6 +1463,10 @@ pub struct DiscoverTelemetry {
     #[serde(default)]
     pub rejected_deflated_sharpe: u64,
     pub rejected_evaluation: u64,
+    #[serde(default)]
+    pub rejected_prefilter: u64,
+    #[serde(default)]
+    pub island_migrations: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
 }
 
@@ -1317,6 +1504,7 @@ impl DiscoverTelemetry {
             DepositDecision::RejectedMultiSymbol => self.rejected_multi_symbol += 1,
             DepositDecision::RejectedDeflatedSharpe => self.rejected_deflated_sharpe += 1,
             DepositDecision::RejectedEvaluation => self.rejected_evaluation += 1,
+            DepositDecision::RejectedPrefilter => self.rejected_prefilter += 1,
         }
     }
 }

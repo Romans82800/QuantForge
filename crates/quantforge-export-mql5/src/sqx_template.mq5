@@ -61,6 +61,7 @@ input string InpParityPrefix="@@PARITY_PREFIX@@";
 CTrade g_trade;
 datetime g_last_bar=0;
 datetime g_last_exit_bar=0;
+int g_loss_streak=0;
 int g_decision_bars_seen=0;
 int g_entry_day_key=0;
 int g_entries_today=0;
@@ -301,6 +302,85 @@ double QFRiskBudget()
    return @@RISK_BUDGET@@;
 }
 
+int QFVolumeMode()
+{
+   return @@VOLUME_MODE@@;
+}
+
+double QFFixedLots()
+{
+   return @@FIXED_LOTS@@;
+}
+
+double QFMartingaleMultiplier()
+{
+   return @@MARTINGALE_MULTIPLIER@@;
+}
+
+int QFMartingaleMaxSteps()
+{
+   return @@MARTINGALE_MAX_STEPS@@;
+}
+
+double QFMartingaleLots()
+{
+   const int steps=(int)MathMin(g_loss_streak,QFMartingaleMaxSteps());
+   return QFFixedLots()*MathPow(QFMartingaleMultiplier(),steps);
+}
+
+
+int QFAtrRiskPeriod()
+{
+   return @@ATR_RISK_PERIOD@@;
+}
+
+double QFAtrRiskMultiplier()
+{
+   return @@ATR_RISK_MULTIPLIER@@;
+}
+
+double QFAtrRiskMaxLots()
+{
+   return @@ATR_RISK_MAX_LOTS@@;
+}
+
+double QFAtrRiskDistance()
+{
+   const double atr=QFATR(QFAtrRiskPeriod(),1);
+   if(!QFValid(atr) || atr<=0.0)
+      return 0.0;
+   return atr*QFAtrRiskMultiplier();
+}
+double QFResolveVolume(const double risk_per_lot)
+{
+   const int mode=QFVolumeMode();
+   if(mode==1)
+      return QFFixedLots();
+   if(mode==2)
+      return QFMartingaleLots();
+   if(mode==3)
+   {
+      const double atr_distance=QFAtrRiskDistance();
+      if(atr_distance<=0.0)
+         return 0.0;
+      const double tick_size=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      const double tick_value=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      if(tick_size<=0.0 || tick_value<=0.0)
+         return 0.0;
+      const double atr_risk_per_lot=atr_distance/tick_size*tick_value;
+      if(atr_risk_per_lot<=0.0)
+         return 0.0;
+      double lots=QFRiskBudget()/atr_risk_per_lot;
+      const double max_lots=QFAtrRiskMaxLots();
+      if(max_lots>0.0)
+         lots=MathMin(lots,max_lots);
+      return lots;
+   }
+   if(risk_per_lot<=0.0)
+      return 0.0;
+   return QFRiskBudget()/risk_per_lot;
+}
+
 int QFEntryOrderKind()
 {
    return @@ENTRY_ORDER_KIND@@;
@@ -309,6 +389,11 @@ int QFEntryOrderKind()
 double QFEntryDistance()
 {
    return @@ENTRY_DISTANCE@@;
+}
+
+double QFEntryLimitOffset()
+{
+   return @@ENTRY_LIMIT_OFFSET@@;
 }
 
 int QFEntryExpiryBars()
@@ -346,6 +431,21 @@ bool QFMaxOneEntryPerDay()
    return @@MAX_ONE_ENTRY_PER_DAY@@;
 }
 
+int QFMaxTradesPerDay()
+{
+   return @@MAX_TRADES_PER_DAY@@;
+}
+
+bool QFDontTradeOnWeekends()
+{
+   return @@DONT_TRADE_WEEKENDS@@;
+}
+
+bool QFExitOnFriday()
+{
+   return @@EXIT_ON_FRIDAY@@;
+}
+
 int QFBrokerDayKey(const datetime bar_time)
 {
    MqlDateTime current;
@@ -374,16 +474,39 @@ void QFSyncEntryDay(const datetime bar_time)
 
 bool QFEntryDayExhausted(const datetime bar_time)
 {
-   if(!QFMaxOneEntryPerDay())
-      return false;
    QFSyncEntryDay(bar_time);
-   return g_entries_today>=1;
+   int cap=0;
+   if(QFMaxOneEntryPerDay())
+      cap=1;
+   else if(QFMaxTradesPerDay()>0)
+      cap=QFMaxTradesPerDay();
+   if(cap<=0)
+      return false;
+   return g_entries_today>=cap;
 }
 
 void QFMarkEntrySignalTaken(const datetime bar_time)
 {
    QFSyncEntryDay(bar_time);
-   g_entries_today=1;
+   g_entries_today++;
+}
+
+bool QFWeekendBlocked(const datetime bar_time)
+{
+   if(!QFDontTradeOnWeekends())
+      return false;
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.day_of_week==0 || current.day_of_week==6;
+}
+
+bool QFFridayFlattenHour(const datetime bar_time)
+{
+   if(!QFExitOnFriday())
+      return false;
+   MqlDateTime current;
+   TimeToStruct(bar_time,current);
+   return current.day_of_week==5 && current.hour>=@@EOD_HOUR@@;
 }
 
 int QFPartialCount()
@@ -422,6 +545,31 @@ double QFNormalizeVolume(const double requested)
    return NormalizeDouble(volume,digits);
 }
 
+bool QFApplyPreferredFilling()
+{
+   ENUM_ORDER_TYPE_FILLING preferred[]={@@FILLING_MODES@@};
+   const int count=@@FILLING_MODE_COUNT@@;
+   if(count<=0)
+      return g_trade.SetTypeFillingBySymbol(_Symbol);
+   const long allowed=SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   for(int i=0;i<count && i<ArraySize(preferred);i++)
+   {
+      long flag=0;
+      if(preferred[i]==ORDER_FILLING_FOK)
+         flag=SYMBOL_FILLING_FOK;
+      else if(preferred[i]==ORDER_FILLING_IOC)
+         flag=SYMBOL_FILLING_IOC;
+      else if(preferred[i]==ORDER_FILLING_RETURN)
+         flag=4; // SYMBOL_FILLING_RETURN — named constant missing on some terminal builds
+      if(flag!=0 && (allowed&flag)==flag)
+      {
+         g_trade.SetTypeFilling(preferred[i]);
+         return true;
+      }
+   }
+   return g_trade.SetTypeFillingBySymbol(_Symbol);
+}
+
 bool QFOpenOrder(const bool buy)
 {
    MqlTick tick;
@@ -434,19 +582,30 @@ bool QFOpenOrder(const bool buy)
       return false;
    const int entry_kind=QFEntryOrderKind();
    const double entry_distance=QFEntryDistance();
+   const double limit_offset=QFEntryLimitOffset();
    if(entry_kind!=0 && (!QFValid(entry_distance) || entry_distance<=0.0))
+      return false;
+   if(entry_kind==3 && (!QFValid(limit_offset) || limit_offset<=0.0))
       return false;
    const double minimum_distance=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
    if(stop_distance<minimum_distance || target_distance<minimum_distance
-      || (entry_kind!=0 && entry_distance<minimum_distance))
+      || (entry_kind!=0 && entry_distance<minimum_distance)
+      || (entry_kind==3 && limit_offset<minimum_distance))
       return false;
 
    const double reference=buy ? tick.ask : tick.bid;
    double intended_entry=reference;
+   double stop_trigger=0.0;
    if(entry_kind==1)
       intended_entry=buy ? reference+entry_distance : reference-entry_distance;
    else if(entry_kind==2)
       intended_entry=buy ? reference-entry_distance : reference+entry_distance;
+   else if(entry_kind==3)
+   {
+      stop_trigger=buy ? reference+entry_distance : reference-entry_distance;
+      intended_entry=buy ? stop_trigger-limit_offset : stop_trigger+limit_offset;
+      stop_trigger=NormalizeDouble(stop_trigger,_Digits);
+   }
    intended_entry=NormalizeDouble(intended_entry,_Digits);
    const double stop=NormalizeDouble(buy ? intended_entry-stop_distance
                                          : intended_entry+stop_distance,_Digits);
@@ -465,13 +624,13 @@ bool QFOpenOrder(const bool buy)
    const double risk_per_lot=loss_per_lot+InpCommissionPerLotRoundTurn+slippage_cost;
    if(risk_per_lot<=0.0)
       return false;
-   const double volume=QFNormalizeVolume(QFRiskBudget()/risk_per_lot);
+   const double volume=QFNormalizeVolume(QFResolveVolume(risk_per_lot));
    if(volume<=0.0)
       return false;
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(InpDeviationPoints);
-   g_trade.SetTypeFillingBySymbol(_Symbol);
+   QFApplyPreferredFilling();
    const string comment="QF-@@FINGERPRINT_SHORT@@";
    bool sent=false;
    if(entry_kind==0)
@@ -488,11 +647,18 @@ bool QFOpenOrder(const bool buy)
                                 ORDER_TIME_SPECIFIED,expiration,comment)
               : g_trade.SellStop(volume,intended_entry,_Symbol,stop,target,
                                  ORDER_TIME_SPECIFIED,expiration,comment);
-      else
+      else if(entry_kind==2)
          sent=buy
               ? g_trade.BuyLimit(volume,intended_entry,_Symbol,stop,target,
                                  ORDER_TIME_SPECIFIED,expiration,comment)
               : g_trade.SellLimit(volume,intended_entry,_Symbol,stop,target,
+                                  ORDER_TIME_SPECIFIED,expiration,comment);
+      else
+         // Prefer OrderOpen over CTrade::BuyStopLimit — older Trade.mqh builds lack the helpers.
+         sent=buy
+              ? g_trade.OrderOpen(_Symbol,ORDER_TYPE_BUY_STOP_LIMIT,volume,intended_entry,stop_trigger,stop,target,
+                                  ORDER_TIME_SPECIFIED,expiration,comment)
+              : g_trade.OrderOpen(_Symbol,ORDER_TYPE_SELL_STOP_LIMIT,volume,intended_entry,stop_trigger,stop,target,
                                   ORDER_TIME_SPECIFIED,expiration,comment);
    }
    if(!sent)
@@ -785,7 +951,7 @@ int OnInit()
    }
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(InpDeviationPoints);
-   g_trade.SetTypeFillingBySymbol(_Symbol);
+   QFApplyPreferredFilling();
    ArrayResize(g_partial_done,QFPartialCount());
    QFResetPositionState();
    g_last_bar=iTime(_Symbol,_Period,0);
@@ -886,6 +1052,14 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    }
    if(deal_entry==DEAL_ENTRY_OUT || deal_entry==DEAL_ENTRY_OUT_BY)
    {
+      const double deal_profit=HistoryDealGetDouble(transaction.deal,DEAL_PROFIT)
+         +HistoryDealGetDouble(transaction.deal,DEAL_SWAP)
+         +HistoryDealGetDouble(transaction.deal,DEAL_COMMISSION)
+         +HistoryDealGetDouble(transaction.deal,DEAL_FEE);
+      if(deal_profit<0.0)
+         g_loss_streak++;
+      else if(deal_profit>0.0)
+         g_loss_streak=0;
       g_last_exit_bar=iTime(_Symbol,_Period,0);
       if(!QFOwnPosition())
          QFResetPositionState();
@@ -916,7 +1090,7 @@ void OnTick()
    if(_sqIsBarOpen)
       g_decision_bars_seen++;
 
-   if(QFFlattenEndOfDay() && QFInCloseBlackout())
+   if((QFFlattenEndOfDay() && QFInCloseBlackout()) || QFFridayFlattenHour(current_bar))
    {
       QFCancelOwnOrders();
       if(QFOwnPosition()
@@ -946,6 +1120,11 @@ void OnTick()
       return;
    }
    if(g_last_exit_bar==current_bar)
+   {
+      QFRecordEquity(current_bar);
+      return;
+   }
+   if(QFWeekendBlocked(current_bar))
    {
       QFRecordEquity(current_bar);
       return;

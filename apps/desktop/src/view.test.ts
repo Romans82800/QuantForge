@@ -10,6 +10,10 @@ import {
   entryWindowError,
   entryWindowSummary,
   filterAndSortElites,
+  filterElitesByCorrelation,
+  databankFilterError,
+  parseDatabankFilter,
+  evalDatabankFilter,
   perturbationError,
   perturbationPercent,
   formatDateRange,
@@ -25,6 +29,9 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
   strategyId: "trend-one",
   entryConditions: 2,
   exitConditions: 1,
+  islandId: 0,
+  entryOrder: "market",
+  management: "none",
   evidence: 10,
   novelty: 0.5,
   trades: 20,
@@ -60,17 +67,37 @@ describe("databank view rules", () => {
 
   it("states the resulting entry-order split, including single-kind runs", () => {
     expect(
-      entryOrderSummary({ allowMarketEntries: false, allowStopEntries: true, allowLimitEntries: false }),
+      entryOrderSummary({
+        allowMarketEntries: false,
+        allowStopEntries: true,
+        allowLimitEntries: false,
+        allowStopLimitEntries: false,
+      }),
     ).toBe("Every candidate uses a stop entry.");
     expect(
-      entryOrderSummary({ allowMarketEntries: true, allowStopEntries: true, allowLimitEntries: true }),
+      entryOrderSummary({
+        allowMarketEntries: true,
+        allowStopEntries: true,
+        allowLimitEntries: true,
+        allowStopLimitEntries: false,
+      }),
     ).toBe("Each candidate draws one of market, stop, limit — roughly 33% each.");
     // Market defaults to on, so an untouched form is never empty.
     expect(
-      entryOrderError({ allowMarketEntries: null, allowStopEntries: null, allowLimitEntries: null }),
+      entryOrderError({
+        allowMarketEntries: null,
+        allowStopEntries: null,
+        allowLimitEntries: null,
+        allowStopLimitEntries: null,
+      }),
     ).toBeNull();
     expect(
-      entryOrderError({ allowMarketEntries: false, allowStopEntries: false, allowLimitEntries: false }),
+      entryOrderError({
+        allowMarketEntries: false,
+        allowStopEntries: false,
+        allowLimitEntries: false,
+        allowStopLimitEntries: false,
+      }),
     ).toMatch(/at least one entry order type/);
   });
 
@@ -94,6 +121,52 @@ describe("databank view rules", () => {
       "drawdown",
     );
     expect(rows.map((row) => row.strategyId)).toEqual(["tight", "slow"]);
+  });
+
+  it("applies SQX-style ranking expressions", () => {
+    const rows = filterAndSortElites(
+      [
+        elite({ strategyId: "keep", profitFactor: 2, drawdownPercent: 10, trades: 40 }),
+        elite({ strategyId: "drop", profitFactor: 1.1, drawdownPercent: 10, trades: 40 }),
+      ],
+      "",
+      "all",
+      "evidence",
+      "all",
+      "PF > 1.5 AND Drawdown < 20 AND Trades >= 30",
+    );
+    expect(rows.map((row) => row.strategyId)).toEqual(["keep"]);
+    expect(databankFilterError("PF >> 1")).toMatch(/operator|column|unexpected/i);
+    const node = parseDatabankFilter("grade == 'illuminated'");
+    expect(evalDatabankFilter(node, elite({}))).toBe(true);
+  });
+
+  it("filters elites by equity-signature correlation", () => {
+    const report = filterElitesByCorrelation(
+      [
+        elite({
+          fingerprint: "a",
+          strategyId: "a",
+          evidence: 10,
+          equitySignature: [1, 2, 3, 4],
+        }),
+        elite({
+          fingerprint: "b",
+          strategyId: "b",
+          evidence: 9,
+          equitySignature: [1, 2, 3, 4.05],
+        }),
+        elite({
+          fingerprint: "c",
+          strategyId: "c",
+          evidence: 8,
+          equitySignature: [4, 3, 2, 1],
+        }),
+      ],
+      0.95,
+    );
+    expect(report.kept.map((row) => row.fingerprint)).toEqual(["a", "c"]);
+    expect(report.rejectedCount).toBe(1);
   });
 
   it("keeps the inspector inside the visible filtered result", () => {

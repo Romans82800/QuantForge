@@ -4,6 +4,7 @@ mod archive;
 mod bakeoff;
 mod engine;
 mod grammar;
+mod islands;
 mod methodology;
 mod model;
 mod multi_symbol;

@@ -43,6 +43,12 @@ import {
   runFidelityDemo,
   runEliteRobustness,
   runM1Judge,
+  runOptimizerNeighborhood,
+  runChallenge,
+  runTaskGraph,
+  runMultiSymbolMatrix,
+  exportResultsPack,
+  runWalkForwardMatrix,
   runSealedFinal,
   startIncubation,
   finalizeIncubation,
@@ -69,6 +75,17 @@ import type {
   ConditionCoverage,
   JudgeRequest,
   JudgeView,
+  ChallengeRequest,
+  ChallengeView,
+  TaskRunRequest,
+  TaskRunView,
+  MultiSymbolMatrixRequest,
+  MultiSymbolMatrixView,
+  ExportResultsPackView,
+  OptimizerRequest,
+  OptimizerView,
+  WalkForwardMatrixRequest,
+  WalkForwardMatrixView,
   IncubationStartRequest,
   IncubationView,
   IndicatorParityRequest,
@@ -99,6 +116,8 @@ import {
   discoverProgress,
   discoverProgressLabel,
   filterAndSortElites,
+  databankFilterError,
+  filterElitesByCorrelation,
   formatDateRange,
   conditionLabel,
   formatNumber,
@@ -119,6 +138,7 @@ type NavIcon =
   | "discover"
   | "databank"
   | "retester"
+  | "optimizer"
   | "data"
   | "portfolio"
   | "settings";
@@ -133,6 +153,7 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
   { name: "Discover", label: "Discover", icon: "discover" },
   { name: "Databank", label: "Databank", icon: "databank" },
   { name: "Parity Lab", label: "Retester", icon: "retester" },
+  { name: "Optimizer", label: "Optimizer", icon: "optimizer" },
   { name: "Data Lab", label: "Data Manager", icon: "data" },
   { name: "Portfolio", label: "Portfolio", icon: "portfolio" },
   { name: "Search Settings", label: "Settings", icon: "settings" },
@@ -234,6 +255,7 @@ const workspaceTitles: Record<WorkspaceName, string> = {
   Vault: "Certified",
   "Data Lab": "Data Manager",
   "Parity Lab": "Retester",
+  Optimizer: "Optimizer",
   Portfolio: "Portfolio",
   Deploy: "Deployment",
 };
@@ -247,6 +269,7 @@ const NAV_GLYPHS: Record<NavIcon, string> = {
   discover: "M10.5 4.5a6 6 0 1 0 0 12 6 6 0 0 0 0-12ZM15 15l4.5 4.5",
   databank: "M4.5 6.5h15M4.5 12h15M4.5 17.5h15M9 4v16",
   retester: "M5 19V9m4.7 10V5m4.6 14v-7m4.7 7V8",
+  optimizer: "M4.5 17.5 9 8l4 6.5L17 5.5l2.5 4",
   data: "M12 4c4 0 7 1.2 7 2.7S16 9.4 12 9.4 5 8.2 5 6.7 8 4 12 4Zm7 5v8.3c0 1.5-3 2.7-7 2.7s-7-1.2-7-2.7V9",
   portfolio: "M4.5 8.5h15v11h-15zM9 8.5V6a3 3 0 0 1 6 0v2.5",
   settings:
@@ -278,7 +301,12 @@ function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [filterExpression, setFilterExpression] = useState("");
+  const [correlationMax, setCorrelationMax] = useState(0.7);
+  const [correlationActive, setCorrelationActive] = useState(false);
+  const [correlationNote, setCorrelationNote] = useState<string | null>(null);
   const [entryFilter, setEntryFilter] = useState("all");
+  const [entryOrderFilter, setEntryOrderFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
   const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
@@ -505,13 +533,29 @@ function App() {
     await selectElite(fingerprint);
   }
 
-  const filtered = useMemo(
-    () =>
-      workspace
-        ? filterAndSortElites(workspace.elites, query, entryFilter, sort)
-        : [],
-    [workspace, query, entryFilter, sort],
-  );
+  const filtered = useMemo(() => {
+    if (!workspace) return [];
+    const base = filterAndSortElites(
+      workspace.elites,
+      query,
+      entryFilter,
+      sort,
+      entryOrderFilter,
+      filterExpression,
+    );
+    if (!correlationActive) return base;
+    return filterElitesByCorrelation(base, correlationMax).kept;
+  }, [
+    workspace,
+    query,
+    entryFilter,
+    entryOrderFilter,
+    sort,
+    filterExpression,
+    correlationActive,
+    correlationMax,
+  ]);
+  const filterExprError = useMemo(() => databankFilterError(filterExpression), [filterExpression]);
 
   useEffect(() => {
     if (!workspace) return;
@@ -666,6 +710,8 @@ function App() {
             judgePreset={judgePreset}
             onError={setError}
           />
+        ) : activeWorkspace === "Optimizer" ? (
+          <OptimizerWorkspace onError={setError} />
         ) : activeWorkspace === "Portfolio" ? (
           <PortfolioWorkspace onError={setError} workspace={workspace} />
         ) : activeWorkspace === "Vault" ? (
@@ -833,6 +879,7 @@ function App() {
                     <div>
                       <p className="eyebrow">Archive champions</p>
                       <h2>{filtered.length} elites</h2>
+                      {correlationNote ? <small className="correlation-note">{correlationNote}</small> : null}
                     </div>
                     <div className="table-controls">
                       <input
@@ -840,6 +887,14 @@ function App() {
                         onChange={(event) => setQuery(event.target.value)}
                         placeholder="Search ID or fingerprint"
                         value={query}
+                      />
+                      <input
+                        aria-label="Databank filter expression"
+                        className={filterExprError ? "input-error" : undefined}
+                        onChange={(event) => setFilterExpression(event.target.value)}
+                        placeholder="PF > 1.5 AND Drawdown < 20"
+                        title={filterExprError ?? "SQX-style ranking filter"}
+                        value={filterExpression}
                       />
                       <select
                         aria-label="Filter entry conditions"
@@ -852,6 +907,17 @@ function App() {
                             {item.label}
                           </option>
                         ))}
+                      </select>
+                      <select
+                        aria-label="Filter entry order"
+                        onChange={(event) => setEntryOrderFilter(event.target.value)}
+                        value={entryOrderFilter}
+                      >
+                        <option value="all">All orders</option>
+                        <option value="market">Market</option>
+                        <option value="stop">Stop</option>
+                        <option value="limit">Limit</option>
+                        <option value="stop_limit">Stop-limit</option>
                       </select>
                       <select
                         aria-label="Sort elites"
@@ -867,6 +933,44 @@ function App() {
                         <option value="entryConditions">Entry conditions</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
+                      <label className="correlation-control" title="SQX DatabankFilterByCorrelation">
+                        Corr ≤
+                        <input
+                          aria-label="Maximum pairwise equity correlation"
+                          max={1}
+                          min={0}
+                          step={0.05}
+                          type="number"
+                          value={correlationMax}
+                          onChange={(event) => setCorrelationMax(Number(event.target.value) || 0)}
+                        />
+                      </label>
+                      <button
+                        className={correlationActive ? "primary" : "secondary"}
+                        onClick={() => {
+                          if (!workspace) return;
+                          const base = filterAndSortElites(
+                            workspace.elites,
+                            query,
+                            entryFilter,
+                            sort,
+                            entryOrderFilter,
+                            filterExpression,
+                          );
+                          const next = !correlationActive;
+                          setCorrelationActive(next);
+                          if (next) {
+                            const report = filterElitesByCorrelation(base, correlationMax);
+                            setCorrelationNote(
+                              `Kept ${report.kept.length}/${base.length}; dropped ${report.rejectedCount} (max pairwise ${report.maxPairwise.toFixed(3)})`,
+                            );
+                          } else {
+                            setCorrelationNote(null);
+                          }
+                        }}
+                      >
+                        {correlationActive ? "Clear correlation" : "Filter by correlation"}
+                      </button>
                     </div>
                     <div className="batch-controls">
                       <label>
@@ -2845,6 +2949,12 @@ function DiscoverWorkspace({
     runMode: "full_harvest" as DiscoverRunModeId,
     earlyStopPotElites: null,
     targetDatabankElites: null,
+    enableCheapPrefilter: false,
+    prefilterBarFraction: 0.25,
+    islandCount: 1,
+    migrationInterval: 0,
+    migrationElites: 2,
+    complexM1IslandCount: 0,
     searchRanges: DEFAULT_SEARCH_RANGES,
     minimumTrades: 10,
     maximumDrawdownPercent: 40,
@@ -2866,6 +2976,7 @@ function DiscoverWorkspace({
     allowMarketEntries: true,
     allowStopEntries: false,
     allowLimitEntries: false,
+    allowStopLimitEntries: false,
     flattenAt22: false,
     endOfDayHour: 23,
     entryWindowStartHour: 2,
@@ -2879,6 +2990,7 @@ function DiscoverWorkspace({
     robustnessMonteCarloTrials: 250,
     robustnessNeighborhoodSamples: 8,
     robustnessPerturbationFraction: 0.2,
+    robustnessParameterChangeProbability: 0.5,
     minimumNeighborhoodSurvivalFraction: 0.7,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
@@ -3090,6 +3202,12 @@ function DiscoverWorkspace({
             runMode: null,
             earlyStopPotElites: null,
             targetDatabankElites: null,
+            enableCheapPrefilter: null,
+            prefilterBarFraction: null,
+            islandCount: null,
+            migrationInterval: null,
+            migrationElites: null,
+            complexM1IslandCount: null,
             searchRanges: null,
             minimumTrades: null,
             maximumDrawdownPercent: null,
@@ -3111,6 +3229,7 @@ function DiscoverWorkspace({
             allowMarketEntries: null,
             allowStopEntries: null,
             allowLimitEntries: null,
+            allowStopLimitEntries: null,
             flattenAt22: null,
             entryWindowStartHour: null,
             entryWindowEndHour: null,
@@ -3123,6 +3242,7 @@ function DiscoverWorkspace({
             robustnessMonteCarloTrials: null,
             robustnessNeighborhoodSamples: null,
             robustnessPerturbationFraction: null,
+            robustnessParameterChangeProbability: null,
             minimumNeighborhoodSurvivalFraction: null,
             calendarYearFolds: null,
             minimumDeflatedTradeSharpe: null,
@@ -3367,16 +3487,111 @@ function DiscoverWorkspace({
                         minimumNeighborhoodSurvivalFraction: 0.5,
                         requireM1Robustness: true,
                         simpleExits: true,
+                        enableCheapPrefilter: false,
+                        islandCount: 1,
+                        complexM1IslandCount: 0,
                       }))
                     }
                   >
                     Quota (20)
+                  </button>
+                  <button
+                    type="button"
+                    className={form.runMode === "mass_builder" ? "active" : ""}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "mass_builder",
+                        mutateAfterElites: 300,
+                        earlyStopPotElites: null,
+                        targetDatabankElites: null,
+                        initialCandidates: Math.max(current.initialCandidates ?? 500, 2000),
+                        batchSize: Math.max(current.batchSize ?? 200, 500),
+                        enableCheapPrefilter: true,
+                        prefilterBarFraction: 0.25,
+                        islandCount: 8,
+                        migrationInterval: 10,
+                        migrationElites: 2,
+                        complexM1IslandCount: 4,
+                        requireM1Robustness: true,
+                        requireM1Precision: false,
+                        simpleExits: false,
+                        allowBreakEven: true,
+                        allowTrailingStops: true,
+                        allowPartialExits: true,
+                        allowMarketEntries: true,
+                        allowStopEntries: true,
+                        allowLimitEntries: true,
+                        allowStopLimitEntries: true,
+                        robustnessMonteCarloTrials: 250,
+                        robustnessNeighborhoodSamples: 8,
+                        minimumNeighborhoodSurvivalFraction: 0.7,
+                      }))
+                    }
+                  >
+                    Mass Builder
                   </button>
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <p className="recipe-summary">
                     Stops at 20 databank elites. Softer ±param gate (50% of 5). Pot is only a breeding bag — not the goal.
                   </p>
+                )}
+                {form.runMode === "mass_builder" && (
+                  <p className="recipe-summary">
+                    Cheap prefilter + genetic islands. Lower islands stay Selected-TF market-only; highest islands sample pending / BE / trail / partials and force M1 on promotion. Scout book defaults remain hedged-single; use CLI `--position-accounting hedged_stack` / `--tick-file` for multi-slot and tick replay. Money management FixedLots / weekend+Friday exits / What-If cross-checks are available via IR and `quantforge what-if`.
+                  </p>
+                )}
+                {(form.runMode === "mass_builder" || (form.islandCount ?? 1) > 1) && (
+                  <div className="form-grid universal-grammar-grid">
+                    <label className="check-field discover-split">
+                      <input
+                        type="checkbox"
+                        checked={form.enableCheapPrefilter ?? false}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            enableCheapPrefilter: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Cheap trailing-window prefilter</span>
+                    </label>
+                    <NumberField
+                      label="Prefilter bar fraction"
+                      value={form.prefilterBarFraction ?? 0.25}
+                      onChange={(value) => update("prefilterBarFraction", value ?? 0.25)}
+                      min={0.05}
+                      max={1}
+                      step={0.05}
+                    />
+                    <NumberField
+                      label="Islands"
+                      value={form.islandCount ?? 1}
+                      onChange={(value) => update("islandCount", value ?? 1)}
+                      min={1}
+                      max={64}
+                    />
+                    <NumberField
+                      label="Complex M1 islands"
+                      value={form.complexM1IslandCount ?? 0}
+                      onChange={(value) => update("complexM1IslandCount", value ?? 0)}
+                      min={0}
+                      max={64}
+                    />
+                    <NumberField
+                      label="Migration interval"
+                      value={form.migrationInterval ?? 0}
+                      onChange={(value) => update("migrationInterval", value ?? 0)}
+                      min={0}
+                    />
+                    <NumberField
+                      label="Migration elites"
+                      value={form.migrationElites ?? 2}
+                      onChange={(value) => update("migrationElites", value ?? 2)}
+                      min={0}
+                    />
+                  </div>
                 )}
               </div>
             </>
@@ -3522,9 +3737,17 @@ function DiscoverWorkspace({
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="Param samples" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
                   <NumberField
-                    label="Param jitter ±% (SQX default 20)"
+                    label="Max param change ±%"
                     value={perturbationPercent(form)}
                     onChange={(value) => update("robustnessPerturbationFraction", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
+                    min={1}
+                    max={100}
+                    step={1}
+                  />
+                  <NumberField
+                    label="Param change probability %"
+                    value={Math.round((form.robustnessParameterChangeProbability ?? 0.5) * 100)}
+                    onChange={(value) => update("robustnessParameterChangeProbability", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
                     min={1}
                     max={100}
                     step={1}
@@ -3565,6 +3788,7 @@ function DiscoverWorkspace({
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false, requireM1Precision: event.target.checked ? current.requireM1Precision : true }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop / sell-stop entry <small>(experimental; weaker in current OOS screen)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-limit / sell-limit entry <small>(test independently; preferred over stops in current screen)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop-limit / sell-stop-limit entry <small>(two-price pending; needs M1 or complex islands)</small></span></label>
               {entryOrderError(form) && <p className="field-error">{entryOrderError(form)}</p>}
             </details>
             <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day)</span></label>
@@ -3654,12 +3878,14 @@ function DiscoverWorkspace({
             <p className="eyebrow">Reject reasons</p>
             <p className="funnel-group-label">Pot gates — Selected-TF only</p>
             <ul>
+              <li><span>Cheap prefilter</span><strong>{formatNumber(job?.rejectedPrefilter ?? 0)}</strong></li>
               <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
               <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
               <li><span>Ambiguous same-bar</span><strong>{formatNumber(job?.rejectedAmbiguous ?? 0)}</strong></li>
               <li><span>Clone</span><strong>{formatNumber(job?.rejectedClone ?? 0)}</strong></li>
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
+              <li><span>Island migrations</span><strong>{formatNumber(job?.islandMigrations ?? 0)}</strong></li>
             </ul>
             <p className="funnel-group-label">Databank gates — run after the pot deposit</p>
             <ul>
@@ -3966,6 +4192,7 @@ function DiscoverContractSummary({
     (form.allowMarketEntries ?? true) ? "Market entries" : null,
     form.allowStopEntries ? "Stop entries" : null,
     form.allowLimitEntries ? "Limit entries" : null,
+    form.allowStopLimitEntries ? "Stop-limit entries" : null,
     form.allowBreakEven ? "Break-even" : null,
     form.allowTrailingStops ? "Trailing stop" : null,
     form.allowPartialExits ? "Partial exits" : null,
@@ -3996,7 +4223,7 @@ function DiscoverContractSummary({
         <p className="eyebrow">Hypothesis</p>
         <div className="contract-hero">
           <strong>{form.decisionTimeframe ?? "—"}</strong>
-          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : "Full harvest"}</span>
+          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : form.runMode === "mass_builder" ? "Mass Builder" : "Full harvest"}</span>
         </div>
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
@@ -4117,6 +4344,559 @@ function SymbolSelect({
   );
 }
 
+function OptimizerWorkspace({ onError }: { onError: (message: string | null) => void }) {
+  const [tab, setTab] = useState<"neighborhood" | "matrix">("neighborhood");
+  return (
+    <div className="wide-tool-content">
+      <div className="workspace-tabs">
+        <button className={tab === "neighborhood" ? "active" : ""} onClick={() => setTab("neighborhood")}>1 · Param neighborhood</button>
+        <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>2 · Walk-forward matrix</button>
+      </div>
+      {tab === "neighborhood" ? <OptimizerPanel onError={onError} /> : <WalkForwardMatrixPanel onError={onError} />}
+    </div>
+  );
+}
+
+function OptimizerPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<OptimizerRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", brokerPath: "",
+    outputPath: "", neighborhoodSamples: 20, perturbationFraction: 0.2, seed: 42,
+    commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19,
+  });
+  const [result, setResult] = useState<OptimizerView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof OptimizerRequest>(key: K, value: OptimizerRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    try { setResult(await runOptimizerNeighborhood(form)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">SQX-style AppOptimizer</p><h2>Perturb parameters and rank survivors</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New optimizer artifact" path={form.outputPath} choose={() => chooseOutputJson("Save optimizer artifact", "optimizer.json")} onChange={(value) => update("outputPath", value)} required />
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Neighbors" value={form.neighborhoodSamples} onChange={(value) => update("neighborhoodSamples", value ?? 20)} min={1} />
+          <NumberField label="Perturbation ±" value={form.perturbationFraction} onChange={(value) => update("perturbationFraction", value ?? 0.2)} step={0.05} />
+          <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} />
+          <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={0.01} />
+          <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
+        </div>
+        <div className="form-footer">
+          <p>Runs Scout on the baseline, then ±perturbation neighborhood samples. Survivors keep return / drawdown / trade-count ratios.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={() => void run()}>{busy ? "Optimizing…" : "Run optimizer"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">Neighborhood</p><h2>{formatNumber(result.passedCount)} / {formatNumber(result.totalCount)} survivors</h2></div><span className="grade-pill">{(result.survivalFraction * 100).toFixed(0)}%</span></div>
+          <div className="job-kpis">
+            <Kpi label="Baseline return" value={`${formatNumber(result.baselineReturnPercent, 2)}%`} note={`${formatNumber(result.baselineTrades)} trades`} />
+            <Kpi label="Baseline DD" value={`${formatNumber(result.baselineDrawdownPercent, 2)}%`} note={`PF ${result.baselineProfitFactor == null ? "∞" : formatNumber(result.baselineProfitFactor, 2)}`} />
+            <Kpi label="Survival" value={`${formatNumber(result.survivalFraction * 100, 1)}%`} note={`${formatNumber(result.passedCount)} passed`} />
+          </div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th>#</th><th>Return %</th><th>PF</th><th>DD %</th><th>Trades</th><th>Ret ratio</th><th>Status</th></tr></thead>
+              <tbody>
+                {result.neighbors.map((row) => (
+                  <tr key={row.sample} className={row.passed ? "" : "row-fail"}>
+                    <td>{row.sample}</td>
+                    <td>{formatNumber(row.returnPercent, 2)}</td>
+                    <td>{row.profitFactor == null ? "∞" : formatNumber(row.profitFactor, 2)}</td>
+                    <td>{formatNumber(row.maximumDrawdownPercent, 2)}</td>
+                    <td>{row.tradeCount}</td>
+                    <td>{row.returnRatio == null ? "—" : formatNumber(row.returnRatio, 2)}</td>
+                    <td>{row.passed ? "pass" : "fail"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <ArtifactPath label="Optimizer artifact" value={result.outputPath} />
+        </section>
+      ) : <WorkspacePrimer title="No optimizer run yet" copy="Pick data + strategy, set neighborhood size, then run. Results mirror SQX parameter-sensitivity tables." />}
+    </div>
+  );
+}
+
+function WalkForwardMatrixPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<WalkForwardMatrixRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", brokerPath: "",
+    outputPath: "", foldCounts: [3, 4, 5, 6], lookbackBars: [60, 120, 240],
+    commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19,
+    minimumFoldTrades: 3, minimumReturnPercent: 0, minimumProfitFactor: 1,
+    maximumDrawdownPercent: 35, minimumPassingFoldFraction: 0.5,
+  });
+  const [foldText, setFoldText] = useState("3,4,5,6");
+  const [lookbackText, setLookbackText] = useState("60,120,240");
+  const [result, setResult] = useState<WalkForwardMatrixView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof WalkForwardMatrixRequest>(key: K, value: WalkForwardMatrixRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  function parseList(text: string): number[] {
+    return text.split(/[,\s]+/).map((part) => Number(part.trim())).filter((value) => Number.isFinite(value) && value > 0);
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    const payload = { ...form, foldCounts: parseList(foldText), lookbackBars: parseList(lookbackText) };
+    try { setResult(await runWalkForwardMatrix(payload)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">CrossCheckWalkForwardMatrix</p><h2>Fold count × lookback grid</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New matrix artifact" path={form.outputPath} choose={() => chooseOutputJson("Save WF matrix", "wf-matrix.json")} onChange={(value) => update("outputPath", value)} required />
+          <label className="field-row"><span>Fold counts</span><input value={foldText} onChange={(event) => setFoldText(event.target.value)} /></label>
+          <label className="field-row"><span>Lookback bars</span><input value={lookbackText} onChange={(event) => setLookbackText(event.target.value)} /></label>
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Min fold trades" value={form.minimumFoldTrades} onChange={(value) => update("minimumFoldTrades", value ?? 0)} min={0} />
+          <NumberField label="Min return %" value={form.minimumReturnPercent} onChange={(value) => update("minimumReturnPercent", value ?? 0)} step={0.1} />
+          <NumberField label="Min PF" value={form.minimumProfitFactor} onChange={(value) => update("minimumProfitFactor", value ?? 1)} step={0.05} />
+          <NumberField label="Max DD %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value ?? 35)} step={0.5} />
+          <NumberField label="Pass fold frac" value={form.minimumPassingFoldFraction} onChange={(value) => update("minimumPassingFoldFraction", value ?? 0.5)} step={0.05} />
+        </div>
+        <div className="form-footer">
+          <p>Each cell replays contiguous OOS folds with the given lookback warmup on Scout.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={() => void run()}>{busy ? "Running matrix…" : "Run walk-forward matrix"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">WF matrix</p><h2>{formatNumber(result.passingCells)} / {formatNumber(result.cells.length)} cells pass</h2></div><span className="grade-pill">{result.protocol}</span></div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th>Folds</th><th>Lookback</th><th>Pass</th><th>Frac</th><th>Mean ret %</th><th>Mean PF</th><th>Mean DD %</th><th>Status</th></tr></thead>
+              <tbody>
+                {result.cells.map((cell, index) => (
+                  <tr key={`${cell.foldCount}-${cell.lookbackBars}`} className={index === result.bestCellIndex ? "row-best" : cell.passed ? "" : "row-fail"}>
+                    <td>{cell.foldCount}</td>
+                    <td>{cell.lookbackBars}</td>
+                    <td>{cell.passingFolds}/{cell.totalFolds}</td>
+                    <td>{formatNumber(cell.passingFraction, 2)}</td>
+                    <td>{formatNumber(cell.meanReturnPercent, 2)}</td>
+                    <td>{formatNumber(cell.meanProfitFactor, 2)}</td>
+                    <td>{formatNumber(cell.meanMaxDrawdownPercent, 2)}</td>
+                    <td>{cell.passed ? (index === result.bestCellIndex ? "best" : "pass") : "fail"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <ArtifactPath label="Matrix artifact" value={result.outputPath} />
+        </section>
+      ) : <WorkspacePrimer title="No matrix yet" copy="Enter fold counts and lookbacks, then run. The grid mirrors SQX Walk-Forward Matrix cells." />}
+    </div>
+  );
+}
+
+function ChallengeRetestPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<ChallengeRequest>({
+    dataPath: "", metadataPath: null, sourceTimezone: "Etc/UTC", strategyPath: "", strategyPaths: [],
+    brokerPath: "", outputDirectory: "", validationFraction: 0.2, sealedFraction: 0.2,
+    evaluationsTouched: 1000, commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0,
+    fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000,
+    entryWindowStartHour: 2, entryWindowEndHour: 19, folds: 5, monteCarloTrials: 200,
+    neighborhoodSamples: 20, seed: 42,
+  });
+  const [result, setResult] = useState<ChallengeView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof ChallengeRequest>(key: K, value: ChallengeRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true); setResult(null); onError(null);
+    try { setResult(await runChallenge(form)); }
+    catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading"><div><p className="eyebrow">TaskRetest / Challenge</p><h2>Purged walk-forward + MC + neighborhood</h2></div></div>
+        <div className="form-stack compact">
+          <SymbolSelect onError={onError} onSelect={(symbol) => setForm((current) => ({
+            ...current, dataPath: symbol.dataPath, metadataPath: symbol.metadataPath, sourceTimezone: null, brokerPath: symbol.brokerPath,
+          }))} selectedDataPath={form.dataPath} />
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
+          <PathField label="New Challenge directory" path={form.outputDirectory} choose={() => chooseNewDirectory("Create Challenge directory", "challenge-run")} onChange={(value) => update("outputDirectory", value)} required />
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Folds" value={form.folds} onChange={(value) => update("folds", value ?? 5)} min={2} />
+          <NumberField label="MC trials" value={form.monteCarloTrials} onChange={(value) => update("monteCarloTrials", value ?? 200)} min={10} />
+          <NumberField label="Neighbors" value={form.neighborhoodSamples} onChange={(value) => update("neighborhoodSamples", value ?? 20)} min={1} />
+          <NumberField label="Validation frac" value={form.validationFraction} onChange={(value) => update("validationFraction", value ?? 0.2)} step={0.05} />
+          <NumberField label="Sealed frac" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value ?? 0.2)} step={0.05} />
+        </div>
+        <div className="form-footer">
+          <p>Writes split-plan + Challenge artifacts. OOS2/sealed stays locked.</p>
+          <button className="primary" disabled={busy || !form.dataPath || !form.strategyPath || !form.brokerPath || !form.outputDirectory} onClick={() => void run()}>{busy ? "Challenging…" : "Run Challenge retest"}</button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero"><div><p className="eyebrow">Challenge</p><h2>{result.passed ? "Passed validation battery" : "Blocked"}</h2></div><span className="grade-pill">{result.grade}</span></div>
+          <div className="job-kpis">
+            <Kpi label="OOS1 trades" value={formatNumber(result.validationTrades)} note={`${formatNumber(result.returnPercent, 2)}%`} />
+            <Kpi label="WF folds" value={`${formatNumber(result.passingFolds)}/${formatNumber(result.totalFolds)}`} note={`cost shocks ${result.passingCostShocks}/${result.totalCostShocks}`} />
+            <Kpi label="Batch" value={`${formatNumber(result.passedCount)}/${formatNumber(result.totalCount)}`} note={result.blockers[0] ?? "no blockers"} />
+          </div>
+          <ArtifactPath label="Challenge artifact" value={result.challengePath} />
+          <ArtifactPath label="Split plan" value={result.splitPlanPath} />
+        </section>
+      ) : <WorkspacePrimer title="No Challenge yet" copy="Retester Challenge runs the same purged walk-forward / Monte Carlo / neighborhood battery as the CLI." />}
+    </div>
+  );
+}
+
+function TaskGraphPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<TaskRunRequest>({
+    graphPath: "",
+    workDir: "",
+    dryRun: false,
+    stopOnFailure: true,
+  });
+  const [result, setResult] = useState<TaskRunView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof TaskRunRequest>(key: K, value: TaskRunRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await runTaskGraph(form));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">TaskRetest / task-run</p>
+            <h2>Execute a QuantForge task graph</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField
+            label="Task graph JSON"
+            path={form.graphPath}
+            choose={() => chooseJsonFile("Choose .qf-task.json graph")}
+            onChange={(value) => update("graphPath", value)}
+            required
+          />
+          <PathField
+            label="Work directory"
+            path={form.workDir}
+            choose={() => chooseNewDirectory("Create task-run work directory", "task-run")}
+            onChange={(value) => update("workDir", value)}
+            required
+          />
+          <label className="check-field">
+            <input
+              type="checkbox"
+              checked={form.dryRun}
+              onChange={(event) => update("dryRun", event.target.checked)}
+            />
+            <span>Dry-run (plan only)</span>
+          </label>
+          <label className="check-field">
+            <input
+              type="checkbox"
+              checked={form.stopOnFailure}
+              onChange={(event) => update("stopOnFailure", event.target.checked)}
+            />
+            <span>Stop on first failure</span>
+          </label>
+        </div>
+        <div className="form-footer">
+          <p>Runs Scout / Challenge / WF / Judge / Export / Filter / What-If / Negate / HTML / multi-symbol steps in-process.</p>
+          <button
+            className="primary"
+            disabled={busy || !form.graphPath || !form.workDir}
+            onClick={() => void run()}
+          >
+            {busy ? "Running…" : form.dryRun ? "Plan task graph" : "Run task graph"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero">
+            <div>
+              <p className="eyebrow">{result.dryRun ? "Dry-run plan" : "Task graph"}</p>
+              <h2>{result.passed ? "Graph finished cleanly" : "Graph blocked"}</h2>
+            </div>
+            <span className="grade-pill">{result.graphName}</span>
+          </div>
+          <div className="job-kpis">
+            <Kpi label="Passed" value={formatNumber(result.passedCount)} note={result.protocol} />
+            <Kpi label="Failed" value={formatNumber(result.failedCount)} note={`skipped ${formatNumber(result.skippedCount)}`} />
+            <Kpi label="Steps" value={formatNumber(result.steps.length)} note={result.dryRun ? "planned" : "executed"} />
+          </div>
+          <ArtifactPath label="Report" value={result.reportPath} />
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Kind</th>
+                  <th>Status</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.steps.map((step) => (
+                  <tr key={step.id}>
+                    <td>{step.id}</td>
+                    <td>{step.kind}</td>
+                    <td>{step.status}</td>
+                    <td>{step.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : (
+        <WorkspacePrimer
+          title="No task graph yet"
+          copy="Load a *.qf-task.json (see docs/examples) and execute the same in-process runner as quantforge task-run."
+        />
+      )}
+    </div>
+  );
+}
+
+function MultiSymbolMatrixPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [form, setForm] = useState<MultiSymbolMatrixRequest>({
+    strategyPath: "",
+    packDir: "C:\\Users\\Administrator\\Documents\\QuantForge\\ICMarkets_EST7_2020_present",
+    symbols: [],
+    sourceTimezone: "ICMarkets/EST+7",
+    initialBalance: 100000,
+    commissionPerLotRoundTurn: 7,
+    requiredPass: 3,
+    minimumNetProfit: 0,
+    outputPath: "",
+  });
+  const [result, setResult] = useState<MultiSymbolMatrixView | null>(null);
+  const [busy, setBusy] = useState(false);
+  function update<K extends keyof MultiSymbolMatrixRequest>(key: K, value: MultiSymbolMatrixRequest[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await runMultiSymbolMatrix(form));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">CrossCheckRetestOnAdditionalMarkets</p>
+            <h2>Cross-symbol retest matrix</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
+          <PathField label="Data pack directory" path={form.packDir} choose={() => chooseDirectory("Choose ICMarkets data pack")} onChange={(value) => update("packDir", value)} required />
+          <PathField label="New matrix artifact" path={form.outputPath} choose={() => chooseOutputJson("Save multi-symbol matrix", "multi-symbol-matrix.json")} onChange={(value) => update("outputPath", value)} required />
+          <label className="field-row">
+            <span>Symbols <small>blank = default FX pack</small></span>
+            <input
+              value={form.symbols.join(",")}
+              placeholder="AUDUSD,GBPUSD,USDJPY"
+              onChange={(event) =>
+                update(
+                  "symbols",
+                  event.target.value
+                    .split(",")
+                    .map((part) => part.trim())
+                    .filter(Boolean),
+                )
+              }
+            />
+          </label>
+        </div>
+        <div className="numeric-grid">
+          <NumberField label="Required pass" value={form.requiredPass} onChange={(value) => update("requiredPass", value ?? 1)} min={1} />
+          <NumberField label="Min net profit" value={form.minimumNetProfit} onChange={(value) => update("minimumNetProfit", value ?? 0)} />
+          <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 7)} step={0.01} />
+          <NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} />
+        </div>
+        <div className="form-footer">
+          <p>Identical params on each pack symbol; reports pass grid plus pairwise equity-signature correlations.</p>
+          <button className="primary" disabled={busy || !form.strategyPath || !form.packDir || !form.outputPath} onClick={() => void run()}>
+            {busy ? "Screening…" : "Run multi-symbol matrix"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className={`panel result-panel ${result.passed ? "result-pass" : "result-fail"}`}>
+          <div className="result-hero">
+            <div>
+              <p className="eyebrow">Multi-symbol matrix</p>
+              <h2>{result.passed ? "Matrix gate passed" : "Matrix gate blocked"}</h2>
+            </div>
+            <span className="grade-pill">{result.strategyId}</span>
+          </div>
+          <div className="job-kpis">
+            <Kpi label="Passing" value={`${formatNumber(result.passingCount)}/${formatNumber(result.symbolCount)}`} note={`need ≥ ${formatNumber(result.requiredPass)}`} />
+            <Kpi label="Mean return" value={`${formatNumber(result.meanReturnPercent, 2)}%`} note={`mean net ${formatNumber(result.meanNetProfit, 0)}`} />
+            <Kpi label="Max pairwise" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="equity signatures" />
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Pass</th>
+                  <th>Trades</th>
+                  <th>Return %</th>
+                  <th>PF</th>
+                  <th>DD %</th>
+                  <th>Net</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.rows.map((row) => (
+                  <tr key={row.symbol}>
+                    <td>{row.symbol}</td>
+                    <td>{row.passed ? "yes" : "no"}</td>
+                    <td>{formatNumber(row.tradeCount)}</td>
+                    <td>{formatNumber(row.returnPercent, 2)}</td>
+                    <td>{row.profitFactor === null ? "∞" : formatNumber(row.profitFactor, 2)}</td>
+                    <td>{formatNumber(row.maxDrawdownPercent, 2)}</td>
+                    <td className={row.netProfit >= 0 ? "profit" : "loss"}>{formatNumber(row.netProfit, 2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {result.pairwise.length > 0 ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Left</th>
+                    <th>Right</th>
+                    <th>Corr</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.pairwise.map((pair) => (
+                    <tr key={`${pair.left}-${pair.right}`}>
+                      <td>{pair.left}</td>
+                      <td>{pair.right}</td>
+                      <td>{formatNumber(pair.correlation, 3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          <ArtifactPath label="Matrix artifact" value={result.outputPath} />
+        </section>
+      ) : (
+        <WorkspacePrimer title="No multi-symbol matrix yet" copy="Retest one IR across the FX pack with the same costs and gates, then inspect pairwise path correlation." />
+      )}
+    </div>
+  );
+}
+
+function ResultsPackPanel({ onError }: { onError: (message: string | null) => void }) {
+  const [inputPath, setInputPath] = useState("");
+  const [title, setTitle] = useState("QuantForge results");
+  const [outputDirectory, setOutputDirectory] = useState("");
+  const [result, setResult] = useState<ExportResultsPackView | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    onError(null);
+    try {
+      setResult(await exportResultsPack({ inputPath, title, outputDirectory }));
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="tool-content">
+      <section className="panel setup-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">SaverHTML / SaverPDF</p>
+            <h2>Export results pack</h2>
+          </div>
+        </div>
+        <div className="form-stack compact">
+          <PathField label="Scout / Judge JSON" path={inputPath} choose={() => chooseJsonFile("Choose Scout or Judge artifact")} onChange={setInputPath} required />
+          <label className="field-row"><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+          <PathField label="New pack directory" path={outputDirectory} choose={() => chooseNewDirectory("Create results pack directory", "qf-results-pack")} onChange={setOutputDirectory} required />
+        </div>
+        <div className="form-footer">
+          <p>Writes results.html, trades.csv, metrics.json, and a minimal results.pdf (print archive).</p>
+          <button className="primary" disabled={busy || !inputPath || !outputDirectory} onClick={() => void run()}>
+            {busy ? "Exporting…" : "Export results pack"}
+          </button>
+        </div>
+      </section>
+      {result ? (
+        <section className="panel result-panel result-pass">
+          <div className="result-hero"><div><p className="eyebrow">Results pack</p><h2>Archive ready</h2></div><span className="grade-pill">Saver</span></div>
+          <ArtifactPath label="Directory" value={result.directory} />
+          <ArtifactPath label="HTML" value={result.htmlPath} />
+          <ArtifactPath label="Trades CSV" value={result.tradesCsvPath} />
+          <ArtifactPath label="Metrics JSON" value={result.metricsJsonPath} />
+          <ArtifactPath label="PDF" value={result.pdfPath} />
+        </section>
+      ) : (
+        <WorkspacePrimer title="No results pack yet" copy="Pick a Scout/Judge artifact to emit the SQX-style HTML/CSV/PDF hand-off bundle." />
+      )}
+    </div>
+  );
+}
+
 function ParityWorkspace({
   exportPreset,
   judgePreset,
@@ -4126,10 +4906,28 @@ function ParityWorkspace({
   judgePreset: Partial<JudgeRequest>;
   onError: (message: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"judge" | "export" | "compare" | "indicators">("judge");
+  const [tab, setTab] = useState<"judge" | "challenge" | "matrix" | "task" | "multisymbol" | "results" | "export" | "compare" | "indicators">("judge");
   return <div className="wide-tool-content">
-    <div className="workspace-tabs"><button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button><button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>2 · EA Export</button><button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>3 · MT5 Compare</button><button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>4 · Indicators</button></div>
-    {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} /> : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} /> : tab === "compare" ? <ParityComparePanel onError={onError} /> : <IndicatorParityPanel onError={onError} />}
+    <div className="workspace-tabs">
+      <button className={tab === "judge" ? "active" : ""} onClick={() => setTab("judge")}>1 · M1 Judge</button>
+      <button className={tab === "challenge" ? "active" : ""} onClick={() => setTab("challenge")}>2 · Challenge</button>
+      <button className={tab === "matrix" ? "active" : ""} onClick={() => setTab("matrix")}>3 · WF Matrix</button>
+      <button className={tab === "task" ? "active" : ""} onClick={() => setTab("task")}>4 · Task Graph</button>
+      <button className={tab === "multisymbol" ? "active" : ""} onClick={() => setTab("multisymbol")}>5 · Multi-Symbol</button>
+      <button className={tab === "results" ? "active" : ""} onClick={() => setTab("results")}>6 · Results Pack</button>
+      <button className={tab === "export" ? "active" : ""} onClick={() => setTab("export")}>7 · EA Export</button>
+      <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>8 · MT5 Compare</button>
+      <button className={tab === "indicators" ? "active" : ""} onClick={() => setTab("indicators")}>9 · Indicators</button>
+    </div>
+    {tab === "judge" ? <JudgePanel onError={onError} preset={judgePreset} />
+      : tab === "challenge" ? <ChallengeRetestPanel onError={onError} />
+      : tab === "matrix" ? <WalkForwardMatrixPanel onError={onError} />
+      : tab === "task" ? <TaskGraphPanel onError={onError} />
+      : tab === "multisymbol" ? <MultiSymbolMatrixPanel onError={onError} />
+      : tab === "results" ? <ResultsPackPanel onError={onError} />
+      : tab === "export" ? <ExportPanel onError={onError} preset={exportPreset} />
+      : tab === "compare" ? <ParityComparePanel onError={onError} />
+      : <IndicatorParityPanel onError={onError} />}
   </div>;
 }
 
@@ -4672,6 +5470,9 @@ function EliteTable({
       <div className="elite-row elite-header">
         {showBatch && <span>Select</span>}
         <span>Strategy</span>
+        <span>Isle</span>
+        <span>Order</span>
+        <span>Mgmt</span>
         <span>Entry/Exit</span>
         <span>Evidence</span>
         <span>Novelty</span>
@@ -4714,6 +5515,9 @@ function EliteTable({
                 </span>
               )}
               <span className="strategy-cell"><strong>{row.strategyId}</strong><small>{row.fingerprint.slice(0, 10)}</small></span>
+              <span title={`Island ${row.islandId ?? 0}`}>{row.islandId ?? 0}</span>
+              <span>{row.entryOrder ?? "market"}</span>
+              <span>{row.management ?? "—"}</span>
               <span>{conditionLabel(row.entryConditions, row.exitConditions)}</span>
               <span>{row.evidence.toFixed(2)}</span>
               <span>{row.novelty.toFixed(3)}</span>
@@ -4949,24 +5753,36 @@ function PartitionEquityChart({
   const height = large ? 340 : 300;
   const pad = 18;
   const equities = chartPoints.map((point) => point.equity);
-  const min = Math.min(...equities);
-  const max = Math.max(...equities);
+  const balances = chartPoints.map((point) => point.balance ?? point.equity);
+  const drawdowns = chartPoints.map((point) => point.drawdownPercent ?? 0);
+  const min = Math.min(...equities, ...balances);
+  const max = Math.max(...equities, ...balances);
   const span = Math.max(max - min, 1e-9);
+  const maxDd = Math.max(...drawdowns, 1e-9);
   const t0 = chartPoints[0].timestampMs;
   const t1 = chartPoints[chartPoints.length - 1].timestampMs;
   const tSpan = Math.max(t1 - t0, 1);
   const xAt = (timestamp: number) => pad + ((timestamp - t0) / tSpan) * (width - pad * 2);
   const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
+  const yDd = (dd: number) => pad + (dd / maxDd) * (height - pad * 2) * 0.28;
   const path = chartPoints
     .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
+    .join(" ");
+  const balancePath = chartPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.balance ?? point.equity).toFixed(1)}`)
+    .join(" ");
+  const ddPath = chartPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yDd(point.drawdownPercent ?? 0).toFixed(1)}`)
     .join(" ");
   const firstX = xAt(chartPoints[0].timestampMs);
   const lastX = xAt(chartPoints.at(-1)!.timestampMs);
   const chartBottom = height - pad;
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
+  const ddArea = `${ddPath} L${lastX.toFixed(1)} ${pad.toFixed(1)} L${firstX.toFixed(1)} ${pad.toFixed(1)} Z`;
   const isX = xAt(view.isEndTimestampMs);
   const oos1X = xAt(view.oos1EndTimestampMs);
   const gradientId = large ? "equity-area-large" : "equity-area-small";
+  const ddGradientId = large ? "dd-area-large" : "dd-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
 
@@ -4996,9 +5812,13 @@ function PartitionEquityChart({
       <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve">
         <defs>
           <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#35d4bd" stopOpacity=".30" />
-            <stop offset="68%" stopColor="#1eae9a" stopOpacity=".08" />
-            <stop offset="100%" stopColor="#1eae9a" stopOpacity="0" />
+            <stop offset="0%" stopColor="var(--accent)" stopOpacity=".30" />
+            <stop offset="68%" stopColor="var(--accent-deep)" stopOpacity=".08" />
+            <stop offset="100%" stopColor="var(--accent-deep)" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id={ddGradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--red)" stopOpacity=".22" />
+            <stop offset="100%" stopColor="var(--red)" stopOpacity="0" />
           </linearGradient>
         </defs>
         {horizontalGuides.map((guide) => {
@@ -5030,7 +5850,10 @@ function PartitionEquityChart({
           <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
         </>}
         <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
+        <path d={ddArea} fill={`url(#${ddGradientId})`} className="drawdown-area" />
+        <path d={balancePath} className="balance-path" />
         <path d={path} className="equity-path" />
+        <path d={ddPath} className="drawdown-path" />
         <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
         {sample === "full" ? <>
           <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
@@ -5038,6 +5861,12 @@ function PartitionEquityChart({
           <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
         </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
+      <div className="partition-equity-legend">
+        <span className="legend-equity">Equity</span>
+        <span className="legend-balance">Balance</span>
+        <span className="legend-dd">Drawdown (top band)</span>
+        <span>Peak DD {formatNumber(Math.max(...drawdowns), 2)}%</span>
+      </div>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
         <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS · chart split`} />
@@ -5137,12 +5966,27 @@ function EliteDetailModal({
 }
 
 function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolean }) {
+  const wins = trades.filter((trade) => trade.netProfit > 0);
+  const losses = trades.filter((trade) => trade.netProfit < 0);
+  const avgWin = wins.length ? wins.reduce((sum, trade) => sum + trade.netProfit, 0) / wins.length : 0;
+  const avgLoss = losses.length ? losses.reduce((sum, trade) => sum + trade.netProfit, 0) / losses.length : 0;
+  const expectancy = trades.length
+    ? trades.reduce((sum, trade) => sum + trade.netProfit, 0) / trades.length
+    : 0;
   return (
     <aside className="trade-list-panel">
       <header>
         <p className="eyebrow">Trade list</p>
         <p>{busy ? "Replaying M1 chronology…" : `${formatNumber(trades.length)} trades (full run)`}</p>
       </header>
+      {trades.length > 0 ? (
+        <div className="trade-analysis-strip">
+          <span>Win {formatNumber((wins.length / trades.length) * 100, 1)}%</span>
+          <span>Avg W {avgWin >= 0 ? "+" : ""}{avgWin.toFixed(2)}</span>
+          <span>Avg L {avgLoss.toFixed(2)}</span>
+          <span>Exp {expectancy >= 0 ? "+" : ""}{expectancy.toFixed(2)}</span>
+        </div>
+      ) : null}
       <div className="trade-list-scroll">
         {trades.length === 0 ? (
           <p className="empty-inline">{busy ? "Loading…" : "No trades in replay."}</p>
@@ -5153,7 +5997,11 @@ function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolea
                 <th>Side</th>
                 <th>Entry</th>
                 <th>Exit</th>
+                <th>Vol</th>
+                <th>Bars</th>
+                <th>R</th>
                 <th>Net</th>
+                <th>Comm</th>
                 <th>Reason</th>
               </tr>
             </thead>
@@ -5163,9 +6011,13 @@ function TradeListPanel({ trades, busy }: { trades: TradeRowView[]; busy: boolea
                   <td>{trade.side}</td>
                   <td>{formatTradeTimestamp(trade.entryTimestampMs)} @ {trade.entryPrice.toFixed(5)}</td>
                   <td>{formatTradeTimestamp(trade.exitTimestampMs)} @ {trade.exitPrice.toFixed(5)}</td>
+                  <td>{trade.volume.toFixed(2)}</td>
+                  <td>{formatNumber(trade.barsHeld)}</td>
+                  <td>{trade.rMultiple === null || trade.rMultiple === undefined ? "—" : trade.rMultiple.toFixed(2)}</td>
                   <td className={trade.netProfit >= 0 ? "profit" : "loss"}>
                     {trade.netProfit >= 0 ? "+" : ""}{trade.netProfit.toFixed(2)}
                   </td>
+                  <td>{trade.commission.toFixed(2)}</td>
                   <td>{trade.exitReason}</td>
                 </tr>
               ))}

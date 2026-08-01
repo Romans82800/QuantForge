@@ -94,6 +94,7 @@ pub struct DiscoverRequest {
     allow_market_entries: Option<bool>,
     allow_stop_entries: Option<bool>,
     allow_limit_entries: Option<bool>,
+    allow_stop_limit_entries: Option<bool>,
     flatten_at_22: Option<bool>,
     end_of_day_hour: Option<u8>,
     /// Broker-local hour from which entries may be placed (inclusive).
@@ -111,6 +112,7 @@ pub struct DiscoverRequest {
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
+    robustness_parameter_change_probability: Option<f64>,
     /// Fraction of ±param neighbors that must survive (default 0.7; Quota uses 0.5).
     minimum_neighborhood_survival_fraction: Option<f64>,
     /// Broker-local calendar-year folds; every year must pass (strict opt-in).
@@ -124,12 +126,21 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
-    /// `fast_scout`, `full_harvest`, or `quota_harvest`.
+    /// `fast_scout`, `full_harvest`, `quota_harvest`, or `mass_builder`.
     run_mode: Option<String>,
     /// Early-stop when accepted pot reaches this size (Fast Scout / Quota).
     early_stop_pot_elites: Option<usize>,
     /// Early-stop when databank reaches this many elites (Quota Harvest default 20).
     target_databank_elites: Option<usize>,
+    /// Cheap trailing-window Scout before full Selected-TF eval (Mass Builder).
+    enable_cheap_prefilter: Option<bool>,
+    prefilter_bar_fraction: Option<f64>,
+    /// Genetic island count (`1` = single population).
+    island_count: Option<usize>,
+    migration_interval: Option<u64>,
+    migration_elites: Option<usize>,
+    /// Highest-numbered islands that sample pending/BE/trail/partials (M1 on promote).
+    complex_m1_island_count: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
@@ -186,6 +197,8 @@ pub struct DiscoverJobView {
     rejected_correlated: u64,
     rejected_niche_not_improved: u64,
     rejected_evaluation: u64,
+    rejected_prefilter: u64,
+    island_migrations: u64,
     rejected_total: u64,
     evaluations_per_hour: f64,
     accepts_per_hour: f64,
@@ -267,6 +280,8 @@ impl DiscoverJobView {
             rejected_correlated: 0,
             rejected_niche_not_improved: 0,
             rejected_evaluation: 0,
+            rejected_prefilter: 0,
+            island_migrations: 0,
             rejected_total: 0,
             evaluations_per_hour: 0.0,
             accepts_per_hour: 0.0,
@@ -425,6 +440,8 @@ pub fn start_discover(
         rejected_correlated: 0,
         rejected_niche_not_improved: 0,
         rejected_evaluation: 0,
+        rejected_prefilter: 0,
+        island_migrations: 0,
         rejected_total: 0,
         evaluations_per_hour: 0.0,
         accepts_per_hour: 0.0,
@@ -623,6 +640,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.allow_market_entries.is_some(),
             request.allow_stop_entries.is_some(),
             request.allow_limit_entries.is_some(),
+            request.allow_stop_limit_entries.is_some(),
             request.flatten_at_22.is_some(),
             request.entry_window_start_hour.is_some(),
             request.entry_window_end_hour.is_some(),
@@ -1527,6 +1545,9 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
         "quota_harvest" | "quotaharvest" | "quota" => {
             Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
         }
+        "mass_builder" | "builder" | "mass" => {
+            Some(quantforge_discover::DiscoverRunMode::MassBuilder)
+        }
         _ => None,
     }
 }
@@ -1579,6 +1600,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         allow_market_entries: request.allow_market_entries.unwrap_or(true),
         allow_stop_entries: request.allow_stop_entries.unwrap_or(false),
         allow_limit_entries: request.allow_limit_entries.unwrap_or(false),
+        allow_stop_limit_entries: request.allow_stop_limit_entries.unwrap_or(false),
         flatten_at_22: request.flatten_at_22.unwrap_or(false),
         end_of_day_hour: request.end_of_day_hour.unwrap_or(23),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
@@ -1596,12 +1618,22 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        robustness_parameter_change_probability: request
+            .robustness_parameter_change_probability
+            .unwrap_or(0.5),
         minimum_neighborhood_survival_fraction: request
             .minimum_neighborhood_survival_fraction
             .unwrap_or(0.7),
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
+        enable_cheap_prefilter: request.enable_cheap_prefilter.unwrap_or(false),
+        prefilter_bar_fraction: request.prefilter_bar_fraction.unwrap_or(0.25),
+        prefilter_gates: GateConfig::prefilter_defaults(),
+        island_count: request.island_count.unwrap_or(1),
+        migration_interval: request.migration_interval.unwrap_or(0),
+        migration_elites: request.migration_elites.unwrap_or(2),
+        complex_m1_island_count: request.complex_m1_island_count.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,
@@ -1611,6 +1643,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
                 commission_per_lot_round_turn: commission,
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: entry_window(
@@ -1619,6 +1652,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             ),
             // Search sets this per batch from the drawdown gate.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
     })
 }
@@ -1735,6 +1771,7 @@ fn update_bank(
         + telemetry.rejected_param_neighborhood
         + telemetry.rejected_multi_symbol
         + telemetry.rejected_deflated_sharpe
+        + telemetry.rejected_prefilter
         + telemetry.rejected_evaluation;
     let hours = clock.active_hours();
     let risk = quantforge_discover::FIXED_RISK_PER_TRADE;
@@ -1842,6 +1879,8 @@ fn update_bank(
     view.rejected_correlated = telemetry.rejected_correlated;
     view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
     view.rejected_evaluation = telemetry.rejected_evaluation;
+    view.rejected_prefilter = telemetry.rejected_prefilter;
+    view.island_migrations = telemetry.island_migrations;
     view.rejected_total = rejected_total;
     view.evaluations_per_hour = bank.evaluation_count as f64 / hours;
     view.accepts_per_hour = accepted_total as f64 / hours;
@@ -1904,6 +1943,7 @@ mod tests {
             allow_market_entries: Some(true),
             allow_stop_entries: Some(false),
             allow_limit_entries: Some(false),
+            allow_stop_limit_entries: Some(false),
             flatten_at_22: Some(false),
             end_of_day_hour: Some(23),
             entry_window_start_hour: None,
@@ -1917,6 +1957,7 @@ mod tests {
             robustness_monte_carlo_trials: Some(50),
             robustness_neighborhood_samples: Some(2),
             robustness_perturbation_fraction: Some(0.20),
+            robustness_parameter_change_probability: Some(0.5),
             minimum_neighborhood_survival_fraction: Some(0.0),
             calendar_year_folds: Some(false),
             minimum_deflated_trade_sharpe: None,
@@ -1926,6 +1967,12 @@ mod tests {
             run_mode: Some("full_harvest".into()),
             early_stop_pot_elites: None,
             target_databank_elites: None,
+            enable_cheap_prefilter: Some(false),
+            prefilter_bar_fraction: None,
+            island_count: Some(1),
+            migration_interval: None,
+            migration_elites: None,
+            complex_m1_island_count: Some(0),
             search_ranges: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),

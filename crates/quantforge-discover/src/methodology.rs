@@ -676,6 +676,7 @@ fn entry_kind_label(order: &EntryOrderPolicy) -> String {
         EntryOrderPolicy::Market => "market".into(),
         EntryOrderPolicy::Stop { .. } => "stop".into(),
         EntryOrderPolicy::Limit { .. } => "limit".into(),
+        EntryOrderPolicy::StopLimit { .. } => "stop_limit".into(),
     }
 }
 

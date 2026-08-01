@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "protocol": "mt5-parity-v2",
+  "tag": "golden_live_audusd",
+  "family": "stop",
+  "symbol": "AUDUSD",
+  "timeframe": "H1",
+  "tester_model": "every_tick_real_ticks",
+  "order_kinds": [
+    "buy_stop",
+    "sell_stop"
+  ],
+  "data_pack": "ICMarkets_EST7_2020_present",
+  "status": "live_capture_passed",
+  "files": {
+    "ir": "strategy.ir.json",
+    "deals": "mt5_deals.csv",
+    "equity": "mt5_equity.csv",
+    "judge": "qf_judge.json",
+    "reference_metrics": "reference_metrics.json",
+    "external_metrics": "external_metrics.json",
+    "notes": "notes.md",
+    "evidence": "evidence.json",
+    "mq5": "expert.mq5",
+    "metadata": "mt5_metadata.json",
+    "compare_report": "compare_report.json",
+    "parity_report": "parity_report.json",
+    "capture_notes": "capture_notes.md"
+  },
+  "from_date": "2024.01.01",
+  "to_date": "2024.02.01",
+  "tester_model_code": 4,
+  "broker_timezone": "ICMarkets/EST+7"
+}

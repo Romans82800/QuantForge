@@ -1,0 +1,1033 @@
+{
+  "trade_count": 4,
+  "net_profit": -1983.25,
+  "max_drawdown": 2250.229999999996,
+  "initial_balance": 100000.0,
+  "ending_balance": 98016.75,
+  "equity": [
+    {
+      "timestamp_ms": 1704146400000,
+      "equity": 100000.0
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99939.56
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99934.97
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99921.2
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99982.4
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99931.91
+    },
+    {
+      "timestamp_ms": 1706090400000,
+      "equity": 99916.61
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99876.83
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99801.86
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99772.79
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99749.84
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99748.31
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99803.39
+    },
+    {
+      "timestamp_ms": 1706094000000,
+      "equity": 99781.97
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99759.02
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99690.17
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99610.61
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99599.9
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99573.89
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99586.13
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99636.62
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99739.13
+    },
+    {
+      "timestamp_ms": 1706097600000,
+      "equity": 99729.95
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99800.33
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99898.25
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99893.66
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99866.12
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99887.54
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99899.78
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99947.21
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 100051.25
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99983.93
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99960.98
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99870.71
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 99950.27
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 100032.89
+    },
+    {
+      "timestamp_ms": 1706101200000,
+      "equity": 100162.94
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100118.57
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100051.25
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100061.96
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100170.59
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100156.82
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100242.5
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100202.72
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100158.35
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 100146.11
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99876.83
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99950.27
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99772.79
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99751.37
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99873.77
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99858.47
+    },
+    {
+      "timestamp_ms": 1706104800000,
+      "equity": 99792.68
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99723.83
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99733.01
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99783.5
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99697.82
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99788.09
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99866.12
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99801.86
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99863.06
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99860.0
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99907.43
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99768.2
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99893.66
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99959.45
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99925.79
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99844.7
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99886.01
+    },
+    {
+      "timestamp_ms": 1706108400000,
+      "equity": 99957.92
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99908.96
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99850.82
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99769.73
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99765.14
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99861.53
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99830.93
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99820.22
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99846.23
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99795.74
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99797.27
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99763.61
+    },
+    {
+      "timestamp_ms": 1706112000000,
+      "equity": 99818.69
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99918.14
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99890.6
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99844.7
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99807.98
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99820.22
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99910.49
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99898.25
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99835.52
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99852.35
+    },
+    {
+      "timestamp_ms": 1706115600000,
+      "equity": 99841.64
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99797.27
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99739.13
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99740.66
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99679.46
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99628.97
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99719.24
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99664.16
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99558.59
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99554.0
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99529.52
+    },
+    {
+      "timestamp_ms": 1706119200000,
+      "equity": 99563.18
+    },
+    {
+      "timestamp_ms": 1706122800000,
+      "equity": 99529.52
+    },
+    {
+      "timestamp_ms": 1706270400000,
+      "equity": 99509.95
+    },
+    {
+      "timestamp_ms": 1706270400000,
+      "equity": 99482.92
+    },
+    {
+      "timestamp_ms": 1706270400000,
+      "equity": 99465.43
+    },
+    {
+      "timestamp_ms": 1706270400000,
+      "equity": 99432.04
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99373.21
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99498.82
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99606.94
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99676.9
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99648.28
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99702.34
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99605.35
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99479.74
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99476.56
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99355.72
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99482.92
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99610.12
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99592.63
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99856.57
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99826.36
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99773.89
+    },
+    {
+      "timestamp_ms": 1706274000000,
+      "equity": 99799.33
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99745.27
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99732.55
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99800.92
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99718.24
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99659.41
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99583.09
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99492.46
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99519.49
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99552.88
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99559.24
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99627.61
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99613.3
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99592.63
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99529.03
+    },
+    {
+      "timestamp_ms": 1706277600000,
+      "equity": 99586.27
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99521.08
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99478.15
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99441.58
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99490.87
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99323.92
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99422.5
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99385.93
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99327.1
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99403.42
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99365.26
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99373.21
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99303.25
+    },
+    {
+      "timestamp_ms": 1706281200000,
+      "equity": 99290.53
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99231.7
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99271.45
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99234.88
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99250.78
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99230.11
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99271.45
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99182.41
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99214.21
+    },
+    {
+      "timestamp_ms": 1706284800000,
+      "equity": 99222.16
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99199.9
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99155.38
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99206.26
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99199.9
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99118.81
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99064.75
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99085.42
+    },
+    {
+      "timestamp_ms": 1706288400000,
+      "equity": 99126.76
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99142.66
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99164.92
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99141.07
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99136.3
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99102.91
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99106.09
+    },
+    {
+      "timestamp_ms": 1706292000000,
+      "equity": 99040.9
+    },
+    {
+      "timestamp_ms": 1706587200000,
+      "equity": 98996.48
+    },
+    {
+      "timestamp_ms": 1706590800000,
+      "equity": 99034.88
+    },
+    {
+      "timestamp_ms": 1706590800000,
+      "equity": 99017.6
+    },
+    {
+      "timestamp_ms": 1706590800000,
+      "equity": 99107.84
+    },
+    {
+      "timestamp_ms": 1706590800000,
+      "equity": 99061.76
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 99008.0
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 99071.36
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 98994.56
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 98963.84
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 98960.0
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 98879.36
+    },
+    {
+      "timestamp_ms": 1706594400000,
+      "equity": 98792.96
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98708.48
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98652.8
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98662.4
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98729.6
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98718.08
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98698.88
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98677.76
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98739.2
+    },
+    {
+      "timestamp_ms": 1706598000000,
+      "equity": 98812.16
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98879.36
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98714.24
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98746.88
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98737.28
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98647.04
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98662.4
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98681.6
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98670.08
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98695.04
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98727.68
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98702.72
+    },
+    {
+      "timestamp_ms": 1706601600000,
+      "equity": 98685.44
+    },
+    {
+      "timestamp_ms": 1706605200000,
+      "equity": 98635.52
+    },
+    {
+      "timestamp_ms": 1706605200000,
+      "equity": 98564.48
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98546.73
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98568.48
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98507.58
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98459.73
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98575.73
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98474.23
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98517.73
+    },
+    {
+      "timestamp_ms": 1706713200000,
+      "equity": 98539.48
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98522.08
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98581.53
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98464.08
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98424.93
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98356.78
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98355.33
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98352.43
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98377.08
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98333.58
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98266.88
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98298.78
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98297.33
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98353.88
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98330.68
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98437.98
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98501.78
+    },
+    {
+      "timestamp_ms": 1706716800000,
+      "equity": 98504.68
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98452.48
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98477.13
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98423.48
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98330.68
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98278.48
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98326.33
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98406.08
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98326.33
+    },
+    {
+      "timestamp_ms": 1706720400000,
+      "equity": 98323.43
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98320.53
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98324.88
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98303.13
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98297.33
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98261.08
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98288.63
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98268.33
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98262.53
+    },
+    {
+      "timestamp_ms": 1706724000000,
+      "equity": 98326.33
+    },
+    {
+      "timestamp_ms": 1706727600000,
+      "equity": 98016.75
+    }
+  ]
+}

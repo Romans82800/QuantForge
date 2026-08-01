@@ -83,23 +83,65 @@ pub fn run_mt5_tester(
         Command::new(&config.executable)
     };
     command
-        .arg(format!("/config:{}", command_path(&command_ini, config)))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg(format!("/config:{}", command_path(&command_ini, config)));
+    if config.portable {
+        command.arg("/portable");
+    }
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    if let Some(parent) = config.executable.parent() {
+        command.current_dir(parent);
+    }
 
     let started = Instant::now();
     let mut child = command.spawn()?;
     let timeout = Duration::from_secs(config.timeout_seconds);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (Some(status), false);
+    // LiveUpdate can exit the initial process and respawn terminal64 under a new
+    // PID while keeping our /config job. Prefer waiting until parity artifacts are
+    // fresh (or timeout), not merely until the first child exits.
+    let mut last_status = None;
+    let mut child_exited = false;
+    let mut grace_applied = false;
+    let timed_out = loop {
+        if is_fresh(&deals_path, prior_deals)
+            && is_fresh(&equity_path, prior_equity)
+            && is_fresh(&metadata_path, prior_metadata)
+        {
+            if !child_exited {
+                let _ = child.kill();
+                last_status = child.wait().ok();
+            }
+            break false;
+        }
+        if !child_exited {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    last_status = Some(status);
+                    child_exited = true;
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if child_exited {
+            if !native_tester_running() {
+                if !grace_applied {
+                    grace_applied = true;
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+                break false;
+            }
+            grace_applied = false;
         }
         if started.elapsed() >= timeout {
-            child.kill()?;
-            let status = child.wait().ok();
-            break (status, true);
+            if !child_exited {
+                let _ = child.kill();
+                last_status = child.wait().ok();
+            }
+            kill_native_testers();
+            break true;
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(500));
     };
 
     let deals_fresh = is_fresh(&deals_path, prior_deals);
@@ -108,7 +150,7 @@ pub fn run_mt5_tester(
     Ok(TesterRunReport {
         success: !timed_out && deals_fresh && equity_fresh && metadata_fresh,
         timed_out,
-        process_exit_code: status.and_then(|status| status.code()),
+        process_exit_code: last_status.and_then(|status| status.code()),
         elapsed_milliseconds: started.elapsed().as_millis(),
         tester_ini,
         deals_path,
@@ -118,6 +160,41 @@ pub fn run_mt5_tester(
         equity_fresh,
         metadata_fresh,
     })
+}
+
+fn native_tester_running() -> bool {
+    #[cfg(windows)]
+    {
+        for name in ["terminal64.exe", "metatester64.exe"] {
+            if let Ok(output) = Command::new("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.to_ascii_lowercase().contains(&name.to_ascii_lowercase()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn kill_native_testers() {
+    #[cfg(windows)]
+    {
+        for name in ["terminal64.exe", "metatester64.exe"] {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 fn command_path(path: &Path, config: &TerminalConfig) -> String {

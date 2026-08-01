@@ -1,0 +1,25 @@
+{
+  "trade_count": 4,
+  "net_profit": 1250.0,
+  "max_drawdown": 320.0,
+  "initial_balance": 100000.0,
+  "ending_balance": 101250.0,
+  "equity": [
+    {
+      "timestamp_ms": 1600000000000,
+      "equity": 100000.0
+    },
+    {
+      "timestamp_ms": 1600003600000,
+      "equity": 100400.0
+    },
+    {
+      "timestamp_ms": 1600007200000,
+      "equity": 99900.0
+    },
+    {
+      "timestamp_ms": 1600010800000,
+      "equity": 101250.0
+    }
+  ]
+}

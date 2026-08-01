@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": "MetaTrader 5",
+  "strategy_fingerprint": "b5fba5a9d21753a87c3c17da21a08550fd74b62dd3f783881db2b94ecc208e56",
+  "broker_spec_hash": "811c32cb57af1fd5a1e2552a9b6a26c6c8cc5ff910d74c0fae7fc6c4729711c7",
+  "source_hash": "5236563e09ac56d0e485c0c410e0bd67346754ff9713b769075a141e8cf9ef60",
+  "strategy_ir_version": 1,
+  "expert_name": "QFManagementGolden",
+  "symbol": "GBPUSD",
+  "timeframe": "H1",
+  "live_trading_default": false,
+  "mandatory_stop_loss": true,
+  "mandatory_take_profit": true,
+  "parity_deals_file": "QuantForge\\QF_b5fba5a9d217_deals.csv",
+  "parity_equity_file": "QuantForge\\QF_b5fba5a9d217_equity.csv",
+  "parity_metadata_file": "QuantForge\\QF_b5fba5a9d217_metadata.csv",
+  "export_style": "sqx",
+  "config": {
+    "expert_name": "QFManagementGolden",
+    "expert_directory": "QuantForge",
+    "timeframe": "H1",
+    "magic": 42424242,
+    "deviation_points": 10,
+    "max_spread_points": null,
+    "estimated_slippage_points_per_side": 0.0,
+    "commission_per_lot_round_turn": 7.0,
+    "allow_live_trading_default": false,
+    "export_style": "sqx",
+    "entry_window_start_hour": 2,
+    "entry_window_end_hour": 19,
+    "tester": {
+      "from_date": "2024.01.01",
+      "to_date": "2024.02.01",
+      "deposit": 100000.0,
+      "currency": "USD",
+      "leverage": 100,
+      "model": 4
+    }
+  }
+}

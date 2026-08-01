@@ -497,6 +497,15 @@ pub enum EntryOrderPolicy {
         distance: EntryDistancePolicy,
         expiry_bars: u16,
     },
+    /// MT5 stop-limit: stop trigger first, then limit fill.
+    /// `stop_distance` places the trigger away from the signal reference;
+    /// `limit_offset` places the limit inward from that trigger
+    /// (buy: limit = stop − offset; sell: limit = stop + offset).
+    StopLimit {
+        stop_distance: EntryDistancePolicy,
+        limit_offset: EntryDistancePolicy,
+        expiry_bars: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +521,41 @@ pub enum Side {
 pub enum RiskPolicy {
     FixedCurrency { amount: f64 },
     PercentBalance { percent: f64 },
+    /// SQX-style fixed lot size (ignores stop-distance risk budget for sizing).
+    FixedLots { lots: f64 },
+    /// SQX SimpleMartingaleMM: scale lots after consecutive losses.
+    ///
+    /// `lots = base_lots * multiplier.min(loss_streak, max_steps)`.
+    /// A winning trade resets the streak to zero.
+    Martingale {
+        base_lots: f64,
+        #[serde(default = "default_martingale_multiplier")]
+        multiplier: f64,
+        #[serde(default = "default_martingale_max_steps")]
+        max_steps: u8,
+    },
+    /// SQX ATRRiskBasedSizing: risk a percent of balance against ATR×multiplier
+    /// as the sizing stop distance (independent of the strategy SL gene).
+    AtrRiskPercent {
+        percent: f64,
+        atr_period: u16,
+        #[serde(default = "default_atr_risk_multiplier")]
+        atr_multiplier: f64,
+        #[serde(default)]
+        max_lots: Option<f64>,
+    },
+}
+
+fn default_martingale_multiplier() -> f64 {
+    2.0
+}
+
+fn default_martingale_max_steps() -> u8 {
+    5
+}
+
+fn default_atr_risk_multiplier() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -578,6 +622,41 @@ pub struct ManagePolicy {
     /// Production Discover stamps this from job config; it is not an evolvable gene.
     #[serde(default)]
     pub max_one_entry_per_day: bool,
+    /// Cancel a working pending when the opposite side signals (SQX-style OCO-lite).
+    #[serde(default = "default_true")]
+    pub cancel_pending_on_opposite: bool,
+    /// Cancel and re-place a working pending when the same side re-signals.
+    #[serde(default)]
+    pub replace_pending_on_reentry: bool,
+    /// Recalculate price/SL/TP/expiry on a working pending when the same side
+    /// re-signals (MT5 OrderModify semantics). Preferred over cancel+replace.
+    #[serde(default = "default_true")]
+    pub modify_pending_on_reentry: bool,
+    /// Block new entries on Saturday/Sunday (SQX DontTradeOnWeekends).
+    #[serde(default)]
+    pub dont_trade_on_weekends: bool,
+    /// Flatten open positions / cancel pendings on Friday at `end_of_day_hour`
+    /// (SQX ExitOnFriday). Independent of `flatten_end_of_day`.
+    #[serde(default)]
+    pub exit_on_friday: bool,
+    /// Cap fills per broker-local day. `None` means unlimited unless
+    /// `max_one_entry_per_day` is set (which behaves as a cap of 1).
+    #[serde(default)]
+    pub max_trades_per_day: Option<u16>,
+    /// Optional SL distance clamps in price points (SQX MinMaxSLPT).
+    #[serde(default)]
+    pub min_stop_points: Option<f64>,
+    #[serde(default)]
+    pub max_stop_points: Option<f64>,
+    /// Optional TP distance clamps in price points.
+    #[serde(default)]
+    pub min_take_profit_points: Option<f64>,
+    #[serde(default)]
+    pub max_take_profit_points: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ManagePolicy {
@@ -590,6 +669,16 @@ impl Default for ManagePolicy {
             flatten_end_of_day: false,
             end_of_day_hour: default_end_of_day_hour(),
             max_one_entry_per_day: false,
+            cancel_pending_on_opposite: true,
+            replace_pending_on_reentry: false,
+            modify_pending_on_reentry: true,
+            dont_trade_on_weekends: false,
+            exit_on_friday: false,
+            max_trades_per_day: None,
+            min_stop_points: None,
+            max_stop_points: None,
+            min_take_profit_points: None,
+            max_take_profit_points: None,
         }
     }
 }
@@ -824,6 +913,21 @@ fn policy_complexity(strategy: &StrategyIr) -> Complexity {
                 | EntryDistancePolicy::RangeMultiple { .. } => 2,
             };
         }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            node_count += 1;
+            parameter_count += 1; // expiry bars
+            for distance in [stop_distance, limit_offset] {
+                parameter_count += match distance {
+                    EntryDistancePolicy::FixedPoints { .. } => 1,
+                    EntryDistancePolicy::AtrMultiple { .. }
+                    | EntryDistancePolicy::RangeMultiple { .. } => 2,
+                };
+            }
+        }
     }
 
     parameter_count += match strategy.stops.stop_loss {
@@ -1005,20 +1109,62 @@ fn validate_risk(risk: &RiskPolicy) -> Result<(), IrError> {
             }
             Ok(())
         }
+        RiskPolicy::FixedLots { lots } => require_positive("risk.lots", *lots),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => {
+            require_positive("risk.base_lots", *base_lots)?;
+            require_positive("risk.multiplier", *multiplier)?;
+            if *multiplier < 1.0 {
+                return Err(IrError::Invalid {
+                    path: "risk.multiplier".into(),
+                    reason: "must be at least 1.0".into(),
+                });
+            }
+            if *max_steps == 0 {
+                return Err(IrError::Invalid {
+                    path: "risk.max_steps".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            Ok(())
+        }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            require_positive("risk.percent", *percent)?;
+            if *percent > 100.0 {
+                return Err(IrError::Invalid {
+                    path: "risk.percent".into(),
+                    reason: "must not exceed 100".into(),
+                });
+            }
+            if *atr_period == 0 {
+                return Err(IrError::Invalid {
+                    path: "risk.atr_period".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            require_positive("risk.atr_multiplier", *atr_multiplier)?;
+            if let Some(max) = max_lots {
+                require_positive("risk.max_lots", *max)?;
+            }
+            Ok(())
+        }
     }
 }
 
 fn validate_entry_order(order: &EntryOrderPolicy, limits: IrLimits) -> Result<(), IrError> {
-    let (distance, expiry_bars) = match order {
+    let expiry_bars = match order {
         EntryOrderPolicy::Market => return Ok(()),
-        EntryOrderPolicy::Stop {
-            distance,
-            expiry_bars,
-        }
-        | EntryOrderPolicy::Limit {
-            distance,
-            expiry_bars,
-        } => (distance, *expiry_bars),
+        EntryOrderPolicy::Stop { expiry_bars, .. }
+        | EntryOrderPolicy::Limit { expiry_bars, .. }
+        | EntryOrderPolicy::StopLimit { expiry_bars, .. } => *expiry_bars,
     };
     if expiry_bars == 0 {
         return Err(IrError::Invalid {
@@ -1026,14 +1172,35 @@ fn validate_entry_order(order: &EntryOrderPolicy, limits: IrLimits) -> Result<()
             reason: "must be greater than zero".into(),
         });
     }
+    match order {
+        EntryOrderPolicy::Market => Ok(()),
+        EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+            validate_entry_distance("entry.order.distance", distance, limits)
+        }
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            validate_entry_distance("entry.order.stop_distance", stop_distance, limits)?;
+            validate_entry_distance("entry.order.limit_offset", limit_offset, limits)
+        }
+    }
+}
+
+fn validate_entry_distance(
+    path: &str,
+    distance: &EntryDistancePolicy,
+    limits: IrLimits,
+) -> Result<(), IrError> {
     match distance {
         EntryDistancePolicy::FixedPoints { points } => {
-            require_positive("entry.order.distance.points", *points)
+            require_positive(&format!("{path}.points"), *points)
         }
         EntryDistancePolicy::AtrMultiple { period, multiplier }
         | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
-            validate_period("entry.order.distance.period", *period, limits)?;
-            require_positive("entry.order.distance.multiplier", *multiplier)
+            validate_period(&format!("{path}.period"), *period, limits)?;
+            require_positive(&format!("{path}.multiplier"), *multiplier)
         }
     }
 }
@@ -1228,6 +1395,27 @@ fn canonicalize_risk(risk: &mut RiskPolicy, policy: FloatPolicy) -> Result<(), I
     match risk {
         RiskPolicy::FixedCurrency { amount } => *amount = q(*amount, policy)?,
         RiskPolicy::PercentBalance { percent } => *percent = q(*percent, policy)?,
+        RiskPolicy::FixedLots { lots } => *lots = q(*lots, policy)?,
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            ..
+        } => {
+            *base_lots = q(*base_lots, policy)?;
+            *multiplier = q(*multiplier, policy)?;
+        }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_multiplier,
+            max_lots,
+            ..
+        } => {
+            *percent = q(*percent, policy)?;
+            *atr_multiplier = q(*atr_multiplier, policy)?;
+            if let Some(max) = max_lots {
+                *max = q(*max, policy)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1236,12 +1424,26 @@ fn canonicalize_entry_order(
     order: &mut EntryOrderPolicy,
     policy: FloatPolicy,
 ) -> Result<(), IrError> {
-    let distance = match order {
-        EntryOrderPolicy::Market => return Ok(()),
+    match order {
+        EntryOrderPolicy::Market => Ok(()),
         EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
-            distance
+            canonicalize_entry_distance(distance, policy)
         }
-    };
+        EntryOrderPolicy::StopLimit {
+            stop_distance,
+            limit_offset,
+            ..
+        } => {
+            canonicalize_entry_distance(stop_distance, policy)?;
+            canonicalize_entry_distance(limit_offset, policy)
+        }
+    }
+}
+
+fn canonicalize_entry_distance(
+    distance: &mut EntryDistancePolicy,
+    policy: FloatPolicy,
+) -> Result<(), IrError> {
     match distance {
         EntryDistancePolicy::FixedPoints { points } => *points = q(*points, policy)?,
         EntryDistancePolicy::AtrMultiple { multiplier, .. }

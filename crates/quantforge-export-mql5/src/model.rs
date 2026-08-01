@@ -313,6 +313,9 @@ pub struct TerminalConfig {
     pub wine_binary: Option<PathBuf>,
     pub wine_prefix: Option<PathBuf>,
     pub timeout_seconds: u64,
+    /// When true, launch with `/portable` (data next to the executable).
+    #[serde(default)]
+    pub portable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,9 @@
 //! protective gaps and stop/target chronology are replayed on M1 bars.
 
 use chrono::Timelike;
-use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
+use quantforge_broker::{BrokerClock, BrokerSpecError, SymbolSpecification, TradeMode};
+#[cfg(test)]
+use quantforge_broker::SwapMode;
 use quantforge_core::FloatPolicy;
 use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
 use quantforge_eval::{
@@ -64,6 +66,9 @@ impl JudgeConfig {
             entry_window: self.entry_window,
             // The judge always replays in full; its metrics are the promotion evidence.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         }
         .validate()?;
         Ok(())
@@ -88,6 +93,8 @@ pub struct JudgeTelemetry {
     pub pending_orders_placed: usize,
     pub pending_orders_filled: usize,
     pub pending_orders_expired: usize,
+    pub pending_orders_cancelled_opposite: usize,
+    pub pending_orders_replaced: usize,
     pub partial_exits_executed: usize,
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,
@@ -139,6 +146,7 @@ struct OpenPosition {
 enum PendingKind {
     Stop,
     Limit,
+    StopLimit,
 }
 
 #[derive(Debug)]
@@ -146,7 +154,12 @@ struct PendingOrder {
     side: PositionSide,
     kind: PendingKind,
     expiry_decision_index: usize,
+    /// Stop/Limit fill level, or StopLimit stop-trigger price.
     activation_price: f64,
+    /// StopLimit limit price once the stop trigger is hit.
+    limit_price: Option<f64>,
+    /// StopLimit: whether the stop trigger has already fired.
+    stop_triggered: bool,
     stop_loss: f64,
     take_profit: f64,
     stop_distance: f64,
@@ -241,6 +254,7 @@ pub fn evaluate_strategy_m1(
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
     let mut signal_taken_today = false;
+    let mut loss_streak: u8 = 0;
 
     for (decision_index, decision_bar) in decision_bars.iter().enumerate().skip(1) {
         let start = decision_bar.timestamp_ms;
@@ -329,6 +343,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 telemetry.end_of_day_flattens += 1;
             }
@@ -385,6 +400,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 closed_this_decision = true;
             }
@@ -436,6 +452,7 @@ pub fn evaluate_strategy_m1(
                     config,
                     &mut balance,
                     &mut trades,
+                    &mut loss_streak,
                 );
                 closed_this_decision = true;
             }
@@ -447,6 +464,64 @@ pub fn evaluate_strategy_m1(
         {
             pending = None;
             telemetry.pending_orders_expired += 1;
+        }
+
+        if position.is_none()
+            && pending.is_some()
+            && !closed_this_decision
+            && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && decision_index >= signal_warmup_bars
+            && (strategy.manage.cancel_pending_on_opposite
+                || strategy.manage.replace_pending_on_reentry
+                || strategy.manage.modify_pending_on_reentry)
+        {
+            let filters_pass = strategy
+                .filters
+                .iter()
+                .map(|filter| features.evaluate_bool(filter, decision_index))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .all(|value| value);
+            if filters_pass {
+                let long_signal = strategy
+                    .entry
+                    .long
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, decision_index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let short_signal = strategy
+                    .entry
+                    .short
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, decision_index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let pending_side = pending.as_ref().map(|order| order.side);
+                match (pending_side, long_signal, short_signal) {
+                    (Some(PositionSide::Long), false, true)
+                    | (Some(PositionSide::Short), true, false)
+                        if strategy.manage.cancel_pending_on_opposite =>
+                    {
+                        pending = None;
+                        telemetry.pending_orders_cancelled_opposite += 1;
+                    }
+                    (Some(PositionSide::Long), true, false)
+                    | (Some(PositionSide::Short), false, true)
+                        if strategy.manage.modify_pending_on_reentry
+                            || strategy.manage.replace_pending_on_reentry =>
+                    {
+                        // Judge: cancel so the place gate re-quotes (OrderModify equiv).
+                        pending = None;
+                        if strategy.manage.modify_pending_on_reentry {
+                            telemetry.pending_orders_replaced += 1;
+                        } else {
+                            telemetry.pending_orders_replaced += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
 
         if position.is_none()
@@ -513,13 +588,16 @@ pub fn evaluate_strategy_m1(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                    loss_streak,
                                 )? {
                                     balance -= open.entry_commission;
                                     position = Some(open);
                                     signal_taken_today = true;
                                 }
                             }
-                            EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. } => {
+                            EntryOrderPolicy::Stop { .. }
+                            | EntryOrderPolicy::Limit { .. }
+                            | EntryOrderPolicy::StopLimit { .. } => {
                                 if let Some(order) = place_pending_order(
                                     side,
                                     decision_index,
@@ -531,6 +609,7 @@ pub fn evaluate_strategy_m1(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                    loss_streak,
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
@@ -575,8 +654,8 @@ pub fn evaluate_strategy_m1(
                 && !closed_this_decision
                 && minute_in_entry_window
                 && let Some(fill_price) = pending
-                    .as_ref()
-                    .and_then(|order| pending_fill_price(order, minute, spread_price))
+                    .as_mut()
+                    .and_then(|order| advance_pending_order(order, minute, spread_price))
             {
                 let order = pending.take().expect("pending order was checked");
                 let open = fill_pending_order(
@@ -619,6 +698,7 @@ pub fn evaluate_strategy_m1(
                         config,
                         &mut balance,
                         &mut trades,
+                    &mut loss_streak,
                     );
                 }
             }
@@ -654,6 +734,7 @@ pub fn evaluate_strategy_m1(
             config,
             &mut balance,
             &mut trades,
+                    &mut loss_streak,
         );
         if let Some(last) = equity.last_mut() {
             last.balance = balance;
@@ -677,14 +758,6 @@ fn validate_broker_compatibility(
     strategy: &StrategyIr,
     broker: &SymbolSpecification,
 ) -> Result<(), JudgeError> {
-    if matches!(
-        broker.swap_mode,
-        SwapMode::ReopenCurrent | SwapMode::ReopenBid
-    ) {
-        return Err(JudgeError::UnsupportedBrokerFeature(
-            "reopen-price swap modes",
-        ));
-    }
     match (broker.trade_mode, strategy.side) {
         (TradeMode::Disabled | TradeMode::CloseOnly, _)
         | (TradeMode::LongOnly, quantforge_ir::Side::ShortOnly | quantforge_ir::Side::Both)
@@ -707,6 +780,7 @@ fn open_position(
     config: &JudgeConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut JudgeTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<OpenPosition>, JudgeError> {
     let Some(stop_distance) = stop_distance(strategy, decision_index, broker, features)? else {
         return Ok(None);
@@ -722,10 +796,6 @@ fn open_position(
         return Ok(None);
     }
 
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -734,8 +804,54 @@ fn open_position(
     } else {
         0.0
     };
-    let raw_volume = risk_budget / (price_risk_per_lot + cost_risk_per_lot);
-    let Some(volume) = normalize_volume(raw_volume, broker) else {
+    let Some(volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => normalize_volume(
+            quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+            broker,
+        ),
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            normalize_volume(
+                quantforge_eval::atr_risk_lots(
+                    balance,
+                    percent,
+                    atr_value,
+                    atr_multiplier,
+                    broker.tick_size,
+                    broker.tick_value,
+                    cost_risk_per_lot,
+                    max_lots,
+                ),
+                broker,
+            )
+        }
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -804,21 +920,42 @@ fn place_pending_order(
     config: &JudgeConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut JudgeTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<PendingOrder>, JudgeError> {
-    let (kind, distance_policy, expiry_bars) = match &strategy.entry.order {
-        EntryOrderPolicy::Market => return Ok(None),
-        EntryOrderPolicy::Stop {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Stop, distance, *expiry_bars),
-        EntryOrderPolicy::Limit {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Limit, distance, *expiry_bars),
-    };
-    let Some(entry_distance) = entry_distance(distance_policy, decision_index, broker, features)?
+    let (kind, stop_distance_policy, limit_offset_policy, expiry_bars) =
+        match &strategy.entry.order {
+            EntryOrderPolicy::Market => return Ok(None),
+            EntryOrderPolicy::Stop {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Stop, distance, None, *expiry_bars),
+            EntryOrderPolicy::Limit {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Limit, distance, None, *expiry_bars),
+            EntryOrderPolicy::StopLimit {
+                stop_distance,
+                limit_offset,
+                expiry_bars,
+            } => (
+                PendingKind::StopLimit,
+                stop_distance,
+                Some(limit_offset),
+                *expiry_bars,
+            ),
+        };
+    let Some(trigger_distance) =
+        entry_distance(stop_distance_policy, decision_index, broker, features)?
     else {
         return Ok(None);
+    };
+    let limit_offset = if let Some(policy) = limit_offset_policy {
+        let Some(offset) = entry_distance(policy, decision_index, broker, features)? else {
+            return Ok(None);
+        };
+        Some(offset)
+    } else {
+        None
     };
     let Some(stop_distance) = stop_distance(strategy, decision_index, broker, features)? else {
         return Ok(None);
@@ -829,9 +966,10 @@ fn place_pending_order(
         return Ok(None);
     };
     let minimum_distance = broker.stops_level_points as f64 * broker.point;
-    if entry_distance < minimum_distance
+    if trigger_distance < minimum_distance
         || stop_distance < minimum_distance
         || target_distance < minimum_distance
+        || limit_offset.is_some_and(|offset| offset < minimum_distance)
     {
         telemetry.skipped_for_broker_stop_level += 1;
         return Ok(None);
@@ -840,33 +978,46 @@ fn place_pending_order(
         PositionSide::Long => bar.open + spread_price,
         PositionSide::Short => bar.open,
     };
-    let activation_price = normalize_price(
-        match (side, kind) {
-            (PositionSide::Long, PendingKind::Stop) => reference + entry_distance,
-            (PositionSide::Short, PendingKind::Stop) => reference - entry_distance,
-            (PositionSide::Long, PendingKind::Limit) => reference - entry_distance,
-            (PositionSide::Short, PendingKind::Limit) => reference + entry_distance,
-        },
-        broker,
-    );
+    let (activation_price, limit_price) = match (side, kind, limit_offset) {
+        (PositionSide::Long, PendingKind::Stop, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Stop, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::Limit, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Limit, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference + trigger_distance, broker);
+            let limit = normalize_price(stop - offset, broker);
+            (stop, Some(limit))
+        }
+        (PositionSide::Short, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference - trigger_distance, broker);
+            let limit = normalize_price(stop + offset, broker);
+            (stop, Some(limit))
+        }
+        (_, PendingKind::StopLimit, None) => return Ok(None),
+    };
+    let intended_entry = limit_price.unwrap_or(activation_price);
     let (stop_loss, take_profit) = match side {
         PositionSide::Long => (
-            normalize_price(activation_price - stop_distance, broker),
-            normalize_price(activation_price + target_distance, broker),
+            normalize_price(intended_entry - stop_distance, broker),
+            normalize_price(intended_entry + target_distance, broker),
         ),
         PositionSide::Short => (
-            normalize_price(activation_price + stop_distance, broker),
-            normalize_price(activation_price - target_distance, broker),
+            normalize_price(intended_entry + stop_distance, broker),
+            normalize_price(intended_entry - target_distance, broker),
         ),
     };
-    let normalized_stop_distance = (activation_price - stop_loss).abs();
+    let normalized_stop_distance = (intended_entry - stop_loss).abs();
     if normalized_stop_distance <= 0.0 {
         return Ok(None);
     }
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = normalized_stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -875,10 +1026,54 @@ fn place_pending_order(
     } else {
         0.0
     };
-    let Some(volume) = normalize_volume(
-        risk_budget / (price_risk_per_lot + cost_risk_per_lot),
-        broker,
-    ) else {
+    let Some(volume) = (match strategy.risk {
+        RiskPolicy::FixedLots { lots } => normalize_volume(lots, broker),
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => normalize_volume(
+            quantforge_eval::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+            broker,
+        ),
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            normalize_volume(
+                quantforge_eval::atr_risk_lots(
+                    balance,
+                    percent,
+                    atr_value,
+                    atr_multiplier,
+                    broker.tick_size,
+                    broker.tick_value,
+                    cost_risk_per_lot,
+                    max_lots,
+                ),
+                broker,
+            )
+        }
+        RiskPolicy::FixedCurrency { amount } => {
+            normalize_volume(amount / (price_risk_per_lot + cost_risk_per_lot), broker)
+        }
+        RiskPolicy::PercentBalance { percent } => normalize_volume(
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot),
+            broker,
+        ),
+    }) else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -887,6 +1082,8 @@ fn place_pending_order(
         kind,
         expiry_decision_index: decision_index.saturating_add(expiry_bars as usize),
         activation_price,
+        limit_price,
+        stop_triggered: false,
         stop_loss,
         take_profit,
         stop_distance: normalized_stop_distance,
@@ -913,6 +1110,56 @@ fn entry_distance(
     Ok(value.filter(|distance| distance.is_finite() && *distance > 0.0))
 }
 
+fn advance_pending_order(order: &mut PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
+    match order.kind {
+        PendingKind::Stop | PendingKind::Limit => pending_fill_price(order, bar, spread_price),
+        PendingKind::StopLimit => {
+            let mut just_triggered = false;
+            if !order.stop_triggered {
+                let stop_touched = match order.side {
+                    PositionSide::Long => bar.high + spread_price >= order.activation_price,
+                    PositionSide::Short => bar.low <= order.activation_price,
+                };
+                if !stop_touched {
+                    return None;
+                }
+                order.stop_triggered = true;
+                just_triggered = true;
+            }
+            let limit_price = order.limit_price?;
+            let open = match order.side {
+                PositionSide::Long => bar.open + spread_price,
+                PositionSide::Short => bar.open,
+            };
+            let touched = match order.side {
+                PositionSide::Long => bar.low + spread_price <= limit_price,
+                PositionSide::Short => bar.high >= limit_price,
+            };
+            if !touched {
+                return None;
+            }
+            // On the trigger minute the open is pre-stop; fill at the limit level.
+            // On later minutes the working limit uses the same gap-through rule as Limit.
+            Some(match order.side {
+                PositionSide::Long => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.min(limit_price)
+                    }
+                }
+                PositionSide::Short => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.max(limit_price)
+                    }
+                }
+            })
+        }
+    }
+}
+
 fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
     let open = match order.side {
         PositionSide::Long => bar.open + spread_price,
@@ -927,6 +1174,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
             bar.low + spread_price <= order.activation_price
         }
         (PositionSide::Short, PendingKind::Limit) => bar.high >= order.activation_price,
+        (_, PendingKind::StopLimit) => return None,
     };
     if !touched {
         return None;
@@ -936,6 +1184,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
         (PositionSide::Short, PendingKind::Stop) => open.min(order.activation_price),
         (PositionSide::Long, PendingKind::Limit) => open.min(order.activation_price),
         (PositionSide::Short, PendingKind::Limit) => open.max(order.activation_price),
+        (_, PendingKind::StopLimit) => return None,
     })
 }
 
@@ -1000,6 +1249,14 @@ fn stop_distance(
                 .map(|range| range * multiplier)
         }
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_stop_points,
+            strategy.manage.max_stop_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
 }
@@ -1018,8 +1275,32 @@ fn target_distance(
             .indicator_at_decision(&IndicatorExpr::Atr { period, shift: 1 }, decision_index)?
             .map(|atr| atr * multiplier),
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_take_profit_points,
+            strategy.manage.max_take_profit_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
+}
+
+fn clamp_distance_points(
+    distance: f64,
+    point: f64,
+    min_points: Option<f64>,
+    max_points: Option<f64>,
+) -> f64 {
+    let mut out = distance;
+    if let Some(min) = min_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.max(min * point);
+    }
+    if let Some(max) = max_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.min(max * point);
+    }
+    out
 }
 
 fn average_completed_range(bars: &[Bar], decision_index: usize, period: usize) -> Option<f64> {
@@ -1339,6 +1620,7 @@ fn close_position(
     config: &JudgeConfig,
     balance: &mut f64,
     trades: &mut Vec<Trade>,
+    loss_streak: &mut u8,
 ) {
     let remaining = position.volume;
     realize_exit_volume(
@@ -1373,6 +1655,13 @@ fn close_position(
         bars_held: decision_index - position.entry_decision_index,
         exit_reason: event.reason,
     });
+    if let Some(last) = trades.last() {
+        if last.net_profit < 0.0 {
+            *loss_streak = loss_streak.saturating_add(1);
+        } else if last.net_profit > 0.0 {
+            *loss_streak = 0;
+        }
+    }
 }
 
 fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f64 {

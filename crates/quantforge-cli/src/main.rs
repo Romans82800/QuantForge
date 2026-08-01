@@ -31,8 +31,12 @@ use quantforge_quality::{
     ExternalParityEvidence, ILLUMINATION_PROTOCOL, INCUBATION_PROTOCOL, INDICATOR_PARITY_PROTOCOL,
     IncubationKillRules, IncubationObservation, IncubationReport, IncubationStart, JUDGE_PROTOCOL,
     SEALED_FINAL_PROTOCOL, SealedFinalConfig, SealedFinalEvidence, SealedFinalReport,
-    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, evaluate_certification,
-    run_challenge, run_incubation, run_sealed_final,
+    StrategyGrade, VALIDATION_PROTOCOL, ValidationAttestation, NegateMode, WhatIfFilter,
+    WalkForwardMatrixConfig, apply_what_if, evaluate_certification, negate_strategy, run_challenge,
+    run_incubation, run_sealed_final, run_task_graph, run_walk_forward_matrix,
+    example_retester_graph, filter_rows, row_from_value, render_results_html_from_json, TaskGraph,
+    TaskRunOptions, candidates_from_values, filter_by_correlation, write_results_pack_from_json,
+    run_multi_symbol_matrix, MatrixSymbolInput,
 };
 use quantforge_storage::{
     CertifiedVaultEntry, RunManifest, RunRecipe, VAULT_SCHEMA_VERSION, admit_certified,
@@ -99,6 +103,21 @@ enum Command {
         /// Broker-local hour from which entries stop being placed (exclusive).
         #[arg(long, default_value_t = quantforge_eval::MANDATORY_ENTRY_WINDOW_END_HOUR)]
         entry_window_end_hour: u32,
+        /// Same-bar SL/TP policy: `conservative` or `every_tick_ohlc`.
+        #[arg(long, default_value = "conservative")]
+        same_bar_policy: String,
+        /// Position book: `hedged_single`, `hedged_stack`, or `netting`.
+        #[arg(long, default_value = "hedged_single")]
+        position_accounting: String,
+        /// Cap for hedged_stack (ignored for single/netting).
+        #[arg(long, default_value_t = 1)]
+        max_open_positions: usize,
+        /// Tick CSV (`timestamp_ms,bid,ask`) for EveryTick file replay.
+        #[arg(long)]
+        tick_file: Option<PathBuf>,
+        /// Walk tick file bids/asks for same-bar protective collisions.
+        #[arg(long, default_value_t = false)]
+        enable_tick_file_replay: bool,
         /// Allow a data-quality Fail and record the override in the manifest.
         #[arg(long)]
         allow_failed_data: bool,
@@ -134,6 +153,24 @@ enum Command {
     IncubationFinalize(IncubationFinalizeArgs),
     /// Materialize the exact parity-passed EA from a Certified Vault entry.
     Deploy(DeployArgs),
+    /// Run SQX-style What-If trade filters on a Scout/Judge trade blotter.
+    WhatIf(WhatIfArgs),
+    /// Flip long/short sides of a strategy IR (SQX Negater cross-check).
+    Negate(NegateArgs),
+    /// SQX-style walk-forward matrix (fold count × lookback grid).
+    WfMatrix(WfMatrixArgs),
+    /// Filter a databank / elite JSON list with an SQX-like expression.
+    DatabankFilter(DatabankFilterArgs),
+    /// Keep a diverse elite subset by equity-signature correlation (SQX DatabankFilterByCorrelation).
+    DatabankCorrelate(DatabankCorrelateArgs),
+    /// Execute (or dry-run) a QuantForge Retester task graph JSON end-to-end.
+    TaskRun(TaskRunArgs),
+    /// Render an SQX SaverHTML-style results report from Scout/Judge JSON.
+    ExportHtml(ExportHtmlArgs),
+    /// Write a Saver-style results pack (HTML + trades CSV + metrics JSON + PDF).
+    ExportResults(ExportResultsArgs),
+    /// Cross-symbol retest matrix with pairwise equity-signature correlations.
+    MultiSymbolMatrix(MultiSymbolMatrixArgs),
     /// Run the validation-only robustness battery for an Illuminated candidate.
     Challenge(ChallengeArgs),
     /// Open one shortlisted candidate's sealed partition exactly once.
@@ -348,9 +385,23 @@ struct EvolveArgs {
     /// Maximum exit conditions (1..=3). Default 3.
     #[arg(long)]
     maximum_exit_conditions: Option<usize>,
-    /// fast_scout | full_harvest
+    /// fast_scout | full_harvest | quota_harvest | mass_builder
     #[arg(long, default_value = "full_harvest")]
     run_mode: String,
+    /// Genetic islands (Mass Builder defaults via run mode).
+    #[arg(long)]
+    island_count: Option<usize>,
+    #[arg(long)]
+    migration_interval: Option<u64>,
+    #[arg(long)]
+    migration_elites: Option<usize>,
+    /// Highest-numbered islands that sample pending/BE/trail/partials.
+    #[arg(long)]
+    complex_m1_island_count: Option<usize>,
+    #[arg(long)]
+    enable_cheap_prefilter: Option<bool>,
+    #[arg(long)]
+    prefilter_bar_fraction: Option<f64>,
     #[arg(long)]
     minimum_trades: Option<usize>,
     #[arg(long)]
@@ -367,6 +418,10 @@ struct EvolveArgs {
     /// local plateau, as a fraction (SQX default 0.20).
     #[arg(long)]
     robustness_perturbation_fraction: Option<f64>,
+    /// Probability that each eligible parameter group is changed in a
+    /// neighbourhood sample (default 0.50).
+    #[arg(long)]
+    robustness_parameter_change_probability: Option<f64>,
     /// Close positions, cancel pending orders and block entries from end-of-day
     /// until the next broker day.
     #[arg(long)]
@@ -570,6 +625,9 @@ struct Mt5TestArgs {
     wine_prefix: Option<PathBuf>,
     #[arg(long)]
     common_files: Option<PathBuf>,
+    /// Launch terminal with `/portable` (data beside the executable).
+    #[arg(long, default_value_t = false)]
+    portable: bool,
     #[arg(long, default_value_t = 1_800)]
     timeout_seconds: u64,
 }
@@ -781,6 +839,158 @@ struct IncubationFinalizeArgs {
     /// The immutable `incubation-start.json` artifact.
     #[arg(long)]
     start: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct NegateArgs {
+    #[arg(long)]
+    strategy: PathBuf,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct WfMatrixArgs {
+    #[command(flatten)]
+    source: DataSourceArgs,
+    #[arg(long)]
+    strategy: PathBuf,
+    #[arg(long)]
+    broker: PathBuf,
+    #[arg(long, value_delimiter = ',', default_value = "3,4,5,6")]
+    fold_counts: Vec<usize>,
+    #[arg(long, value_delimiter = ',', default_value = "60,120,240")]
+    lookback_bars: Vec<usize>,
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    #[arg(long, default_value_t = 7.0)]
+    commission_per_lot_round_turn: f64,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_points_per_side: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DatabankFilterArgs {
+    /// Elite list JSON: `[...]`, `{ "elites": [...] }`, or a databank workspace export.
+    #[arg(long)]
+    elites: PathBuf,
+    /// Expression, e.g. `PF > 1.5 AND Drawdown < 20`.
+    #[arg(long)]
+    expr: String,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DatabankCorrelateArgs {
+    /// Elite list JSON with `fingerprint` + `equity_signature` (or camelCase).
+    #[arg(long)]
+    elites: PathBuf,
+    /// Maximum allowed pairwise correlation in [0, 1] (default 0.70).
+    #[arg(long, default_value_t = 0.70)]
+    max_correlation: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct TaskRunArgs {
+    /// QuantForge task graph JSON (`*.qf-task.json`).
+    #[arg(long)]
+    graph: Option<PathBuf>,
+    /// Emit the built-in Retester example graph instead of loading a file.
+    #[arg(long, default_value_t = false)]
+    example: bool,
+    /// Validate + print planned order without executing steps.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Working directory for step artifacts (created if missing).
+    #[arg(long, default_value = ".")]
+    work_dir: PathBuf,
+    /// Continue after a failed step instead of stopping.
+    #[arg(long, default_value_t = false)]
+    continue_on_failure: bool,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ExportHtmlArgs {
+    /// Scout / Judge / metrics JSON artifact.
+    #[arg(long)]
+    input: PathBuf,
+    /// HTML title.
+    #[arg(long, default_value = "QuantForge results")]
+    title: String,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ExportResultsArgs {
+    /// Scout / Judge / metrics JSON artifact.
+    #[arg(long)]
+    input: PathBuf,
+    /// Report title.
+    #[arg(long, default_value = "QuantForge results")]
+    title: String,
+    /// Output directory for the pack (HTML, CSV, metrics JSON, PDF).
+    #[arg(long)]
+    out_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct MultiSymbolMatrixArgs {
+    #[arg(long)]
+    strategy: PathBuf,
+    /// Pack root containing `ICMarketsSC-Demo_<SYM>_H1_*.tsv` and `<SYM>.broker.json`.
+    #[arg(long)]
+    pack_dir: PathBuf,
+    /// Comma-separated symbols (default: DEFAULT FX pack majors).
+    #[arg(long, default_value = "AUDUSD,EURGBP,EURJPY,EURNZD,GBPJPY,GBPUSD,NZDUSD,USDCHF,USDJPY")]
+    symbols: String,
+    #[arg(long, default_value = "Etc/UTC")]
+    source_timezone: String,
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    #[arg(long, default_value_t = 7.0)]
+    commission_per_lot_round_turn: f64,
+    /// Minimum number of symbols that must pass (net profit > floor).
+    #[arg(long, default_value_t = 1)]
+    required_pass: usize,
+    #[arg(long, default_value_t = 0.0)]
+    minimum_net_profit: f64,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct WhatIfArgs {
+    /// Scout or Judge JSON artifact containing `result.trades` (or a bare trades array).
+    #[arg(long)]
+    trades: PathBuf,
+    /// Initial balance used to rebuild filtered equity metrics.
+    #[arg(long, default_value_t = 100_000.0)]
+    initial_balance: f64,
+    /// Drop top percent of trades by net profit (best winners).
+    #[arg(long)]
+    exclude_pct_biggest_pl: Option<f64>,
+    /// Drop bottom percent of trades by net profit (worst losers).
+    #[arg(long)]
+    exclude_pct_lowest_pl: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    exclude_short_trades: bool,
+    #[arg(long, default_value_t = false)]
+    exclude_long_trades: bool,
+    /// Keep every Nth trade (1-based SQX "every second" ⇒ `--take-every-nth-trade 2`).
+    #[arg(long)]
+    take_every_nth_trade: Option<usize>,
+    #[arg(long)]
+    take_max_trades_per_day: Option<usize>,
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1268,6 +1478,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             initial_balance,
             entry_window_start_hour,
             entry_window_end_hour,
+            same_bar_policy,
+            position_accounting,
+            max_open_positions,
+            tick_file,
+            enable_tick_file_replay,
             allow_failed_data,
             out,
         } => {
@@ -1286,15 +1501,48 @@ fn main() -> Result<(), Box<dyn Error>> {
             let broker_hash = broker_spec.content_hash()?;
             let strategy_fingerprint =
                 strategy_ir.structural_fingerprint(quantforge_core::FloatPolicy::default())?;
+            let same_bar_policy = match same_bar_policy.to_ascii_lowercase().as_str() {
+                "conservative" => quantforge_eval::SameBarPolicy::Conservative,
+                "every_tick_ohlc" | "everytick_ohlc" | "ohlc" => {
+                    quantforge_eval::SameBarPolicy::EveryTickOhlc
+                }
+                other => {
+                    return Err(format!(
+                        "unknown same_bar_policy '{other}' (expected conservative|every_tick_ohlc)"
+                    )
+                    .into());
+                }
+            };
+            let position_accounting = match position_accounting.to_ascii_lowercase().as_str() {
+                "hedged_single" | "single" => quantforge_eval::PositionAccounting::HedgedSingle,
+                "hedged_stack" | "stack" => quantforge_eval::PositionAccounting::HedgedStack,
+                "netting" => quantforge_eval::PositionAccounting::Netting,
+                other => {
+                    return Err(format!(
+                        "unknown position_accounting '{other}' (expected hedged_single|hedged_stack|netting)"
+                    )
+                    .into());
+                }
+            };
+            let tick_dataset = match &tick_file {
+                Some(path) => Some(quantforge_eval::load_tick_csv(path, Some(broker_spec.point))?),
+                None => None,
+            };
+            if enable_tick_file_replay && tick_dataset.is_none() {
+                return Err(
+                    "--enable-tick-file-replay requires --tick-file <path>".into(),
+                );
+            }
             let config = ScoutConfig {
                 initial_balance,
-                same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
+                same_bar_policy,
                 costs: CostModel {
                     fallback_spread_points,
                     adverse_slippage_points_per_side: slippage_points_per_side,
                     commission_per_lot_round_turn,
                     max_spread_points,
                     include_costs_in_risk: true,
+                    fill_simulation: Default::default(),
                 },
                 indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
                 entry_window: quantforge_eval::EntryWindow::new(
@@ -1302,8 +1550,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     entry_window_end_hour,
                 ),
                 abandon_above_drawdown_percent: None,
+                position_accounting,
+                max_open_positions,
+                enable_tick_file_replay,
             };
-            let result = evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?;
+            let result = if let Some(ticks) = &tick_dataset {
+                quantforge_eval::evaluate_strategy_with_ticks(
+                    &strategy_ir,
+                    &dataset,
+                    &broker_spec,
+                    &config,
+                    ticks,
+                )?
+            } else {
+                evaluate_strategy(&strategy_ir, &dataset, &broker_spec, &config)?
+            };
 
             let mut manifest_config = BTreeMap::<String, Value>::from([
                 ("source".into(), json!(display_path(&source.path))),
@@ -1367,6 +1628,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::IncubationRecord(args) => incubation_record_command(args)?,
         Command::IncubationFinalize(args) => incubation_finalize_command(args)?,
         Command::Deploy(args) => deploy_command(args)?,
+        Command::WhatIf(args) => what_if_command(args)?,
+        Command::Negate(args) => negate_command(args)?,
+        Command::WfMatrix(args) => wf_matrix_command(args)?,
+        Command::DatabankFilter(args) => databank_filter_command(args)?,
+        Command::DatabankCorrelate(args) => databank_correlate_command(args)?,
+        Command::TaskRun(args) => task_run_command(args)?,
+        Command::ExportHtml(args) => export_html_command(args)?,
+        Command::ExportResults(args) => export_results_command(args)?,
+        Command::MultiSymbolMatrix(args) => multi_symbol_matrix_command(args)?,
         Command::Challenge(args) => challenge_command(args)?,
         Command::SealedFinal(args) => sealed_final_command(args)?,
         Command::PermutationNull(args) => permutation_null_command(args)?,
@@ -1381,6 +1651,7 @@ fn parse_cli_run_mode(value: &str) -> Result<DiscoverRunMode, Box<dyn Error>> {
         "fast_scout" | "scout" => Ok(DiscoverRunMode::FastScout),
         "full_harvest" | "harvest" => Ok(DiscoverRunMode::FullHarvest),
         "quota_harvest" | "quota" => Ok(DiscoverRunMode::QuotaHarvest),
+        "mass_builder" | "builder" | "mass" => Ok(DiscoverRunMode::MassBuilder),
         other => Err(format!("unknown run mode: {other}").into()),
     }
 }
@@ -1680,6 +1951,283 @@ fn split_plan_command(args: SplitPlanArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn negate_command(args: NegateArgs) -> Result<(), Box<dyn Error>> {
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let report = negate_strategy(&strategy, NegateMode::FlipSides)?;
+    if let Some(out) = args.out {
+        let backup = write_json_versioned(&out, &report)?;
+        println!("wrote {}", out.display());
+        if let Some(backup) = backup {
+            println!("preserved previous report as {}", backup.display());
+        }
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn wf_matrix_command(args: WfMatrixArgs) -> Result<(), Box<dyn Error>> {
+    let (dataset, metadata) = load_source(&args.source)?;
+    let broker: SymbolSpecification = read_json(&args.broker)?;
+    if let Some(metadata) = &metadata {
+        // Best-effort bind when metadata exists; ignore soft mismatches for research matrix runs.
+        let _ = metadata;
+    }
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let config = WalkForwardMatrixConfig {
+        fold_counts: args.fold_counts,
+        lookback_bars: args.lookback_bars,
+        initial_balance: args.initial_balance,
+        costs: CostModel {
+            commission_per_lot_round_turn: args.commission_per_lot_round_turn,
+            adverse_slippage_points_per_side: args.slippage_points_per_side,
+            ..CostModel::default()
+        },
+        ..WalkForwardMatrixConfig::default()
+    };
+    let report = run_walk_forward_matrix(&strategy, &dataset, &broker, &config)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} ({} cells, {} passing)",
+            out.display(),
+            report.cells.len(),
+            report.passing_cells
+        );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn databank_filter_command(args: DatabankFilterArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.elites)?;
+    let list = if let Some(arr) = raw.as_array() {
+        arr.clone()
+    } else if let Some(arr) = raw.get("elites").and_then(|v| v.as_array()) {
+        arr.clone()
+    } else {
+        return Err("elites JSON must be an array or an object with an `elites` array".into());
+    };
+    let mut rows = Vec::with_capacity(list.len());
+    for item in &list {
+        rows.push(row_from_value(item)?);
+    }
+    let report = filter_rows(&args.expr, &rows)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} (matched {} / {})",
+            out.display(),
+            report.matched,
+            report.total
+        );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn databank_correlate_command(args: DatabankCorrelateArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.elites)?;
+    let list = if let Some(arr) = raw.as_array() {
+        arr.clone()
+    } else if let Some(arr) = raw.get("elites").and_then(|v| v.as_array()) {
+        arr.clone()
+    } else {
+        return Err("elites JSON must be an array or an object with an `elites` array".into());
+    };
+    let candidates = candidates_from_values(&list)?;
+    let report = filter_by_correlation(&candidates, args.max_correlation)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} (kept {} / {}, max pairwise {:.4})",
+            out.display(),
+            report.kept_count,
+            report.input_count,
+            report.maximum_observed_pairwise_correlation
+        );
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn task_run_command(args: TaskRunArgs) -> Result<(), Box<dyn Error>> {
+    let graph: TaskGraph = if args.example {
+        example_retester_graph()
+    } else {
+        let path = args
+            .graph
+            .as_ref()
+            .ok_or("provide --graph path or --example")?;
+        read_json(path)?
+    };
+    graph.validate()?;
+    let options = TaskRunOptions {
+        work_dir: args.work_dir.clone(),
+        dry_run: args.dry_run,
+        stop_on_failure: !args.continue_on_failure,
+    };
+    let report = run_task_graph(&graph, &options)?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!("wrote {}", out.display());
+    } else {
+        print_json(&report)?;
+    }
+    if !report.passed {
+        return Err("task graph failed one or more steps".into());
+    }
+    Ok(())
+}
+
+fn export_html_command(args: ExportHtmlArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.input)?;
+    let html = render_results_html_from_json(&args.title, &raw)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.out, html)?;
+    println!("wrote {}", args.out.display());
+    Ok(())
+}
+
+fn export_results_command(args: ExportResultsArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.input)?;
+    let paths = write_results_pack_from_json(&args.out_dir, &args.title, &raw)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    println!("wrote results pack {}", paths.directory.display());
+    println!("  html {}", paths.html.display());
+    println!("  trades {}", paths.trades_csv.display());
+    println!("  metrics {}", paths.metrics_json.display());
+    println!("  pdf {}", paths.pdf.display());
+    Ok(())
+}
+
+fn multi_symbol_matrix_command(args: MultiSymbolMatrixArgs) -> Result<(), Box<dyn Error>> {
+    let strategy: StrategyIr = read_json(&args.strategy)?;
+    let timezone: SourceTimezone = args.source_timezone.parse()?;
+    let symbols: Vec<String> = args
+        .symbols
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if symbols.is_empty() {
+        return Err("provide at least one symbol".into());
+    }
+    let mut markets = Vec::new();
+    for symbol in &symbols {
+        let data = find_pack_h1(&args.pack_dir, symbol)?;
+        let broker_path = args.pack_dir.join(format!("{symbol}.broker.json"));
+        if !broker_path.is_file() {
+            return Err(format!("missing broker profile {}", broker_path.display()).into());
+        }
+        let broker: SymbolSpecification = read_json(&broker_path)?;
+        let dataset = BarDataset::load_mt5(&data, timezone.clone())?;
+        markets.push(MatrixSymbolInput {
+            symbol: symbol.clone(),
+            dataset,
+            broker,
+        });
+    }
+    let scout = ScoutConfig {
+        initial_balance: args.initial_balance,
+        costs: CostModel {
+            commission_per_lot_round_turn: args.commission_per_lot_round_turn,
+            ..CostModel::default()
+        },
+        ..ScoutConfig::default()
+    };
+    let report = run_multi_symbol_matrix(
+        &strategy,
+        &markets,
+        &scout,
+        args.required_pass,
+        args.minimum_net_profit,
+    )?;
+    if let Some(out) = args.out {
+        write_json_new(&out, &report)?;
+        println!(
+            "wrote {} ({} / {} symbols passed, max pairwise {:.3})",
+            out.display(),
+            report.passing_count,
+            report.symbols.len(),
+            report.maximum_pairwise_correlation
+        );
+    } else {
+        print_json(&report)?;
+    }
+    if !report.matrix_passed {
+        return Err("multi-symbol matrix did not meet required_pass".into());
+    }
+    Ok(())
+}
+
+fn find_pack_h1(pack_dir: &Path, symbol: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let exact = pack_dir.join(format!("ICMarketsSC-Demo_{symbol}_H1_2020_present.tsv"));
+    if exact.is_file() {
+        return Ok(exact);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains(&format!("_{symbol}_H1_")) && name.ends_with(".tsv") {
+            return Ok(path);
+        }
+    }
+    Err(format!("H1 TSV for {symbol} not found under {}", pack_dir.display()).into())
+}
+
+fn what_if_command(args: WhatIfArgs) -> Result<(), Box<dyn Error>> {
+    let raw: Value = read_json(&args.trades)?;
+    let trades: Vec<quantforge_eval::Trade> = if let Some(_arr) = raw.as_array() {
+        serde_json::from_value(raw.clone())?
+    } else if let Some(result) = raw.get("result") {
+        serde_json::from_value(result.get("trades").cloned().unwrap_or(json!([])))?
+    } else if raw.get("trades").is_some() {
+        serde_json::from_value(raw.get("trades").cloned().unwrap_or(json!([])))?
+    } else {
+        return Err("what-if input must be a trades array or Scout/Judge artifact".into());
+    };
+    let mut filters = Vec::new();
+    if let Some(percent) = args.exclude_pct_biggest_pl {
+        filters.push(WhatIfFilter::ExcludePctBiggestPl { percent });
+    }
+    if let Some(percent) = args.exclude_pct_lowest_pl {
+        filters.push(WhatIfFilter::ExcludePctLowestPl { percent });
+    }
+    if args.exclude_short_trades {
+        filters.push(WhatIfFilter::ExcludeShortTrades);
+    }
+    if args.exclude_long_trades {
+        filters.push(WhatIfFilter::ExcludeLongTrades);
+    }
+    if let Some(n) = args.take_every_nth_trade {
+        filters.push(WhatIfFilter::TakeEveryNthTrade { n });
+    }
+    if let Some(max) = args.take_max_trades_per_day {
+        filters.push(WhatIfFilter::TakeMaxTradesPerDay { max });
+    }
+    if filters.is_empty() {
+        return Err("specify at least one what-if filter flag".into());
+    }
+    let report = apply_what_if(&trades, args.initial_balance, &filters)?;
+    if let Some(out) = args.out {
+        let backup = write_json_versioned(&out, &report)?;
+        println!("wrote {}", out.display());
+        if let Some(backup) = backup {
+            println!("preserved previous report as {}", backup.display());
+        }
+    } else {
+        print_json(&report)?;
+    }
+    Ok(())
+}
+
 fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
     if args.out.exists() {
         return Err(format!(
@@ -1723,6 +2271,7 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 commission_per_lot_round_turn: args.commission_per_lot_round_turn,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -1730,6 +2279,9 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 args.entry_window_end_hour,
             ),
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         folds: args.folds,
         purge_bars: args.purge_bars,
@@ -1922,6 +2474,7 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 commission_per_lot_round_turn: args.commission_per_lot_round_turn,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -1929,6 +2482,9 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 args.entry_window_end_hour,
             ),
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         minimum_trades: args.minimum_trades,
         minimum_return_percent: args.minimum_return_percent,
@@ -3355,6 +3911,7 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
             commission_per_lot_round_turn: args.commission_per_lot_round_turn,
             max_spread_points: args.max_spread_points,
             include_costs_in_risk: true,
+            fill_simulation: Default::default(),
         },
         allow_execution_gaps: args.allow_execution_gaps,
         indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
@@ -3787,9 +4344,18 @@ fn mt5_test_command(args: Mt5TestArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn metaeditor_config(args: &ExportArgs) -> Result<MetaEditorConfig, Box<dyn Error>> {
+    let native_windows = PathBuf::from(r"C:\Program Files\MetaTrader 5\metaeditor64.exe");
+    if args.metaeditor.is_none() && native_windows.is_file() {
+        return Ok(MetaEditorConfig {
+            executable: native_windows,
+            wine_binary: None,
+            wine_prefix: None,
+        });
+    }
     let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("HOME is unavailable; provide --metaeditor, --wine and --wine-prefix")?;
+        .ok_or("HOME/USERPROFILE is unavailable; provide --metaeditor")?;
     let default_prefix =
         user_home.join("Library/Application Support/net.metaquotes.wine.metatrader5");
     let executable = args.metaeditor.clone().unwrap_or_else(|| {
@@ -3812,12 +4378,37 @@ fn metaeditor_config(args: &ExportArgs) -> Result<MetaEditorConfig, Box<dyn Erro
 }
 
 fn terminal_config(args: &Mt5TestArgs) -> Result<(TerminalConfig, PathBuf), Box<dyn Error>> {
+    let native_terminal = PathBuf::from(r"C:\Program Files\MetaTrader 5\terminal64.exe");
+    // Prefer native Windows MT5 when present (or when explicitly pointed at).
+    if args.terminal.as_ref().is_some_and(|path| path.is_file())
+        || (args.terminal.is_none() && native_terminal.is_file())
+    {
+        let executable = args.terminal.clone().unwrap_or(native_terminal);
+        let common_files = args.common_files.clone().or_else(|| {
+            std::env::var_os("APPDATA").map(|appdata| {
+                PathBuf::from(appdata).join("MetaQuotes/Terminal/Common/Files")
+            })
+        }).ok_or("APPDATA unavailable; provide --common-files")?;
+        return Ok((
+            TerminalConfig {
+                executable,
+                wine_binary: None,
+                wine_prefix: None,
+                timeout_seconds: args.timeout_seconds,
+                portable: args.portable,
+            },
+            common_files,
+        ));
+    }
+
     let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("HOME is unavailable; provide explicit MT5 terminal paths")?;
+        .ok_or("HOME/USERPROFILE is unavailable; provide explicit MT5 terminal paths")?;
     let user_name = std::env::var_os("USER")
+        .or_else(|| std::env::var_os("USERNAME"))
         .map(PathBuf::from)
-        .ok_or("USER is unavailable; provide --common-files")?;
+        .ok_or("USER/USERNAME is unavailable; provide --common-files")?;
     let default_prefix =
         user_home.join("Library/Application Support/net.metaquotes.wine.metatrader5");
     let executable = args.terminal.clone().unwrap_or_else(|| {
@@ -3843,6 +4434,7 @@ fn terminal_config(args: &Mt5TestArgs) -> Result<(TerminalConfig, PathBuf), Box<
             wine_binary,
             wine_prefix,
             timeout_seconds: args.timeout_seconds,
+            portable: args.portable,
         },
         common_files,
     ))
@@ -4602,6 +5194,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         allow_market_entries: true,
         allow_stop_entries: false,
         allow_limit_entries: false,
+        allow_stop_limit_entries: false,
         flatten_at_22: args.flatten_at_22,
         end_of_day_hour: args.end_of_day_hour,
         max_one_entry_per_day: true,
@@ -4615,10 +5208,20 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        robustness_parameter_change_probability: args
+            .robustness_parameter_change_probability
+            .unwrap_or(0.5),
         minimum_neighborhood_survival_fraction: 0.7,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        enable_cheap_prefilter: args.enable_cheap_prefilter.unwrap_or(false),
+        prefilter_bar_fraction: args.prefilter_bar_fraction.unwrap_or(0.25),
+        prefilter_gates: GateConfig::prefilter_defaults(),
+        island_count: args.island_count.unwrap_or(1),
+        migration_interval: args.migration_interval.unwrap_or(0),
+        migration_elites: args.migration_elites.unwrap_or(2),
+        complex_m1_island_count: args.complex_m1_island_count.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,
@@ -4628,6 +5231,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
                 commission_per_lot_round_turn: commission,
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: quantforge_eval::EntryWindow::new(
@@ -4636,6 +5240,9 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             ),
             // Search overrides this per batch; the CLI default keeps full metrics.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
     })
 }

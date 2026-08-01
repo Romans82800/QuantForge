@@ -220,6 +220,7 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
             commission_per_lot_round_turn: request.commission_per_lot_round_turn,
             max_spread_points: request.max_spread_points,
             include_costs_in_risk: true,
+            fill_simulation: Default::default(),
         },
         allow_execution_gaps: false,
         indicator_engine: quantforge_eval::IndicatorEngine::Sqx,

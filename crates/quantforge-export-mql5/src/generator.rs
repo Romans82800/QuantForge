@@ -62,6 +62,7 @@ pub fn generate_bundle(
         source = source.replace("@@SQX_RUNTIME@@", &sqx_runtime_inline());
     }
     source = source.replace("@@QF_EXTENDED_INDICATORS@@", EXTENDED_INDICATORS);
+    let (filling_modes, filling_mode_count) = filling_modes_mql(broker);
     for (placeholder, value) in [
         ("@@EXPERT_NAME@@", config.expert_name.clone()),
         ("@@ALLOW_LIVE@@", "false".into()),
@@ -126,11 +127,16 @@ pub fn generate_bundle(
         ("@@STOP_DISTANCE@@", stop_distance(&strategy)),
         ("@@TARGET_DISTANCE@@", target_distance(&strategy)),
         ("@@RISK_BUDGET@@", risk_budget(&strategy)),
-        (
-            "@@ENTRY_ORDER_KIND@@",
-            entry_order_kind(&strategy).to_string(),
-        ),
+        ("@@VOLUME_MODE@@", volume_mode(&strategy).to_string()),
+        ("@@FIXED_LOTS@@", fixed_lots(&strategy)),
+        ("@@MARTINGALE_MULTIPLIER@@", martingale_multiplier(&strategy)),
+        ("@@MARTINGALE_MAX_STEPS@@", martingale_max_steps(&strategy)),
+        ("@@ATR_RISK_PERIOD@@", atr_risk_period(&strategy)),
+        ("@@ATR_RISK_MULTIPLIER@@", atr_risk_multiplier(&strategy)),
+        ("@@ATR_RISK_MAX_LOTS@@", atr_risk_max_lots(&strategy)),
+        ("@@ENTRY_ORDER_KIND@@", entry_order_kind(&strategy).to_string()),
         ("@@ENTRY_DISTANCE@@", entry_distance(&strategy)),
+        ("@@ENTRY_LIMIT_OFFSET@@", entry_limit_offset(&strategy)),
         ("@@ENTRY_EXPIRY@@", entry_expiry(&strategy).to_string()),
         (
             "@@BREAK_EVEN_R@@",
@@ -160,6 +166,30 @@ pub fn generate_bundle(
             },
         ),
         (
+            "@@MAX_TRADES_PER_DAY@@",
+            strategy
+                .manage
+                .max_trades_per_day
+                .unwrap_or(0)
+                .to_string(),
+        ),
+        (
+            "@@DONT_TRADE_WEEKENDS@@",
+            if strategy.manage.dont_trade_on_weekends {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        (
+            "@@EXIT_ON_FRIDAY@@",
+            if strategy.manage.exit_on_friday {
+                "true".into()
+            } else {
+                "false".into()
+            },
+        ),
+        (
             "@@PARTIAL_COUNT@@",
             strategy.manage.partial_exits.len().to_string(),
         ),
@@ -170,6 +200,8 @@ pub fn generate_bundle(
             strategy.manage.time_stop_bars.unwrap_or(0).to_string(),
         ),
         ("@@FINGERPRINT_SHORT@@", fingerprint_short.into()),
+        ("@@FILLING_MODES@@", filling_modes),
+        ("@@FILLING_MODE_COUNT@@", filling_mode_count.to_string()),
         ("@@SYMBOL@@", mql_string(&broker.symbol)),
         ("@@BROKER_TIMEZONE@@", broker.timezone.clone()),
     ] {
@@ -710,10 +742,67 @@ fn target_distance(strategy: &StrategyIr) -> String {
 fn risk_budget(strategy: &StrategyIr) -> String {
     match strategy.risk {
         RiskPolicy::FixedCurrency { amount } => mql_double(amount),
-        RiskPolicy::PercentBalance { percent } => format!(
+        RiskPolicy::PercentBalance { percent }
+        | RiskPolicy::AtrRiskPercent { percent, .. } => format!(
             "AccountInfoDouble(ACCOUNT_BALANCE)*{}/100.0",
             mql_double(percent)
         ),
+        RiskPolicy::FixedLots { .. } | RiskPolicy::Martingale { .. } => "0.0".into(),
+    }
+}
+
+fn volume_mode(strategy: &StrategyIr) -> u8 {
+    match strategy.risk {
+        RiskPolicy::FixedLots { .. } => 1,
+        RiskPolicy::Martingale { .. } => 2,
+        RiskPolicy::AtrRiskPercent { .. } => 3,
+        _ => 0,
+    }
+}
+
+fn fixed_lots(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::FixedLots { lots } => mql_double(lots),
+        RiskPolicy::Martingale { base_lots, .. } => mql_double(base_lots),
+        _ => "0.0".into(),
+    }
+}
+
+fn martingale_multiplier(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::Martingale { multiplier, .. } => mql_double(multiplier),
+        _ => "2.0".into(),
+    }
+}
+
+fn martingale_max_steps(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::Martingale { max_steps, .. } => max_steps.to_string(),
+        _ => "5".into(),
+    }
+}
+
+fn atr_risk_period(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent { atr_period, .. } => atr_period.to_string(),
+        _ => "14".into(),
+    }
+}
+
+fn atr_risk_multiplier(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent { atr_multiplier, .. } => mql_double(atr_multiplier),
+        _ => "1.0".into(),
+    }
+}
+
+fn atr_risk_max_lots(strategy: &StrategyIr) -> String {
+    match strategy.risk {
+        RiskPolicy::AtrRiskPercent {
+            max_lots: Some(max),
+            ..
+        } => mql_double(max),
+        _ => "0.0".into(),
     }
 }
 
@@ -722,7 +811,32 @@ fn entry_order_kind(strategy: &StrategyIr) -> u8 {
         EntryOrderPolicy::Market => 0,
         EntryOrderPolicy::Stop { .. } => 1,
         EntryOrderPolicy::Limit { .. } => 2,
+        EntryOrderPolicy::StopLimit { .. } => 3,
     }
+}
+
+/// Preferred MT5 filling enums from the bound broker profile.
+/// Returns `(modes_csv, count)` — when count is 0 the EA falls back to symbol autodetection.
+fn filling_modes_mql(broker: &quantforge_broker::SymbolSpecification) -> (String, usize) {
+    use quantforge_broker::FillingMode;
+    let modes: Vec<&'static str> = broker
+        .filling_modes
+        .iter()
+        .filter_map(|mode| match mode {
+            FillingMode::FillOrKill => Some("ORDER_FILLING_FOK"),
+            FillingMode::ImmediateOrCancel => Some("ORDER_FILLING_IOC"),
+            FillingMode::Return => Some("ORDER_FILLING_RETURN"),
+            FillingMode::BookOrCancel => None,
+        })
+        .collect();
+    let count = modes.len();
+    // Array initializer must stay non-empty for MQL5 compile; count gates use.
+    let csv = if modes.is_empty() {
+        "ORDER_FILLING_FOK".into()
+    } else {
+        modes.join(", ")
+    };
+    (csv, count)
 }
 
 fn entry_distance(strategy: &StrategyIr) -> String {
@@ -731,7 +845,19 @@ fn entry_distance(strategy: &StrategyIr) -> String {
         EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
             distance
         }
+        EntryOrderPolicy::StopLimit { stop_distance, .. } => stop_distance,
     };
+    distance_expr(policy)
+}
+
+fn entry_limit_offset(strategy: &StrategyIr) -> String {
+    match &strategy.entry.order {
+        EntryOrderPolicy::StopLimit { limit_offset, .. } => distance_expr(limit_offset),
+        _ => "0.0".into(),
+    }
+}
+
+fn distance_expr(policy: &EntryDistancePolicy) -> String {
     match *policy {
         EntryDistancePolicy::FixedPoints { points } => format!("{}*_Point", mql_double(points)),
         EntryDistancePolicy::AtrMultiple { period, multiplier } => {
@@ -747,7 +873,8 @@ fn entry_expiry(strategy: &StrategyIr) -> u16 {
     match strategy.entry.order {
         EntryOrderPolicy::Market => 0,
         EntryOrderPolicy::Stop { expiry_bars, .. }
-        | EntryOrderPolicy::Limit { expiry_bars, .. } => expiry_bars,
+        | EntryOrderPolicy::Limit { expiry_bars, .. }
+        | EntryOrderPolicy::StopLimit { expiry_bars, .. } => expiry_bars,
     }
 }
 
@@ -1203,6 +1330,29 @@ mod tests {
                 .contains("current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour")
         );
         assert!(bundle.source.contains("QFMarkEntrySignalTaken"));
+    }
+
+    #[test]
+    fn stop_limit_entries_are_exported() {
+        let mut strategy = strategy();
+        strategy.entry.order = EntryOrderPolicy::StopLimit {
+            stop_distance: EntryDistancePolicy::AtrMultiple {
+                period: 14,
+                multiplier: 0.5,
+            },
+            limit_offset: EntryDistancePolicy::AtrMultiple {
+                period: 14,
+                multiplier: 0.25,
+            },
+            expiry_bars: 4,
+        };
+        let bundle = generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
+        assert!(bundle.source.contains("return 3;"));
+        assert!(bundle.source.contains("ORDER_TYPE_BUY_STOP_LIMIT"));
+        assert!(bundle.source.contains("ORDER_TYPE_SELL_STOP_LIMIT"));
+        assert!(bundle.source.contains("g_trade.OrderOpen"));
+        assert!(bundle.source.contains("QFEntryLimitOffset"));
+        assert!(!bundle.source.contains("@@"));
     }
 
     #[test]

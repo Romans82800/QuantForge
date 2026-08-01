@@ -18,15 +18,31 @@ export function filterAndSortElites(
   query: string,
   entryConditions: string,
   sort: EliteSort,
+  entryOrder = "all",
+  expression = "",
 ): EliteRow[] {
   const needle = query.trim().toLowerCase();
+  const expr = expression.trim();
+  let parsed: ReturnType<typeof parseDatabankFilter> | null = null;
+  let parseError: string | null = null;
+  if (expr.length > 0) {
+    try {
+      parsed = parseDatabankFilter(expr);
+    } catch (reason) {
+      parseError = String(reason);
+    }
+  }
   return elites
     .filter(
       (elite) =>
         (entryConditions === "all" || String(elite.entryConditions) === entryConditions) &&
+        (entryOrder === "all" || (elite.entryOrder ?? "market") === entryOrder) &&
         (needle.length === 0 ||
           elite.strategyId.toLowerCase().includes(needle) ||
-          elite.fingerprint.toLowerCase().includes(needle)),
+          elite.fingerprint.toLowerCase().includes(needle) ||
+          (elite.management ?? "").toLowerCase().includes(needle) ||
+          String(elite.islandId ?? "").includes(needle)) &&
+        (parsed === null || (parseError === null && evalDatabankFilter(parsed, elite))),
     )
     .sort((left, right) => {
       if (sort === "entryConditions") {
@@ -60,6 +76,327 @@ export function filterAndSortElites(
       if (sort === "novelty") return right.novelty - left.novelty;
       return right.evidence - left.evidence;
     });
+}
+
+/** SQX-like databank expression: `PF > 1.5 AND Drawdown < 20`. */
+export type DatabankFilterNode =
+  | { type: "and" | "or"; children: DatabankFilterNode[] }
+  | { type: "not"; child: DatabankFilterNode }
+  | { type: "cmp"; column: string; op: string; value: number | string | boolean | null };
+
+export function parseDatabankFilter(source: string): DatabankFilterNode {
+  const parser = new FilterParser(source);
+  const node = parser.parseOr();
+  parser.skipWs();
+  if (!parser.done()) throw new Error(`unexpected trailing input near \`${parser.rest()}\``);
+  return node;
+}
+
+export function evalDatabankFilter(node: DatabankFilterNode, elite: EliteRow): boolean {
+  switch (node.type) {
+    case "and":
+      return node.children.every((child) => evalDatabankFilter(child, elite));
+    case "or":
+      return node.children.some((child) => evalDatabankFilter(child, elite));
+    case "not":
+      return !evalDatabankFilter(node.child, elite);
+    case "cmp": {
+      const left = columnValue(elite, node.column);
+      return compareFilterValues(left, node.op, node.value);
+    }
+  }
+}
+
+export function databankFilterError(expression: string): string | null {
+  const trimmed = expression.trim();
+  if (!trimmed) return null;
+  try {
+    parseDatabankFilter(trimmed);
+    return null;
+  } catch (reason) {
+    return String(reason).replace(/^Error:\s*/, "");
+  }
+}
+
+/** SQX DatabankFilterByCorrelation — greedy keep by evidence, drop high-corr peers. */
+export function filterElitesByCorrelation(
+  elites: EliteRow[],
+  maximumCorrelation: number,
+): { kept: EliteRow[]; rejectedCount: number; maxPairwise: number } {
+  const threshold = Number.isFinite(maximumCorrelation)
+    ? Math.min(1, Math.max(0, maximumCorrelation))
+    : 0.7;
+  const ordered = [...elites].sort(
+    (left, right) =>
+      right.evidence - left.evidence || left.fingerprint.localeCompare(right.fingerprint),
+  );
+  const kept: EliteRow[] = [];
+  let rejectedCount = 0;
+  let maxPairwise = 0;
+  for (const candidate of ordered) {
+    const signature = candidate.equitySignature ?? [];
+    if (signature.length < 2) {
+      kept.push(candidate);
+      continue;
+    }
+    let blocked = false;
+    for (const existing of kept) {
+      const other = existing.equitySignature ?? [];
+      if (other.length < 2) continue;
+      const corr = equitySignatureCorrelation(signature, other);
+      maxPairwise = Math.max(maxPairwise, corr);
+      if (corr > threshold + 1e-12) {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) rejectedCount += 1;
+    else kept.push(candidate);
+  }
+  let keptMax = 0;
+  for (let left = 0; left < kept.length; left += 1) {
+    for (let right = left + 1; right < kept.length; right += 1) {
+      keptMax = Math.max(
+        keptMax,
+        equitySignatureCorrelation(kept[left].equitySignature ?? [], kept[right].equitySignature ?? []),
+      );
+    }
+  }
+  return {
+    kept,
+    rejectedCount,
+    maxPairwise: kept.length >= 2 ? keptMax : maxPairwise,
+  };
+}
+
+function equitySignatureCorrelation(left: number[], right: number[]): number {
+  const length = Math.min(left.length, right.length);
+  if (length < 2) return 0;
+  const a = left.slice(0, length);
+  const b = right.slice(0, length);
+  const meanA = a.reduce((sum, value) => sum + value, 0) / length;
+  const meanB = b.reduce((sum, value) => sum + value, 0) / length;
+  let covariance = 0;
+  let varA = 0;
+  let varB = 0;
+  for (let index = 0; index < length; index += 1) {
+    const da = a[index] - meanA;
+    const db = b[index] - meanB;
+    covariance += da * db;
+    varA += da * da;
+    varB += db * db;
+  }
+  const denom = Math.sqrt(varA * varB);
+  if (denom <= Number.EPSILON) return 0;
+  return Math.max(0, Math.min(1, Math.max(-1, covariance / denom)));
+}
+
+function columnValue(elite: EliteRow, raw: string): number | string | boolean | null {
+  const key = canonicalizeFilterColumn(raw);
+  const map: Record<string, number | string | boolean | null> = {
+    fingerprint: elite.fingerprint,
+    strategyId: elite.strategyId,
+    entryConditions: elite.entryConditions,
+    exitConditions: elite.exitConditions,
+    islandId: elite.islandId,
+    entryOrder: elite.entryOrder ?? "market",
+    management: elite.management ?? "",
+    evidence: elite.evidence,
+    novelty: elite.novelty,
+    trades: elite.trades,
+    returnPercent: elite.returnPercent,
+    drawdownPercent: elite.drawdownPercent,
+    recoveryFactor: elite.recoveryFactor,
+    profitFactor: elite.profitFactor,
+    sharpeRatio: elite.sharpeRatio,
+    isExpectancy: elite.isExpectancy,
+    oos1Expectancy: elite.oos1Expectancy,
+    oos1ExpectancyRatio: elite.oos1ExpectancyRatio,
+    complexity: elite.complexity,
+    generation: elite.generation,
+    grade: elite.grade,
+    parity: elite.parity,
+  };
+  return map[key] ?? null;
+}
+
+function canonicalizeFilterColumn(raw: string): string {
+  const key = raw.trim().toLowerCase().replace(/[_\s-]/g, "");
+  const aliases: Record<string, string> = {
+    fingerprint: "fingerprint",
+    strategyid: "strategyId",
+    id: "strategyId",
+    name: "strategyId",
+    entryconditions: "entryConditions",
+    exitconditions: "exitConditions",
+    islandid: "islandId",
+    island: "islandId",
+    entryorder: "entryOrder",
+    management: "management",
+    evidence: "evidence",
+    fitness: "evidence",
+    novelty: "novelty",
+    trades: "trades",
+    numberoftrades: "trades",
+    returnpercent: "returnPercent",
+    return: "returnPercent",
+    netprofit: "returnPercent",
+    netprofitpct: "returnPercent",
+    drawdownpercent: "drawdownPercent",
+    drawdown: "drawdownPercent",
+    maxdd: "drawdownPercent",
+    recoveryfactor: "recoveryFactor",
+    rf: "recoveryFactor",
+    profitfactor: "profitFactor",
+    pf: "profitFactor",
+    sharperatio: "sharpeRatio",
+    sharpe: "sharpeRatio",
+    isexpectancy: "isExpectancy",
+    expectancy: "isExpectancy",
+    complexity: "complexity",
+    generation: "generation",
+    grade: "grade",
+    parity: "parity",
+  };
+  const mapped = aliases[key];
+  if (!mapped) throw new Error(`unknown column \`${raw}\``);
+  return mapped;
+}
+
+function compareFilterValues(
+  left: number | string | boolean | null,
+  op: string,
+  right: number | string | boolean | null,
+): boolean {
+  if (left === null || right === null) {
+    if (op === "==" || op === "=") return left === right;
+    if (op === "!=") return left !== right;
+    return false;
+  }
+  if (typeof left === "number" && typeof right === "number") {
+    switch (op) {
+      case ">": return left > right;
+      case ">=": return left >= right;
+      case "<": return left < right;
+      case "<=": return left <= right;
+      case "==":
+      case "=": return Math.abs(left - right) <= 1e-12;
+      case "!=": return Math.abs(left - right) > 1e-12;
+    }
+  }
+  const ls = String(left).toLowerCase();
+  const rs = String(right).toLowerCase();
+  switch (op) {
+    case ">": return ls > rs;
+    case ">=": return ls >= rs;
+    case "<": return ls < rs;
+    case "<=": return ls <= rs;
+    case "==":
+    case "=": return ls === rs;
+    case "!=": return ls !== rs;
+  }
+  return false;
+}
+
+class FilterParser {
+  private chars: string[];
+  private pos = 0;
+  constructor(source: string) {
+    this.chars = [...source];
+  }
+  done() { return this.pos >= this.chars.length; }
+  rest() { return this.chars.slice(this.pos).join(""); }
+  skipWs() { while (this.pos < this.chars.length && /\s/.test(this.chars[this.pos])) this.pos += 1; }
+  parseOr(): DatabankFilterNode {
+    const nodes = [this.parseAnd()];
+    while (this.consumeKeyword("OR")) nodes.push(this.parseAnd());
+    return nodes.length === 1 ? nodes[0]! : { type: "or", children: nodes };
+  }
+  parseAnd(): DatabankFilterNode {
+    const nodes = [this.parseUnary()];
+    while (this.consumeKeyword("AND")) nodes.push(this.parseUnary());
+    return nodes.length === 1 ? nodes[0]! : { type: "and", children: nodes };
+  }
+  parseUnary(): DatabankFilterNode {
+    this.skipWs();
+    if (this.consumeKeyword("NOT")) return { type: "not", child: this.parseUnary() };
+    if (this.consumeChar("(")) {
+      const inner = this.parseOr();
+      this.skipWs();
+      if (!this.consumeChar(")")) throw new Error("expected `)`");
+      return inner;
+    }
+    return this.parseCompare();
+  }
+  parseCompare(): DatabankFilterNode {
+    this.skipWs();
+    const column = this.parseIdent();
+    canonicalizeFilterColumn(column);
+    this.skipWs();
+    const op = this.parseOp();
+    this.skipWs();
+    const value = this.parseValue();
+    return { type: "cmp", column, op, value };
+  }
+  parseIdent(): string {
+    const start = this.pos;
+    if (this.done() || !/[A-Za-z_#]/.test(this.chars[this.pos]!)) throw new Error("expected column name");
+    this.pos += 1;
+    while (!this.done() && /[A-Za-z0-9_#% ]/.test(this.chars[this.pos]!)) this.pos += 1;
+    return this.chars.slice(start, this.pos).join("").trim();
+  }
+  parseOp(): string {
+    for (const token of [">=", "<=", "!=", "==", "=", ">", "<"]) {
+      if (this.consumeStr(token)) return token;
+    }
+    throw new Error("expected comparison operator");
+  }
+  parseValue(): number | string | boolean | null {
+    this.skipWs();
+    if (this.done()) throw new Error("expected value");
+    const ch = this.chars[this.pos]!;
+    if (ch === "'" || ch === '"') return this.parseString(ch);
+    if (this.consumeKeyword("TRUE")) return true;
+    if (this.consumeKeyword("FALSE")) return false;
+    if (this.consumeKeyword("NULL")) return null;
+    if (/[<>=!]/.test(ch)) throw new Error("unexpected comparison operator");
+    const start = this.pos;
+    if (ch === "-" || ch === "+") this.pos += 1;
+    let saw = false;
+    while (!this.done() && /[0-9.]/.test(this.chars[this.pos]!)) { saw = true; this.pos += 1; }
+    if (!saw) throw new Error("expected number or string");
+    return Number(this.chars.slice(start, this.pos).join(""));
+  }
+  parseString(quote: string): string {
+    this.pos += 1;
+    const start = this.pos;
+    while (!this.done() && this.chars[this.pos] !== quote) this.pos += 1;
+    if (this.done()) throw new Error("unterminated string");
+    const text = this.chars.slice(start, this.pos).join("");
+    this.pos += 1;
+    return text;
+  }
+  consumeKeyword(keyword: string): boolean {
+    this.skipWs();
+    const end = this.pos + keyword.length;
+    const slice = this.chars.slice(this.pos, end).join("");
+    if (slice.toUpperCase() !== keyword) return false;
+    const next = this.chars[end];
+    if (next && /[A-Za-z0-9_]/.test(next)) return false;
+    this.pos = end;
+    return true;
+  }
+  consumeStr(token: string): boolean {
+    const end = this.pos + token.length;
+    if (this.chars.slice(this.pos, end).join("") !== token) return false;
+    this.pos = end;
+    return true;
+  }
+  consumeChar(ch: string): boolean {
+    if (this.chars[this.pos] !== ch) return false;
+    this.pos += 1;
+    return true;
+  }
 }
 
 function compareDescending(
@@ -158,7 +495,7 @@ export function entryWindowError(
 
 type EntryOrderToggles = Pick<
   DiscoverRequest,
-  "allowMarketEntries" | "allowStopEntries" | "allowLimitEntries"
+  "allowMarketEntries" | "allowStopEntries" | "allowLimitEntries" | "allowStopLimitEntries"
 >;
 
 function enabledEntryOrders(request: EntryOrderToggles): string[] {
@@ -166,6 +503,7 @@ function enabledEntryOrders(request: EntryOrderToggles): string[] {
     (request.allowMarketEntries ?? true) ? "market" : null,
     request.allowStopEntries ? "stop" : null,
     request.allowLimitEntries ? "limit" : null,
+    request.allowStopLimitEntries ? "stop_limit" : null,
   ].filter((value): value is string => value !== null);
 }
 
@@ -185,7 +523,7 @@ export function entryOrderSummary(request: EntryOrderToggles): string {
 
 export function entryOrderError(request: EntryOrderToggles): string | null {
   if (enabledEntryOrders(request).length === 0) {
-    return "Enable at least one entry order type: market, stop or limit.";
+    return "Enable at least one entry order type: market, stop, limit or stop-limit.";
   }
   return null;
 }

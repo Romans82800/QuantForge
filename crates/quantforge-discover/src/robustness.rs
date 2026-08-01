@@ -6,7 +6,9 @@ use quantforge_core::FloatPolicy;
 use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
-use quantforge_quality::{monte_carlo_trade_resampling_with_skip, perturb_strategy_parameters};
+use quantforge_quality::{
+    monte_carlo_trade_resampling_with_skip, perturb_strategy_parameters_with_probability,
+};
 
 use crate::model::{
     M1RetentionEvidence, ParameterNeighborhoodEvidence, ParameterNeighborhoodSample,
@@ -46,6 +48,8 @@ pub struct RobustnessConfig {
     pub minimum_passing_fold_fraction: f64,
     pub minimum_neighborhood_survival_fraction: f64,
     pub parameter_perturbation_fraction: f64,
+    /// SQX-style probability that each eligible parameter group is changed.
+    pub parameter_change_probability: f64,
     /// Search-profile bounds used by the dedicated ADX plateau check.
     pub adx_period_min: u16,
     pub adx_period_max: u16,
@@ -206,9 +210,10 @@ pub fn run_m1_predeposit_robustness(
     let mut evaluated_samples = 0usize;
     let mut neighborhood_samples = Vec::with_capacity(config.neighborhood_samples);
     for sample in 0..config.neighborhood_samples {
-        let Ok(neighbor) = perturb_strategy_parameters(
+        let Ok(neighbor) = perturb_strategy_parameters_with_probability(
             strategy,
             config.parameter_perturbation_fraction,
+            config.parameter_change_probability,
             sample,
             config.seed,
         ) else {
@@ -276,6 +281,7 @@ pub fn run_m1_predeposit_robustness(
             monte_carlo: mc,
             parameter_neighborhood: ParameterNeighborhoodEvidence {
                 perturbation_fraction: config.parameter_perturbation_fraction,
+                change_probability: config.parameter_change_probability,
                 samples_requested: config.neighborhood_samples,
                 samples_evaluated: evaluated_samples,
                 surviving_samples: surviving,

@@ -249,6 +249,7 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
                 commission_per_lot_round_turn: request.commission_per_lot_round_turn,
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
+                fill_simulation: Default::default(),
             },
             indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
             entry_window: crate::discover::entry_window(
@@ -257,6 +258,9 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
             ),
             // Challenge reports its metrics, so it must always replay in full.
             abandon_above_drawdown_percent: None,
+            position_accounting: Default::default(),
+            max_open_positions: 1,
+        enable_tick_file_replay: false,
         },
         folds: request.folds,
         monte_carlo_trials: request.monte_carlo_trials,

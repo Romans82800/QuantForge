@@ -8,6 +8,7 @@ export type WorkspaceName =
   | "Vault"
   | "Data Lab"
   | "Parity Lab"
+  | "Optimizer"
   | "Portfolio"
   | "Deploy";
 
@@ -58,6 +59,8 @@ export interface SymbolPack {
 export interface PartitionEquityPoint {
   timestampMs: number;
   equity: number;
+  balance: number;
+  drawdownPercent: number;
 }
 
 export interface PartitionEquityView {
@@ -100,7 +103,12 @@ export interface TradeRowView {
   exitTimestampMs: number;
   entryPrice: number;
   exitPrice: number;
+  volume: number;
   netProfit: number;
+  commission: number;
+  swap: number;
+  barsHeld: number;
+  rMultiple: number | null;
   exitReason: string;
 }
 
@@ -125,6 +133,9 @@ export interface EliteRow {
   strategyId: string;
   entryConditions: number;
   exitConditions: number;
+  islandId: number;
+  entryOrder: string;
+  management: string;
   evidence: number;
   novelty: number;
   trades: number;
@@ -178,6 +189,7 @@ export interface DatabankWorkspace {
   allowMarketEntries: boolean;
   allowStopEntries: boolean;
   allowLimitEntries: boolean;
+  allowStopLimitEntries: boolean;
   maxOneEntryPerDay: boolean;
   validationFraction: number;
   sealedFraction: number;
@@ -397,7 +409,7 @@ export interface UniversalGrammarConfig {
   maximumShift: number;
 }
 
-export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest";
+export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest" | "mass_builder";
 
 export interface ConditionBakeoffRow {
   entryConditions: number;
@@ -458,6 +470,12 @@ export interface DiscoverRequest {
   runMode: DiscoverRunModeId | null;
   earlyStopPotElites: number | null;
   targetDatabankElites: number | null;
+  enableCheapPrefilter: boolean | null;
+  prefilterBarFraction: number | null;
+  islandCount: number | null;
+  migrationInterval: number | null;
+  migrationElites: number | null;
+  complexM1IslandCount: number | null;
   searchRanges: SearchRangeProfile | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
@@ -479,6 +497,7 @@ export interface DiscoverRequest {
   allowMarketEntries: boolean | null;
   allowStopEntries: boolean | null;
   allowLimitEntries: boolean | null;
+  allowStopLimitEntries: boolean | null;
   flattenAt22: boolean | null;
   endOfDayHour: number | null;
   entryWindowStartHour: number | null;
@@ -492,6 +511,7 @@ export interface DiscoverRequest {
   robustnessMonteCarloTrials: number | null;
   robustnessNeighborhoodSamples: number | null;
   robustnessPerturbationFraction: number | null;
+  robustnessParameterChangeProbability: number | null;
   minimumNeighborhoodSurvivalFraction: number | null;
   calendarYearFolds: boolean | null;
   minimumDeflatedTradeSharpe: number | null;
@@ -627,6 +647,8 @@ export interface DiscoverJobView {
   rejectedCorrelated: number;
   rejectedNicheNotImproved: number;
   rejectedEvaluation: number;
+  rejectedPrefilter: number;
+  islandMigrations: number;
   rejectedTotal: number;
   evaluationsPerHour: number;
   acceptsPerHour: number;
@@ -661,6 +683,93 @@ export interface ChallengeRequest {
   monteCarloTrials: number;
   neighborhoodSamples: number;
   seed: number;
+}
+
+export interface TaskRunRequest {
+  graphPath: string;
+  workDir: string;
+  dryRun: boolean;
+  stopOnFailure: boolean;
+}
+
+export interface TaskStepView {
+  id: string;
+  kind: string;
+  status: string;
+  message: string;
+  artifacts: Record<string, string>;
+}
+
+export interface TaskRunView {
+  passed: boolean;
+  protocol: string;
+  graphName: string;
+  graphPath: string;
+  workDir: string;
+  dryRun: boolean;
+  reportPath: string;
+  steps: TaskStepView[];
+  passedCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
+export interface MultiSymbolMatrixRequest {
+  strategyPath: string;
+  packDir: string;
+  symbols: string[];
+  sourceTimezone: string | null;
+  initialBalance: number;
+  commissionPerLotRoundTurn: number;
+  requiredPass: number;
+  minimumNetProfit: number;
+  outputPath: string;
+}
+
+export interface MultiSymbolMatrixRowView {
+  symbol: string;
+  passed: boolean;
+  tradeCount: number;
+  returnPercent: number;
+  profitFactor: number | null;
+  maxDrawdownPercent: number;
+  netProfit: number;
+  winRate: number;
+  expectancy: number;
+}
+
+export interface PairwiseCorrelationView {
+  left: string;
+  right: string;
+  correlation: number;
+}
+
+export interface MultiSymbolMatrixView {
+  passed: boolean;
+  strategyId: string;
+  outputPath: string;
+  passingCount: number;
+  requiredPass: number;
+  symbolCount: number;
+  meanReturnPercent: number;
+  meanNetProfit: number;
+  maximumPairwiseCorrelation: number;
+  rows: MultiSymbolMatrixRowView[];
+  pairwise: PairwiseCorrelationView[];
+}
+
+export interface ExportResultsPackRequest {
+  inputPath: string;
+  title: string;
+  outputDirectory: string;
+}
+
+export interface ExportResultsPackView {
+  directory: string;
+  htmlPath: string;
+  tradesCsvPath: string;
+  metricsJsonPath: string;
+  pdfPath: string;
 }
 
 export interface ChallengeItemView {
@@ -705,6 +814,90 @@ export interface ChallengeView {
   passedCount: number;
   failedCount: number;
   totalCount: number;
+}
+
+export interface OptimizerRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  strategyPath: string;
+  brokerPath: string;
+  outputPath: string;
+  neighborhoodSamples: number;
+  perturbationFraction: number;
+  seed: number;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
+}
+
+export interface OptimizerNeighborView {
+  sample: number;
+  strategyFingerprint: string;
+  returnPercent: number;
+  profitFactor: number | null;
+  maximumDrawdownPercent: number;
+  tradeCount: number;
+  returnRatio: number | null;
+  drawdownRatio: number;
+  passed: boolean;
+}
+
+export interface OptimizerView {
+  outputPath: string;
+  baselineReturnPercent: number;
+  baselineProfitFactor: number | null;
+  baselineDrawdownPercent: number;
+  baselineTrades: number;
+  neighbors: OptimizerNeighborView[];
+  passedCount: number;
+  totalCount: number;
+  survivalFraction: number;
+}
+
+export interface WalkForwardMatrixRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  strategyPath: string;
+  brokerPath: string;
+  outputPath: string;
+  foldCounts: number[];
+  lookbackBars: number[];
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  initialBalance: number;
+  entryWindowStartHour: number | null;
+  entryWindowEndHour: number | null;
+  minimumFoldTrades: number;
+  minimumReturnPercent: number;
+  minimumProfitFactor: number;
+  maximumDrawdownPercent: number;
+  minimumPassingFoldFraction: number;
+}
+
+export interface WalkForwardMatrixCellView {
+  foldCount: number;
+  lookbackBars: number;
+  totalFolds: number;
+  passingFolds: number;
+  passingFraction: number;
+  passed: boolean;
+  meanReturnPercent: number;
+  meanProfitFactor: number;
+  meanMaxDrawdownPercent: number;
+}
+
+export interface WalkForwardMatrixView {
+  outputPath: string;
+  protocol: string;
+  foldCounts: number[];
+  lookbackBars: number[];
+  cells: WalkForwardMatrixCellView[];
+  bestCellIndex: number | null;
+  passingCells: number;
 }
 
 export interface SealedRequest {

@@ -1,0 +1,20 @@
+property,value
+strategy_fingerprint,b5fba5a9d21753a87c3c17da21a08550fd74b62dd3f783881db2b94ecc208e56
+broker_spec_hash,811c32cb57af1fd5a1e2552a9b6a26c6c8cc5ff910d74c0fae7fc6c4729711c7
+terminal_build,5975
+broker,Raw Trading Ltd
+server,ICMarketsSC-Demo
+symbol,GBPUSD
+timeframe,PERIOD_H1
+magic,42424242
+deviation_points,10
+max_spread_points,0.0
+estimated_slippage_points_per_side,0.0
+commission_per_lot_round_turn,7.0
+risk_budget,500.0
+initial_deposit,100000.0
+account_currency,USD
+broker_timezone,ICMarkets/EST+7
+server_utc_offset_seconds_at_export,0
+started_server_time,2024.01.01 00:00:00
+finished_server_time,2024.01.31 23:58:59

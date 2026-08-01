@@ -9,8 +9,8 @@ use crate::model::{
     ScoutTelemetry, Trade,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
-use chrono::Timelike;
-use quantforge_broker::{BrokerClock, SwapMode, SymbolSpecification, TradeMode};
+use chrono::{Datelike, Timelike, Weekday};
+use quantforge_broker::{BrokerClock, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{Bar, BarDataset};
 use quantforge_ir::{
@@ -52,6 +52,7 @@ struct OpenPosition {
 enum PendingKind {
     Stop,
     Limit,
+    StopLimit,
 }
 
 #[derive(Debug)]
@@ -59,7 +60,12 @@ struct PendingOrder {
     side: PositionSide,
     kind: PendingKind,
     expiry_index: usize,
+    /// Stop/Limit fill level, or StopLimit stop-trigger price.
     activation_price: f64,
+    /// StopLimit limit price once the stop trigger is hit.
+    limit_price: Option<f64>,
+    /// StopLimit: whether the stop trigger has already fired.
+    stop_triggered: bool,
     stop_loss: f64,
     take_profit: f64,
     stop_distance: f64,
@@ -78,7 +84,7 @@ pub fn evaluate_strategy(
     broker: &SymbolSpecification,
     config: &ScoutConfig,
 ) -> Result<ScoutResult, EvalError> {
-    evaluate_strategy_inner(strategy, dataset, broker, config, None, None)
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, None, None)
 }
 
 /// Same as [`evaluate_strategy`], reusing indicator buffers across candidates.
@@ -93,7 +99,7 @@ pub fn evaluate_strategy_cached(
     config: &ScoutConfig,
     cache: &IndicatorBufferCache,
 ) -> Result<ScoutResult, EvalError> {
-    evaluate_strategy_inner(strategy, dataset, broker, config, None, Some(cache))
+    evaluate_strategy_inner(strategy, dataset, broker, config, None, Some(cache), None)
 }
 
 /// Evaluates a strategy with all earlier bars available as indicator warm-up,
@@ -124,6 +130,27 @@ pub fn evaluate_strategy_from(
         config,
         Some(entry_start_timestamp_ms),
         None,
+        None,
+    )
+}
+
+/// Like [`evaluate_strategy`], optionally walking a tick file for same-bar
+/// protective collisions when [`ScoutConfig::enable_tick_file_replay`] is set.
+pub fn evaluate_strategy_with_ticks(
+    strategy: &StrategyIr,
+    dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &ScoutConfig,
+    ticks: &crate::TickDataset,
+) -> Result<ScoutResult, EvalError> {
+    evaluate_strategy_inner(
+        strategy,
+        dataset,
+        broker,
+        config,
+        None,
+        None,
+        Some(ticks),
     )
 }
 
@@ -134,6 +161,7 @@ fn evaluate_strategy_inner(
     config: &ScoutConfig,
     entry_start_timestamp_ms: Option<i64>,
     indicator_cache: Option<&IndicatorBufferCache>,
+    ticks: Option<&crate::TickDataset>,
 ) -> Result<ScoutResult, EvalError> {
     if dataset.bars.len() < 2 {
         return Err(EvalError::InsufficientBars);
@@ -141,14 +169,6 @@ fn evaluate_strategy_inner(
     broker.validate()?;
     config.validate()?;
     strategy.validate_export_safe(IrLimits::default())?;
-    if matches!(
-        broker.swap_mode,
-        SwapMode::ReopenCurrent | SwapMode::ReopenBid
-    ) {
-        return Err(EvalError::UnsupportedBrokerFeature(
-            "reopen-price swap modes",
-        ));
-    }
     match (broker.trade_mode, strategy.side) {
         (TradeMode::Disabled | TradeMode::CloseOnly, _)
         | (TradeMode::LongOnly, quantforge_ir::Side::ShortOnly | quantforge_ir::Side::Both)
@@ -176,7 +196,7 @@ fn evaluate_strategy_inner(
         indicator_cache,
     )?;
     let mut balance = config.initial_balance;
-    let mut position: Option<OpenPosition> = None;
+    let mut positions: Vec<OpenPosition> = Vec::new();
     let mut pending: Option<PendingOrder> = None;
     let mut trades = Vec::new();
     let mut equity = Vec::with_capacity(bars.len() - 1);
@@ -185,7 +205,13 @@ fn evaluate_strategy_inner(
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
-    let mut signal_taken_today = false;
+    let mut entries_today: u16 = 0;
+    let mut loss_streak: u8 = 0;
+    let stack_mode = matches!(
+        config.position_accounting,
+        crate::PositionAccounting::HedgedStack
+    );
+    let tick_replay = config.enable_tick_file_replay && ticks.is_some_and(|t| !t.is_empty());
 
     for (index, bar) in bars.iter().enumerate().skip(1) {
         let spread = resolve_spread(bar, broker, &config.costs)?;
@@ -205,19 +231,35 @@ fn evaluate_strategy_inner(
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
             active_entry_day = Some(day_key);
-            signal_taken_today = false;
+            entries_today = 0;
         }
         let mut closed_this_bar = false;
         let mut opened_this_bar = false;
+        let mut opened_slot: Option<usize> = None;
+        let tick_window = if tick_replay {
+            ticks.map(|dataset| {
+                crate::ticks_in_bar_window(dataset, previous_bar, bar)
+            })
+        } else {
+            None
+        };
 
-        if strategy.manage.flatten_end_of_day && in_close_blackout {
+        let weekday = current_local.weekday();
+        let friday_flatten = strategy.manage.exit_on_friday
+            && weekday == Weekday::Fri
+            && current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let session_flatten = (strategy.manage.flatten_end_of_day && in_close_blackout)
+            || friday_flatten;
+
+        if session_flatten {
             // The 22:00 broker-time bar is reserved for flatten/cancellation.
             // The entry gate below keeps the strategy flat through 23:59.
+            // Friday exit uses the same end_of_day_hour when exit_on_friday is set.
             closed_this_bar = true;
             if pending.take().is_some() {
                 telemetry.pending_orders_expired += 1;
             }
-            if let Some(open) = position.take() {
+            while let Some(open) = positions.pop() {
                 let event = ExitEvent {
                     base_price: market_exit_base(open.side, bar.open, spread_price),
                     reason: ExitReason::EndOfDay,
@@ -231,8 +273,12 @@ fn evaluate_strategy_inner(
                     config,
                     &mut balance,
                     &mut trades,
+                &mut loss_streak,
                 );
                 telemetry.end_of_day_flattens += 1;
+                if friday_flatten {
+                    telemetry.friday_exits += 1;
+                }
             }
         } else if !in_entry_window {
             // Hard session: cancel unfilled pending outside [02:00, 19:00).
@@ -241,97 +287,125 @@ fn evaluate_strategy_inner(
             }
         }
 
-        if !closed_this_bar && let Some(open) = position.as_mut() {
-            let accrual = accrue_swap(
-                open.side,
-                open.volume,
-                open.entry_price,
-                bar.open,
-                bars[index - 1].timestamp_ms,
-                bar.timestamp_ms,
-                broker,
-            )?;
-            open.swap += accrual.cash;
-            balance += accrual.cash;
-            telemetry.swap_rollover_events += accrual.rollover_events;
-            telemetry.swap_effective_days += accrual.effective_days;
-        }
-
-        if !closed_this_bar && let Some(open) = position.as_mut() {
-            apply_completed_bar_management(
-                open,
-                &strategy,
-                previous_bar,
-                previous_spread_price,
-                index,
-                bar,
-                spread_price,
-                broker,
-                config,
-                &mut features,
-                &mut balance,
-                &mut telemetry,
-            )?;
-            if open.volume <= 1.0e-12 {
-                let open = position.take().expect("managed position exists");
-                let side = open.side;
-                close_position(
-                    open,
-                    ExitEvent {
-                        base_price: market_exit_base(side, bar.open, spread_price),
-                        reason: ExitReason::PartialExit,
-                    },
-                    index,
+        if !closed_this_bar {
+            for open in positions.iter_mut() {
+                let accrual = accrue_swap(
+                    open.side,
+                    open.volume,
+                    open.entry_price,
+                    bar.open,
+                    bars[index - 1].timestamp_ms,
                     bar.timestamp_ms,
                     broker,
-                    config,
-                    &mut balance,
-                    &mut trades,
-                );
-                closed_this_bar = true;
+                )?;
+                open.swap += accrual.cash;
+                balance += accrual.cash;
+                telemetry.swap_rollover_events += accrual.rollover_events;
+                telemetry.swap_effective_days += accrual.effective_days;
             }
         }
 
-        if !closed_this_bar && let Some(open) = position.as_ref() {
-            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker)
-            {
-                Some(event)
-            } else if let Some(exit) = match open.side {
-                PositionSide::Long => strategy.long_exit(),
-                PositionSide::Short => strategy.short_exit(),
-            }
-                && features.evaluate_bool(exit, index)?
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(open.side, bar.open, spread_price),
-                    reason: ExitReason::Indicator,
-                })
-            } else if strategy
-                .manage
-                .time_stop_bars
-                .is_some_and(|limit| index - open.entry_index >= limit as usize)
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(open.side, bar.open, spread_price),
-                    reason: ExitReason::TimeStop,
-                })
-            } else {
-                protective_intrabar_exit(open, bar, spread_price, broker)
-            };
-
-            if let Some(event) = event {
-                let open = position.take().expect("position was checked above");
-                close_position(
-                    open,
-                    event,
+        if !closed_this_bar {
+            let mut i = 0;
+            while i < positions.len() {
+                apply_completed_bar_management(
+                    &mut positions[i],
+                    &strategy,
+                    previous_bar,
+                    previous_spread_price,
                     index,
-                    bar.timestamp_ms,
+                    bar,
+                    spread_price,
                     broker,
                     config,
+                    &mut features,
                     &mut balance,
-                    &mut trades,
-                );
-                closed_this_bar = true;
+                    &mut telemetry,
+                )?;
+                if positions[i].volume <= 1.0e-12 {
+                    let open = positions.remove(i);
+                    let side = open.side;
+                    close_position(
+                        open,
+                        ExitEvent {
+                            base_price: market_exit_base(side, bar.open, spread_price),
+                            reason: ExitReason::PartialExit,
+                        },
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    &mut loss_streak,
+                    );
+                    if !stack_mode {
+                        closed_this_bar = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if !closed_this_bar {
+            let mut i = 0;
+            while i < positions.len() {
+                let open = &positions[i];
+                let event = if let Some(event) =
+                    protective_gap_exit(open, bar, spread_price, broker)
+                {
+                    Some(event)
+                } else if let Some(exit) = match open.side {
+                    PositionSide::Long => strategy.long_exit(),
+                    PositionSide::Short => strategy.short_exit(),
+                } && features.evaluate_bool(exit, index)?
+                {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::Indicator,
+                    })
+                } else if strategy
+                    .manage
+                    .time_stop_bars
+                    .is_some_and(|limit| index - open.entry_index >= limit as usize)
+                {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::TimeStop,
+                    })
+                } else {
+                    protective_intrabar_exit(
+                        open,
+                        bar,
+                        spread_price,
+                        broker,
+                        config.same_bar_policy,
+                        tick_window,
+                    )
+                };
+
+                if let Some(event) = event {
+                    let open = positions.remove(i);
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    &mut loss_streak,
+                    );
+                    if !stack_mode {
+                        closed_this_bar = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
             }
         }
 
@@ -343,10 +417,149 @@ fn evaluate_strategy_inner(
             telemetry.pending_orders_expired += 1;
         }
 
-        if position.is_none()
-            && pending.is_none()
+        // OCO-lite / re-entry: cancel a working pending before the place gate.
+        // Pending is managed even while stacked positions are open.
+        if pending.is_some()
             && !closed_this_bar
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && !(strategy.manage.exit_on_friday
+                && current_local.weekday() == Weekday::Fri
+                && current_local.hour() >= strategy.manage.end_of_day_hour as u32)
+            && index >= signal_warmup_bars
+            && (strategy.manage.cancel_pending_on_opposite
+                || strategy.manage.replace_pending_on_reentry
+                || strategy.manage.modify_pending_on_reentry)
+        {
+            let mut filters_pass = true;
+            for filter in &strategy.filters {
+                if !features.evaluate_bool(filter, index)? {
+                    filters_pass = false;
+                    break;
+                }
+            }
+            if filters_pass {
+                let long_signal = strategy
+                    .entry
+                    .long
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let short_signal = strategy
+                    .entry
+                    .short
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let pending_side = pending.as_ref().map(|order| order.side);
+                match (pending_side, long_signal, short_signal) {
+                    (Some(PositionSide::Long), false, true)
+                    | (Some(PositionSide::Short), true, false)
+                        if strategy.manage.cancel_pending_on_opposite =>
+                    {
+                        pending = None;
+                        telemetry.pending_orders_cancelled_opposite += 1;
+                    }
+                    (Some(PositionSide::Long), true, false)
+                    | (Some(PositionSide::Short), false, true)
+                        if strategy.manage.modify_pending_on_reentry =>
+                    {
+                        if let Some(order) = pending.as_mut() {
+                            if modify_pending_order(
+                                order,
+                                index,
+                                bar,
+                                spread_price,
+                                balance,
+                                &strategy,
+                                broker,
+                                config,
+                                &mut features,
+                                &mut telemetry,
+                            )? {
+                                telemetry.pending_orders_modified += 1;
+                            }
+                        }
+                    }
+                    (Some(PositionSide::Long), true, false)
+                    | (Some(PositionSide::Short), false, true)
+                        if strategy.manage.replace_pending_on_reentry =>
+                    {
+                        pending = None;
+                        telemetry.pending_orders_replaced += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Netting pre-pass: close on opposite signal so the entry gate below can open.
+        if matches!(
+            config.position_accounting,
+            crate::PositionAccounting::Netting
+        ) && positions.len() == 1
+            && pending.is_none()
+            && !closed_this_bar
+            && index >= signal_warmup_bars
+        {
+            let mut filters_pass = true;
+            for filter in &strategy.filters {
+                if !features.evaluate_bool(filter, index)? {
+                    filters_pass = false;
+                    break;
+                }
+            }
+            if filters_pass {
+                let long_signal = strategy
+                    .entry
+                    .long
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let short_signal = strategy
+                    .entry
+                    .short
+                    .as_ref()
+                    .map(|entry| features.evaluate_bool(entry, index))
+                    .transpose()?
+                    .unwrap_or(false);
+                let open_side = positions.first().map(|open| open.side);
+                let opposite = match (open_side, long_signal, short_signal) {
+                    (Some(PositionSide::Long), false, true)
+                    | (Some(PositionSide::Short), true, false) => true,
+                    _ => false,
+                };
+                if opposite
+                    && in_entry_window
+                    && broker.is_trading_at(bar.timestamp_ms)?
+                {
+                    let open = positions.pop().expect("checked");
+                    let event = ExitEvent {
+                        base_price: market_exit_base(open.side, bar.open, spread_price),
+                        reason: ExitReason::Indicator,
+                    };
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    &mut loss_streak,
+                    );
+                    telemetry.netting_closes += 1;
+                }
+            }
+        }
+
+        if crate::position_book::can_open_another(positions.len(), config)
+            && pending.is_none()
+            && !closed_this_bar
+            && !session_flatten
             && index >= signal_warmup_bars
             && entry_start_timestamp_ms.is_none_or(|start| bar.timestamp_ms >= start)
         {
@@ -384,8 +597,17 @@ fn evaluate_strategy_inner(
                 };
 
                 if let Some(side) = side {
+                    let day_cap = if strategy.manage.max_one_entry_per_day {
+                        Some(1u16)
+                    } else {
+                        strategy.manage.max_trades_per_day
+                    };
+                    let weekend_block = strategy.manage.dont_trade_on_weekends
+                        && matches!(weekday, Weekday::Sat | Weekday::Sun);
                     if !broker.is_trading_at(bar.timestamp_ms)? {
                         telemetry.skipped_outside_session += 1;
+                    } else if weekend_block {
+                        telemetry.skipped_weekend_entries += 1;
                     } else if !in_entry_window {
                         telemetry.skipped_outside_entry_window += 1;
                     } else if config
@@ -394,7 +616,7 @@ fn evaluate_strategy_inner(
                         .is_some_and(|maximum| spread.points > maximum)
                     {
                         telemetry.skipped_for_spread += 1;
-                    } else if strategy.manage.max_one_entry_per_day && signal_taken_today {
+                    } else if day_cap.is_some_and(|cap| entries_today >= cap) {
                         telemetry.skipped_max_one_entry_per_day += 1;
                     } else {
                         match &strategy.entry.order {
@@ -410,14 +632,19 @@ fn evaluate_strategy_inner(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                loss_streak,
                                 )? {
                                     balance -= open.entry_commission;
-                                    position = Some(open);
+                                    positions.push(open);
                                     opened_this_bar = true;
-                                    signal_taken_today = true;
+                                    opened_slot = Some(positions.len() - 1);
+                                    entries_today = entries_today.saturating_add(1);
+                                    telemetry.stacked_opens += usize::from(positions.len() > 1);
                                 }
                             }
-                            EntryOrderPolicy::Stop { .. } | EntryOrderPolicy::Limit { .. } => {
+                            EntryOrderPolicy::Stop { .. }
+                            | EntryOrderPolicy::Limit { .. }
+                            | EntryOrderPolicy::StopLimit { .. } => {
                                 if let Some(order) = place_pending_order(
                                     side,
                                     index,
@@ -429,6 +656,7 @@ fn evaluate_strategy_inner(
                                     config,
                                     &mut features,
                                     &mut telemetry,
+                                loss_streak,
                                 )? {
                                     pending = Some(order);
                                     telemetry.pending_orders_placed += 1;
@@ -440,12 +668,12 @@ fn evaluate_strategy_inner(
             }
         }
 
-        if position.is_none()
+        if crate::position_book::can_open_another(positions.len(), config)
             && !closed_this_bar
             && in_entry_window
             && let Some(fill_price) = pending
-                .as_ref()
-                .and_then(|order| pending_fill_price(order, bar, spread_price))
+                .as_mut()
+                .and_then(|order| advance_pending_order(order, bar, spread_price))
         {
             let order = pending.take().expect("pending order was checked");
             let open = fill_pending_order(
@@ -458,10 +686,12 @@ fn evaluate_strategy_inner(
                 config,
             );
             balance -= open.entry_commission;
-            position = Some(open);
+            positions.push(open);
             telemetry.pending_orders_filled += 1;
             opened_this_bar = true;
-            signal_taken_today = true;
+            opened_slot = Some(positions.len() - 1);
+            entries_today = entries_today.saturating_add(1);
+            telemetry.stacked_opens += usize::from(positions.len() > 1);
         }
 
         // MetaTrader 5 hedged model: an attached stop/target is live from the fill,
@@ -471,27 +701,39 @@ fn evaluate_strategy_inner(
         // These trades open and close on one bar, so `ambiguous_trade_fraction` counts
         // them and dismisses strategies that lean on the assumption.
         if opened_this_bar {
-            let event = position
-                .as_ref()
-                .and_then(|open| protective_intrabar_exit(open, bar, spread_price, broker));
-            if let Some(event) = event {
-                let open = position.take().expect("position was just opened");
-                close_position(
-                    open,
-                    event,
-                    index,
-                    bar.timestamp_ms,
-                    broker,
-                    config,
-                    &mut balance,
-                    &mut trades,
-                );
+            if let Some(slot) = opened_slot {
+                let event = positions.get(slot).and_then(|open| {
+                    protective_intrabar_exit(
+                        open,
+                        bar,
+                        spread_price,
+                        broker,
+                        config.same_bar_policy,
+                        tick_window,
+                    )
+                });
+                if let Some(event) = event {
+                    let open = positions.remove(slot);
+                    close_position(
+                        open,
+                        event,
+                        index,
+                        bar.timestamp_ms,
+                        broker,
+                        config,
+                        &mut balance,
+                        &mut trades,
+                    &mut loss_streak,
+                    );
+                }
             }
         }
 
-        let marked_equity = position.as_ref().map_or(balance, |open| {
-            liquidation_equity(open, bar, spread_price, balance, broker, config)
-        });
+        let mut marked_equity = balance;
+        for open in &positions {
+            marked_equity =
+                liquidation_equity(open, bar, spread_price, marked_equity, broker, config);
+        }
         equity.push(EquityPoint {
             timestamp_ms: bar.timestamp_ms,
             balance,
@@ -507,7 +749,7 @@ fn evaluate_strategy_inner(
         }
     }
 
-    if let Some(open) = position.take() {
+    while let Some(open) = positions.pop() {
         // Equity gains one point per replayed bar starting at index 1, so this is
         // the last bar reached — the final bar normally, earlier when abandoned.
         let final_index = equity.len().min(bars.len() - 1);
@@ -526,6 +768,7 @@ fn evaluate_strategy_inner(
             config,
             &mut balance,
             &mut trades,
+        &mut loss_streak,
         );
         if let Some(last) = equity.last_mut() {
             last.balance = balance;
@@ -554,6 +797,7 @@ fn open_position(
     config: &ScoutConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut ScoutTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<OpenPosition>, EvalError> {
     let Some(stop_distance) = stop_distance(strategy, index, broker, features)? else {
         return Ok(None);
@@ -568,10 +812,6 @@ fn open_position(
         return Ok(None);
     }
 
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -580,13 +820,51 @@ fn open_position(
     } else {
         0.0
     };
-    let raw_volume = risk_budget / (price_risk_per_lot + cost_risk_per_lot);
-    let Some(volume) = normalize_volume(raw_volume, broker) else {
+    let Some(mut volume) = resolve_entry_volume(
+        strategy,
+        balance,
+        price_risk_per_lot,
+        cost_risk_per_lot,
+        loss_streak,
+        broker,
+        index,
+        features,
+    )?
+    else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
 
-    let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
+    let fill = &config.costs.fill_simulation;
+    // Deterministic requote: hash bar timestamp into [0,1).
+    let requote_roll = {
+        let mut hash = bar.timestamp_ms.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64) as u64;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        (hash as f64) / (u64::MAX as f64)
+    };
+    let mut slippage = config.costs.adverse_slippage_points_per_side * broker.point;
+    if fill.requote_probability > 0.0 && requote_roll < fill.requote_probability {
+        telemetry.entry_requotes += 1;
+        if fill.requote_rejects {
+            telemetry.entry_requote_rejects += 1;
+            return Ok(None);
+        }
+        slippage += fill.requote_extra_slippage_points * broker.point;
+    }
+    if fill.fill_volume_fraction < 1.0 - f64::EPSILON {
+        let scaled = volume * fill.fill_volume_fraction;
+        let Some(partial) = normalize_volume(scaled, broker) else {
+            telemetry.skipped_below_minimum_volume += 1;
+            return Ok(None);
+        };
+        if (partial - volume).abs() > f64::EPSILON {
+            telemetry.partial_entry_fills += 1;
+        }
+        volume = partial;
+    }
+
     // Match MT5 NormalizeDouble on entry/SL/TP before risk geometry locks in.
     let intended_entry_price = normalize_price(
         match side {
@@ -653,20 +931,40 @@ fn place_pending_order(
     config: &ScoutConfig,
     features: &mut FeatureCache<'_>,
     telemetry: &mut ScoutTelemetry,
+    loss_streak: u8,
 ) -> Result<Option<PendingOrder>, EvalError> {
-    let (kind, distance_policy, expiry_bars) = match &strategy.entry.order {
-        EntryOrderPolicy::Market => return Ok(None),
-        EntryOrderPolicy::Stop {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Stop, distance, *expiry_bars),
-        EntryOrderPolicy::Limit {
-            distance,
-            expiry_bars,
-        } => (PendingKind::Limit, distance, *expiry_bars),
-    };
-    let Some(entry_distance) = entry_distance(distance_policy, index, broker, features)? else {
+    let (kind, stop_distance_policy, limit_offset_policy, expiry_bars) =
+        match &strategy.entry.order {
+            EntryOrderPolicy::Market => return Ok(None),
+            EntryOrderPolicy::Stop {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Stop, distance, None, *expiry_bars),
+            EntryOrderPolicy::Limit {
+                distance,
+                expiry_bars,
+            } => (PendingKind::Limit, distance, None, *expiry_bars),
+            EntryOrderPolicy::StopLimit {
+                stop_distance,
+                limit_offset,
+                expiry_bars,
+            } => (
+                PendingKind::StopLimit,
+                stop_distance,
+                Some(limit_offset),
+                *expiry_bars,
+            ),
+        };
+    let Some(trigger_distance) = entry_distance(stop_distance_policy, index, broker, features)? else {
         return Ok(None);
+    };
+    let limit_offset = if let Some(policy) = limit_offset_policy {
+        let Some(offset) = entry_distance(policy, index, broker, features)? else {
+            return Ok(None);
+        };
+        Some(offset)
+    } else {
+        None
     };
     let Some(stop_distance) = stop_distance(strategy, index, broker, features)? else {
         return Ok(None);
@@ -676,9 +974,10 @@ fn place_pending_order(
         return Ok(None);
     };
     let minimum_distance = broker.stops_level_points as f64 * broker.point;
-    if entry_distance < minimum_distance
+    if trigger_distance < minimum_distance
         || stop_distance < minimum_distance
         || target_distance < minimum_distance
+        || limit_offset.is_some_and(|offset| offset < minimum_distance)
     {
         telemetry.skipped_for_broker_stop_level += 1;
         return Ok(None);
@@ -687,33 +986,46 @@ fn place_pending_order(
         PositionSide::Long => bar.open + spread_price,
         PositionSide::Short => bar.open,
     };
-    let activation_price = normalize_price(
-        match (side, kind) {
-            (PositionSide::Long, PendingKind::Stop) => reference + entry_distance,
-            (PositionSide::Short, PendingKind::Stop) => reference - entry_distance,
-            (PositionSide::Long, PendingKind::Limit) => reference - entry_distance,
-            (PositionSide::Short, PendingKind::Limit) => reference + entry_distance,
-        },
-        broker,
-    );
+    let (activation_price, limit_price) = match (side, kind, limit_offset) {
+        (PositionSide::Long, PendingKind::Stop, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Stop, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::Limit, _) => {
+            (normalize_price(reference - trigger_distance, broker), None)
+        }
+        (PositionSide::Short, PendingKind::Limit, _) => {
+            (normalize_price(reference + trigger_distance, broker), None)
+        }
+        (PositionSide::Long, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference + trigger_distance, broker);
+            let limit = normalize_price(stop - offset, broker);
+            (stop, Some(limit))
+        }
+        (PositionSide::Short, PendingKind::StopLimit, Some(offset)) => {
+            let stop = normalize_price(reference - trigger_distance, broker);
+            let limit = normalize_price(stop + offset, broker);
+            (stop, Some(limit))
+        }
+        (_, PendingKind::StopLimit, None) => return Ok(None),
+    };
+    let intended_entry = limit_price.unwrap_or(activation_price);
     let (stop_loss, take_profit) = match side {
         PositionSide::Long => (
-            normalize_price(activation_price - stop_distance, broker),
-            normalize_price(activation_price + target_distance, broker),
+            normalize_price(intended_entry - stop_distance, broker),
+            normalize_price(intended_entry + target_distance, broker),
         ),
         PositionSide::Short => (
-            normalize_price(activation_price + stop_distance, broker),
-            normalize_price(activation_price - target_distance, broker),
+            normalize_price(intended_entry + stop_distance, broker),
+            normalize_price(intended_entry - target_distance, broker),
         ),
     };
-    let normalized_stop_distance = (activation_price - stop_loss).abs();
+    let normalized_stop_distance = (intended_entry - stop_loss).abs();
     if normalized_stop_distance <= 0.0 {
         return Ok(None);
     }
-    let risk_budget = match strategy.risk {
-        RiskPolicy::FixedCurrency { amount } => amount,
-        RiskPolicy::PercentBalance { percent } => balance * percent / 100.0,
-    };
     let price_risk_per_lot = normalized_stop_distance / broker.tick_size * broker.tick_value;
     let cost_risk_per_lot = if config.costs.include_costs_in_risk {
         config.costs.commission_per_lot_round_turn
@@ -722,10 +1034,17 @@ fn place_pending_order(
     } else {
         0.0
     };
-    let Some(volume) = normalize_volume(
-        risk_budget / (price_risk_per_lot + cost_risk_per_lot),
+    let Some(volume) = resolve_entry_volume(
+        strategy,
+        balance,
+        price_risk_per_lot,
+        cost_risk_per_lot,
+        loss_streak,
         broker,
-    ) else {
+        index,
+        features,
+    )?
+    else {
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
@@ -734,11 +1053,71 @@ fn place_pending_order(
         kind,
         expiry_index: index.saturating_add(expiry_bars as usize),
         activation_price,
+        limit_price,
+        stop_triggered: false,
         stop_loss,
         take_profit,
         stop_distance: normalized_stop_distance,
         volume,
     }))
+}
+
+/// MT5-style OrderModify for a working pending: refresh price, SL, TP, expiry
+/// in place without canceling the ticket.
+#[allow(clippy::too_many_arguments)]
+fn modify_pending_order(
+    order: &mut PendingOrder,
+    index: usize,
+    bar: &Bar,
+    spread_price: f64,
+    balance: f64,
+    strategy: &StrategyIr,
+    broker: &SymbolSpecification,
+    config: &ScoutConfig,
+    features: &mut FeatureCache<'_>,
+    telemetry: &mut ScoutTelemetry,
+) -> Result<bool, EvalError> {
+    let Some(fresh) = place_pending_order(
+        order.side,
+        index,
+        bar,
+        spread_price,
+        balance,
+        strategy,
+        broker,
+        config,
+        features,
+        telemetry,
+        0,
+    )?
+    else {
+        return Ok(false);
+    };
+    let changed = order.activation_price != fresh.activation_price
+        || order.limit_price != fresh.limit_price
+        || order.stop_loss != fresh.stop_loss
+        || order.take_profit != fresh.take_profit
+        || order.expiry_index != fresh.expiry_index
+        || order.volume != fresh.volume;
+    if !changed {
+        return Ok(false);
+    }
+    // Preserve stop-limit trigger state when the stop price is unchanged.
+    let keep_trigger = order.kind == PendingKind::StopLimit
+        && order.stop_triggered
+        && order.activation_price == fresh.activation_price;
+    order.activation_price = fresh.activation_price;
+    order.limit_price = fresh.limit_price;
+    order.stop_loss = fresh.stop_loss;
+    order.take_profit = fresh.take_profit;
+    order.stop_distance = fresh.stop_distance;
+    order.volume = fresh.volume;
+    order.expiry_index = fresh.expiry_index;
+    order.kind = fresh.kind;
+    if !keep_trigger {
+        order.stop_triggered = false;
+    }
+    Ok(true)
 }
 
 fn entry_distance(
@@ -760,6 +1139,56 @@ fn entry_distance(
     Ok(value.filter(|distance| distance.is_finite() && *distance > 0.0))
 }
 
+fn advance_pending_order(order: &mut PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
+    match order.kind {
+        PendingKind::Stop | PendingKind::Limit => pending_fill_price(order, bar, spread_price),
+        PendingKind::StopLimit => {
+            let mut just_triggered = false;
+            if !order.stop_triggered {
+                let stop_touched = match order.side {
+                    PositionSide::Long => bar.high + spread_price >= order.activation_price,
+                    PositionSide::Short => bar.low <= order.activation_price,
+                };
+                if !stop_touched {
+                    return None;
+                }
+                order.stop_triggered = true;
+                just_triggered = true;
+            }
+            let limit_price = order.limit_price?;
+            let open = match order.side {
+                PositionSide::Long => bar.open + spread_price,
+                PositionSide::Short => bar.open,
+            };
+            let touched = match order.side {
+                PositionSide::Long => bar.low + spread_price <= limit_price,
+                PositionSide::Short => bar.high >= limit_price,
+            };
+            if !touched {
+                return None;
+            }
+            // On the trigger bar the open is pre-stop; fill at the limit level.
+            // On later bars the working limit uses the same gap-through rule as Limit.
+            Some(match order.side {
+                PositionSide::Long => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.min(limit_price)
+                    }
+                }
+                PositionSide::Short => {
+                    if just_triggered {
+                        limit_price
+                    } else {
+                        open.max(limit_price)
+                    }
+                }
+            })
+        }
+    }
+}
+
 fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
     let open = match order.side {
         PositionSide::Long => bar.open + spread_price,
@@ -774,6 +1203,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
             bar.low + spread_price <= order.activation_price
         }
         (PositionSide::Short, PendingKind::Limit) => bar.high >= order.activation_price,
+        (_, PendingKind::StopLimit) => return None,
     };
     if !touched {
         return None;
@@ -783,6 +1213,7 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
         (PositionSide::Short, PendingKind::Stop) => open.min(order.activation_price),
         (PositionSide::Long, PendingKind::Limit) => open.min(order.activation_price),
         (PositionSide::Short, PendingKind::Limit) => open.max(order.activation_price),
+        (_, PendingKind::StopLimit) => return None,
     })
 }
 
@@ -847,6 +1278,14 @@ fn stop_distance(
                 .map(|range| range * multiplier)
         }
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_stop_points,
+            strategy.manage.max_stop_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
 }
@@ -865,8 +1304,97 @@ fn target_distance(
             .indicator_at_decision(&IndicatorExpr::Atr { period, shift: 1 }, decision_index)?
             .map(|atr| atr * multiplier),
     }
+    .map(|distance| {
+        clamp_distance_points(
+            distance,
+            broker.point,
+            strategy.manage.min_take_profit_points,
+            strategy.manage.max_take_profit_points,
+        )
+    })
     .filter(|distance| distance.is_finite() && *distance > 0.0);
     Ok(distance)
+}
+
+fn resolve_entry_volume(
+    strategy: &StrategyIr,
+    balance: f64,
+    price_risk_per_lot: f64,
+    cost_risk_per_lot: f64,
+    loss_streak: u8,
+    broker: &SymbolSpecification,
+    decision_index: usize,
+    features: &mut FeatureCache<'_>,
+) -> Result<Option<f64>, EvalError> {
+    let raw = match strategy.risk {
+        RiskPolicy::FixedLots { lots } => lots,
+        RiskPolicy::Martingale {
+            base_lots,
+            multiplier,
+            max_steps,
+        } => crate::martingale_lots(base_lots, multiplier, max_steps, loss_streak),
+        RiskPolicy::FixedCurrency { amount } => {
+            amount / (price_risk_per_lot + cost_risk_per_lot)
+        }
+        RiskPolicy::PercentBalance { percent } => {
+            (balance * percent / 100.0) / (price_risk_per_lot + cost_risk_per_lot)
+        }
+        RiskPolicy::AtrRiskPercent {
+            percent,
+            atr_period,
+            atr_multiplier,
+            max_lots,
+        } => {
+            let Some(atr_value) = features.indicator_at_decision(
+                &IndicatorExpr::Atr {
+                    period: atr_period,
+                    shift: 1,
+                },
+                decision_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            crate::atr_risk_lots(
+                balance,
+                percent,
+                atr_value,
+                atr_multiplier,
+                broker.tick_size,
+                broker.tick_value,
+                cost_risk_per_lot,
+                max_lots,
+            )
+        }
+    };
+    Ok(normalize_volume(raw, broker))
+}
+
+fn note_closed_trade_streak(trades: &[Trade], loss_streak: &mut u8) {
+    let Some(last) = trades.last() else {
+        return;
+    };
+    if last.net_profit < 0.0 {
+        *loss_streak = loss_streak.saturating_add(1);
+    } else if last.net_profit > 0.0 {
+        *loss_streak = 0;
+    }
+}
+
+fn clamp_distance_points(
+    distance: f64,
+    point: f64,
+    min_points: Option<f64>,
+    max_points: Option<f64>,
+) -> f64 {
+    let mut out = distance;
+    if let Some(min) = min_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.max(min * point);
+    }
+    if let Some(max) = max_points.filter(|v| v.is_finite() && *v > 0.0) {
+        out = out.min(max * point);
+    }
+    out
 }
 
 fn average_completed_range(bars: &[Bar], decision_index: usize, period: usize) -> Option<f64> {
@@ -1117,6 +1645,8 @@ fn protective_intrabar_exit(
     bar: &Bar,
     spread_price: f64,
     broker: &SymbolSpecification,
+    policy: crate::SameBarPolicy,
+    tick_window: Option<&[crate::Tick]>,
 ) -> Option<ExitEvent> {
     let (stop_touched, target_touched) = match position.side {
         PositionSide::Long => (
@@ -1128,20 +1658,73 @@ fn protective_intrabar_exit(
             price_reaches_from_above(bar.low + spread_price, position.take_profit, broker),
         ),
     };
+    if !(stop_touched || target_touched) {
+        return None;
+    }
+    if stop_touched && target_touched {
+        // Prefer real tick order when file replay is active for this bar.
+        if let Some(window) = tick_window.filter(|w| !w.is_empty()) {
+            match crate::tick_file_stop_hit_first(
+                position.side,
+                position.stop_loss,
+                position.take_profit,
+                window,
+            ) {
+                Some(true) | None => {
+                    return Some(ExitEvent {
+                        base_price: position.stop_loss,
+                        reason: ExitReason::StopLoss,
+                    });
+                }
+                Some(false) => {
+                    return Some(ExitEvent {
+                        base_price: position.take_profit,
+                        reason: ExitReason::TakeProfit,
+                    });
+                }
+            }
+        }
+        match policy {
+            crate::SameBarPolicy::Conservative => {
+                return Some(ExitEvent {
+                    base_price: position.stop_loss,
+                    reason: ExitReason::StopLoss,
+                });
+            }
+            crate::SameBarPolicy::EveryTickOhlc => {
+                match crate::everytick_stop_hit_first(
+                    position.side,
+                    position.stop_loss,
+                    position.take_profit,
+                    bar,
+                    spread_price,
+                ) {
+                    Some(true) | None => {
+                        return Some(ExitEvent {
+                            base_price: position.stop_loss,
+                            reason: ExitReason::StopLoss,
+                        });
+                    }
+                    Some(false) => {
+                        return Some(ExitEvent {
+                            base_price: position.take_profit,
+                            reason: ExitReason::TakeProfit,
+                        });
+                    }
+                }
+            }
+        }
+    }
     if stop_touched {
-        // Conservative is the only v1 policy: it also resolves bars touching
-        // both levels without fabricating an intrabar path.
         Some(ExitEvent {
             base_price: position.stop_loss,
             reason: ExitReason::StopLoss,
         })
-    } else if target_touched {
+    } else {
         Some(ExitEvent {
             base_price: position.take_profit,
             reason: ExitReason::TakeProfit,
         })
-    } else {
-        None
     }
 }
 
@@ -1155,6 +1738,7 @@ fn close_position(
     config: &ScoutConfig,
     balance: &mut f64,
     trades: &mut Vec<Trade>,
+    loss_streak: &mut u8,
 ) {
     let remaining = position.volume;
     realize_exit_volume(
@@ -1190,6 +1774,7 @@ fn close_position(
         bars_held: exit_index - position.entry_index,
         exit_reason: event.reason,
     });
+    note_closed_trade_streak(trades, loss_streak);
 }
 
 fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f64 {
@@ -1219,7 +1804,7 @@ fn liquidation_equity(
     balance + gross - exit_commission
 }
 
-fn calculate_metrics(
+pub fn calculate_metrics(
     initial_balance: f64,
     ending_balance: f64,
     trades: &[Trade],
@@ -1325,7 +1910,8 @@ mod tests {
     use quantforge_core::{ContentHash, STRATEGY_IR_VERSION};
     use quantforge_ir::{
         BoolExpr, ComparisonOp, EntryDistancePolicy, EntryOrderPolicy, EntrySignals, ManagePolicy,
-        NumericExpr, PartialExit, PriceField, ProtectiveStops, Side, StrategyMeta, TrailingPolicy,
+        NumericExpr, PartialExit, PriceField, ProtectiveStops, RiskPolicy, Side, StrategyMeta,
+        TrailingPolicy,
     };
 
     fn broker() -> SymbolSpecification {
@@ -1809,6 +2395,37 @@ mod tests {
     }
 
     #[test]
+    fn stop_limit_entries_trigger_then_fill_at_limit() {
+        let mut strategy = strategy();
+        strategy.entry.order = EntryOrderPolicy::StopLimit {
+            stop_distance: EntryDistancePolicy::FixedPoints { points: 2.0 },
+            limit_offset: EntryDistancePolicy::FixedPoints { points: 1.0 },
+            expiry_bars: 3,
+        };
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        // Signal bar at 100. Buy stop trigger = 102, limit = 101.
+        // Next bar touches the stop (high 103) and the limit (low 100.5) → fill at 101.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 103.0, 100.5, 102.0),
+            bar(120_000, 102.0, 102.5, 101.5, 102.0),
+        ]);
+        let result = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 100.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.telemetry.pending_orders_placed, 1);
+        assert_eq!(result.telemetry.pending_orders_filled, 1);
+        assert_eq!(result.trades[0].entry_price, 101.0);
+    }
+
+    #[test]
     fn stop_and_limit_entries_use_persistent_pending_orders() {
         for (order, expected_entry, expected_reason) in [
             (
@@ -2146,6 +2763,238 @@ mod tests {
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.telemetry.synthetic_spread_bars, 1);
         assert_eq!(result.telemetry.fallback_spread_bars, 0);
+    }
+
+    #[test]
+    fn hedged_stack_allows_multiple_concurrent_positions() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        // Wide TP so positions stay open across subsequent signal bars.
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(10);
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            // Open #1 at 100; range never hits SL 98 / far TP.
+            bar(60_000, 100.0, 101.0, 99.0, 100.5),
+            // Open #2 while #1 still live.
+            bar(120_000, 100.5, 101.5, 99.5, 101.0),
+            // Open #3.
+            bar(180_000, 101.0, 102.0, 100.0, 101.5),
+            // Cap hit — no fourth open; flatten at end.
+            bar(240_000, 101.5, 102.5, 100.5, 102.0),
+        ]);
+        let config = ScoutConfig {
+            initial_balance: 10_000.0,
+            position_accounting: crate::PositionAccounting::HedgedStack,
+            max_open_positions: 3,
+            ..ScoutConfig::default()
+        };
+        let stacked = evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
+        assert!(
+            stacked.telemetry.stacked_opens >= 1,
+            "expected at least one stacked open, got {}",
+            stacked.telemetry.stacked_opens
+        );
+        assert_eq!(stacked.trades.len(), 3);
+
+        let single = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                position_accounting: crate::PositionAccounting::HedgedSingle,
+                max_open_positions: 8,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(single.trades.len(), 1);
+        assert_eq!(single.telemetry.stacked_opens, 0);
+    }
+
+    #[test]
+    fn hedged_stack_respects_max_open_positions_cap() {
+        let mut strategy = strategy();
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(20);
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 101.0, 99.0, 100.5),
+            bar(120_000, 100.5, 101.5, 99.5, 101.0),
+            bar(180_000, 101.0, 102.0, 100.0, 101.5),
+            bar(240_000, 101.5, 102.5, 100.5, 102.0),
+        ]);
+        let capped = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                position_accounting: crate::PositionAccounting::HedgedStack,
+                max_open_positions: 2,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.trades.len(), 2);
+    }
+
+    #[test]
+    fn tick_file_replay_resolves_same_bar_collision_by_tick_order() {
+        let strategy = strategy();
+        // SL 2 pts below entry 100 → 98; TP 4 pts above → 104.
+        // Bar range touches both; ticks hit TP first.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 105.0, 97.0, 103.0),
+        ]);
+        let ticks = crate::TickDataset {
+            ticks: vec![
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 30_000,
+                    bid: 100.0,
+                    ask: 100.0,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 20_000,
+                    bid: 104.5,
+                    ask: 104.5,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000 - 10_000,
+                    bid: 97.5,
+                    ask: 97.5,
+                },
+                crate::Tick {
+                    timestamp_ms: FIXTURE_BASE_MS + 60_000,
+                    bid: 103.0,
+                    ask: 103.0,
+                },
+            ],
+        };
+        let config = ScoutConfig {
+            initial_balance: 100.0,
+            same_bar_policy: crate::SameBarPolicy::Conservative,
+            enable_tick_file_replay: true,
+            ..ScoutConfig::default()
+        };
+        let with_ticks =
+            evaluate_strategy_with_ticks(&strategy, &data, &broker(), &config, &ticks).unwrap();
+        assert_eq!(with_ticks.trades.len(), 1);
+        assert_eq!(with_ticks.trades[0].exit_reason, ExitReason::TakeProfit);
+
+        let conservative =
+            evaluate_strategy(&strategy, &data, &broker(), &config).unwrap();
+        assert_eq!(conservative.trades[0].exit_reason, ExitReason::StopLoss);
+    }
+
+    #[test]
+    fn fixed_lots_risk_sizes_to_requested_volume() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::FixedLots { lots: 3.0 };
+        let result = evaluate_strategy(
+            &strategy,
+            &dataset(99.0),
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 100.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.trades[0].volume, 3.0);
+    }
+
+    #[test]
+    fn martingale_scales_volume_after_losses() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::Martingale {
+            base_lots: 1.0,
+            multiplier: 2.0,
+            max_steps: 3,
+        };
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        // Decision → SL fill, decision → SL fill, decision → SL fill.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(60_000, 100.0, 101.0, 97.0, 98.0),
+            bar(120_000, 100.0, 101.0, 99.0, 100.0),
+            bar(180_000, 100.0, 101.0, 97.0, 98.0),
+            bar(240_000, 100.0, 101.0, 99.0, 100.0),
+            bar(300_000, 100.0, 101.0, 97.0, 98.0),
+        ]);
+        let result = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(result.trades.len() >= 3, "trades={}", result.trades.len());
+        assert_eq!(result.trades[0].volume, 1.0);
+        assert_eq!(result.trades[1].volume, 2.0);
+        assert_eq!(result.trades[2].volume, 4.0);
+        assert!(result.trades.iter().all(|t| t.exit_reason == ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn atr_risk_percent_sizes_from_atr_not_stop_distance() {
+        let mut strategy = strategy();
+        strategy.risk = RiskPolicy::AtrRiskPercent {
+            percent: 1.0,
+            atr_period: 2,
+            atr_multiplier: 1.0,
+            max_lots: Some(10.0),
+        };
+        // Enough bars for ATR(2) to warm; stop is 2 points but ATR path should drive size.
+        let data = dataset_with_bars(vec![
+            bar(0, 100.0, 102.0, 98.0, 100.0),
+            bar(60_000, 100.0, 103.0, 97.0, 101.0),
+            bar(120_000, 100.0, 104.0, 96.0, 100.0),
+            bar(180_000, 100.0, 105.0, 99.0, 104.0),
+        ]);
+        let result = evaluate_strategy(
+            &strategy,
+            &data,
+            &broker(),
+            &ScoutConfig {
+                initial_balance: 10_000.0,
+                ..ScoutConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(!result.trades.is_empty());
+        assert!(result.trades[0].volume > 0.0);
+        assert!(result.trades[0].volume <= 10.0);
+    }
+
+    #[test]
+    fn weekend_filter_blocks_saturday_entries() {
+        let mut strategy = strategy();
+        strategy.manage.dont_trade_on_weekends = true;
+        strategy.manage.max_one_entry_per_day = false;
+        strategy.stops.take_profit = TakeProfitPolicy::RiskMultiple { multiple: 50.0 };
+        strategy.manage.time_stop_bars = Some(1);
+        // 2024-01-06 is Saturday.
+        let data = dataset_with_bars(vec![
+            timed_bar("2024-01-06T10:00:00Z"),
+            timed_bar("2024-01-06T11:00:00Z"),
+            timed_bar("2024-01-08T10:00:00Z"), // Monday
+            timed_bar("2024-01-08T11:00:00Z"),
+        ]);
+        let result =
+            evaluate_strategy(&strategy, &data, &broker(), &ScoutConfig::default()).unwrap();
+        assert!(result.telemetry.skipped_weekend_entries > 0);
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(
+            result.trades[0].entry_timestamp_ms,
+            timed_bar("2024-01-08T10:00:00Z").timestamp_ms
+        );
     }
 
     fn timed_bar(timestamp: &str) -> Bar {

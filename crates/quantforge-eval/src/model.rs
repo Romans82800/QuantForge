@@ -3,12 +3,61 @@ use quantforge_ir::IrError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SameBarPolicy {
     /// When both protective levels are touched and path order is unknown, the
     /// stop loss wins.
+    #[default]
     Conservative,
+    /// Walk a synthetic EveryTick OHLC path (Open → extreme1 → extreme2 → Close)
+    /// to resolve same-bar stop/target collisions. Foundation for true tick files.
+    EveryTickOhlc,
+}
+
+/// How open positions are accounted for during Scout / Judge replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionAccounting {
+    /// At most one open position (current QuantForge default / MT5 hedged single).
+    #[default]
+    HedgedSingle,
+    /// Multiple concurrent positions up to [`ScoutConfig::max_open_positions`].
+    HedgedStack,
+    /// One net position; an opposite signal closes the open trade before a new entry.
+    Netting,
+}
+
+/// Configurable fill / requote simulation (idealized broker realism hook).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillSimulation {
+    /// Fraction of intended volume filled on entry (`1.0` = full fill).
+    #[serde(default = "default_fill_fraction")]
+    pub fill_volume_fraction: f64,
+    /// Deterministic probability `[0, 1]` that a market entry is requoted.
+    #[serde(default)]
+    pub requote_probability: f64,
+    /// Extra adverse slippage (points) applied when a requote fires.
+    #[serde(default)]
+    pub requote_extra_slippage_points: f64,
+    /// When true, a requote rejects the entry instead of filling worse.
+    #[serde(default)]
+    pub requote_rejects: bool,
+}
+
+fn default_fill_fraction() -> f64 {
+    1.0
+}
+
+impl Default for FillSimulation {
+    fn default() -> Self {
+        Self {
+            fill_volume_fraction: 1.0,
+            requote_probability: 0.0,
+            requote_extra_slippage_points: 0.0,
+            requote_rejects: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +70,9 @@ pub struct CostModel {
     /// Position size solves for stop loss plus estimated round-turn commission
     /// and entry/exit slippage inside the configured risk budget.
     pub include_costs_in_risk: bool,
+    /// Optional partial-fill / requote simulation (default: ideal full fills).
+    #[serde(default)]
+    pub fill_simulation: FillSimulation,
 }
 
 impl Default for CostModel {
@@ -31,6 +83,7 @@ impl Default for CostModel {
             commission_per_lot_round_turn: 0.0,
             max_spread_points: None,
             include_costs_in_risk: true,
+            fill_simulation: FillSimulation::default(),
         }
     }
 }
@@ -64,6 +117,20 @@ pub struct ScoutConfig {
     /// Leave `None` whenever the metrics themselves are the output.
     #[serde(default)]
     pub abandon_above_drawdown_percent: Option<f64>,
+    /// Hedged-single / hedged-stack / netting accounting.
+    #[serde(default)]
+    pub position_accounting: PositionAccounting,
+    /// Cap for [`PositionAccounting::HedgedStack`] (ignored for single/netting).
+    #[serde(default = "default_max_open_positions")]
+    pub max_open_positions: usize,
+    /// When true (and a tick dataset is supplied to evaluate), protective
+    /// same-bar collisions walk real tick bids/asks inside each bar window.
+    #[serde(default)]
+    pub enable_tick_file_replay: bool,
+}
+
+fn default_max_open_positions() -> usize {
+    1
 }
 
 impl Default for ScoutConfig {
@@ -75,6 +142,9 @@ impl Default for ScoutConfig {
             indicator_engine: IndicatorEngine::Sqx,
             entry_window: EntryWindow::default(),
             abandon_above_drawdown_percent: None,
+            position_accounting: PositionAccounting::HedgedSingle,
+            max_open_positions: 1,
+            enable_tick_file_replay: false,
         }
     }
 }
@@ -111,6 +181,30 @@ impl ScoutConfig {
                     "{name} must be finite and non-negative"
                 )));
             }
+        }
+        let fill = &self.costs.fill_simulation;
+        let fraction = fill.fill_volume_fraction;
+        let requote_p = fill.requote_probability;
+        let requote_slip = fill.requote_extra_slippage_points;
+        if !(0.0..=1.0).contains(&fraction) || !fraction.is_finite() {
+            return Err(EvalError::InvalidConfig(
+                "fill_volume_fraction must be in [0, 1]".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&requote_p) || !requote_p.is_finite() {
+            return Err(EvalError::InvalidConfig(
+                "requote_probability must be in [0, 1]".into(),
+            ));
+        }
+        if !requote_slip.is_finite() || requote_slip < 0.0 {
+            return Err(EvalError::InvalidConfig(
+                "requote_extra_slippage_points must be finite and non-negative".into(),
+            ));
+        }
+        if self.max_open_positions == 0 {
+            return Err(EvalError::InvalidConfig(
+                "max_open_positions must be at least 1".into(),
+            ));
         }
         self.entry_window.validate()?;
         Ok(())
@@ -272,12 +366,31 @@ pub struct ScoutTelemetry {
     pub pending_orders_placed: usize,
     pub pending_orders_filled: usize,
     pub pending_orders_expired: usize,
+    pub pending_orders_cancelled_opposite: usize,
+    pub pending_orders_replaced: usize,
+    #[serde(default)]
+    pub pending_orders_modified: usize,
+    #[serde(default)]
+    pub entry_requotes: usize,
+    #[serde(default)]
+    pub entry_requote_rejects: usize,
+    #[serde(default)]
+    pub partial_entry_fills: usize,
+    #[serde(default)]
+    pub netting_closes: usize,
+    /// Opens that landed while at least one other position was already open.
+    #[serde(default)]
+    pub stacked_opens: usize,
     pub partial_exits_executed: usize,
     pub break_even_moves: usize,
     pub trailing_stop_moves: usize,
     pub end_of_day_flattens: usize,
     #[serde(default)]
     pub skipped_max_one_entry_per_day: usize,
+    #[serde(default)]
+    pub skipped_weekend_entries: usize,
+    #[serde(default)]
+    pub friday_exits: usize,
     pub synthetic_spread_bars: usize,
     pub fallback_spread_bars: usize,
     pub swap_rollover_events: usize,

@@ -10,6 +10,16 @@ import type {
   EvidenceView,
   ChallengeRequest,
   ChallengeView,
+  TaskRunRequest,
+  TaskRunView,
+  MultiSymbolMatrixRequest,
+  MultiSymbolMatrixView,
+  ExportResultsPackRequest,
+  ExportResultsPackView,
+  OptimizerRequest,
+  OptimizerView,
+  WalkForwardMatrixRequest,
+  WalkForwardMatrixView,
   DataLabRequest,
   DataLabView,
   DeployRequest,
@@ -204,6 +214,32 @@ export function stopDiscover(): Promise<DiscoverJobView> {
 
 export function runChallenge(request: ChallengeRequest): Promise<ChallengeView> {
   return invoke<ChallengeView>("run_challenge_workflow", { request });
+}
+
+export function runTaskGraph(request: TaskRunRequest): Promise<TaskRunView> {
+  return invoke<TaskRunView>("run_task_graph_workflow", { request });
+}
+
+export function runMultiSymbolMatrix(
+  request: MultiSymbolMatrixRequest,
+): Promise<MultiSymbolMatrixView> {
+  return invoke<MultiSymbolMatrixView>("run_multi_symbol_matrix_workflow", { request });
+}
+
+export function exportResultsPack(
+  request: ExportResultsPackRequest,
+): Promise<ExportResultsPackView> {
+  return invoke<ExportResultsPackView>("export_results_pack_workflow", { request });
+}
+
+export function runOptimizerNeighborhood(request: OptimizerRequest): Promise<OptimizerView> {
+  return invoke<OptimizerView>("run_optimizer_neighborhood", { request });
+}
+
+export function runWalkForwardMatrix(
+  request: WalkForwardMatrixRequest,
+): Promise<WalkForwardMatrixView> {
+  return invoke<WalkForwardMatrixView>("run_walk_forward_matrix_workflow", { request });
 }
 
 export function runSealedFinal(request: SealedRequest): Promise<SealedView> {

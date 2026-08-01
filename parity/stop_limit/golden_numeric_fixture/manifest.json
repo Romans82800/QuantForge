@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "protocol": "mt5-parity-v2",
+  "tag": "golden_numeric_fixture",
+  "symbol": "EURNZD",
+  "timeframe": "H1",
+  "tester_model": "every_tick_real_ticks",
+  "order_kinds": [
+    "buy_stop_limit",
+    "sell_stop_limit"
+  ],
+  "data_pack": "ICMarkets_EST7_2020_present",
+  "status": "numeric_fixture_ready",
+  "files": {
+    "ir": "strategy.ir.json",
+    "deals": "mt5_deals.csv",
+    "equity": "mt5_equity.csv",
+    "judge": "qf_judge.json",
+    "reference_metrics": "reference_metrics.json",
+    "external_metrics": "external_metrics.json",
+    "notes": "notes.md"
+  }
+}

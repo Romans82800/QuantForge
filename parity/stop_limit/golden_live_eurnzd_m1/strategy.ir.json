@@ -1,0 +1,72 @@
+{
+  "id": "stop-limit-pending-fixture",
+  "version": 1,
+  "entry": {
+    "long": {
+      "operator": "cross_above",
+      "left": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 12,
+          "shift": 1
+        }
+      },
+      "right": {
+        "kind": "indicator",
+        "value": {
+          "operator": "ema",
+          "source": "close",
+          "period": 48,
+          "shift": 1
+        }
+      }
+    },
+    "short": null,
+    "order": {
+      "kind": "stop_limit",
+      "stop_distance": {
+        "kind": "atr_multiple",
+        "period": 14,
+        "multiplier": 0.5
+      },
+      "limit_offset": {
+        "kind": "atr_multiple",
+        "period": 14,
+        "multiplier": 0.25
+      },
+      "expiry_bars": 4
+    }
+  },
+  "exit": null,
+  "filters": [],
+  "side": "long_only",
+  "risk": {
+    "kind": "percent_balance",
+    "percent": 0.5
+  },
+  "stops": {
+    "stop_loss": {
+      "kind": "atr_multiple",
+      "period": 14,
+      "multiplier": 2.0
+    },
+    "take_profit": {
+      "kind": "risk_multiple",
+      "multiple": 3.0
+    }
+  },
+  "manage": {
+    "break_even_at_r": null,
+    "trailing": null,
+    "time_stop_bars": 48,
+    "partial_exits": [],
+    "flatten_end_of_day": false
+  },
+  "meta": {
+    "thesis_hint": "BuyStopLimit / SellStopLimit IR + export fixture",
+    "complexity": 0,
+    "export_safe": true
+  }
+}

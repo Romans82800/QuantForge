@@ -1,8 +1,18 @@
 //! Statistical evidence, sealed data partitions and non-bypassable promotion gates.
 
 mod challenge;
+mod databank_correlation;
+mod databank_filter;
 mod incubation;
+mod multi_symbol_matrix;
+mod negate;
+mod results_html;
+mod results_pack;
 mod sealed;
+mod task_executor;
+mod task_graph;
+mod walk_forward_matrix;
+mod what_if;
 
 pub use challenge::{
     CHALLENGE_REPORT_SCHEMA_VERSION, ChallengeBlocker, ChallengeConfig, ChallengeError,
@@ -10,15 +20,53 @@ pub use challenge::{
     ParameterNeighbor, ParameterNeighborhoodReport, PurgedFoldReport, SelectionBiasLevel,
     deflated_trade_sharpe, expected_max_lucky_sharpe, monte_carlo_from_trade_profits,
     monte_carlo_trade_resampling_with_skip,
-    perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
+    perturb_strategy_parameters, perturb_strategy_parameters_with_probability, run_challenge,
+    trade_sharpe_proxy,
+};
+pub use databank_correlation::{
+    DATABANK_CORRELATION_PROTOCOL, CorrelationCandidate, CorrelationFilterError,
+    CorrelationFilterReport, RejectedPair, candidates_from_values, filter_by_correlation,
+};
+pub use databank_filter::{
+    DATABANK_FILTER_PROTOCOL, CompareOp, FilterError, FilterExpr, FilterReport, FilterValue,
+    eval_filter, filter_rows, known_columns, parse_filter, row_from_value,
+};
+pub use multi_symbol_matrix::{
+    MULTI_SYMBOL_MATRIX_PROTOCOL, MatrixSymbolInput, MultiSymbolMatrixError,
+    MultiSymbolMatrixReport, MultiSymbolMatrixRow, PairwiseSymbolCorrelation,
+    run_multi_symbol_matrix,
 };
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,
     IncubationObservation, IncubationReport, IncubationStart, run_incubation,
 };
+pub use negate::{
+    NEGATE_PROTOCOL_VERSION, NegateError, NegateMode, NegateReport, negate_strategy,
+};
+pub use results_html::{
+    HTML_REPORT_PROTOCOL, render_results_html, render_results_html_from_json,
+    render_results_html_from_scout,
+};
+pub use results_pack::{
+    RESULTS_PACK_PROTOCOL, ResultsPackPaths, render_results_pdf, render_trades_csv,
+    write_results_pack, write_results_pack_from_json, write_results_pack_from_scout,
+};
 pub use sealed::{
     SEALED_FINAL_REPORT_SCHEMA_VERSION, SealedFinalBlocker, SealedFinalConfig, SealedFinalError,
     SealedFinalReport, run_sealed_final,
+};
+pub use task_executor::{TaskArtifactStore, TaskRunOptions, run_task_graph};
+pub use task_graph::{
+    TASK_GRAPH_PROTOCOL, TASK_GRAPH_SCHEMA_VERSION, TaskGraph, TaskGraphError, TaskRunReport,
+    TaskStep, TaskStepKind, TaskStepResult, TaskStepStatus, example_retester_graph,
+};
+pub use walk_forward_matrix::{
+    WALK_FORWARD_MATRIX_PROTOCOL, WalkForwardMatrixCell, WalkForwardMatrixConfig,
+    WalkForwardMatrixError, WalkForwardMatrixFold, WalkForwardMatrixReport,
+    run_walk_forward_matrix,
+};
+pub use what_if::{
+    WHAT_IF_PROTOCOL_VERSION, WhatIfError, WhatIfFilter, WhatIfReport, apply_what_if,
 };
 
 use quantforge_core::{ContentHash, HashError, stable_json_hash};
