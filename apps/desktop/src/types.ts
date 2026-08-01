@@ -511,6 +511,7 @@ export interface DiscoverRequest {
   robustnessMonteCarloTrials: number | null;
   robustnessNeighborhoodSamples: number | null;
   robustnessPerturbationFraction: number | null;
+  robustnessParameterChangeProbability: number | null;
   minimumNeighborhoodSurvivalFraction: number | null;
   calendarYearFolds: boolean | null;
   minimumDeflatedTradeSharpe: number | null;

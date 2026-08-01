@@ -359,6 +359,7 @@ class FilterParser {
     if (this.consumeKeyword("TRUE")) return true;
     if (this.consumeKeyword("FALSE")) return false;
     if (this.consumeKeyword("NULL")) return null;
+    if (/[<>=!]/.test(ch)) throw new Error("unexpected comparison operator");
     const start = this.pos;
     if (ch === "-" || ch === "+") this.pos += 1;
     let saw = false;

@@ -908,6 +908,7 @@ fn run_parameter_neighborhood(
         let neighbor = perturb_strategy(
             strategy,
             config.parameter_perturbation_fraction,
+            1.0,
             sample,
             &mut rng,
         )?;
@@ -960,48 +961,90 @@ pub fn perturb_strategy_parameters(
     sample: usize,
     seed: u64,
 ) -> Result<StrategyIr, ChallengeError> {
+    perturb_strategy_parameters_with_probability(strategy, fraction, 1.0, sample, seed)
+}
+
+/// Perturb a strategy using an SQX-style per-parameter change probability.
+///
+/// `fraction` is the maximum relative change for a parameter that is selected,
+/// while `change_probability` controls how often each parameter group is
+/// changed. Keeping those knobs separate avoids treating one simultaneous
+/// full-strategy mutation as a parameter plateau test.
+pub fn perturb_strategy_parameters_with_probability(
+    strategy: &StrategyIr,
+    fraction: f64,
+    change_probability: f64,
+    sample: usize,
+    seed: u64,
+) -> Result<StrategyIr, ChallengeError> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15 ^ sample as u64);
-    perturb_strategy(strategy, fraction, sample, &mut rng)
+    perturb_strategy(strategy, fraction, change_probability, sample, &mut rng)
 }
 
 fn perturb_strategy(
     strategy: &StrategyIr,
     fraction: f64,
+    change_probability: f64,
     sample: usize,
     rng: &mut ChaCha8Rng,
 ) -> Result<StrategyIr, ChallengeError> {
+    let change_probability = change_probability.clamp(0.0, 1.0);
     let mut neighbor = strategy.clone();
-    neighbor.id = format!("{}-neighbor-{sample}", strategy.id);
+    let neighbor_id = format!("{}-neighbor-{sample}", strategy.id);
     if let Some(entry) = &mut neighbor.entry.long {
-        perturb_bool(entry, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(entry, fraction, rng);
+        }
     }
     if let Some(entry) = &mut neighbor.entry.short {
-        perturb_bool(entry, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(entry, fraction, rng);
+        }
     }
     if let Some(exit) = &mut neighbor.exit {
-        perturb_bool(exit, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(exit, fraction, rng);
+        }
     }
     if let Some(exit) = &mut neighbor.exit_long {
-        perturb_bool(exit, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(exit, fraction, rng);
+        }
     }
     if let Some(exit) = &mut neighbor.exit_short {
-        perturb_bool(exit, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(exit, fraction, rng);
+        }
     }
     for filter in &mut neighbor.filters {
-        perturb_bool(filter, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_bool(filter, fraction, rng);
+        }
     }
     match &mut neighbor.risk {
         // Fixed-dollar risk is a research invariant, not a tunable parameter.
         RiskPolicy::FixedCurrency { .. } => {}
-        RiskPolicy::PercentBalance { percent } => perturb_positive(percent, fraction, 0.01, rng),
-        RiskPolicy::FixedLots { lots } => perturb_positive(lots, fraction, 0.01, rng),
+        RiskPolicy::PercentBalance { percent } => {
+            if should_perturb(change_probability, rng) {
+                perturb_positive(percent, fraction, 0.01, rng)
+            }
+        }
+        RiskPolicy::FixedLots { lots } => {
+            if should_perturb(change_probability, rng) {
+                perturb_positive(lots, fraction, 0.01, rng)
+            }
+        }
         RiskPolicy::Martingale {
             base_lots,
             multiplier,
             ..
         } => {
-            perturb_positive(base_lots, fraction, 0.01, rng);
-            perturb_positive(multiplier, fraction, 1.0, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_positive(base_lots, fraction, 0.01, rng);
+            }
+            if should_perturb(change_probability, rng) {
+                perturb_positive(multiplier, fraction, 1.0, rng);
+            }
         }
         RiskPolicy::AtrRiskPercent {
             percent,
@@ -1009,29 +1052,53 @@ fn perturb_strategy(
             max_lots,
             ..
         } => {
-            perturb_positive(percent, fraction, 0.01, rng);
-            perturb_positive(atr_multiplier, fraction, 0.01, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_positive(percent, fraction, 0.01, rng);
+            }
+            if should_perturb(change_probability, rng) {
+                perturb_positive(atr_multiplier, fraction, 0.01, rng);
+            }
             if let Some(max) = max_lots {
-                perturb_positive(max, fraction, 0.01, rng);
+                if should_perturb(change_probability, rng) {
+                    perturb_positive(max, fraction, 0.01, rng);
+                }
             }
         }
     }
     match &mut neighbor.stops.stop_loss {
-        StopLossPolicy::FixedPoints { points } => perturb_positive(points, fraction, 0.01, rng),
+        StopLossPolicy::FixedPoints { points } => {
+            if should_perturb(change_probability, rng) {
+                perturb_positive(points, fraction, 0.01, rng)
+            }
+        }
         StopLossPolicy::AtrMultiple { period, multiplier }
         | StopLossPolicy::RangeMultiple { period, multiplier } => {
-            perturb_period(period, fraction, rng);
-            perturb_positive(multiplier, fraction, 0.01, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_period(period, fraction, rng);
+            }
+            if should_perturb(change_probability, rng) {
+                perturb_positive(multiplier, fraction, 0.01, rng);
+            }
         }
     }
     match &mut neighbor.stops.take_profit {
         TakeProfitPolicy::RiskMultiple { multiple } => {
-            perturb_positive(multiple, fraction, 0.01, rng)
+            if should_perturb(change_probability, rng) {
+                perturb_positive(multiple, fraction, 0.01, rng)
+            }
         }
-        TakeProfitPolicy::FixedPoints { points } => perturb_positive(points, fraction, 0.01, rng),
+        TakeProfitPolicy::FixedPoints { points } => {
+            if should_perturb(change_probability, rng) {
+                perturb_positive(points, fraction, 0.01, rng)
+            }
+        }
         TakeProfitPolicy::AtrMultiple { period, multiplier } => {
-            perturb_period(period, fraction, rng);
-            perturb_positive(multiplier, fraction, 0.01, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_period(period, fraction, rng);
+            }
+            if should_perturb(change_probability, rng) {
+                perturb_positive(multiplier, fraction, 0.01, rng);
+            }
         }
     }
     match &mut neighbor.entry.order {
@@ -1046,15 +1113,23 @@ fn perturb_strategy(
         } => {
             match distance {
                 EntryDistancePolicy::FixedPoints { points } => {
-                    perturb_positive(points, fraction, 0.01, rng)
+                    if should_perturb(change_probability, rng) {
+                        perturb_positive(points, fraction, 0.01, rng)
+                    }
                 }
                 EntryDistancePolicy::AtrMultiple { period, multiplier }
                 | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
-                    perturb_period(period, fraction, rng);
-                    perturb_positive(multiplier, fraction, 0.01, rng);
+                    if should_perturb(change_probability, rng) {
+                        perturb_period(period, fraction, rng);
+                    }
+                    if should_perturb(change_probability, rng) {
+                        perturb_positive(multiplier, fraction, 0.01, rng);
+                    }
                 }
             }
-            perturb_period(expiry_bars, fraction, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_period(expiry_bars, fraction, rng);
+            }
         }
         EntryOrderPolicy::StopLimit {
             stop_distance,
@@ -1064,20 +1139,30 @@ fn perturb_strategy(
             for distance in [stop_distance, limit_offset] {
                 match distance {
                     EntryDistancePolicy::FixedPoints { points } => {
-                        perturb_positive(points, fraction, 0.01, rng)
+                        if should_perturb(change_probability, rng) {
+                            perturb_positive(points, fraction, 0.01, rng)
+                        }
                     }
                     EntryDistancePolicy::AtrMultiple { period, multiplier }
                     | EntryDistancePolicy::RangeMultiple { period, multiplier } => {
-                        perturb_period(period, fraction, rng);
-                        perturb_positive(multiplier, fraction, 0.01, rng);
+                        if should_perturb(change_probability, rng) {
+                            perturb_period(period, fraction, rng);
+                        }
+                        if should_perturb(change_probability, rng) {
+                            perturb_positive(multiplier, fraction, 0.01, rng);
+                        }
                     }
                 }
             }
-            perturb_period(expiry_bars, fraction, rng);
+            if should_perturb(change_probability, rng) {
+                perturb_period(expiry_bars, fraction, rng);
+            }
         }
     }
     if let Some(value) = &mut neighbor.manage.break_even_at_r {
-        perturb_positive(value, fraction, 0.01, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_positive(value, fraction, 0.01, rng);
+        }
     }
     if let Some(trailing) = &mut neighbor.manage.trailing {
         match trailing {
@@ -1085,26 +1170,43 @@ fn perturb_strategy(
                 activate_at_r,
                 distance_r,
             } => {
-                perturb_positive(activate_at_r, fraction, 0.01, rng);
-                perturb_positive(distance_r, fraction, 0.01, rng);
+                if should_perturb(change_probability, rng) {
+                    perturb_positive(activate_at_r, fraction, 0.01, rng);
+                }
+                if should_perturb(change_probability, rng) {
+                    perturb_positive(distance_r, fraction, 0.01, rng);
+                }
             }
             TrailingPolicy::AtrMultiple {
                 activate_at_r,
                 period,
                 multiplier,
             } => {
-                perturb_positive(activate_at_r, fraction, 0.01, rng);
-                perturb_period(period, fraction, rng);
-                perturb_positive(multiplier, fraction, 0.01, rng);
+                if should_perturb(change_probability, rng) {
+                    perturb_positive(activate_at_r, fraction, 0.01, rng);
+                }
+                if should_perturb(change_probability, rng) {
+                    perturb_period(period, fraction, rng);
+                }
+                if should_perturb(change_probability, rng) {
+                    perturb_positive(multiplier, fraction, 0.01, rng);
+                }
             }
         }
     }
     if let Some(bars) = &mut neighbor.manage.time_stop_bars {
-        perturb_period(bars, fraction, rng);
+        if should_perturb(change_probability, rng) {
+            perturb_period(bars, fraction, rng);
+        }
     }
     for partial in &mut neighbor.manage.partial_exits {
-        perturb_positive(&mut partial.at_r, fraction, 0.01, rng);
-        partial.fraction = (partial.fraction * random_factor(fraction, rng)).clamp(1.0e-6, 1.0);
+        if should_perturb(change_probability, rng) {
+            perturb_positive(&mut partial.at_r, fraction, 0.01, rng);
+        }
+        if should_perturb(change_probability, rng) {
+            partial.fraction =
+                (partial.fraction * random_factor(fraction, rng)).clamp(1.0e-6, 1.0);
+        }
     }
     let total_fraction: f64 = neighbor
         .manage
@@ -1117,9 +1219,18 @@ fn perturb_strategy(
             partial.fraction /= total_fraction;
         }
     }
+    neighbor.id = strategy.id.clone();
+    if neighbor == *strategy && change_probability > 0.0 && change_probability < 1.0 {
+        neighbor = perturb_strategy(strategy, fraction, 1.0, sample, rng)?;
+    }
+    neighbor.id = neighbor_id;
     let neighbor = neighbor.canonicalized(FloatPolicy::default())?;
     neighbor.validate_export_safe(quantforge_ir::IrLimits::default())?;
     Ok(neighbor)
+}
+
+fn should_perturb(change_probability: f64, rng: &mut ChaCha8Rng) -> bool {
+    change_probability >= 1.0 || (change_probability > 0.0 && rng.gen_bool(change_probability))
 }
 
 fn perturb_bool(expression: &mut BoolExpr, fraction: f64, rng: &mut ChaCha8Rng) {

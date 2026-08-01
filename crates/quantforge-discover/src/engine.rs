@@ -106,6 +106,9 @@ fn evaluate_and_deposit(
             .minimum_neighborhood_survival_fraction
             .clamp(0.25, 1.0),
         parameter_perturbation_fraction: bank.config.robustness_perturbation_fraction,
+        parameter_change_probability: bank
+            .config
+            .robustness_parameter_change_probability,
         adx_period_min: bank
             .config
             .search_ranges
@@ -1423,6 +1426,7 @@ mod tests {
             robustness_monte_carlo_trials: 50,
             robustness_neighborhood_samples: 2,
             robustness_perturbation_fraction: 0.20,
+            robustness_parameter_change_probability: 0.5,
             minimum_neighborhood_survival_fraction: 0.7,
             calendar_year_folds: false,
             minimum_deflated_trade_sharpe: None,

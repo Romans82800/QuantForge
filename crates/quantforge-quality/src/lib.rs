@@ -20,7 +20,8 @@ pub use challenge::{
     ParameterNeighbor, ParameterNeighborhoodReport, PurgedFoldReport, SelectionBiasLevel,
     deflated_trade_sharpe, expected_max_lucky_sharpe, monte_carlo_from_trade_profits,
     monte_carlo_trade_resampling_with_skip,
-    perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
+    perturb_strategy_parameters, perturb_strategy_parameters_with_probability, run_challenge,
+    trade_sharpe_proxy,
 };
 pub use databank_correlation::{
     DATABANK_CORRELATION_PROTOCOL, CorrelationCandidate, CorrelationFilterError,

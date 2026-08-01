@@ -829,6 +829,9 @@ fn run_elite_robustness_sync(
             .minimum_neighborhood_survival_fraction
             .clamp(0.25, 1.0),
         parameter_perturbation_fraction: snapshot.config.robustness_perturbation_fraction,
+        parameter_change_probability: snapshot
+            .config
+            .robustness_parameter_change_probability,
         adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
         adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
         adx_period_step: search.indicator_period.step.round().max(1.0) as u16,

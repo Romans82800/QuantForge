@@ -217,6 +217,7 @@ fn write_databank(
         robustness_monte_carlo_trials: 50,
         robustness_neighborhood_samples: 2,
         robustness_perturbation_fraction: 0.20,
+        robustness_parameter_change_probability: 0.5,
         minimum_neighborhood_survival_fraction: 0.0,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,

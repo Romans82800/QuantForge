@@ -418,6 +418,10 @@ struct EvolveArgs {
     /// local plateau, as a fraction (SQX default 0.20).
     #[arg(long)]
     robustness_perturbation_fraction: Option<f64>,
+    /// Probability that each eligible parameter group is changed in a
+    /// neighbourhood sample (default 0.50).
+    #[arg(long)]
+    robustness_parameter_change_probability: Option<f64>,
     /// Close positions, cancel pending orders and block entries from end-of-day
     /// until the next broker day.
     #[arg(long)]
@@ -5204,6 +5208,9 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        robustness_parameter_change_probability: args
+            .robustness_parameter_change_probability
+            .unwrap_or(0.5),
         minimum_neighborhood_survival_fraction: 0.7,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,

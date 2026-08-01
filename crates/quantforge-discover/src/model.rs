@@ -657,6 +657,11 @@ pub struct DiscoverConfig {
     /// local plateau. `0.20` matches the SQX parameter-sensitivity default.
     #[serde(default = "default_robustness_perturbation_fraction")]
     pub robustness_perturbation_fraction: f64,
+    /// Probability that each eligible parameter group is changed in a
+    /// neighbourhood sample. This separates change frequency from the
+    /// maximum relative move applied to a selected parameter.
+    #[serde(default = "default_robustness_parameter_change_probability")]
+    pub robustness_parameter_change_probability: f64,
     /// Fraction of ±param neighbors that must survive for databank promotion.
     #[serde(default = "default_minimum_neighborhood_survival_fraction")]
     pub minimum_neighborhood_survival_fraction: f64,
@@ -761,6 +766,10 @@ fn default_robustness_perturbation_fraction() -> f64 {
     crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION
 }
 
+fn default_robustness_parameter_change_probability() -> f64 {
+    0.5
+}
+
 fn default_minimum_neighborhood_survival_fraction() -> f64 {
     0.7
 }
@@ -834,6 +843,8 @@ impl Default for DiscoverConfig {
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
             robustness_neighborhood_samples: default_robustness_neighborhood_samples(),
             robustness_perturbation_fraction: default_robustness_perturbation_fraction(),
+            robustness_parameter_change_probability:
+                default_robustness_parameter_change_probability(),
             minimum_neighborhood_survival_fraction: default_minimum_neighborhood_survival_fraction(
             ),
             calendar_year_folds: default_calendar_year_folds(),
@@ -1132,6 +1143,14 @@ impl DiscoverConfig {
                     "robustness_perturbation_fraction must be finite and between 0.01 and 1".into(),
                 ));
             }
+            if !self.robustness_parameter_change_probability.is_finite()
+                || !(0.01..=1.0).contains(&self.robustness_parameter_change_probability)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_parameter_change_probability must be finite and between 0.01 and 1"
+                        .into(),
+                ));
+            }
         }
         self.search_ranges.validate()?;
         self.universal_grammar.validate()?;
@@ -1290,6 +1309,9 @@ pub struct ParameterNeighborhoodSample {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParameterNeighborhoodEvidence {
     pub perturbation_fraction: f64,
+    /// Probability that an eligible parameter group was changed per sample.
+    #[serde(default = "default_robustness_parameter_change_probability")]
+    pub change_probability: f64,
     pub samples_requested: usize,
     /// Samples that produced a canonical, evaluable neighbour.
     pub samples_evaluated: usize,

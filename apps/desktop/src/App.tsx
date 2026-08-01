@@ -2990,6 +2990,7 @@ function DiscoverWorkspace({
     robustnessMonteCarloTrials: 250,
     robustnessNeighborhoodSamples: 8,
     robustnessPerturbationFraction: 0.2,
+    robustnessParameterChangeProbability: 0.5,
     minimumNeighborhoodSurvivalFraction: 0.7,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
@@ -3241,6 +3242,7 @@ function DiscoverWorkspace({
             robustnessMonteCarloTrials: null,
             robustnessNeighborhoodSamples: null,
             robustnessPerturbationFraction: null,
+            robustnessParameterChangeProbability: null,
             minimumNeighborhoodSurvivalFraction: null,
             calendarYearFolds: null,
             minimumDeflatedTradeSharpe: null,
@@ -3735,9 +3737,17 @@ function DiscoverWorkspace({
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="Param samples" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
                   <NumberField
-                    label="Param jitter ±% (SQX default 20)"
+                    label="Max param change ±%"
                     value={perturbationPercent(form)}
                     onChange={(value) => update("robustnessPerturbationFraction", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
+                    min={1}
+                    max={100}
+                    step={1}
+                  />
+                  <NumberField
+                    label="Param change probability %"
+                    value={Math.round((form.robustnessParameterChangeProbability ?? 0.5) * 100)}
+                    onChange={(value) => update("robustnessParameterChangeProbability", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
                     min={1}
                     max={100}
                     step={1}

@@ -112,6 +112,7 @@ pub struct DiscoverRequest {
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
+    robustness_parameter_change_probability: Option<f64>,
     /// Fraction of ±param neighbors that must survive (default 0.7; Quota uses 0.5).
     minimum_neighborhood_survival_fraction: Option<f64>,
     /// Broker-local calendar-year folds; every year must pass (strict opt-in).
@@ -1617,6 +1618,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
+        robustness_parameter_change_probability: request
+            .robustness_parameter_change_probability
+            .unwrap_or(0.5),
         minimum_neighborhood_survival_fraction: request
             .minimum_neighborhood_survival_fraction
             .unwrap_or(0.7),
@@ -1953,6 +1957,7 @@ mod tests {
             robustness_monte_carlo_trials: Some(50),
             robustness_neighborhood_samples: Some(2),
             robustness_perturbation_fraction: Some(0.20),
+            robustness_parameter_change_probability: Some(0.5),
             minimum_neighborhood_survival_fraction: Some(0.0),
             calendar_year_folds: Some(false),
             minimum_deflated_trade_sharpe: None,
