@@ -17,6 +17,10 @@ use thiserror::Error;
 
 pub const CHALLENGE_REPORT_SCHEMA_VERSION: u16 = 1;
 
+/// Default Monte Carlo gate: the 80th percentile of resampled net profit must
+/// retain at least this fraction of the baseline (original) net profit.
+pub const MONTE_CARLO_P80_PROFIT_RETENTION: f64 = 0.60;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChallengeConfig {
@@ -37,6 +41,9 @@ pub struct ChallengeConfig {
     pub monte_carlo_block_length: usize,
     pub monte_carlo_minimum_p05_net_profit: f64,
     pub monte_carlo_maximum_p95_drawdown_percent: f64,
+    /// Fraction of baseline net profit that the 80th percentile of the Monte
+    /// Carlo net-profit distribution must retain (default 0.60).
+    pub monte_carlo_minimum_p80_profit_retention: f64,
     pub neighborhood_samples: usize,
     pub parameter_perturbation_fraction: f64,
     pub minimum_neighborhood_survival_fraction: f64,
@@ -68,6 +75,7 @@ impl Default for ChallengeConfig {
             monte_carlo_block_length: 5,
             monte_carlo_minimum_p05_net_profit: 0.0,
             monte_carlo_maximum_p95_drawdown_percent: 35.0,
+            monte_carlo_minimum_p80_profit_retention: MONTE_CARLO_P80_PROFIT_RETENTION,
             neighborhood_samples: 20,
             parameter_perturbation_fraction: 0.1,
             minimum_neighborhood_survival_fraction: 0.7,
@@ -127,6 +135,10 @@ impl ChallengeConfig {
             (
                 "minimum_neighborhood_trade_ratio",
                 self.minimum_neighborhood_trade_ratio,
+            ),
+            (
+                "monte_carlo_minimum_p80_profit_retention",
+                self.monte_carlo_minimum_p80_profit_retention,
             ),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -250,8 +262,18 @@ pub struct MonteCarloReport {
     pub minimum_p05_net_profit: f64,
     #[serde(default)]
     pub maximum_p95_drawdown_percent: f64,
+    /// Required fraction of [`Self::baseline_net_profit`] that
+    /// [`Self::p80_net_profit`] must retain.
+    #[serde(default = "default_minimum_p80_profit_retention")]
+    pub minimum_p80_profit_retention: f64,
+    /// Original (pre-resampling) net profit the retention gate is measured against.
+    #[serde(default)]
+    pub baseline_net_profit: f64,
     pub p05_net_profit: f64,
     pub median_net_profit: f64,
+    /// 80th percentile of the Monte Carlo net-profit distribution.
+    #[serde(default)]
+    pub p80_net_profit: f64,
     pub p95_drawdown_percent: f64,
     pub worst_drawdown_percent: f64,
     /// A small deterministic sample of paths for Results. Full trial paths are
@@ -259,6 +281,10 @@ pub struct MonteCarloReport {
     #[serde(default)]
     pub sample_paths: Vec<Vec<f64>>,
     pub passed: bool,
+}
+
+fn default_minimum_p80_profit_retention() -> f64 {
+    MONTE_CARLO_P80_PROFIT_RETENTION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,11 +442,24 @@ impl ChallengeReport {
         let monte_carlo_passed = self.baseline.metrics.trade_count > 0
             && self.monte_carlo.p05_net_profit >= self.config.monte_carlo_minimum_p05_net_profit
             && self.monte_carlo.p95_drawdown_percent
-                <= self.config.monte_carlo_maximum_p95_drawdown_percent;
+                <= self.config.monte_carlo_maximum_p95_drawdown_percent
+            && passes_p80_profit_retention(
+                self.monte_carlo.p80_net_profit,
+                self.baseline.metrics.net_profit,
+                self.config.monte_carlo_minimum_p80_profit_retention,
+            );
         if self.monte_carlo.method != "moving_block_trade_bootstrap_v1"
             || self.monte_carlo.seed != self.config.seed
             || self.monte_carlo.trials != self.config.monte_carlo_trials
             || self.monte_carlo.block_length != self.config.monte_carlo_block_length
+            || !same_float(
+                self.monte_carlo.minimum_p80_profit_retention,
+                self.config.monte_carlo_minimum_p80_profit_retention,
+            )
+            || !same_float(
+                self.monte_carlo.baseline_net_profit,
+                self.baseline.metrics.net_profit,
+            )
             || self.monte_carlo.passed != monte_carlo_passed
         {
             return Err(ChallengeError::InvalidReport(
@@ -752,6 +791,7 @@ pub fn monte_carlo_from_trade_profits(
     minimum_p05_net_profit: f64,
     maximum_p95_drawdown_percent: f64,
 ) -> MonteCarloReport {
+    let baseline_net_profit: f64 = profits.iter().sum();
     monte_carlo_trade_resampling_with_skip(
         profits,
         initial_balance,
@@ -761,6 +801,8 @@ pub fn monte_carlo_from_trade_profits(
         seed,
         minimum_p05_net_profit,
         maximum_p95_drawdown_percent,
+        baseline_net_profit,
+        MONTE_CARLO_P80_PROFIT_RETENTION,
     )
 }
 
@@ -771,6 +813,9 @@ pub fn monte_carlo_from_trade_profits(
 /// edge survives both a different ordering and a realistic proportion of
 /// missed/filtered fills; it never changes the original backtest or searches
 /// for a favourable seed.
+///
+/// Pass requires the usual left-tail / drawdown floors plus the 80th-percentile
+/// net-profit retention gate: `p80_net_profit >= retention * baseline_net_profit`.
 pub fn monte_carlo_trade_resampling_with_skip(
     profits: &[f64],
     initial_balance: f64,
@@ -780,6 +825,8 @@ pub fn monte_carlo_trade_resampling_with_skip(
     seed: u64,
     minimum_p05_net_profit: f64,
     maximum_p95_drawdown_percent: f64,
+    baseline_net_profit: f64,
+    minimum_p80_profit_retention: f64,
 ) -> MonteCarloReport {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xa5a5_01b0_07c5_7a11);
     let mut net_profits = Vec::with_capacity(trials);
@@ -807,8 +854,14 @@ pub fn monte_carlo_trade_resampling_with_skip(
     drawdowns.sort_by(f64::total_cmp);
     let p05_net_profit = quantile(&net_profits, 0.05);
     let median_net_profit = quantile(&net_profits, 0.5);
+    let p80_net_profit = quantile(&net_profits, 0.80);
     let p95_drawdown_percent = quantile(&drawdowns, 0.95);
     let worst_drawdown_percent = *drawdowns.last().unwrap_or(&0.0);
+    let p80_retained = passes_p80_profit_retention(
+        p80_net_profit,
+        baseline_net_profit,
+        minimum_p80_profit_retention,
+    );
     MonteCarloReport {
         method: if skip_trade_probability > 0.0 {
             "moving_block_trade_resampling_with_skip_v1".into()
@@ -821,15 +874,31 @@ pub fn monte_carlo_trade_resampling_with_skip(
         skip_trade_probability,
         minimum_p05_net_profit,
         maximum_p95_drawdown_percent,
+        minimum_p80_profit_retention,
+        baseline_net_profit,
         p05_net_profit,
         median_net_profit,
+        p80_net_profit,
         p95_drawdown_percent,
         worst_drawdown_percent,
         sample_paths,
         passed: !profits.is_empty()
             && p05_net_profit >= minimum_p05_net_profit
-            && p95_drawdown_percent <= maximum_p95_drawdown_percent,
+            && p95_drawdown_percent <= maximum_p95_drawdown_percent
+            && p80_retained,
     }
+}
+
+/// True when the 80th percentile of Monte Carlo net profit retains at least
+/// `retention` of the original baseline net profit.
+pub fn passes_p80_profit_retention(p80_net_profit: f64, baseline_net_profit: f64, retention: f64) -> bool {
+    if !p80_net_profit.is_finite() || !baseline_net_profit.is_finite() || !retention.is_finite() {
+        return false;
+    }
+    if baseline_net_profit <= 0.0 {
+        return false;
+    }
+    p80_net_profit + 1e-12 >= retention * baseline_net_profit
 }
 
 fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCarloReport {
@@ -838,14 +907,17 @@ fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCar
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
-    monte_carlo_from_trade_profits(
+    monte_carlo_trade_resampling_with_skip(
         &profits,
         config.scout.initial_balance,
         config.monte_carlo_trials,
         config.monte_carlo_block_length,
+        0.0,
         config.seed,
         config.monte_carlo_minimum_p05_net_profit,
         config.monte_carlo_maximum_p95_drawdown_percent,
+        baseline.metrics.net_profit,
+        config.monte_carlo_minimum_p80_profit_retention,
     )
 }
 
@@ -1586,6 +1658,66 @@ mod tests {
         let second = moving_block_sample(&values, 3, &mut right);
         assert_eq!(first, second);
         assert_eq!(first.len(), values.len());
+    }
+
+    #[test]
+    fn p80_profit_retention_requires_sixty_percent_of_baseline() {
+        assert!(passes_p80_profit_retention(600.0, 1_000.0, 0.60));
+        assert!(passes_p80_profit_retention(599.999_999_999_999, 1_000.0, 0.60));
+        assert!(!passes_p80_profit_retention(599.0, 1_000.0, 0.60));
+        assert!(!passes_p80_profit_retention(100.0, 0.0, 0.60));
+        assert!(!passes_p80_profit_retention(100.0, -50.0, 0.60));
+    }
+
+    #[test]
+    fn monte_carlo_pass_requires_p80_retention_of_baseline_net_profit() {
+        let strong = [100.0; 20];
+        let baseline: f64 = strong.iter().sum();
+        let passed = monte_carlo_trade_resampling_with_skip(
+            &strong,
+            10_000.0,
+            50,
+            5,
+            0.0,
+            7,
+            0.0,
+            100.0,
+            baseline,
+            0.60,
+        );
+        assert!(passed.passed);
+        assert!((passed.p80_net_profit - baseline).abs() < 1e-9);
+        assert_eq!(passed.minimum_p80_profit_retention, 0.60);
+        assert_eq!(passed.baseline_net_profit, baseline);
+
+        let skipped = monte_carlo_trade_resampling_with_skip(
+            &strong,
+            10_000.0,
+            200,
+            5,
+            0.15,
+            11,
+            0.0,
+            100.0,
+            baseline,
+            1.0,
+        );
+        assert!(skipped.p80_net_profit < baseline);
+        assert!(!skipped.passed);
+        let skipped_relaxed = monte_carlo_trade_resampling_with_skip(
+            &strong,
+            10_000.0,
+            200,
+            5,
+            0.15,
+            11,
+            0.0,
+            100.0,
+            baseline,
+            0.60,
+        );
+        assert!(skipped_relaxed.passed);
+        assert!(skipped_relaxed.p80_net_profit >= 0.60 * baseline);
     }
 
     #[test]

@@ -868,6 +868,10 @@ fn run_elite_robustness_sync(
                     "monte_carlo_skip_trade_probability".into(),
                     json!(quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY),
                 ),
+                (
+                    "monte_carlo_minimum_p80_profit_retention".into(),
+                    json!(quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION),
+                ),
                 ("neighborhood_samples".into(), json!(neighborhood_samples)),
                 (
                     "parameter_perturbation_fraction".into(),
@@ -981,7 +985,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::MonteCarlo => (
             "monte_carlo",
-            "Failed the block-bootstrap Monte Carlo requirement.",
+            "Failed the block-bootstrap Monte Carlo requirement (P80 net profit must keep ≥60% of baseline).",
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",

@@ -1746,17 +1746,33 @@ function MonteCarloPanel({
       </RobustnessShell>
     );
   }
+  const p80 = evidence.p80_net_profit ?? null;
+  const baseline = evidence.baseline_net_profit ?? null;
+  const retentionFloor = evidence.minimum_p80_profit_retention ?? 0.6;
   const scale = Math.max(
     Math.abs(evidence.median_net_profit),
     Math.abs(evidence.p05_net_profit),
+    p80 != null ? Math.abs(p80) : 0,
+    baseline != null ? Math.abs(baseline) : 0,
     1e-9,
   );
+  const p80Retained =
+    p80 != null &&
+    baseline != null &&
+    baseline > 0 &&
+    p80 >= retentionFloor * baseline;
   const bars: Array<{ label: string; value: number; width: number; tone: string }> = [
     {
       label: "Median net profit",
       value: evidence.median_net_profit,
       width: Math.abs(evidence.median_net_profit) / scale,
       tone: evidence.median_net_profit >= 0 ? "pass" : "fail",
+    },
+    {
+      label: "80th percentile",
+      value: p80 ?? 0,
+      width: Math.abs(p80 ?? 0) / scale,
+      tone: p80Retained ? "pass" : "fail",
     },
     {
       label: "5th percentile",
@@ -1786,7 +1802,14 @@ function MonteCarloPanel({
           ["Trials", formatNumber(evidence.trials)],
           ["Method", `${evidence.method} · block ${formatNumber(evidence.block_length)}`],
           ["Trade removal", `${((evidence.skip_trade_probability ?? 0) * 100).toFixed(0)}% per simulation`],
-          ["Profit criterion", `P05 ≥ $${formatNumber(evidence.minimum_p05_net_profit ?? 0)}`],
+          ["P05 floor", `P05 ≥ $${formatNumber(evidence.minimum_p05_net_profit ?? 0)}`],
+          [
+            "P80 retention",
+            `P80 ≥ ${(retentionFloor * 100).toFixed(0)}% of baseline${
+              baseline != null ? ` ($${formatNumber(retentionFloor * baseline)})` : ""
+            }`,
+          ],
+          ["Baseline net profit", baseline != null ? `$${formatNumber(baseline)}` : "—"],
           ["Drawdown criterion", `P95 ≤ ${(evidence.maximum_p95_drawdown_percent ?? 0).toFixed(2)}%`],
           ["P95 drawdown", `${evidence.p95_drawdown_percent.toFixed(2)}%`],
           ["Worst drawdown", `${evidence.worst_drawdown_percent.toFixed(2)}%`],

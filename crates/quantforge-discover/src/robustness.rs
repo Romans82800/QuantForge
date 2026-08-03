@@ -72,6 +72,8 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
 /// SQX-style trade manipulation: each resampled path loses 15% of fills.
 pub const MONTE_CARLO_SKIP_TRADE_PROBABILITY: f64 = 0.15;
+/// Re-export of the shared Monte Carlo P80 net-profit retention floor (60%).
+pub use quantforge_quality::MONTE_CARLO_P80_PROFIT_RETENTION;
 
 /// M1 baseline → SQX retention vs H1 → WFO/MC/params.
 pub fn run_m1_predeposit_robustness(
@@ -197,7 +199,11 @@ pub fn run_m1_predeposit_robustness(
         config.seed,
         0.0,
         config.maximum_drawdown_percent.max(35.0),
+        baseline.metrics.net_profit,
+        MONTE_CARLO_P80_PROFIT_RETENTION,
     );
+    // Require a non-negative median path and the shared P80 retention gate
+    // (p80_net_profit >= 60% of baseline net profit) encoded in `mc.passed`.
     if !mc.passed || mc.median_net_profit < 0.0 {
         return Err(RobustnessReject::MonteCarlo);
     }

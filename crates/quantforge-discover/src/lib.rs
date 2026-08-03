@@ -37,8 +37,9 @@ pub use permutation::{
     PermutationNullConfig, PermutationNullReport, run_permutation_null, stationary_bootstrap_bars,
 };
 pub use robustness::{
-    MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
-    RobustnessConfig, RobustnessOutcome, RobustnessReject, run_m1_predeposit_robustness,
+    MONTE_CARLO_P80_PROFIT_RETENTION, MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+    PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessConfig, RobustnessOutcome,
+    RobustnessReject, run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

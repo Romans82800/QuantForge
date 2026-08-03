@@ -36,5 +36,8 @@ This is a strong purged walk-forward k-fold implementation, which the product
 spec permits as the v1 alternative to combinatorial purged CV. It is not full
 CPCV path enumeration. Monte Carlo v1 resamples contiguous blocks of trade
 outcomes; moving-block bar resampling and optional cross-seed reappearance are
-future extensions. These method names are recorded explicitly in JSON so the
-evidence cannot be mistaken for a stronger protocol.
+future extensions. The pass gate requires the 80th percentile of resampled net
+profit to retain at least 60% of the baseline net profit (`P80 ≥ 0.60 ×
+baseline`), alongside the configured P05 profit floor and P95 drawdown cap.
+These method names are recorded explicitly in JSON so the evidence cannot be
+mistaken for a stronger protocol.

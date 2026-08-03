@@ -245,8 +245,11 @@ export interface RobustnessEvidence {
     skip_trade_probability?: number;
     minimum_p05_net_profit?: number;
     maximum_p95_drawdown_percent?: number;
+    minimum_p80_profit_retention?: number;
+    baseline_net_profit?: number;
     p05_net_profit: number;
     median_net_profit: number;
+    p80_net_profit?: number;
     p95_drawdown_percent: number;
     worst_drawdown_percent: number;
     sample_paths?: number[][];

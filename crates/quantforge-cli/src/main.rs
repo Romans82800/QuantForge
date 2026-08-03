@@ -834,6 +834,9 @@ struct ChallengeArgs {
     monte_carlo_minimum_p05_net_profit: f64,
     #[arg(long, default_value_t = 35.0)]
     monte_carlo_maximum_p95_drawdown_percent: f64,
+    /// Fraction of baseline net profit the MC 80th percentile must retain.
+    #[arg(long, default_value_t = 0.60)]
+    monte_carlo_minimum_p80_profit_retention: f64,
     #[arg(long, default_value_t = 20)]
     neighborhood_samples: usize,
     #[arg(long, default_value_t = 0.1)]
@@ -1747,6 +1750,7 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
         monte_carlo_block_length: args.monte_carlo_block_length,
         monte_carlo_minimum_p05_net_profit: args.monte_carlo_minimum_p05_net_profit,
         monte_carlo_maximum_p95_drawdown_percent: args.monte_carlo_maximum_p95_drawdown_percent,
+        monte_carlo_minimum_p80_profit_retention: args.monte_carlo_minimum_p80_profit_retention,
         neighborhood_samples: args.neighborhood_samples,
         parameter_perturbation_fraction: args.parameter_perturbation_fraction,
         minimum_neighborhood_survival_fraction: args.minimum_neighborhood_survival_fraction,
