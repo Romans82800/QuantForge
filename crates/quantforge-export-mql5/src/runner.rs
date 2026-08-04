@@ -53,7 +53,11 @@ pub fn run_mt5_tester(
                 drive_c.display()
             )));
         }
-        Some(tempfile::Builder::new().prefix("qf-tester-").tempdir_in(drive_c)?)
+        Some(
+            tempfile::Builder::new()
+                .prefix("qf-tester-")
+                .tempdir_in(drive_c)?,
+        )
     } else {
         None
     };
@@ -90,14 +94,27 @@ pub fn run_mt5_tester(
     let started = Instant::now();
     let mut child = command.spawn()?;
     let timeout = Duration::from_secs(config.timeout_seconds);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (Some(status), false);
+    let mut status = None;
+    let timed_out = loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        // On Wine, terminal64 is a launcher: it can exit while the tester
+        // agent continues writing FILE_COMMON artifacts.  The EA's OnDeinit
+        // completion marker is the authoritative boundary, not launcher exit.
+        if is_fresh(&deals_path, prior_deals)
+            && is_fresh(&equity_path, prior_equity)
+            && is_fresh(&metadata_path, prior_metadata)
+            && metadata_is_complete(&metadata_path)
+        {
+            break false;
         }
         if started.elapsed() >= timeout {
-            child.kill()?;
-            let status = child.wait().ok();
-            break (status, true);
+            if status.is_none() {
+                child.kill()?;
+                status = child.wait().ok();
+            }
+            break true;
         }
         thread::sleep(Duration::from_millis(250));
     };
@@ -117,6 +134,14 @@ pub fn run_mt5_tester(
         deals_fresh,
         equity_fresh,
         metadata_fresh,
+    })
+}
+
+fn metadata_is_complete(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| {
+        bytes
+            .windows(b"finished_server_time".len())
+            .any(|window| window == b"finished_server_time")
     })
 }
 

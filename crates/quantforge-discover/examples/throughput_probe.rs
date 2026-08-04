@@ -166,7 +166,10 @@ fn probe_indicator_lookup() {
     let started = Instant::now();
     for index in 0..reps {
         let expression = &expressions[index % expressions.len()];
-        sink += typed.get(&expression.buffer_key()).copied().unwrap_or_default();
+        sink += typed
+            .get(&expression.buffer_key())
+            .copied()
+            .unwrap_or_default();
     }
     let typed_elapsed = started.elapsed();
 

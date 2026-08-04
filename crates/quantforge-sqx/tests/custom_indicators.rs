@@ -1,9 +1,9 @@
+use quantforge_broker::BrokerClock;
 use quantforge_data::Bar;
 use quantforge_sqx::{
     atr_percentile_series, liquidity_sweep_score_series, rate_of_change_series, rsi_series,
     session_range_series, swing_base_zone_series, zscore_series,
 };
-use quantforge_broker::BrokerClock;
 
 fn bar(ts: i64, o: f64, h: f64, l: f64, c: f64) -> Bar {
     Bar {
@@ -62,14 +62,26 @@ fn sqx_liquidity_sweep_emits_discrete_scores() {
         })
         .collect();
     let scores = liquidity_sweep_score_series(&bars, 5);
-    assert!(scores.iter().any(|value| *value == 1.0 || *value == -1.0 || *value == 0.0));
+    assert!(
+        scores
+            .iter()
+            .any(|value| *value == 1.0 || *value == -1.0 || *value == 0.0)
+    );
 }
 
 #[test]
 fn sqx_session_range_carries_forward() {
     let clock = BrokerClock::parse("Etc/UTC").unwrap();
     let bars: Vec<Bar> = (0..48)
-        .map(|index| bar(index * 3_600_000, 1.0, 1.0 + (index as f64 * 0.01), 0.9, 1.0))
+        .map(|index| {
+            bar(
+                index * 3_600_000,
+                1.0,
+                1.0 + (index as f64 * 0.01),
+                0.9,
+                1.0,
+            )
+        })
         .collect();
     let highs = session_range_series(&bars, &clock, 0, 4, true);
     let lows = session_range_series(&bars, &clock, 0, 4, false);
@@ -83,7 +95,13 @@ fn sqx_swing_zone_high_is_at_least_low() {
     let bars: Vec<Bar> = (0..40)
         .map(|index| {
             let wiggle = ((index % 9) as f64 - 4.0).abs();
-            bar(index * 3_600_000, 1.0, 1.2 + wiggle * 0.02, 0.8 - wiggle * 0.02, 1.0)
+            bar(
+                index * 3_600_000,
+                1.0,
+                1.2 + wiggle * 0.02,
+                0.8 - wiggle * 0.02,
+                1.0,
+            )
         })
         .collect();
     let highs = swing_base_zone_series(&bars, 2, 2, 3, true);

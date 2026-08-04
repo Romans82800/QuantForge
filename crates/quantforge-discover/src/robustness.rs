@@ -3,7 +3,9 @@
 use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::FloatPolicy;
-use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
+use quantforge_data::{
+    BarDataset, QuoteBarDataset, bar_content_hash, infer_median_interval_ms, quote_bar_content_hash,
+};
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
 use quantforge_quality::{
@@ -20,7 +22,7 @@ use crate::model::{
     M1RetentionEvidence, ParameterNeighborhoodEvidence, ParameterNeighborhoodSample,
     RobustnessEvidence, WalkForwardEvidence, WalkForwardFold,
 };
-use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 
 /// M1 replay that leaves the battery plus the structured record of what the
 /// battery measured. `evidence` is `None` only on the research-only path that
@@ -85,6 +87,7 @@ pub fn run_m1_predeposit_robustness(
     strategy: &StrategyIr,
     is_decision: &BarDataset,
     m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     config: &RobustnessConfig,
     h1_metrics: &quantforge_eval::BacktestMetrics,
@@ -96,8 +99,15 @@ pub fn run_m1_predeposit_robustness(
         indicator_engine: config.indicator_engine,
         entry_window: config.entry_window,
     };
-    let baseline = evaluate_strategy_m1(strategy, is_decision, m1_dataset, broker, &judge)
-        .map_err(|_| RobustnessReject::M1Fidelity)?;
+    let baseline = evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        is_decision,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+    )
+    .map_err(|_| RobustnessReject::M1Fidelity)?;
     // This is deliberately the result that leaves the robustness battery.  The
     // selected-timeframe run is a scout; the databank must retain the exact M1
     // chronology, equity path and metrics that were actually admitted.
@@ -141,9 +151,16 @@ pub fn run_m1_predeposit_robustness(
         let interval_ms = infer_median_interval_ms(&is_decision.bars).unwrap_or(3_600_000);
         let end_exclusive_ms = last_open_ms.saturating_add(interval_ms);
         let m1_slice = slice_m1_covering(m1_dataset, start_ms, end_exclusive_ms);
-        let fold_result =
-            evaluate_strategy_m1(strategy, &decision_slice, &m1_slice, broker, &judge)
-                .map_err(|_| RobustnessReject::WalkForward)?;
+        let quote_slice = quote_dataset.map(|quotes| slice_quotes_covering(quotes, &m1_slice));
+        let fold_result = evaluate_strategy_m1_with_optional_quotes(
+            strategy,
+            &decision_slice,
+            &m1_slice,
+            quote_slice.as_ref(),
+            broker,
+            &judge,
+        )
+        .map_err(|_| RobustnessReject::WalkForward)?;
         let fold_trades = fold_result
             .trades
             .iter()
@@ -195,8 +212,8 @@ pub fn run_m1_predeposit_robustness(
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
-    let maximum_p95_drawdown_percent = baseline.metrics.max_drawdown_percent
-        * MONTE_CARLO_MAX_DRAWDOWN_RATIO;
+    let maximum_p95_drawdown_percent =
+        baseline.metrics.max_drawdown_percent * MONTE_CARLO_MAX_DRAWDOWN_RATIO;
     let mut mc = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.initial_balance,
@@ -223,12 +240,10 @@ pub fn run_m1_predeposit_robustness(
     // Test deterministic one-axis low/high permutations first.  A joint
     // seeded perturbation fills any remaining budget, preserving the existing
     // fast/deep runtime presets while making the result a real plateau test.
-    let mut permutation_neighbors = parameter_permutation_neighbors(
-        strategy,
-        config.parameter_perturbation_fraction,
-    )
-    .unwrap_or_default()
-    .into_iter();
+    let mut permutation_neighbors =
+        parameter_permutation_neighbors(strategy, config.parameter_perturbation_fraction)
+            .unwrap_or_default()
+            .into_iter();
     for sample in 0..config.neighborhood_samples {
         let neighbor = permutation_neighbors.next().or_else(|| {
             perturb_strategy_parameters(
@@ -240,8 +255,14 @@ pub fn run_m1_predeposit_robustness(
             .ok()
         });
         let Some(neighbor) = neighbor else { continue };
-        let Ok(result) = evaluate_strategy_m1(&neighbor, is_decision, m1_dataset, broker, &judge)
-        else {
+        let Ok(result) = evaluate_strategy_m1_with_optional_quotes(
+            &neighbor,
+            is_decision,
+            m1_dataset,
+            quote_dataset,
+            broker,
+            &judge,
+        ) else {
             continue;
         };
         evaluated_samples += 1;
@@ -282,9 +303,16 @@ pub fn run_m1_predeposit_robustness(
         plateau_surviving = plateau_neighbors
             .iter()
             .filter_map(|neighbor| {
-                evaluate_strategy_m1(neighbor, is_decision, m1_dataset, broker, &judge)
-                    .ok()
-                    .map(|result| neighborhood_survives(&result.metrics, &baseline.metrics, config))
+                evaluate_strategy_m1_with_optional_quotes(
+                    neighbor,
+                    is_decision,
+                    m1_dataset,
+                    quote_dataset,
+                    broker,
+                    &judge,
+                )
+                .ok()
+                .map(|result| neighborhood_survives(&result.metrics, &baseline.metrics, config))
             })
             .filter(|passed| *passed)
             .count();
@@ -316,6 +344,27 @@ pub fn run_m1_predeposit_robustness(
             },
         }),
     })
+}
+
+fn evaluate_strategy_m1_with_optional_quotes(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    judge: &JudgeConfig,
+) -> Result<quantforge_tick::JudgeResult, quantforge_tick::JudgeError> {
+    match quote_dataset {
+        Some(quotes) => evaluate_strategy_m1_with_quotes(
+            strategy,
+            decision_dataset,
+            m1_dataset,
+            quotes,
+            broker,
+            judge,
+        ),
+        None => evaluate_strategy_m1(strategy, decision_dataset, m1_dataset, broker, judge),
+    }
 }
 
 fn m1_retention_evidence(
@@ -705,6 +754,35 @@ fn slice_m1_covering(m1: &BarDataset, start_ms: i64, end_exclusive_ms: i64) -> B
         delimiter: m1.delimiter,
         source_timezone: m1.source_timezone.clone(),
         bars,
+    }
+}
+
+fn slice_quotes_covering(quotes: &QuoteBarDataset, m1: &BarDataset) -> QuoteBarDataset {
+    let (Some(first), Some(last)) = (m1.bars.first(), m1.bars.last()) else {
+        return QuoteBarDataset {
+            bars: Vec::new(),
+            source_rows: 0,
+            source_timezone: quotes.source_timezone.clone(),
+            data_hash: quote_bar_content_hash(&[]),
+            schema_version: QuoteBarDataset::SCHEMA_VERSION,
+            source_model: quotes.source_model,
+        };
+    };
+    let start_ms = first.timestamp_ms;
+    let end_exclusive_ms = last.timestamp_ms.saturating_add(60_000);
+    let bars = quotes
+        .bars
+        .iter()
+        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms < end_exclusive_ms)
+        .cloned()
+        .collect::<Vec<_>>();
+    QuoteBarDataset {
+        source_rows: bars.len(),
+        data_hash: quote_bar_content_hash(&bars),
+        bars,
+        source_timezone: quotes.source_timezone.clone(),
+        schema_version: quotes.schema_version,
+        source_model: quotes.source_model,
     }
 }
 

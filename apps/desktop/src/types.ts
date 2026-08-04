@@ -332,6 +332,15 @@ export interface EliteDetail {
   robustness?: EliteRobustnessView | null;
 }
 
+export interface EliteMql5SourceView {
+  fingerprint: string;
+  expertName: string;
+  timeframe: string;
+  exportStyle: string;
+  sourceHash: string;
+  source: string;
+}
+
 export type EliteSort =
   | "evidence"
   | "novelty"
@@ -380,6 +389,9 @@ export interface DataLabView {
   inputWasSorted: boolean;
   delimiter: string;
   sourceTimezone: string;
+  feedMode: string;
+  quotePath: string | null;
+  certificationReady: boolean;
   firstTimestampMs: number;
   lastTimestampMs: number;
   quality: DataQualityView;
@@ -403,6 +415,9 @@ export interface MarketFileImportView {
   m1MetadataPath: string | null;
   h1Path: string | null;
   h1MetadataPath: string | null;
+  quotePath: string | null;
+  quoteMetadataPath: string | null;
+  priceBasis: string | null;
   status: string;
   message: string | null;
 }
@@ -836,6 +851,7 @@ export interface JudgeRequest {
   m1DataPath: string;
   m1MetadataPath: string | null;
   m1SourceTimezone: string | null;
+  quotePath: string | null;
   splitPlanPath: string | null;
   strategyPath: string;
   brokerPath: string;
@@ -907,6 +923,7 @@ export interface ParityRequest {
   mt5DealsPath: string;
   mt5EquityPath: string;
   mt5MetadataPath: string;
+  quotePath: string | null;
   outputPath: string;
   initialBalance: number;
   tradeCountRelative: number;

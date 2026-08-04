@@ -45,7 +45,10 @@ impl IndicatorBufferCache {
     }
 
     pub fn len(&self) -> usize {
-        self.state.read().map(|state| state.buffers.len()).unwrap_or(0)
+        self.state
+            .read()
+            .map(|state| state.buffers.len())
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -103,7 +106,7 @@ pub struct FeatureCache<'a> {
 
 impl<'a> FeatureCache<'a> {
     pub fn new(bars: &'a [Bar], timezone: &str) -> Result<Self, EvalError> {
-        Self::with_engine(bars, timezone, IndicatorEngine::Sqx)
+        Self::with_engine(bars, timezone, IndicatorEngine::Mt5)
     }
 
     pub fn with_engine(
@@ -340,7 +343,7 @@ fn source_series(bars: &[Bar], field: PriceField) -> Vec<f64> {
 ///
 /// Session-range indicators require a broker clock; without one they return NaN.
 pub fn calculate_indicator_series(bars: &[Bar], indicator: &IndicatorExpr) -> Vec<f64> {
-    calculate_indicator_series_with_clock(bars, indicator, None, IndicatorEngine::Sqx)
+    calculate_indicator_series_with_clock(bars, indicator, None, IndicatorEngine::Mt5)
 }
 
 pub fn calculate_indicator_series_with_clock(
@@ -395,18 +398,14 @@ pub fn calculate_indicator_series_with_clock(
             let values = source_series(bars, source);
             match engine {
                 IndicatorEngine::Sqx => quantforge_sqx::highest_series(&values, period as usize),
-                IndicatorEngine::Mt5 => {
-                    rolling_extreme(&values, period as usize, true)
-                }
+                IndicatorEngine::Mt5 => rolling_extreme(&values, period as usize, true),
             }
         }
         IndicatorExpr::Lowest { source, period, .. } => {
             let values = source_series(bars, source);
             match engine {
                 IndicatorEngine::Sqx => quantforge_sqx::lowest_series(&values, period as usize),
-                IndicatorEngine::Mt5 => {
-                    rolling_extreme(&values, period as usize, false)
-                }
+                IndicatorEngine::Mt5 => rolling_extreme(&values, period as usize, false),
             }
         }
         IndicatorExpr::StandardDeviation { source, period, .. } => {
@@ -522,11 +521,9 @@ pub fn calculate_indicator_series_with_clock(
             lookback,
             ..
         } => match engine {
-            IndicatorEngine::Sqx => quantforge_sqx::atr_percentile_series(
-                bars,
-                atr_period as usize,
-                lookback as usize,
-            ),
+            IndicatorEngine::Sqx => {
+                quantforge_sqx::atr_percentile_series(bars, atr_period as usize, lookback as usize)
+            }
             IndicatorEngine::Mt5 => {
                 atr_percentile_series(bars, atr_period as usize, lookback as usize, engine)
             }
@@ -1388,12 +1385,14 @@ mod tests {
                 spread_points: Some(0),
             },
         ];
-        let values = calculate_indicator_series(
+        let values = calculate_indicator_series_with_clock(
             &bars,
             &IndicatorExpr::Atr {
                 period: 14,
                 shift: 0,
             },
+            None,
+            IndicatorEngine::Sqx,
         );
         assert_eq!(values[0], 2.0);
         assert!((values[1] - 2.5).abs() < 1e-9);
@@ -1484,23 +1483,18 @@ mod tests {
             period: 2,
             shift: 1,
         };
-        let legacy = calculate_indicator_series_with_clock(
-            &bars,
-            &indicator,
-            None,
-            IndicatorEngine::Mt5,
-        );
+        let legacy =
+            calculate_indicator_series_with_clock(&bars, &indicator, None, IndicatorEngine::Mt5);
         assert_eq!(legacy[0], 0.0);
         assert_eq!(legacy[1], 0.0);
         assert_eq!(legacy[2], 1.0);
 
-        let sqx = calculate_indicator_series_with_clock(
-            &bars,
-            &indicator,
-            None,
-            IndicatorEngine::Sqx,
+        let sqx =
+            calculate_indicator_series_with_clock(&bars, &indicator, None, IndicatorEngine::Sqx);
+        assert!(
+            sqx.iter()
+                .all(|value| *value == 0.0 || *value == 1.0 || *value == -1.0)
         );
-        assert!(sqx.iter().all(|value| *value == 0.0 || *value == 1.0 || *value == -1.0));
     }
 
     fn trending_bars(count: usize) -> Vec<Bar> {
@@ -1660,7 +1654,13 @@ mod tests {
     #[test]
     fn cci_is_positive_while_price_trends_up() {
         let bars = trending_bars(120);
-        let cci = calculate_indicator_series(&bars, &IndicatorExpr::Cci { period: 20, shift: 1 });
+        let cci = calculate_indicator_series(
+            &bars,
+            &IndicatorExpr::Cci {
+                period: 20,
+                shift: 1,
+            },
+        );
         let index = bars.len() - 1;
         assert!(cci[index].is_finite());
         assert!(cci[index] > 0.0);

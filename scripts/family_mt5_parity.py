@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Prove Scout/Judge ↔ MT5 trade-count parity for every Search Family.
+"""Certify QuantForge M1 replay against MT5's canonical bid/ask feed.
 
-Runs market + pending variants. Stops on the first hard failure unless --continue.
-Accepts trade-count deltas within max(10%, 8) absolute — rejects 500-vs-700 class gaps.
+Each case is deliberately two phase: MT5 Model=1 first captures the exact
+broker bid/ask M1 stream and its execution results; QuantForge then replays that
+quote sidecar before strict, one-to-one reconciliation. No synthetic-spread or
+trade-count tolerance is permitted in certification mode.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime as dt
 import json
 import os
 import shutil
@@ -26,6 +30,7 @@ TZ = "ICMarkets/EST+7"
 COMMISSION = 7.0
 RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / SYMBOL
 TIMEFRAME = "H1"
+TIME_STOP_OVERRIDE: int | None = None
 QF = ROOT / "target/release/quantforge"
 WINE = Path("/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine")
 WINEPREFIX = Path.home() / "Library/Application Support/net.metaquotes.wine.metatrader5"
@@ -78,10 +83,11 @@ def kill_mt5() -> None:
 
 
 def ensure_tools() -> None:
-    if not QF.is_file():
-        r = run(["cargo", "build", "-p", "quantforge-cli", "--release"])
-        if r.returncode:
-            sys.exit(r.returncode)
+    # Export templates are compiled into the CLI binary. Always rebuild so a
+    # parity run cannot silently exercise a stale EA after template changes.
+    r = run(["cargo", "build", "-p", "quantforge-cli", "--release"])
+    if r.returncode:
+        sys.exit(r.returncode)
     r = run(
         [
             "cargo",
@@ -96,11 +102,6 @@ def ensure_tools() -> None:
     if r.returncode:
         sys.exit(r.returncode)
     EXPERTS.mkdir(parents=True, exist_ok=True)
-    # Keep Sq* indicators in sync with repo (compiled later if needed).
-    for src in INDICATORS_SRC.glob("Sq*.mq5"):
-        dst = INDICATORS_DST / src.name
-        if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
-            shutil.copy2(src, dst)
 
 
 def emit_strategy(family: str, mode: str, out: Path, sequence: int) -> None:
@@ -120,6 +121,10 @@ def emit_strategy(family: str, mode: str, out: Path, sequence: int) -> None:
     )
     if r.returncode:
         raise RuntimeError(f"emit failed for {family}/{mode}")
+    if TIME_STOP_OVERRIDE is not None:
+        strategy = json.loads(out.read_text())
+        strategy["manage"]["time_stop_bars"] = TIME_STOP_OVERRIDE
+        out.write_text(json.dumps(strategy, indent=2) + "\n")
 
 
 def slice_tsv(src: Path, dst: Path, from_date: str, to_date: str) -> None:
@@ -133,6 +138,91 @@ def slice_tsv(src: Path, dst: Path, from_date: str, to_date: str) -> None:
                 fout.write(line)
 
 
+def write_bid_m1_from_quotes(quotes: Path, destination: Path, point: float) -> None:
+    """Materialize the capture EA's bid bars as canonical MT5 M1 TSV.
+
+    The timestamp integer deliberately remains broker-wall epoch here; the QF
+    loader and the quote loader both apply the same source timezone afterward.
+    """
+    with quotes.open(newline="") as source, destination.open("w", newline="") as target:
+        reader = csv.DictReader(source)
+        target.write("<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>\n")
+        rows = 0
+        for row in reader:
+            timestamp = dt.datetime.utcfromtimestamp(int(row["timestamp_ms"]) / 1000)
+            spread = max(
+                0,
+                round((float(row["ask_close"]) - float(row["bid_close"])) / point),
+            )
+            target.write(
+                "\t".join(
+                    [
+                        timestamp.strftime("%Y.%m.%d"),
+                        timestamp.strftime("%H:%M:%S"),
+                        row["bid_open"],
+                        row["bid_high"],
+                        row["bid_low"],
+                        row["bid_close"],
+                        row.get("tick_count") or "0",
+                        "0",
+                        str(spread),
+                    ]
+                )
+                + "\n"
+            )
+            rows += 1
+    if rows < 2:
+        raise RuntimeError("MT5 quote capture produced fewer than two M1 bid bars")
+
+
+def aggregate_bid_decision_bars(m1: Path, destination: Path, timeframe: str) -> None:
+    """Build the decision timeframe from canonical bid M1 broker-wall bars."""
+    minutes = {"M15": 15, "H1": 60}.get(timeframe)
+    if minutes is None:
+        raise ValueError(f"unsupported canonical decision timeframe: {timeframe}")
+
+    def bucket(row: dict[str, str]) -> dt.datetime:
+        value = dt.datetime.strptime(
+            f'{row["<DATE>"]} {row["<TIME>"]}', "%Y.%m.%d %H:%M:%S"
+        )
+        floored_minute = (value.minute // minutes) * minutes if minutes < 60 else 0
+        return value.replace(minute=floored_minute, second=0, microsecond=0)
+
+    with m1.open(newline="") as source:
+        rows = list(csv.DictReader(source, delimiter="\t"))
+    if not rows:
+        raise RuntimeError("canonical M1 input is empty")
+
+    groups: list[tuple[dt.datetime, list[dict[str, str]]]] = []
+    for row in rows:
+        key = bucket(row)
+        if not groups or groups[-1][0] != key:
+            groups.append((key, []))
+        groups[-1][1].append(row)
+
+    with destination.open("w", newline="") as target:
+        target.write(
+            "<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>\n"
+        )
+        for stamp, bars in groups:
+            target.write(
+                "\t".join(
+                    [
+                        stamp.strftime("%Y.%m.%d"),
+                        stamp.strftime("%H:%M:%S"),
+                        bars[0]["<OPEN>"],
+                        str(max(float(bar["<HIGH>"]) for bar in bars)),
+                        str(min(float(bar["<LOW>"]) for bar in bars)),
+                        bars[-1]["<CLOSE>"],
+                        str(sum(int(float(bar["<TICKVOL>"])) for bar in bars)),
+                        str(sum(int(float(bar["<VOL>"])) for bar in bars)),
+                        bars[-1]["<SPREAD>"],
+                    ]
+                )
+                + "\n"
+            )
+
+
 def count_trades_from_scout(path: Path) -> int:
     data = json.loads(path.read_text())
     return int(data["result"]["metrics"]["trade_count"])
@@ -143,7 +233,7 @@ def count_trades_from_parity(path: Path) -> tuple[int, int, int, bool]:
     ref = int(data["reference"]["metrics"]["trade_count"])
     ext = int(data["external"]["metrics"]["trade_count"])
     delta = int(data["report"]["trade_count_delta"])
-    passed = bool(data["report"]["trade_count_passed"])
+    passed = bool(data["report"]["passed"])
     return ref, ext, delta, passed
 
 
@@ -222,7 +312,13 @@ def run_case(
     m1 = work / f"{SYMBOL}_M1.tsv"
     slice_tsv(H1, h1, from_date, to_date)
     slice_tsv(M1, m1, from_date, to_date)
-    decision_data = h1 if TIMEFRAME == "H1" else m1
+    if TIMEFRAME == "H1":
+        decision_data = h1
+    elif TIMEFRAME == "M15":
+        decision_data = work / f"{SYMBOL}_M15.tsv"
+        aggregate_bid_decision_bars(m1, decision_data, TIMEFRAME)
+    else:
+        decision_data = m1
 
     if sequence is None:
         sequence = find_sequence_with_trades(family, mode, work, decision_data, from_date, to_date)
@@ -239,7 +335,9 @@ def run_case(
     export_dir = work / "export"
     export_dir.mkdir()
 
-    for cmd in (
+    # Scout remains useful as a quick selected-timeframe diagnostic. The Judge
+    # is intentionally deferred until MT5 has captured the canonical quotes.
+    r = run(
         [
             str(QF),
             "scout",
@@ -260,41 +358,15 @@ def run_case(
             "--out",
             str(scout),
         ],
-        [
-            str(QF),
-            "judge",
-            str(decision_data),
-            "--source-timezone",
-            TZ,
-            "--m1",
-            str(m1),
-            "--m1-source-timezone",
-            TZ,
-            "--strategy",
-            str(strategy),
-            "--broker",
-            str(BROKER),
-            "--commission-per-lot-round-turn",
-            str(COMMISSION),
-            "--fallback-spread-points",
-            "1",
-            "--initial-balance",
-            "100000",
-            "--allow-execution-gaps",
-            "--allow-failed-data",
-            "--out",
-            str(judge),
-        ],
-    ):
-        r = run(cmd, capture_output=True)
-        if r.returncode:
-            print(r.stdout)
-            print(r.stderr)
-            raise RuntimeError(f"{cmd[1]} failed for {tag}")
+        capture_output=True,
+    )
+    if r.returncode:
+        print(r.stdout)
+        print(r.stderr)
+        raise RuntimeError(f"scout failed for {tag}")
 
     scout_trades = count_trades_from_scout(scout)
-    judge_trades = count_trades_from_scout(judge)
-    print(f"  scout={scout_trades} judge={judge_trades}", flush=True)
+    print(f"  scout={scout_trades}; canonical Judge waits for MT5 quote capture", flush=True)
 
     # Export + compile into MT5 Experts tree so tester finds the EA.
     experts_export = EXPERTS  # compile in-place under Wine C:
@@ -331,11 +403,11 @@ def run_case(
             "--deposit",
             "100000",
             "--tester-model",
-            # QF's reference engine is an M1 OHLC replay, not a real-tick
-            # stream.  MT5 model 2 (1-minute OHLC) is the only tester mode
-            # with the same information set; model 1 would introduce
-            # intrabar ticks and make a 1:1 M1 comparison impossible.
-            "2" if TIMEFRAME == "M1" else "1",
+            # Canonical parity uses MT5's one-minute OHLC model. Model 4 is
+            # reserved for an explicit real-tick audit and must never be
+            # substituted here; model 2 is open-prices-only and cannot claim
+            # M1 chronology parity.
+            "1",
             "--compile",
         ],
         capture_output=True,
@@ -372,6 +444,7 @@ def run_case(
     deals_rel = evidence_data["parity_deals_file"]
     equity_rel = evidence_data["parity_equity_file"]
     meta_rel = evidence_data["parity_metadata_file"]
+    quote_rel = evidence_data["parity_quote_file"]
 
     def win_to_path(rel: str) -> Path:
         return COMMON.joinpath(*rel.replace("\\", "/").split("/"))
@@ -379,7 +452,8 @@ def run_case(
     deals = win_to_path(deals_rel)
     equity = win_to_path(equity_rel)
     metadata = win_to_path(meta_rel)
-    for p in (deals, equity, metadata):
+    quotes = win_to_path(quote_rel)
+    for p in (deals, equity, metadata, quotes):
         if p.exists():
             p.unlink()
 
@@ -408,8 +482,64 @@ def run_case(
         raise RuntimeError(f"mt5-test failed for {tag}")
 
     # Copy artifacts into work dir
-    for src, name in ((deals, "deals.csv"), (equity, "equity.csv"), (metadata, "metadata.csv")):
+    for src, name in (
+        (deals, "deals.csv"),
+        (equity, "equity.csv"),
+        (metadata, "metadata.csv"),
+        (quotes, "quotes.csv"),
+    ):
         shutil.copy2(src, work / name)
+
+    point = float(json.loads(BROKER.read_text())["point"])
+    write_bid_m1_from_quotes(work / "quotes.csv", m1, point)
+    # Every decision timeframe must be built from the exact same captured bid
+    # minutes. Reusing the older midpoint H1 export changes indicators and can
+    # introduce a weekend bar-count discrepancy in time-based exits.
+    if TIMEFRAME == "M1":
+        decision_data = m1
+    else:
+        aggregate_bid_decision_bars(m1, decision_data, TIMEFRAME)
+
+    # Phase two: QF replays the exact bid/ask minutes emitted by the same MT5
+    # test above. The legacy fallback spread is deliberately absent.
+    if judge.exists():
+        judge.unlink()
+    r = run(
+        [
+            str(QF),
+            "judge",
+            str(decision_data),
+            "--source-timezone",
+            TZ,
+            "--m1",
+            str(m1),
+            "--m1-source-timezone",
+            TZ,
+            "--quote-path",
+            str(work / "quotes.csv"),
+            "--quote-source-timezone",
+            TZ,
+            "--strategy",
+            str(strategy),
+            "--broker",
+            str(BROKER),
+            "--commission-per-lot-round-turn",
+            str(COMMISSION),
+            "--initial-balance",
+            "100000",
+            "--allow-execution-gaps",
+            "--allow-failed-data",
+            "--out",
+            str(judge),
+        ],
+        capture_output=True,
+    )
+    if r.returncode:
+        print(r.stdout)
+        print(r.stderr)
+        raise RuntimeError(f"canonical quote Judge failed for {tag}")
+    judge_trades = count_trades_from_scout(judge)
+    print(f"  canonical judge={judge_trades}", flush=True)
 
     parity_out = work / "parity_judge_vs_mt5.json"
     if parity_out.exists():
@@ -430,14 +560,12 @@ def run_case(
             str(work / "equity.csv"),
             "--mt5-metadata",
             str(work / "metadata.csv"),
+            "--quote-path",
+            str(work / "quotes.csv"),
             "--broker-timezone",
             TZ,
-            "--trade-timestamp-tolerance-ms",
-            "60000",
-            "--trade-count-relative",
-            "0.10",
-            "--trade-count-absolute",
-            "8",
+            "--strict-one-to-one",
+            "true",
             "--out",
             str(parity_out),
         ],
@@ -450,7 +578,7 @@ def run_case(
         raise RuntimeError(f"parity command failed for {tag}")
 
     ref, ext, delta, passed_flag = count_trades_from_parity(parity_out)
-    ok = acceptable(ref, ext)
+    ok = passed_flag
     result = {
         "family": family,
         "mode": mode,
@@ -473,7 +601,7 @@ def run_case(
 
 
 def main() -> int:
-    global PACK, SYMBOL, H1, M1, BROKER, COMMISSION, RUN_ROOT, TIMEFRAME
+    global PACK, SYMBOL, H1, M1, BROKER, COMMISSION, RUN_ROOT, TIMEFRAME, TIME_STOP_OVERRIDE
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-date", default="2024.01.01")
     parser.add_argument("--to-date", default="2024.07.01")
@@ -494,16 +622,22 @@ def main() -> int:
     parser.add_argument(
         "--commission",
         type=float,
-        default=7.0,
-        help="round-turn commission per lot; use 0 for commission-free indices",
+        default=None,
+        help="round-turn commission per lot; defaults to captured IC Markets terms (0 for BTCUSD/US500, 7 for FX/metals)",
     )
     parser.add_argument("--continue", dest="cont", action="store_true")
     parser.add_argument("--force", action="store_true", help="rerun even if prior PASS")
     parser.add_argument(
         "--timeframe",
-        choices=("H1", "M1"),
+        choices=("H1", "M15", "M1"),
         default="H1",
         help="decision and MT5 tester timeframe; M1 compares the direct M1 QF replay with an M1 EA",
+    )
+    parser.add_argument(
+        "--time-stop-bars",
+        type=int,
+        default=None,
+        help="optional deterministic management override for a focused parity case",
     )
     args = parser.parse_args()
 
@@ -512,8 +646,9 @@ def main() -> int:
     H1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_H1_2020_present.tsv"
     M1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_M1_2020_present.tsv"
     BROKER = PACK / f"{SYMBOL}.broker.json"
-    COMMISSION = args.commission
+    COMMISSION = args.commission if args.commission is not None else (0.0 if SYMBOL in {"BTCUSD", "US500"} else 7.0)
     TIMEFRAME = args.timeframe
+    TIME_STOP_OVERRIDE = args.time_stop_bars
     RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / TIMEFRAME / SYMBOL
     for required in (H1, M1, BROKER):
         if not required.is_file():

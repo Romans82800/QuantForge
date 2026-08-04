@@ -58,7 +58,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let oos1_trades: Vec<_> = result
             .trades
             .iter()
-            .filter(|trade| trade.entry_timestamp_ms >= is_end && trade.entry_timestamp_ms < oos1_end)
+            .filter(|trade| {
+                trade.entry_timestamp_ms >= is_end && trade.entry_timestamp_ms < oos1_end
+            })
             .collect();
         let oos2_trades: Vec<_> = result
             .trades

@@ -1,3 +1,4 @@
+use crate::data_lab::{build_decision_from_m1, load_bound_broker, load_quote_sidecar};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
 use quantforge_discover::{
@@ -5,12 +6,11 @@ use quantforge_discover::{
     RobustnessEvidence, RobustnessReject, ThreeLevelBucket, niche_label,
     run_m1_predeposit_robustness,
 };
-use crate::data_lab::{build_decision_from_m1, load_bound_broker};
 use quantforge_eval::evaluate_strategy;
-use quantforge_export_mql5::{generate_bundle, Mql5ExportConfig, TesterConfig};
+use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
+use quantforge_ir::{BoolExpr, RiskPolicy, StrategyIr};
 use quantforge_quality::DataSplitPlan;
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_text_new};
-use quantforge_ir::{BoolExpr, RiskPolicy, StrategyIr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -262,6 +262,20 @@ pub struct EliteDetail {
     robustness: Option<EliteRobustnessView>,
 }
 
+/// Deterministic, in-memory preview of the exact QuantForge-native expert that
+/// batch export would write for an elite. Keeping this generation server-side
+/// means the Databank viewer and exported file cannot silently drift.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliteMql5SourceView {
+    fingerprint: String,
+    expert_name: String,
+    timeframe: String,
+    export_style: &'static str,
+    source_hash: String,
+    source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartitionEquityPoint {
@@ -404,9 +418,7 @@ fn load_databank_path(
     let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
     let metadata_path = companion_metadata_path(&artifact.source);
     let m1_source = manifest_path(&artifact, "m1_source");
-    let m1_metadata_path = m1_source
-        .as_deref()
-        .and_then(companion_metadata_path);
+    let m1_metadata_path = m1_source.as_deref().and_then(companion_metadata_path);
     let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
     let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
     *state
@@ -482,12 +494,7 @@ fn verify_legacy_raw_bindings(raw: &Value) -> Result<(), DesktopError> {
     }
 
     verify_legacy_raw_coverage(raw, "elites", "coverage_map", true)?;
-    verify_legacy_raw_coverage(
-        raw,
-        "accepted_pool",
-        "accepted_coverage_map",
-        false,
-    )
+    verify_legacy_raw_coverage(raw, "accepted_pool", "accepted_coverage_map", false)
 }
 
 fn verify_legacy_raw_coverage(
@@ -500,17 +507,13 @@ fn verify_legacy_raw_coverage(
         .pointer(&format!("/databank/{entries_key}"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            DesktopError::InvalidArtifact(format!(
-                "legacy databank is missing {entries_key}"
-            ))
+            DesktopError::InvalidArtifact(format!("legacy databank is missing {entries_key}"))
         })?;
     let coverage = raw
         .pointer(&format!("/databank/{coverage_key}"))
         .and_then(Value::as_object)
         .ok_or_else(|| {
-            DesktopError::InvalidArtifact(format!(
-                "legacy databank is missing {coverage_key}"
-            ))
+            DesktopError::InvalidArtifact(format!("legacy databank is missing {coverage_key}"))
         })?;
     if entries.len() != coverage.len() {
         return Err(DesktopError::InvalidArtifact(format!(
@@ -534,13 +537,11 @@ fn verify_legacy_raw_coverage(
             )));
         }
         let key = if niche_keyed {
-            legacy_niche_label(
-                entry.get("niche").ok_or_else(|| {
-                    DesktopError::InvalidArtifact(format!(
-                        "legacy {entries_key} contains an entry without a niche"
-                    ))
-                })?,
-            )?
+            legacy_niche_label(entry.get("niche").ok_or_else(|| {
+                DesktopError::InvalidArtifact(format!(
+                    "legacy {entries_key} contains an entry without a niche"
+                ))
+            })?)?
         } else {
             fingerprint.to_owned()
         };
@@ -559,11 +560,7 @@ fn legacy_niche_label(niche: &Value) -> Result<String, DesktopError> {
             .get(name)
             .and_then(Value::as_str)
             .map(|value| value.replace('_', ""))
-            .ok_or_else(|| {
-                DesktopError::InvalidArtifact(format!(
-                    "legacy niche is missing {name}"
-                ))
-            })
+            .ok_or_else(|| DesktopError::InvalidArtifact(format!("legacy niche is missing {name}")))
     };
     Ok([
         field("family")?,
@@ -582,21 +579,15 @@ fn adapt_legacy_archive_axes(raw: &mut Value) -> Result<(), DesktopError> {
             .pointer_mut(&format!("/databank/{entries_key}"))
             .and_then(Value::as_array_mut)
             .ok_or_else(|| {
-                DesktopError::InvalidArtifact(format!(
-                    "legacy databank is missing {entries_key}"
-                ))
+                DesktopError::InvalidArtifact(format!("legacy databank is missing {entries_key}"))
             })?;
         for entry in entries {
-            let strategy: StrategyIr = serde_json::from_value(
-                entry
-                    .get("strategy")
-                    .cloned()
-                    .ok_or_else(|| {
-                        DesktopError::InvalidArtifact(format!(
-                            "legacy {entries_key} contains an entry without a strategy"
-                        ))
-                    })?,
-            )?;
+            let strategy: StrategyIr =
+                serde_json::from_value(entry.get("strategy").cloned().ok_or_else(|| {
+                    DesktopError::InvalidArtifact(format!(
+                        "legacy {entries_key} contains an entry without a strategy"
+                    ))
+                })?)?;
             let entry_conditions = strategy_entry_condition_count(&strategy);
             let exit_conditions = strategy_exit_condition_count(&strategy);
             let descriptor = entry
@@ -633,11 +624,7 @@ fn adapt_legacy_archive_axes(raw: &mut Value) -> Result<(), DesktopError> {
     Ok(())
 }
 
-fn rename_legacy_field(
-    object: &mut serde_json::Map<String, Value>,
-    legacy: &str,
-    current: &str,
-) {
+fn rename_legacy_field(object: &mut serde_json::Map<String, Value>, legacy: &str, current: &str) {
     if let Some(value) = object.remove(legacy) {
         object.insert(current.into(), value);
     }
@@ -649,6 +636,17 @@ pub fn get_elite(
     state: State<'_, DesktopState>,
 ) -> Result<EliteDetail, String> {
     get_elite_from_state(&fingerprint, &state).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_elite_mql5_source(
+    fingerprint: String,
+    timeframe: String,
+    magic: u64,
+    state: State<'_, DesktopState>,
+) -> Result<EliteMql5SourceView, String> {
+    get_elite_mql5_source_from_state(&fingerprint, &timeframe, magic, &state)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -749,11 +747,33 @@ pub async fn run_elite_robustness(
             config: loaded.bank.config.clone(),
         }
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        run_elite_robustness_sync(&request, &snapshot)
-    })
-    .await
-    .map_err(|error| format!("Results robustness task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || run_elite_robustness_sync(&request, &snapshot))
+        .await
+        .map_err(|error| format!("Results robustness task failed: {error}"))?
+}
+
+fn infer_quote_sidecar_path(m1_path: &str) -> Option<PathBuf> {
+    let path = Path::new(m1_path);
+    let stem = path.file_stem()?.to_str()?;
+    let mut candidates = vec![path.with_file_name(format!("{stem}.quotes.csv"))];
+    for suffix in ["_H1", "_M15"] {
+        if let Some(base) = stem.strip_suffix(suffix) {
+            candidates.push(path.with_file_name(format!("{base}_M1.quotes.csv")));
+        }
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMetadata>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    metadata.properties.get("price_basis").is_some_and(|value| {
+        value.eq_ignore_ascii_case("bid") || value.eq_ignore_ascii_case("bid_ask")
+    }) && metadata
+        .properties
+        .get("import_kind")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("bid_ask"))
 }
 
 fn run_elite_robustness_sync(
@@ -770,14 +790,28 @@ fn run_elite_robustness_sync(
         snapshot.m1_metadata_path.as_deref(),
         None,
     )?;
+    let quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1_source.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1_source.dataset)
+            .map_err(|error| format!("quote sidecar does not match M1 data: {error}"))?;
+    } else if metadata_is_canonical_bid_ask(m1_source.metadata.as_ref()) {
+        return Err(
+            "canonical bid/ask M1 metadata is present but its .quotes.csv sidecar was not found"
+                .into(),
+        );
+    }
     let broker = load_bound_broker(&snapshot.broker, decision_source.metadata.as_ref())?;
     load_bound_broker(&snapshot.broker, m1_source.metadata.as_ref())?;
 
     // Reconstruct the exact Selected-TF candles from M1, then recover the same
     // IS partition that Discover hashed into the databank. This prevents a
     // Results retest from silently drifting onto full history or OOS1/OOS2.
-    let full_decision =
-        build_decision_from_m1(&m1_source.dataset, Some(&decision_source.dataset))?;
+    let full_decision = build_decision_from_m1(&m1_source.dataset, Some(&decision_source.dataset))?;
     let is_decision = databank_decision_partition(
         &full_decision,
         &snapshot.data_hash,
@@ -831,6 +865,7 @@ fn run_elite_robustness_sync(
         &snapshot.elite.strategy,
         &is_decision,
         &m1_source.dataset,
+        quote_dataset.as_ref(),
         &broker,
         &config,
         &selected_timeframe.metrics,
@@ -952,12 +987,8 @@ fn databank_decision_partition(
     if &full_decision.data_hash == expected_hash {
         return Ok(full_decision.clone());
     }
-    let split = DataSplitPlan::chronological(
-        full_decision,
-        validation_fraction,
-        sealed_fraction,
-    )
-    .map_err(|error| error.to_string())?;
+    let split = DataSplitPlan::chronological(full_decision, validation_fraction, sealed_fraction)
+        .map_err(|error| error.to_string())?;
     let bars = full_decision.bars[..split.development.bar_count].to_vec();
     let development = BarDataset {
         data_hash: bar_content_hash(&bars),
@@ -998,10 +1029,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
     }
 }
 
-fn robustness_depth(
-    config: &DiscoverConfig,
-    mode: ResultsRobustnessMode,
-) -> (usize, usize, usize) {
+fn robustness_depth(config: &DiscoverConfig, mode: ResultsRobustnessMode) -> (usize, usize, usize) {
     match mode {
         ResultsRobustnessMode::Standard => (
             config.robustness_folds,
@@ -1036,6 +1064,16 @@ fn partition_equity_for_elite(
     })?;
     let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
     crate::data_lab::load_bound_broker(broker_path, m1.metadata.as_ref())?;
+    let quote_dataset = infer_quote_sidecar_path(m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1.dataset)
+            .map_err(|error| format!("quote sidecar does not match M1 data: {error}"))?;
+    }
     // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
     // align with the exported EA and external MT5 backtests.
     let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
@@ -1048,19 +1086,30 @@ fn partition_equity_for_elite(
         sealed_fraction,
     )
     .map_err(|error| error.to_string())?;
-    let result = quantforge_tick::evaluate_strategy_m1(
-        &elite.strategy,
-        &decision_dataset,
-        &m1.dataset,
-        &broker,
-        &quantforge_tick::JudgeConfig {
-            initial_balance: scout.initial_balance,
-            costs: scout.costs.clone(),
-            allow_execution_gaps: false,
-            indicator_engine: scout.indicator_engine,
-            entry_window: scout.entry_window,
-        },
-    )
+    let judge = quantforge_tick::JudgeConfig {
+        initial_balance: scout.initial_balance,
+        costs: scout.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: scout.indicator_engine,
+        entry_window: scout.entry_window,
+    };
+    let result = match quote_dataset.as_ref() {
+        Some(quotes) => quantforge_tick::evaluate_strategy_m1_with_quotes(
+            &elite.strategy,
+            &decision_dataset,
+            &m1.dataset,
+            quotes,
+            &broker,
+            &judge,
+        ),
+        None => quantforge_tick::evaluate_strategy_m1(
+            &elite.strategy,
+            &decision_dataset,
+            &m1.dataset,
+            &broker,
+            &judge,
+        ),
+    }
     .map_err(|error| format!("M1 full-run replay failed: {error}"))?;
 
     let is_end = plan.development.end_timestamp_ms_exclusive;
@@ -1080,9 +1129,7 @@ fn partition_equity_for_elite(
     let oos2_trades: Vec<_> = result
         .trades
         .iter()
-        .filter(|trade| {
-            trade.entry_timestamp_ms >= oos1_end && trade.entry_timestamp_ms < oos2_end
-        })
+        .filter(|trade| trade.entry_timestamp_ms >= oos1_end && trade.entry_timestamp_ms < oos2_end)
         .collect();
 
     let is_expectancy = mean_expectancy(&is_trades);
@@ -1125,7 +1172,12 @@ fn partition_equity_for_elite(
         oos1_expectancy,
         oos1_expectancy_ratio: oos1_ratio,
         oos2_expectancy,
-        is_return_percent: segment_return(&result.equity, scout.initial_balance, None, Some(is_end)),
+        is_return_percent: segment_return(
+            &result.equity,
+            scout.initial_balance,
+            None,
+            Some(is_end),
+        ),
         oos1_return_percent: segment_return(
             &result.equity,
             scout.initial_balance,
@@ -1330,12 +1382,9 @@ pub fn promote_elite_to_vault(
             path.display()
         ));
     }
-    quantforge_storage::write_json_new(&path, &elite.strategy).map_err(|error| error.to_string())?;
-    Ok(path
-        .canonicalize()
-        .unwrap_or(path)
-        .display()
-        .to_string())
+    quantforge_storage::write_json_new(&path, &elite.strategy)
+        .map_err(|error| error.to_string())?;
+    Ok(path.canonicalize().unwrap_or(path).display().to_string())
 }
 
 fn export_elite_eas_to(
@@ -1429,7 +1478,7 @@ fn export_elite_eas_to(
             estimated_slippage_points_per_side: costs.adverse_slippage_points_per_side,
             commission_per_lot_round_turn: costs.commission_per_lot_round_turn,
             allow_live_trading_default: false,
-            export_style: quantforge_export_mql5::ExportStyle::Sqx,
+            export_style: quantforge_export_mql5::ExportStyle::Quantforge,
             entry_window_start_hour: loaded.bank.config.scout.entry_window.start_hour,
             entry_window_end_hour: loaded.bank.config.scout.entry_window.end_hour,
             tester: TesterConfig {
@@ -1651,6 +1700,69 @@ fn get_elite_from_state(
     elite_detail(elite).map_err(DesktopError::Json)
 }
 
+fn get_elite_mql5_source_from_state(
+    fingerprint: &str,
+    timeframe: &str,
+    magic: u64,
+    state: &DesktopState,
+) -> Result<EliteMql5SourceView, DesktopError> {
+    if magic == 0 {
+        return Err(DesktopError::InvalidExport(
+            "magic must be greater than zero".into(),
+        ));
+    }
+    let timeframe = timeframe.trim().to_ascii_uppercase();
+    if !matches!(timeframe.as_str(), "M1" | "M15" | "H1") {
+        return Err(DesktopError::InvalidExport(
+            "source preview timeframe must be M1, M15 or H1".into(),
+        ));
+    }
+    let loaded = state
+        .loaded
+        .read()
+        .map_err(|_| DesktopError::StateUnavailable)?;
+    let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
+    let elite = loaded
+        .bank
+        .elites
+        .iter()
+        .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+        .ok_or_else(|| DesktopError::MissingElite(fingerprint.into()))?;
+    let broker = load_bound_broker(&loaded.broker, None).map_err(DesktopError::InvalidExport)?;
+    let costs = &loaded.bank.config.scout.costs;
+    let expert_name =
+        quantforge_export_mql5::suggested_expert_name(&broker.symbol, &elite.strategy.id, magic);
+    let config = Mql5ExportConfig {
+        expert_name: expert_name.clone(),
+        expert_directory: "QuantForge".into(),
+        timeframe: timeframe.clone(),
+        magic,
+        deviation_points: 10,
+        max_spread_points: costs.max_spread_points,
+        estimated_slippage_points_per_side: costs.adverse_slippage_points_per_side,
+        commission_per_lot_round_turn: costs.commission_per_lot_round_turn,
+        allow_live_trading_default: false,
+        export_style: quantforge_export_mql5::ExportStyle::Quantforge,
+        entry_window_start_hour: loaded.bank.config.scout.entry_window.start_hour,
+        entry_window_end_hour: loaded.bank.config.scout.entry_window.end_hour,
+        tester: TesterConfig {
+            deposit: loaded.bank.config.scout.initial_balance,
+            model: 1,
+            ..TesterConfig::default()
+        },
+    };
+    let bundle = generate_bundle(&elite.strategy, &broker, &config)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    Ok(EliteMql5SourceView {
+        fingerprint: fingerprint.into(),
+        expert_name,
+        timeframe,
+        export_style: "quantforge-native-v1",
+        source_hash: bundle.evidence.source_hash.to_string(),
+        source: bundle.source,
+    })
+}
+
 pub(crate) fn verify_artifact(artifact: &EvolveArtifact) -> Result<(), DesktopError> {
     artifact
         .manifest
@@ -1704,11 +1816,7 @@ fn verify_legacy_artifact(artifact: &EvolveArtifact) -> Result<(), DesktopError>
                 .into(),
         ));
     }
-    verify_legacy_entries(
-        &bank.elites,
-        &bank.config,
-        bank.completed_generations,
-    )?;
+    verify_legacy_entries(&bank.elites, &bank.config, bank.completed_generations)?;
     verify_legacy_entries(
         &bank.accepted_pool,
         &bank.config,
@@ -1740,10 +1848,8 @@ fn verify_legacy_entries(
         );
         let recovery = elite.metrics.recovery_factor();
         if fingerprint != elite.structural_fingerprint
-            || strategy_entry_condition_count(&elite.strategy)
-                != elite.descriptor.entry_conditions
-            || strategy_exit_condition_count(&elite.strategy)
-                != elite.descriptor.exit_conditions
+            || strategy_entry_condition_count(&elite.strategy) != elite.descriptor.entry_conditions
+            || strategy_exit_condition_count(&elite.strategy) != elite.descriptor.exit_conditions
             || niche_from_descriptor(&elite.descriptor) != elite.niche
             || elite.strategy.manage.flatten_end_of_day != config.flatten_at_22
             || elite.strategy.manage.max_one_entry_per_day != config.max_one_entry_per_day
@@ -1792,9 +1898,7 @@ fn strategy_exit_condition_count(strategy: &StrategyIr) -> usize {
         .unwrap_or(0)
 }
 
-fn niche_from_descriptor(
-    descriptor: &quantforge_discover::BehaviorDescriptor,
-) -> NicheKey {
+fn niche_from_descriptor(descriptor: &quantforge_discover::BehaviorDescriptor) -> NicheKey {
     NicheKey {
         entry_conditions: descriptor.entry_conditions,
         trade_frequency: three_level_bucket(descriptor.trades_per_1000_bars, 5.0, 20.0),
@@ -2131,51 +2235,55 @@ fn coverage_condition_groups(bank: &Databank) -> Vec<ConditionCoverage> {
     ENTRY_CONDITION_COUNTS
         .into_iter()
         .map(|entry_conditions| {
-        let mut cells = Vec::with_capacity(3usize.pow(5));
-        for win_rate in three_levels() {
-            for skew in skew_levels() {
-                for trade_frequency in three_levels() {
-                    for hold_time in three_levels() {
-                        for drawdown in three_levels() {
-                            let niche = NicheKey {
-                                entry_conditions,
-                                trade_frequency,
-                                hold_time,
-                                drawdown,
-                                win_rate,
-                                long_short_skew: skew,
-                            };
-                            let label = niche_label(&niche);
-                            let elite = bank
-                                .coverage_map
-                                .get(&label)
-                                .and_then(|fingerprint| elites.get(fingerprint.as_str()).copied());
-                            cells.push(CoverageCell {
-                                index: cells.len(),
-                                niche: label,
-                                occupied: elite.is_some(),
-                                fingerprint: elite
-                                    .map(|value| value.structural_fingerprint.as_str().to_owned()),
-                                intensity: elite
-                                    .map(|value| {
-                                        evidence_intensity(value.evidence.total, minimum, maximum)
-                                    })
-                                    .unwrap_or(0.0),
-                            });
+            let mut cells = Vec::with_capacity(3usize.pow(5));
+            for win_rate in three_levels() {
+                for skew in skew_levels() {
+                    for trade_frequency in three_levels() {
+                        for hold_time in three_levels() {
+                            for drawdown in three_levels() {
+                                let niche = NicheKey {
+                                    entry_conditions,
+                                    trade_frequency,
+                                    hold_time,
+                                    drawdown,
+                                    win_rate,
+                                    long_short_skew: skew,
+                                };
+                                let label = niche_label(&niche);
+                                let elite = bank.coverage_map.get(&label).and_then(|fingerprint| {
+                                    elites.get(fingerprint.as_str()).copied()
+                                });
+                                cells.push(CoverageCell {
+                                    index: cells.len(),
+                                    niche: label,
+                                    occupied: elite.is_some(),
+                                    fingerprint: elite.map(|value| {
+                                        value.structural_fingerprint.as_str().to_owned()
+                                    }),
+                                    intensity: elite
+                                        .map(|value| {
+                                            evidence_intensity(
+                                                value.evidence.total,
+                                                minimum,
+                                                maximum,
+                                            )
+                                        })
+                                        .unwrap_or(0.0),
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
-        ConditionCoverage {
-            entry_conditions,
-            label: format!("{entry_conditions} entry conditions"),
-            occupied: cells.iter().filter(|cell| cell.occupied).count(),
-            total: cells.len(),
-            cells,
-        }
-    })
-    .collect()
+            ConditionCoverage {
+                entry_conditions,
+                label: format!("{entry_conditions} entry conditions"),
+                occupied: cells.iter().filter(|cell| cell.occupied).count(),
+                total: cells.len(),
+                cells,
+            }
+        })
+        .collect()
 }
 
 fn evidence_intensity(value: f64, minimum: f64, maximum: f64) -> f64 {
@@ -2288,8 +2396,7 @@ mod tests {
         assert_eq!(recovered.data_hash, expected);
         assert_eq!(recovered.bars.len(), split.development.bar_count);
         assert!(
-            databank_decision_partition(&full, &ContentHash::sha256("other"), 0.2, 0.2)
-                .is_err()
+            databank_decision_partition(&full, &ContentHash::sha256("other"), 0.2, 0.2).is_err()
         );
     }
 
@@ -2380,7 +2487,9 @@ pub async fn run_fidelity_demo(request: FidelityDemoRequest) -> Result<FidelityD
 }
 
 fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoView, String> {
-    use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
+    use crate::data_lab::{
+        build_decision_from_m1, display_path, load_bound_broker, load_data_source,
+    };
     use quantforge_eval::evaluate_strategy;
     use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
     use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
@@ -2440,14 +2549,9 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     for elite in &artifact.databank.elites {
         let h1_result = evaluate_strategy(&elite.strategy, &decision, &broker, scout)
             .map_err(|error| error.to_string());
-        let m1_result = evaluate_strategy_m1(
-            &elite.strategy,
-            &decision,
-            &m1.dataset,
-            &broker,
-            &judge,
-        )
-        .map_err(|error| error.to_string());
+        let m1_result =
+            evaluate_strategy_m1(&elite.strategy, &decision, &m1.dataset, &broker, &judge)
+                .map_err(|error| error.to_string());
 
         let (passed, reason, row) = match (h1_result, m1_result) {
             (Ok(h1_eval), Ok(m1_eval)) => {
@@ -2470,7 +2574,8 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
                 let h1_dd = h1_eval.metrics.max_drawdown_percent;
                 let m1_dd = m1_eval.metrics.max_drawdown_percent;
                 let dd_ok = m1_dd <= h1_dd * drawdown_expansion + 1.0e-9;
-                let passed = ret_ratio >= return_retention && trade_ratio >= trade_retention && dd_ok;
+                let passed =
+                    ret_ratio >= return_retention && trade_ratio >= trade_retention && dd_ok;
                 let reason = if passed {
                     "passed SQX-style M1 fidelity band".into()
                 } else if !dd_ok {

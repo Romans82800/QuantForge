@@ -42,8 +42,7 @@ pub fn directional_index(bars: &[Bar], period: usize) -> (Vec<f64>, Vec<f64>, Ve
             sum_dm_plus[index] = sum_dm_plus[index - 1] + dm_plus;
             sum_dm_minus[index] = sum_dm_minus[index - 1] + dm_minus;
         } else {
-            sum_tr[index] =
-                sum_tr[index - 1] - sum_tr[index - 1] / period as f64 + tr;
+            sum_tr[index] = sum_tr[index - 1] - sum_tr[index - 1] / period as f64 + tr;
             sum_dm_plus[index] =
                 sum_dm_plus[index - 1] - sum_dm_plus[index - 1] / period as f64 + dm_plus;
             sum_dm_minus[index] =

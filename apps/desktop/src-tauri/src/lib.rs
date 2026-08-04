@@ -33,6 +33,7 @@ pub fn run() {
             assets::delete_asset,
             databank::load_databank,
             databank::get_elite,
+            databank::get_elite_mql5_source,
             databank::get_elite_partition_equity,
             databank::run_elite_robustness,
             databank::export_elite_strategy,

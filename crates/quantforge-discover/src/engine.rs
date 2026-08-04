@@ -1,21 +1,20 @@
-use crate::archive::{deposit_to_accepted_pool, deposit_to_databank, CandidateEvaluation};
+use crate::archive::{CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank};
 use crate::grammar::{
     apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
 };
 use crate::model::{
-    recovery_factor,
-    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite,
-    GateResult, SearchFamily, SymbolScreenResult,
+    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateResult, SearchFamily,
+    SymbolScreenResult, recovery_factor,
 };
-use crate::multi_symbol::{screen_multi_symbol, PackSymbol};
+use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
-use quantforge_data::{BarDataset, bar_content_hash};
-use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
+use quantforge_data::{BarDataset, QuoteBarDataset, bar_content_hash};
 use quantforge_eval::ScoutResult;
+use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_ir::StrategyIr;
 use quantforge_quality::{deflated_trade_sharpe, expected_max_lucky_sharpe, trade_sharpe_proxy};
-use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -56,6 +55,7 @@ fn evaluate_and_deposit(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
@@ -89,9 +89,14 @@ fn evaluate_and_deposit(
             .into_par_iter()
             .map(|strategy| {
                 let result = (|| {
-                    let coarse =
-                        evaluate_strategy_cached(&strategy, dataset, broker, &scout, indicator_cache)
-                            .map_err(|error| error.to_string())?;
+                    let coarse = evaluate_strategy_cached(
+                        &strategy,
+                        dataset,
+                        broker,
+                        &scout,
+                        indicator_cache,
+                    )
+                    .map_err(|error| error.to_string())?;
                     if !crate::archive::passes_gates(&coarse, discover_config) {
                         return Ok::<_, String>(CandidateOutcome::CoarseRejected);
                     }
@@ -283,6 +288,7 @@ fn evaluate_and_deposit(
                 strategy,
                 dataset,
                 m1_dataset,
+                quote_dataset,
                 broker,
                 &robustness,
                 &pot_evaluation.result.metrics,
@@ -291,56 +297,79 @@ fn evaluate_and_deposit(
                 Ok(outcome) => (outcome.result, outcome.evidence),
             }
         } else {
-            match evaluate_strategy_cached(strategy, m1_dataset, broker, &scout, indicator_cache) {
+            match evaluate_strategy_m1_with_optional_quotes(
+                strategy,
+                dataset,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &JudgeConfig {
+                    initial_balance: robustness.initial_balance,
+                    costs: robustness.costs.clone(),
+                    allow_execution_gaps: false,
+                    indicator_engine: robustness.indicator_engine,
+                    entry_window: robustness.entry_window,
+                },
+            ) {
                 Err(error) => {
                     return PromotionOutcome::EvaluationError {
                         message: error.to_string(),
-                    }
-                }
-                Ok(result) => (result, None),
-            }
-        };
-        let (archived_oos1_expectancy, archived_oos1_ratio) = if let Some(m1_oos1_decision) = m1_oos1_decision.as_ref() {
-            let oos1_start_ms = oos1_dataset
-                .and_then(|data| data.bars.first())
-                .map(|bar| bar.timestamp_ms)
-                .expect("OOS1 dataset must contain at least one bar");
-            let judge = JudgeConfig {
-                initial_balance: robustness.initial_balance,
-                costs: robustness.costs.clone(),
-                allow_execution_gaps: false,
-                indicator_engine: robustness.indicator_engine,
-                entry_window: robustness.entry_window,
-            };
-            let m1_oos1_replay = match evaluate_strategy_m1(
-                strategy,
-                m1_oos1_decision,
-                m1_dataset,
-                broker,
-                &judge,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    return PromotionOutcome::EvaluationError {
-                        message: format!("M1 OOS1 replay failed: {error}"),
                     };
                 }
-            };
-            let m1_is_expectancy = expectancy_before(&m1_oos1_replay.trades, oos1_start_ms);
-            let m1_oos1_expectancy = expectancy_from(&m1_oos1_replay.trades, oos1_start_ms);
-            if !passes_oos1_pick(m1_is_expectancy, m1_oos1_expectancy, oos1_retention) {
-                return PromotionOutcome::Oos1Rejected;
+                Ok(result) => (
+                    ScoutResult {
+                        trades: result.trades,
+                        equity: result.equity,
+                        metrics: result.metrics,
+                        telemetry: Default::default(),
+                    },
+                    None,
+                ),
             }
-            let m1_oos1_ratio = (m1_is_expectancy > 0.0)
-                .then_some(m1_oos1_expectancy / m1_is_expectancy)
-                .filter(|value| value.is_finite());
-            // Archive the M1 OOS1 evidence, rather than the preliminary
-            // Selected-TF figure, so the Databank table and full-run chart
-            // describe the very gate that admitted the strategy.
-            (Some(m1_oos1_expectancy), m1_oos1_ratio)
-        } else {
-            (oos1_expectancy, oos1_expectancy_ratio)
         };
+        let (archived_oos1_expectancy, archived_oos1_ratio) =
+            if let Some(m1_oos1_decision) = m1_oos1_decision.as_ref() {
+                let oos1_start_ms = oos1_dataset
+                    .and_then(|data| data.bars.first())
+                    .map(|bar| bar.timestamp_ms)
+                    .expect("OOS1 dataset must contain at least one bar");
+                let judge = JudgeConfig {
+                    initial_balance: robustness.initial_balance,
+                    costs: robustness.costs.clone(),
+                    allow_execution_gaps: false,
+                    indicator_engine: robustness.indicator_engine,
+                    entry_window: robustness.entry_window,
+                };
+                let m1_oos1_replay = match evaluate_strategy_m1_with_optional_quotes(
+                    strategy,
+                    m1_oos1_decision,
+                    m1_dataset,
+                    quote_dataset,
+                    broker,
+                    &judge,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return PromotionOutcome::EvaluationError {
+                            message: format!("M1 OOS1 replay failed: {error}"),
+                        };
+                    }
+                };
+                let m1_is_expectancy = expectancy_before(&m1_oos1_replay.trades, oos1_start_ms);
+                let m1_oos1_expectancy = expectancy_from(&m1_oos1_replay.trades, oos1_start_ms);
+                if !passes_oos1_pick(m1_is_expectancy, m1_oos1_expectancy, oos1_retention) {
+                    return PromotionOutcome::Oos1Rejected;
+                }
+                let m1_oos1_ratio = (m1_is_expectancy > 0.0)
+                    .then_some(m1_oos1_expectancy / m1_is_expectancy)
+                    .filter(|value| value.is_finite());
+                // Archive the M1 OOS1 evidence, rather than the preliminary
+                // Selected-TF figure, so the Databank table and full-run chart
+                // describe the very gate that admitted the strategy.
+                (Some(m1_oos1_expectancy), m1_oos1_ratio)
+            } else {
+                (oos1_expectancy, oos1_expectancy_ratio)
+            };
         if !crate::archive::passes_gate_config(&m1_outcome.0, &deposit_gates) {
             return PromotionOutcome::DatabankGateRejected;
         }
@@ -391,11 +420,7 @@ fn evaluate_and_deposit(
                 }
             },
             PromotionOutcome::EvaluationError { message } => {
-                *bank
-                    .telemetry
-                    .evaluation_errors
-                    .entry(message)
-                    .or_default() += 1;
+                *bank.telemetry.evaluation_errors.entry(message).or_default() += 1;
                 bank.telemetry.record(DepositDecision::RejectedEvaluation);
             }
             PromotionOutcome::Ready {
@@ -469,7 +494,11 @@ fn expectancy_for(trades: &[quantforge_eval::Trade], include: impl Fn(i64) -> bo
             count += 1;
         }
     }
-    if count == 0 { 0.0 } else { profit / count as f64 }
+    if count == 0 {
+        0.0
+    } else {
+        profit / count as f64
+    }
 }
 
 enum PromotionOutcome {
@@ -490,9 +519,7 @@ enum PromotionOutcome {
     },
 }
 
-fn robustness_config_from_discover(
-    config: &DiscoverConfig,
-) -> crate::robustness::RobustnessConfig {
+fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness::RobustnessConfig {
     let search = &config.search_ranges;
     crate::robustness::RobustnessConfig {
         folds: config.robustness_folds,
@@ -547,6 +574,27 @@ pub(crate) fn ambiguous_trade_fraction(result: &ScoutResult) -> f64 {
     ambiguous as f64 / total as f64
 }
 
+fn evaluate_strategy_m1_with_optional_quotes(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    judge: &JudgeConfig,
+) -> Result<quantforge_tick::JudgeResult, quantforge_tick::JudgeError> {
+    match quote_dataset {
+        Some(quotes) => evaluate_strategy_m1_with_quotes(
+            strategy,
+            decision_dataset,
+            m1_dataset,
+            quotes,
+            broker,
+            judge,
+        ),
+        None => evaluate_strategy_m1(strategy, decision_dataset, m1_dataset, broker, judge),
+    }
+}
+
 pub fn evolve_new(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
@@ -572,6 +620,31 @@ pub fn evolve_new_with_pack(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
+    config: DiscoverConfig,
+    generations: u64,
+) -> Result<Databank, DiscoverError> {
+    evolve_new_with_pack_and_quotes(
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        None,
+        broker,
+        pack,
+        primary_symbol,
+        config,
+        generations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_new_with_pack_and_quotes(
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
@@ -628,6 +701,7 @@ pub fn evolve_new_with_pack(
         dataset,
         oos1_dataset,
         m1_dataset,
+        quote_dataset,
         broker,
         pack,
         primary_symbol,
@@ -640,6 +714,7 @@ pub fn evolve_new_with_pack(
         dataset,
         oos1_dataset,
         m1_dataset,
+        quote_dataset,
         broker,
         pack,
         primary_symbol,
@@ -681,6 +756,31 @@ pub fn continue_evolution_with_pack(
     primary_symbol: &str,
     additional_generations: u64,
 ) -> Result<Databank, DiscoverError> {
+    continue_evolution_with_pack_and_quotes(
+        bank,
+        dataset,
+        oos1_dataset,
+        m1_dataset,
+        None,
+        broker,
+        pack,
+        primary_symbol,
+        additional_generations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continue_evolution_with_pack_and_quotes(
+    mut bank: Databank,
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
+    additional_generations: u64,
+) -> Result<Databank, DiscoverError> {
     validate_resume(&bank, dataset, m1_dataset, broker)?;
     let pool = build_worker_pool(bank.config.worker_threads)?;
     let indicator_cache = IndicatorBufferCache::new(dataset.bars.len());
@@ -689,6 +789,7 @@ pub fn continue_evolution_with_pack(
         dataset,
         oos1_dataset,
         m1_dataset,
+        quote_dataset,
         broker,
         pack,
         primary_symbol,
@@ -734,12 +835,39 @@ impl EvolutionSession {
         primary_symbol: &str,
         additional_generations: u64,
     ) -> Result<Databank, DiscoverError> {
+        self.advance_with_quotes(
+            bank,
+            dataset,
+            oos1_dataset,
+            m1_dataset,
+            None,
+            broker,
+            pack,
+            primary_symbol,
+            additional_generations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_with_quotes(
+        &self,
+        mut bank: Databank,
+        dataset: &BarDataset,
+        oos1_dataset: Option<&BarDataset>,
+        m1_dataset: &BarDataset,
+        quote_dataset: Option<&QuoteBarDataset>,
+        broker: &SymbolSpecification,
+        pack: &[PackSymbol],
+        primary_symbol: &str,
+        additional_generations: u64,
+    ) -> Result<Databank, DiscoverError> {
         validate_resume(&bank, dataset, m1_dataset, broker)?;
         run_generations(
             &mut bank,
             dataset,
             oos1_dataset,
             m1_dataset,
+            quote_dataset,
             broker,
             pack,
             primary_symbol,
@@ -768,6 +896,7 @@ fn run_generations(
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
@@ -789,6 +918,7 @@ fn run_generations(
             dataset,
             oos1_dataset,
             m1_dataset,
+            quote_dataset,
             broker,
             pack,
             primary_symbol,
@@ -1358,7 +1488,10 @@ mod tests {
         let second = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
         assert_eq!(first, second);
         assert!(first.pot_size() >= 4);
-        assert!(first.elites.is_empty(), "databank stays empty before breeding");
+        assert!(
+            first.elites.is_empty(),
+            "databank stays empty before breeding"
+        );
         assert_eq!(first.evaluation_count, 64);
         let non_market: Vec<_> = first
             .accepted_pool
@@ -1506,10 +1639,11 @@ mod tests {
         let mut config = config();
         config.flatten_at_22 = true;
         let bank = evolve_new(&dataset, None, &dataset, &broker(), config, 1).unwrap();
-        assert!(bank
-            .elites
-            .iter()
-            .all(|elite| elite.strategy.manage.flatten_end_of_day));
+        assert!(
+            bank.elites
+                .iter()
+                .all(|elite| elite.strategy.manage.flatten_end_of_day)
+        );
         bank.validate_integrity().unwrap();
     }
 
@@ -1519,10 +1653,11 @@ mod tests {
         let mut config = config();
         config.max_one_entry_per_day = true;
         let bank = evolve_new(&dataset, None, &dataset, &broker(), config, 1).unwrap();
-        assert!(bank
-            .elites
-            .iter()
-            .all(|elite| elite.strategy.manage.max_one_entry_per_day));
+        assert!(
+            bank.elites
+                .iter()
+                .all(|elite| elite.strategy.manage.max_one_entry_per_day)
+        );
         bank.validate_integrity().unwrap();
     }
 
@@ -1550,15 +1685,21 @@ mod tests {
                 )
             })
             .collect();
-        assert!(candidates
-            .iter()
-            .any(|strategy| strategy.manage.break_even_at_r.is_some()));
-        assert!(candidates
-            .iter()
-            .any(|strategy| strategy.manage.trailing.is_some()));
-        assert!(candidates
-            .iter()
-            .any(|strategy| !strategy.manage.partial_exits.is_empty()));
+        assert!(
+            candidates
+                .iter()
+                .any(|strategy| strategy.manage.break_even_at_r.is_some())
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|strategy| strategy.manage.trailing.is_some())
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|strategy| !strategy.manage.partial_exits.is_empty())
+        );
         assert!(candidates.iter().any(|strategy| matches!(
             strategy.entry.order,
             quantforge_ir::EntryOrderPolicy::Stop { .. }
@@ -1626,7 +1767,11 @@ mod tests {
             config.validate().unwrap();
 
             let (markets, stops, limits) = counts(&population(&config));
-            assert_eq!(markets > 0, market, "market share for {market}/{stop}/{limit}");
+            assert_eq!(
+                markets > 0,
+                market,
+                "market share for {market}/{stop}/{limit}"
+            );
             assert_eq!(stops > 0, stop, "stop share for {market}/{stop}/{limit}");
             assert_eq!(limits > 0, limit, "limit share for {market}/{stop}/{limit}");
         }

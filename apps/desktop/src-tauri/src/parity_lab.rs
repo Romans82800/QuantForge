@@ -3,7 +3,7 @@ use crate::workflow::{
     ChallengeArtifact, IndicatorParityArtifact, JudgeArtifact, ParityArtifact, ScoutArtifactInput,
     ensure_new, manifest, read_json, recipe_path, write_json_new, write_text_new,
 };
-use quantforge_data::{DataQualityReport, QualityGrade};
+use quantforge_data::{DataQualityReport, QualityGrade, QuoteBarDataset, SourceTimezone};
 use quantforge_eval::CostModel;
 use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
 use quantforge_ir::StrategyIr;
@@ -11,7 +11,7 @@ use quantforge_parity::{
     ParityRun, ParityTolerances, compare_runs, load_mt5_tester_metadata,
     load_mt5_tester_run_in_timezone,
 };
-use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -27,6 +27,8 @@ pub struct JudgeRequest {
     m1_data_path: String,
     m1_metadata_path: Option<String>,
     m1_source_timezone: Option<String>,
+    #[serde(default)]
+    quote_path: Option<String>,
     split_plan_path: Option<String>,
     strategy_path: String,
     broker_path: String,
@@ -110,6 +112,10 @@ pub struct ParityRequest {
     mt5_deals_path: String,
     mt5_equity_path: String,
     mt5_metadata_path: String,
+    /// Bid/ask M1 sidecar emitted by the MT5 capture EA. Required for strict
+    /// certification; omitted only for legacy diagnostic comparisons.
+    #[serde(default)]
+    quote_path: Option<String>,
     /// Same timezone token used for bar ingestion (e.g. ICMarkets/EST+7).
     #[serde(default)]
     broker_timezone: Option<String>,
@@ -234,14 +240,30 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
             include_costs_in_risk: true,
         },
         allow_execution_gaps: false,
-        indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+        indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
         entry_window: crate::discover::entry_window(
             request.entry_window_start_hour,
             request.entry_window_end_hour,
         ),
     };
-    let result = evaluate_strategy_m1(&strategy, &decision_dataset, &m1.dataset, &broker, &config)
-        .map_err(|error| error.to_string())?;
+    let quote_dataset = request
+        .quote_path
+        .as_deref()
+        .map(|path| load_quote_sidecar(path, m1.metadata.as_ref()))
+        .transpose()?;
+    let result = if let Some(quotes) = quote_dataset.as_ref() {
+        evaluate_strategy_m1_with_quotes(
+            &strategy,
+            &decision_dataset,
+            &m1.dataset,
+            quotes,
+            &broker,
+            &config,
+        )
+    } else {
+        evaluate_strategy_m1(&strategy, &decision_dataset, &m1.dataset, &broker, &config)
+    }
+    .map_err(|error| error.to_string())?;
     let combined_data_hash = quantforge_core::stable_json_hash(&BTreeMap::from([
         ("decision", &decision_dataset.data_hash),
         ("m1", &m1.dataset.data_hash),
@@ -279,6 +301,21 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
                 json!(&decision_dataset.data_hash),
             ),
             ("m1_data_hash".into(), json!(&m1.dataset.data_hash)),
+            (
+                "quote_source".into(),
+                request
+                    .quote_path
+                    .as_deref()
+                    .map(recipe_path)
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "quote_data_hash".into(),
+                quote_dataset
+                    .as_ref()
+                    .map(|quotes| json!(&quotes.data_hash))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
             ("decision_quality".into(), json!(decision_quality.grade)),
             ("m1_quality".into(), json!(m1_quality.grade)),
         ]),
@@ -390,7 +427,7 @@ fn export_mql5_sync(request: &ExportRequest) -> Result<ExportView, String> {
         estimated_slippage_points_per_side: request.slippage_points_per_side,
         commission_per_lot_round_turn: request.commission_per_lot_round_turn,
         allow_live_trading_default: false,
-        export_style: quantforge_export_mql5::ExportStyle::Sqx,
+        export_style: quantforge_export_mql5::ExportStyle::Quantforge,
         entry_window_start_hour: window.start_hour,
         entry_window_end_hour: window.end_hour,
         tester: TesterConfig {
@@ -501,6 +538,86 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
     evidence.mandatory_take_profit &= protective_calls;
     let metadata =
         load_mt5_tester_metadata(&request.mt5_metadata_path).map_err(|error| error.to_string())?;
+    let mut certification_price_tolerance = None;
+    let mut certification_volume_tolerance = None;
+    let quote_data_hash = if request.strict_one_to_one {
+        let execution_policy_hash = metadata
+            .properties
+            .get("execution_policy_hash")
+            .ok_or_else(|| {
+                "MT5 metadata is missing execution_policy_hash; rerun the capture EA".to_owned()
+            })?;
+        if execution_policy_hash != evidence.execution_policy_hash.as_str() {
+            return Err("MT5 metadata execution_policy_hash does not match export evidence".into());
+        }
+        let quote_path = request.quote_path.as_deref().ok_or_else(|| {
+            "strict parity certification requires selecting the bid/ask M1 quote sidecar explicitly"
+                .to_owned()
+        })?;
+        let timezone = request
+            .broker_timezone
+            .clone()
+            .or_else(|| metadata.properties.get("broker_timezone").cloned())
+            .ok_or_else(|| "MT5 metadata is missing broker_timezone".to_owned())?
+            .parse::<SourceTimezone>()
+            .map_err(|error| format!("MT5 broker_timezone is invalid: {error}"))?;
+        let quotes = QuoteBarDataset::load_csv_server_epoch(quote_path, timezone)
+            .map_err(|error| format!("quote sidecar failed validation: {error}"))?;
+        if quotes.bars.len() < 2 {
+            return Err("quote sidecar contains fewer than two M1 bars".into());
+        }
+        let tester_model = metadata
+            .properties
+            .get("tester_model")
+            .ok_or_else(|| "MT5 metadata is missing tester_model; rerun the capture EA".to_owned())?
+            .parse::<u8>()
+            .map_err(|_| "MT5 metadata tester_model is not an integer".to_owned())?;
+        if tester_model != evidence.config.tester.model {
+            return Err(format!(
+                "MT5 tester model {tester_model} does not match export model {}",
+                evidence.config.tester.model
+            ));
+        }
+        if evidence.config.timeframe.eq_ignore_ascii_case("M1") && tester_model != 1 {
+            return Err(
+                "strict M1 parity requires MT5 Model=1; Model=4 is reserved for an explicit real-tick audit"
+                    .into(),
+            );
+        }
+        certification_price_tolerance = Some(
+            metadata
+                .properties
+                .get("point")
+                .ok_or_else(|| "MT5 metadata is missing point; rerun the capture EA".to_owned())?
+                .parse::<f64>()
+                .map_err(|_| "MT5 metadata point is not numeric".to_owned())?,
+        );
+        certification_volume_tolerance = Some(
+            metadata
+                .properties
+                .get("volume_step")
+                .ok_or_else(|| {
+                    "MT5 metadata is missing volume_step; rerun the capture EA".to_owned()
+                })?
+                .parse::<f64>()
+                .map_err(|_| "MT5 metadata volume_step is not numeric".to_owned())?,
+        );
+        if certification_price_tolerance.is_some_and(|value| value <= 0.0)
+            || certification_volume_tolerance.is_some_and(|value| value <= 0.0)
+        {
+            return Err("MT5 metadata point and volume_step must be positive".into());
+        }
+        if metadata
+            .properties
+            .get("price_basis")
+            .is_some_and(|value| value != "bid_ask")
+        {
+            return Err("MT5 metadata is not bound to bid/ask quote capture".into());
+        }
+        Some(quotes.data_hash)
+    } else {
+        None
+    };
     metadata
         .validate_evidence(&evidence)
         .map_err(|error| error.to_string())?;
@@ -516,7 +633,10 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
     )
     .map_err(|error| error.to_string())?;
     let tolerances = if request.strict_one_to_one {
-        ParityTolerances::strict_one_to_one()
+        let mut strict = ParityTolerances::strict_one_to_one();
+        strict.price_tolerance = certification_price_tolerance;
+        strict.volume_tolerance = certification_volume_tolerance;
+        strict
     } else {
         ParityTolerances {
             trade_count_relative: request.trade_count_relative,
@@ -526,6 +646,8 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
             max_equity_divergence_percent: request.max_equity_divergence_percent,
             trade_timestamp_tolerance_ms: request.trade_timestamp_tolerance_ms,
             minimum_aligned_trade_fraction: request.minimum_aligned_trade_fraction,
+            price_tolerance: None,
+            volume_tolerance: None,
         }
     };
     let report = compare_runs(&reference, &external, &evidence, tolerances)
@@ -563,6 +685,17 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
                 } else {
                     "diagnostic_tolerance"
                 }),
+            ),
+            (
+                "quote_data_hash".into(),
+                quote_data_hash
+                    .as_ref()
+                    .map(|hash| json!(hash))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "execution_policy_hash".into(),
+                json!(&evidence.execution_policy_hash),
             ),
         ]),
     )?;
@@ -604,6 +737,27 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         recovery_factor_delta_relative: artifact.report.recovery_factor_delta_relative,
         recovery_factor_passed: artifact.report.recovery_factor_passed,
     })
+}
+
+fn load_quote_sidecar(
+    path: &str,
+    m1_metadata: Option<&quantforge_data::Mt5ExportMetadata>,
+) -> Result<QuoteBarDataset, String> {
+    let server_epoch = m1_metadata.is_some_and(|metadata| {
+        metadata
+            .properties
+            .get("execution_model")
+            .is_some_and(|value| value.contains("TESTER_TICKS"))
+    });
+    if server_epoch {
+        let timezone = m1_metadata
+            .ok_or_else(|| "quote sidecar requires M1 metadata for timezone conversion".to_owned())?
+            .source_timezone()
+            .map_err(|error| error.to_string())?;
+        QuoteBarDataset::load_csv_server_epoch(path, timezone).map_err(|error| error.to_string())
+    } else {
+        QuoteBarDataset::load_csv(path).map_err(|error| error.to_string())
+    }
 }
 
 #[tauri::command]

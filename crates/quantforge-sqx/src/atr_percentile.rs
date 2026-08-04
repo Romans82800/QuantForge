@@ -124,12 +124,16 @@ mod tests {
     #[test]
     fn degenerate_inputs_still_return_nan_series() {
         let bars = series(12);
-        assert!(atr_percentile_series(&bars, 0, 10)
-            .iter()
-            .all(|value| value.is_nan()));
-        assert!(atr_percentile_series(&bars, 14, 0)
-            .iter()
-            .all(|value| value.is_nan()));
+        assert!(
+            atr_percentile_series(&bars, 0, 10)
+                .iter()
+                .all(|value| value.is_nan())
+        );
+        assert!(
+            atr_percentile_series(&bars, 14, 0)
+                .iter()
+                .all(|value| value.is_nan())
+        );
         assert!(atr_percentile_series(&[], 14, 10).is_empty());
     }
 }

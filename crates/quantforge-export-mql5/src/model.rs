@@ -12,15 +12,17 @@ pub const MANDATORY_ENTRY_WINDOW_END_HOUR: u32 = 19;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportStyle {
-    /// Legacy QuantForge inline-indicator expert.
+    /// Original QuantForge runtime using native MT5 indicator handles and
+    /// QuantForge-owned helpers for concepts MT5 does not expose natively.
     Quantforge,
-    /// StrategyQuant-style shell with Sq* custom indicators.
+    /// Legacy StrategyQuant-compatible shell. Kept only so older evidence
+    /// bundles remain reproducible; new exports must use `Quantforge`.
     Sqx,
 }
 
 impl Default for ExportStyle {
     fn default() -> Self {
-        Self::Sqx
+        Self::Quantforge
     }
 }
 
@@ -63,7 +65,7 @@ impl Default for Mql5ExportConfig {
             estimated_slippage_points_per_side: 0.0,
             commission_per_lot_round_turn: 0.0,
             allow_live_trading_default: false,
-            export_style: ExportStyle::Sqx,
+            export_style: ExportStyle::Quantforge,
             entry_window_start_hour: MANDATORY_ENTRY_WINDOW_START_HOUR,
             entry_window_end_hour: MANDATORY_ENTRY_WINDOW_END_HOUR,
             tester: TesterConfig::default(),
@@ -180,6 +182,11 @@ impl Mql5ExportConfig {
                 "entry window start hour must be earlier than its end hour".into(),
             ));
         }
+        if self.timeframe.eq_ignore_ascii_case("M1") && self.tester.model == 2 {
+            return Err(ExportError::InvalidConfig(
+                "M1 parity cannot use MT5 Model=2 (open prices only); use Model=1 for canonical M1 OHLC or Model=4 for an explicit real-tick audit".into(),
+            ));
+        }
         self.tester.validate()
     }
 }
@@ -263,6 +270,8 @@ pub struct ExportEvidenceCard {
     pub target: String,
     pub strategy_fingerprint: ContentHash,
     pub broker_spec_hash: ContentHash,
+    #[serde(default = "default_execution_policy_hash")]
+    pub execution_policy_hash: ContentHash,
     pub source_hash: ContentHash,
     pub strategy_ir_version: u16,
     pub expert_name: String,
@@ -274,8 +283,14 @@ pub struct ExportEvidenceCard {
     pub parity_deals_file: String,
     pub parity_equity_file: String,
     pub parity_metadata_file: String,
+    #[serde(default)]
+    pub parity_quote_file: Option<String>,
     pub export_style: ExportStyle,
     pub config: Mql5ExportConfig,
+}
+
+fn default_execution_policy_hash() -> ContentHash {
+    ContentHash::sha256("legacy-execution-policy")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -16,13 +16,12 @@ const PERIODS: [u16; 3] = [10, 14, 20];
 /// ATR / R-multiple ladder in 0.25 steps (cross-symbol comparable).  These
 /// are proposal values only; the sealed SearchRangeProfile remains the source
 /// of truth for the actual gene space.
-const ATR_STOP_MULTIPLIERS: [f64; 11] =
-    [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0];
-const ATR_TP_MULTIPLIERS: [f64; 11] =
-    [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
+const ATR_STOP_MULTIPLIERS: [f64; 11] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0];
+const ATR_TP_MULTIPLIERS: [f64; 11] = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
 const ATR_ENTRY_MULTIPLIERS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
-const RISK_MULTIPLES: [f64; 12] =
-    [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5];
+const RISK_MULTIPLES: [f64; 12] = [
+    0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5,
+];
 const ATR_TRAIL_MULTIPLIERS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5];
 const R_ACTIVATE: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 const R_DISTANCE: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];

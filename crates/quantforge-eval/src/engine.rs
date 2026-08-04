@@ -199,8 +199,7 @@ fn evaluate_strategy_inner(
         let previous_spread_price =
             resolve_spread(previous_bar, broker, &config.costs)?.points * broker.point;
         let current_local = broker_clock.local_datetime(bar.timestamp_ms)?;
-        let in_close_blackout =
-            current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let in_close_blackout = current_local.hour() >= strategy.manage.end_of_day_hour as u32;
         let in_entry_window = config.entry_window.contains(current_local.hour());
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
@@ -293,14 +292,12 @@ fn evaluate_strategy_inner(
         }
 
         if !closed_this_bar && let Some(open) = position.as_ref() {
-            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker)
-            {
+            let event = if let Some(event) = protective_gap_exit(open, bar, spread_price, broker) {
                 Some(event)
             } else if let Some(exit) = match open.side {
                 PositionSide::Long => strategy.long_exit(),
                 PositionSide::Short => strategy.short_exit(),
-            }
-                && features.evaluate_bool(exit, index)?
+            } && features.evaluate_bool(exit, index)?
             {
                 Some(ExitEvent {
                     base_price: market_exit_base(open.side, bar.open, spread_price),
@@ -805,9 +802,7 @@ fn fill_pending_order(
     );
     let stop_loss = normalize_price(order.stop_loss, broker);
     let take_profit = normalize_price(order.take_profit, broker);
-    let initial_risk_distance = (entry_price - stop_loss)
-        .abs()
-        .max(order.stop_distance);
+    let initial_risk_distance = (entry_price - stop_loss).abs().max(order.stop_distance);
     OpenPosition {
         side: order.side,
         entry_index: index,
@@ -1543,8 +1538,14 @@ mod tests {
         let bytes_for_two = 2 * dataset.bars.len() * std::mem::size_of::<f64>();
         let cache = IndicatorBufferCache::with_budget(dataset.bars.len(), bytes_for_two);
         for period in [8, 12, 16, 24, 32] {
-            evaluate_strategy_cached(&indicator_strategy(period), &dataset, &broker, &config, &cache)
-                .unwrap();
+            evaluate_strategy_cached(
+                &indicator_strategy(period),
+                &dataset,
+                &broker,
+                &config,
+                &cache,
+            )
+            .unwrap();
         }
         assert!(
             cache.len() <= 2,
@@ -1558,7 +1559,8 @@ mod tests {
         let dataset = dataset_with_bars(oscillating_bars(400));
         let broker = broker();
         let strategy = indicator_strategy(10);
-        let full = evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
+        let full =
+            evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
 
         let ceiling = 0.0;
         let abandoning = ScoutConfig {
@@ -1580,7 +1582,8 @@ mod tests {
         let dataset = dataset_with_bars(oscillating_bars(400));
         let broker = broker();
         let strategy = indicator_strategy(10);
-        let full = evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
+        let full =
+            evaluate_strategy(&strategy, &dataset, &broker, &ScoutConfig::default()).unwrap();
         let guarded = evaluate_strategy(
             &strategy,
             &dataset,

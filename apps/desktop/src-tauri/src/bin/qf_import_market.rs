@@ -1,6 +1,6 @@
 //! Import IC Markets `*_TickData.csv` folders into QuantForge OHLC packs.
 
-use quantforge_desktop_lib::data_lab::{import_market_folder_sync, MarketFolderImportRequest};
+use quantforge_desktop_lib::data_lab::{MarketFolderImportRequest, import_market_folder_sync};
 use std::env;
 
 fn main() {
@@ -11,9 +11,7 @@ fn main() {
     let output = args
         .next()
         .expect("usage: qf-import-market <source_dir> <output_dir> [timezone]");
-    let timezone = args
-        .next()
-        .unwrap_or_else(|| "ICMarkets/EST+7".to_owned());
+    let timezone = args.next().unwrap_or_else(|| "ICMarkets/EST+7".to_owned());
     let report = import_market_folder_sync(&MarketFolderImportRequest {
         source_directory: source,
         output_directory: Some(output),

@@ -19,6 +19,7 @@ import type {
   DiscoverJobView,
   DiscoverRequest,
   EliteDetail,
+  EliteMql5SourceView,
   ConditionBakeoffReport,
   ConditionBakeoffRequest,
   ExportRequest,
@@ -78,6 +79,18 @@ export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityD
 
 export async function loadElite(fingerprint: string): Promise<EliteDetail> {
   return invoke<EliteDetail>("get_elite", { fingerprint });
+}
+
+export function getEliteMql5Source(
+  fingerprint: string,
+  timeframe = "H1",
+  magic = 42_424_242,
+): Promise<EliteMql5SourceView> {
+  return invoke<EliteMql5SourceView>("get_elite_mql5_source", {
+    fingerprint,
+    timeframe,
+    magic,
+  });
 }
 
 export async function exportEliteStrategy(fingerprint: string): Promise<string | null> {

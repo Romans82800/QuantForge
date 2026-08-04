@@ -16,7 +16,7 @@ pub use bakeoff::{
 };
 pub use engine::{
     EvolutionSession, continue_evolution, continue_evolution_with_pack, evolve_new,
-    evolve_new_with_pack,
+    evolve_new_with_pack, evolve_new_with_pack_and_quotes,
 };
 pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use methodology::{
@@ -24,13 +24,12 @@ pub use methodology::{
     MethodologyReport, run_methodology_grid,
 };
 pub use model::{
-    BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError,
-    DiscoverRunMode, DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig,
-    GateResult, LongShortSkewBucket, M1RetentionEvidence, NicheKey,
-    ParameterNeighborhoodEvidence, ParameterNeighborhoodSample, PrecisionGateConfig,
-    RobustnessEvidence, SearchFamily,
-    SearchRange, SearchRangeProfile, SearchFamilySpec, SymbolScreenResult, ThreeLevelBucket,
-    UniversalGrammarConfig, WalkForwardEvidence, WalkForwardFold, TRIAL_BUDGET_WARNING,
+    BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError, DiscoverRunMode,
+    DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult,
+    LongShortSkewBucket, M1RetentionEvidence, NicheKey, ParameterNeighborhoodEvidence,
+    ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, SearchFamily,
+    SearchFamilySpec, SearchRange, SearchRangeProfile, SymbolScreenResult, TRIAL_BUDGET_WARNING,
+    ThreeLevelBucket, UniversalGrammarConfig, WalkForwardEvidence, WalkForwardFold,
 };
 pub use multi_symbol::{DEFAULT_FX_PACK, DISPLAY_ONLY_SYMBOLS, PackSymbol, screen_multi_symbol};
 pub use permutation::{
@@ -38,9 +37,8 @@ pub use permutation::{
 };
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
-    MONTE_CARLO_SKIP_TRADE_PROBABILITY,
-    PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessConfig, RobustnessOutcome,
-    RobustnessReject, run_m1_predeposit_robustness,
+    MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
+    RobustnessConfig, RobustnessOutcome, RobustnessReject, run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

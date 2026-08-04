@@ -6,13 +6,12 @@
 use chrono::Timelike;
 use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
-use quantforge_data::{Bar, BarDataset, forward_fill_zero_spreads};
+use quantforge_data::{Bar, BarDataset, QuoteBar, QuoteBarDataset, forward_fill_zero_spreads};
 use quantforge_eval::{
     BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason, FeatureCache,
     PositionSide, ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio,
-    favorable_r as compute_favorable_r, favorable_sample_from_m1_window, normalize_price,
-    placeable_stop_candidate, price_reaches_from_above, price_reaches_from_below,
-    ratchet_favorable_peak, resolve_spread,
+    favorable_r as compute_favorable_r, normalize_price, placeable_stop_candidate,
+    price_reaches_from_above, price_reaches_from_below, ratchet_favorable_peak, resolve_spread,
 };
 use quantforge_ir::{
     EntryDistancePolicy, EntryOrderPolicy, IndicatorExpr, IrError, IrLimits, RiskPolicy,
@@ -52,7 +51,7 @@ impl Default for JudgeConfig {
             initial_balance: 100_000.0,
             costs: CostModel::default(),
             allow_execution_gaps: true,
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: EntryWindow::default(),
         }
     }
@@ -172,6 +171,35 @@ pub fn evaluate_strategy_m1(
     broker: &SymbolSpecification,
     config: &JudgeConfig,
 ) -> Result<JudgeResult, JudgeError> {
+    evaluate_strategy_m1_internal(strategy, decision_dataset, m1_dataset, None, broker, config)
+}
+
+pub fn evaluate_strategy_m1_with_quotes(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: &QuoteBarDataset,
+    broker: &SymbolSpecification,
+    config: &JudgeConfig,
+) -> Result<JudgeResult, JudgeError> {
+    evaluate_strategy_m1_internal(
+        strategy,
+        decision_dataset,
+        m1_dataset,
+        Some(quote_dataset),
+        broker,
+        config,
+    )
+}
+
+fn evaluate_strategy_m1_internal(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &JudgeConfig,
+) -> Result<JudgeResult, JudgeError> {
     if decision_dataset.bars.len() < 2 {
         return Err(JudgeError::InsufficientDecisionBars);
     }
@@ -206,6 +234,11 @@ pub fn evaluate_strategy_m1(
     {
         return Err(JudgeError::InvalidDecisionTimeframe);
     }
+    if let Some(quotes) = quote_dataset {
+        quotes
+            .validate_against(m1_dataset)
+            .map_err(|error| JudgeError::QuoteDatasetMismatch(error.to_string()))?;
+    }
 
     let strategy = strategy.canonicalized(FloatPolicy::default())?;
     // Quiet-minute SPREAD=0 on M1 understates ask stops. Carry the last positive
@@ -229,6 +262,12 @@ pub fn evaluate_strategy_m1(
             std::borrow::Cow::Borrowed(&m1_dataset.bars)
         };
     let m1_bars: &[Bar] = &m1_bars_owned;
+    let quote_bars_owned = if let Some(quotes) = quote_dataset {
+        std::borrow::Cow::Borrowed(quotes.bars.as_slice())
+    } else {
+        std::borrow::Cow::Owned(derive_quote_bars(m1_bars, broker, &config.costs)?)
+    };
+    let quote_bars: &[QuoteBar] = &quote_bars_owned;
     let mut features =
         FeatureCache::with_engine(decision_bars, &broker.timezone, config.indicator_engine)?;
     let mut balance = config.initial_balance;
@@ -240,6 +279,7 @@ pub fn evaluate_strategy_m1(
     let mut m1_cursor = 0usize;
     let mut last_execution_timestamp_ms: Option<i64> = None;
     let mut last_execution_bars: &[Bar] = &[];
+    let mut last_execution_quotes: &[QuoteBar] = &[];
     let broker_clock = BrokerClock::parse(&broker.timezone)?;
     let mut active_entry_day: Option<chrono::NaiveDate> = None;
     // First fill (market open or pending activation) locks the broker day.
@@ -266,6 +306,7 @@ pub fn evaluate_strategy_m1(
             m1_cursor += 1;
         }
         let execution_bars = &m1_bars[slice_start..m1_cursor];
+        let execution_quotes = &quote_bars[slice_start..m1_cursor];
         let (gap_events, missing_minutes) =
             execution_gap_summary(execution_bars, start, end, execution_interval_ms);
         if gap_events > 0 {
@@ -288,15 +329,25 @@ pub fn evaluate_strategy_m1(
         telemetry.decision_bars_replayed += 1;
 
         let opening_minute = &execution_bars[0];
-        let opening_spread = resolve_spread(opening_minute, broker, &config.costs)?;
-        record_spread_source(opening_spread.source, &mut telemetry);
-        let opening_spread_price = opening_spread.points * broker.point;
+        let opening_quote = &execution_quotes[0];
+        let opening_spread_price = opening_quote.spread_open();
+        // In canonical mode the sidecar is the source of truth. Never apply a
+        // synthetic/fallback SPREAD column to the max-spread gate when the
+        // actual bid/ask quote is available.
+        let opening_spread_points = if quote_dataset.is_some() {
+            opening_spread_price / broker.point
+        } else {
+            let spread = resolve_spread(opening_minute, broker, &config.costs)?;
+            record_spread_source(spread.source, &mut telemetry);
+            spread.points
+        };
         let mut closed_this_decision = false;
         let previous_decision_bar = &decision_bars[decision_index - 1];
         let previous_spread_price =
             resolve_spread(previous_decision_bar, broker, &config.costs)?.points * broker.point;
         // M1 window for the just-completed decision bar (set at end of prior loop).
         let previous_execution_bars = last_execution_bars;
+        let previous_execution_quotes = last_execution_quotes;
         let current_local = broker_clock.local_datetime(opening_minute.timestamp_ms)?;
         let in_close_blackout = current_local.hour() >= strategy.manage.end_of_day_hour as u32;
         let in_entry_window = config.entry_window.contains(current_local.hour());
@@ -315,11 +366,7 @@ pub fn evaluate_strategy_m1(
             }
             if let Some(open) = position.take() {
                 let event = ExitEvent {
-                    base_price: market_exit_base(
-                        open.side,
-                        opening_minute.open,
-                        opening_spread_price,
-                    ),
+                    base_price: market_exit_base_quote(open.side, opening_quote),
                     reason: ExitReason::EndOfDay,
                 };
                 close_position(
@@ -344,7 +391,15 @@ pub fn evaluate_strategy_m1(
         {
             apply_swap(
                 open,
-                opening_minute.open,
+                if quote_dataset.is_some() {
+                    if open.side == PositionSide::Long {
+                        opening_quote.bid_open
+                    } else {
+                        opening_quote.ask_open
+                    }
+                } else {
+                    opening_minute.open
+                },
                 previous_timestamp_ms,
                 opening_minute.timestamp_ms,
                 broker,
@@ -358,9 +413,11 @@ pub fn evaluate_strategy_m1(
                 open,
                 &strategy,
                 previous_execution_bars,
+                previous_execution_quotes,
                 previous_spread_price,
                 decision_index,
                 opening_minute,
+                opening_quote,
                 opening_spread_price,
                 broker,
                 config,
@@ -374,11 +431,7 @@ pub fn evaluate_strategy_m1(
                 close_position(
                     open,
                     ExitEvent {
-                        base_price: market_exit_base(
-                            side,
-                            opening_minute.open,
-                            opening_spread_price,
-                        ),
+                        base_price: market_exit_base_quote(side, opening_quote),
                         reason: ExitReason::PartialExit,
                     },
                     decision_index,
@@ -394,9 +447,7 @@ pub fn evaluate_strategy_m1(
 
         if !closed_this_decision && let Some(open) = position.as_ref() {
             let event =
-                if let Some(event) =
-                    protective_gap_exit(open, opening_minute, opening_spread_price, broker)
-                {
+                if let Some(event) = protective_gap_exit_quote(open, opening_quote, broker) {
                     Some(event)
                 } else if let Some(exit) = match open.side {
                     PositionSide::Long => strategy.long_exit(),
@@ -404,22 +455,14 @@ pub fn evaluate_strategy_m1(
                 } && features.evaluate_bool(exit, decision_index)?
                 {
                     Some(ExitEvent {
-                        base_price: market_exit_base(
-                            open.side,
-                            opening_minute.open,
-                            opening_spread_price,
-                        ),
+                        base_price: market_exit_base_quote(open.side, opening_quote),
                         reason: ExitReason::Indicator,
                     })
                 } else if strategy.manage.time_stop_bars.is_some_and(|limit| {
                     decision_index - open.entry_decision_index >= limit as usize
                 }) {
                     Some(ExitEvent {
-                        base_price: market_exit_base(
-                            open.side,
-                            opening_minute.open,
-                            opening_spread_price,
-                        ),
+                        base_price: market_exit_base_quote(open.side, opening_quote),
                         reason: ExitReason::TimeStop,
                     })
                 } else {
@@ -494,7 +537,7 @@ pub fn evaluate_strategy_m1(
                     } else if config
                         .costs
                         .max_spread_points
-                        .is_some_and(|maximum| opening_spread.points > maximum)
+                        .is_some_and(|maximum| opening_spread_points > maximum)
                     {
                         telemetry.skipped_for_spread += 1;
                     } else if strategy.manage.max_one_entry_per_day && signal_taken_today {
@@ -507,6 +550,7 @@ pub fn evaluate_strategy_m1(
                                     decision_index,
                                     opening_minute,
                                     opening_spread_price,
+                                    opening_quote,
                                     balance,
                                     &strategy,
                                     broker,
@@ -525,6 +569,7 @@ pub fn evaluate_strategy_m1(
                                     decision_index,
                                     opening_minute,
                                     opening_spread_price,
+                                    opening_quote,
                                     balance,
                                     &strategy,
                                     broker,
@@ -544,19 +589,21 @@ pub fn evaluate_strategy_m1(
 
         for (minute_index, minute) in execution_bars.iter().enumerate() {
             telemetry.m1_bars_replayed += 1;
-            let spread = if minute_index == 0 {
-                opening_spread
-            } else {
-                let spread = resolve_spread(minute, broker, &config.costs)?;
-                record_spread_source(spread.source, &mut telemetry);
-                spread
-            };
+            let quote = &execution_quotes[minute_index];
             if minute_index > 0
                 && let Some(open) = position.as_mut()
             {
                 apply_swap(
                     open,
-                    minute.open,
+                    if quote_dataset.is_some() {
+                        if open.side == PositionSide::Long {
+                            quote.bid_open
+                        } else {
+                            quote.ask_open
+                        }
+                    } else {
+                        minute.open
+                    },
                     execution_bars[minute_index - 1].timestamp_ms,
                     minute.timestamp_ms,
                     broker,
@@ -564,7 +611,6 @@ pub fn evaluate_strategy_m1(
                     &mut telemetry,
                 )?;
             }
-            let spread_price = spread.points * broker.point;
             let minute_local = broker_clock.local_datetime(minute.timestamp_ms)?;
             let minute_in_entry_window = config.entry_window.contains(minute_local.hour());
             if !minute_in_entry_window && pending.take().is_some() {
@@ -576,7 +622,7 @@ pub fn evaluate_strategy_m1(
                 && minute_in_entry_window
                 && let Some(fill_price) = pending
                     .as_ref()
-                    .and_then(|order| pending_fill_price(order, minute, spread_price))
+                    .and_then(|order| pending_fill_price(order, quote))
             {
                 let order = pending.take().expect("pending order was checked");
                 let open = fill_pending_order(
@@ -596,10 +642,10 @@ pub fn evaluate_strategy_m1(
             }
             if let Some(open) = position.as_ref() {
                 let event = if filled_this_minute {
-                    protective_intrabar_exit(open, minute, spread_price, broker, &mut telemetry)
+                    protective_intrabar_exit_quote(open, quote, broker, &mut telemetry)
                 } else {
-                    protective_gap_exit(open, minute, spread_price, broker).or_else(|| {
-                        protective_intrabar_exit(open, minute, spread_price, broker, &mut telemetry)
+                    protective_gap_exit_quote(open, quote, broker).or_else(|| {
+                        protective_intrabar_exit_quote(open, quote, broker, &mut telemetry)
                     })
                 };
                 if let Some(event) = event {
@@ -617,7 +663,7 @@ pub fn evaluate_strategy_m1(
                 }
             }
             let marked_equity = position.as_ref().map_or(balance, |open| {
-                liquidation_equity(open, minute, spread_price, balance, broker, config)
+                liquidation_equity_quote(open, quote, balance, broker, config)
             });
             equity.push(EquityPoint {
                 timestamp_ms: minute.timestamp_ms,
@@ -627,16 +673,18 @@ pub fn evaluate_strategy_m1(
             last_execution_timestamp_ms = Some(minute.timestamp_ms);
         }
         last_execution_bars = execution_bars;
+        last_execution_quotes = execution_quotes;
     }
 
     if let Some(open) = position.take() {
         let final_minute = m1_bars
             .get(m1_cursor.saturating_sub(1))
             .ok_or(JudgeError::InsufficientM1Bars)?;
-        let spread_price =
-            resolve_spread(final_minute, broker, &config.costs)?.points * broker.point;
+        let final_quote = quote_bars
+            .get(m1_cursor.saturating_sub(1))
+            .ok_or(JudgeError::InsufficientM1Bars)?;
         let event = ExitEvent {
-            base_price: market_exit_base(open.side, final_minute.close, spread_price),
+            base_price: market_exit_base_quote(open.side, final_quote),
             reason: ExitReason::EndOfData,
         };
         close_position(
@@ -694,7 +742,8 @@ fn open_position(
     side: PositionSide,
     decision_index: usize,
     bar: &Bar,
-    spread_price: f64,
+    _spread_price: f64,
+    quote: &QuoteBar,
     balance: f64,
     strategy: &StrategyIr,
     broker: &SymbolSpecification,
@@ -734,8 +783,8 @@ fn open_position(
         return Ok(None);
     };
     let margin_reference_price = match side {
-        PositionSide::Long => bar.open + spread_price,
-        PositionSide::Short => bar.open,
+        PositionSide::Long => quote.ask_open,
+        PositionSide::Short => quote.bid_open,
     };
     if !margin_is_affordable(balance, volume, broker, margin_reference_price) {
         telemetry.skipped_insufficient_margin += 1;
@@ -745,8 +794,8 @@ fn open_position(
     let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
     let intended_entry_price = normalize_price(
         match side {
-            PositionSide::Long => bar.open + spread_price,
-            PositionSide::Short => bar.open,
+            PositionSide::Long => quote.ask_open,
+            PositionSide::Short => quote.bid_open,
         },
         broker,
     );
@@ -798,8 +847,9 @@ fn open_position(
 fn place_pending_order(
     side: PositionSide,
     decision_index: usize,
-    bar: &Bar,
-    spread_price: f64,
+    _bar: &Bar,
+    _spread_price: f64,
+    quote: &QuoteBar,
     balance: f64,
     strategy: &StrategyIr,
     broker: &SymbolSpecification,
@@ -839,8 +889,8 @@ fn place_pending_order(
         return Ok(None);
     }
     let reference = match side {
-        PositionSide::Long => bar.open + spread_price,
-        PositionSide::Short => bar.open,
+        PositionSide::Long => quote.ask_open,
+        PositionSide::Short => quote.bid_open,
     };
     let activation_price = normalize_price(
         match (side, kind) {
@@ -919,20 +969,16 @@ fn entry_distance(
     Ok(value.filter(|distance| distance.is_finite() && *distance > 0.0))
 }
 
-fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Option<f64> {
+fn pending_fill_price(order: &PendingOrder, quote: &QuoteBar) -> Option<f64> {
     let open = match order.side {
-        PositionSide::Long => bar.open + spread_price,
-        PositionSide::Short => bar.open,
+        PositionSide::Long => quote.ask_open,
+        PositionSide::Short => quote.bid_open,
     };
     let touched = match (order.side, order.kind) {
-        (PositionSide::Long, PendingKind::Stop) => {
-            bar.high + spread_price >= order.activation_price
-        }
-        (PositionSide::Short, PendingKind::Stop) => bar.low <= order.activation_price,
-        (PositionSide::Long, PendingKind::Limit) => {
-            bar.low + spread_price <= order.activation_price
-        }
-        (PositionSide::Short, PendingKind::Limit) => bar.high >= order.activation_price,
+        (PositionSide::Long, PendingKind::Stop) => quote.ask_high >= order.activation_price,
+        (PositionSide::Short, PendingKind::Stop) => quote.bid_low <= order.activation_price,
+        (PositionSide::Long, PendingKind::Limit) => quote.ask_low <= order.activation_price,
+        (PositionSide::Short, PendingKind::Limit) => quote.bid_high >= order.activation_price,
     };
     if !touched {
         return None;
@@ -943,6 +989,113 @@ fn pending_fill_price(order: &PendingOrder, bar: &Bar, spread_price: f64) -> Opt
         (PositionSide::Long, PendingKind::Limit) => open.min(order.activation_price),
         (PositionSide::Short, PendingKind::Limit) => open.max(order.activation_price),
     })
+}
+
+fn favorable_quote_sample(
+    side: PositionSide,
+    bars: &[Bar],
+    quotes: &[QuoteBar],
+    entry_timestamp_ms: i64,
+) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for (bar, quote) in bars.iter().zip(quotes) {
+        if bar.timestamp_ms < entry_timestamp_ms {
+            continue;
+        }
+        let sample = if bar.timestamp_ms == entry_timestamp_ms {
+            match side {
+                PositionSide::Long => quote.bid_close,
+                PositionSide::Short => quote.ask_close,
+            }
+        } else {
+            match side {
+                PositionSide::Long => quote.bid_high,
+                PositionSide::Short => quote.ask_low,
+            }
+        };
+        best = Some(match (side, best) {
+            (PositionSide::Long, Some(current)) => current.max(sample),
+            (PositionSide::Short, Some(current)) => current.min(sample),
+            (_, None) => sample,
+        });
+    }
+    best
+}
+
+fn protective_gap_exit_quote(
+    position: &OpenPosition,
+    quote: &QuoteBar,
+    broker: &SymbolSpecification,
+) -> Option<ExitEvent> {
+    let open = match position.side {
+        PositionSide::Long => quote.bid_open,
+        PositionSide::Short => quote.ask_open,
+    };
+    match position.side {
+        PositionSide::Long if price_reaches_from_above(open, position.stop_loss, broker) => {
+            Some(ExitEvent {
+                // MT5's Model=1 OHLC engine records protective stops at the
+                // requested stop price even when the synthesized minute opens
+                // beyond it. Real-tick audits may model broker gap slippage,
+                // but canonical M1 certification must reproduce Model=1.
+                base_price: position.stop_loss,
+                reason: ExitReason::StopLoss,
+            })
+        }
+        PositionSide::Long if price_reaches_from_below(open, position.take_profit, broker) => {
+            Some(ExitEvent {
+                base_price: position.take_profit,
+                reason: ExitReason::TakeProfit,
+            })
+        }
+        PositionSide::Short if price_reaches_from_below(open, position.stop_loss, broker) => {
+            Some(ExitEvent {
+                base_price: position.stop_loss,
+                reason: ExitReason::StopLoss,
+            })
+        }
+        PositionSide::Short if price_reaches_from_above(open, position.take_profit, broker) => {
+            Some(ExitEvent {
+                base_price: position.take_profit,
+                reason: ExitReason::TakeProfit,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn protective_intrabar_exit_quote(
+    position: &OpenPosition,
+    quote: &QuoteBar,
+    broker: &SymbolSpecification,
+    telemetry: &mut JudgeTelemetry,
+) -> Option<ExitEvent> {
+    let (stop_touched, target_touched) = match position.side {
+        PositionSide::Long => (
+            price_reaches_from_above(quote.bid_low, position.stop_loss, broker),
+            price_reaches_from_below(quote.bid_high, position.take_profit, broker),
+        ),
+        PositionSide::Short => (
+            price_reaches_from_below(quote.ask_high, position.stop_loss, broker),
+            price_reaches_from_above(quote.ask_low, position.take_profit, broker),
+        ),
+    };
+    if stop_touched && target_touched {
+        telemetry.same_minute_stop_target_collisions += 1;
+    }
+    if stop_touched {
+        Some(ExitEvent {
+            base_price: position.stop_loss,
+            reason: ExitReason::StopLoss,
+        })
+    } else if target_touched {
+        Some(ExitEvent {
+            base_price: position.take_profit,
+            reason: ExitReason::TakeProfit,
+        })
+    } else {
+        None
+    }
 }
 
 fn fill_pending_order(
@@ -1070,21 +1223,23 @@ fn apply_completed_bar_management(
     position: &mut OpenPosition,
     strategy: &StrategyIr,
     previous_execution_bars: &[Bar],
-    completed_spread_price: f64,
+    previous_execution_quotes: &[QuoteBar],
+    _completed_spread_price: f64,
     decision_index: usize,
-    current_bar: &Bar,
-    current_spread_price: f64,
+    _current_bar: &Bar,
+    current_quote: &QuoteBar,
+    _current_spread_price: f64,
     broker: &SymbolSpecification,
     config: &JudgeConfig,
     features: &mut FeatureCache<'_>,
     balance: &mut f64,
     telemetry: &mut JudgeTelemetry,
 ) -> Result<(), JudgeError> {
-    let Some(sample) = favorable_sample_from_m1_window(
+    let Some(sample) = favorable_quote_sample(
         position.side,
         previous_execution_bars,
+        previous_execution_quotes,
         position.entry_timestamp_ms,
-        completed_spread_price,
     ) else {
         return Ok(());
     };
@@ -1106,11 +1261,15 @@ fn apply_completed_bar_management(
         .break_even_at_r
         .is_some_and(|activation| favorable_r >= activation)
     {
+        let reference_open = match position.side {
+            PositionSide::Long => current_quote.bid_open,
+            PositionSide::Short => current_quote.ask_open,
+        };
         if let Some(candidate) = placeable_stop_candidate(
             position.side,
             position.entry_price,
-            current_bar.open,
-            current_spread_price,
+            reference_open,
+            current_quote.spread_open(),
             minimum_distance,
         ) {
             if tighten_stop(position, candidate) {
@@ -1149,11 +1308,15 @@ fn apply_completed_bar_management(
                 PositionSide::Long => favorable_price - distance,
                 PositionSide::Short => favorable_price + distance,
             };
+            let reference_open = match position.side {
+                PositionSide::Long => current_quote.bid_open,
+                PositionSide::Short => current_quote.ask_open,
+            };
             if let Some(candidate) = placeable_stop_candidate(
                 position.side,
                 raw_candidate,
-                current_bar.open,
-                current_spread_price,
+                reference_open,
+                current_quote.spread_open(),
                 minimum_distance,
             ) {
                 if tighten_stop(position, candidate) {
@@ -1172,7 +1335,7 @@ fn apply_completed_bar_management(
         else {
             continue;
         };
-        let base_price = market_exit_base(position.side, current_bar.open, current_spread_price);
+        let base_price = market_exit_base_quote(position.side, current_quote);
         realize_exit_volume(position, close_volume, base_price, broker, config, balance);
         position.partial_exit_done[partial_index] = true;
         telemetry.partial_exits_executed += 1;
@@ -1284,6 +1447,7 @@ fn apply_swap(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn protective_gap_exit(
     position: &OpenPosition,
     bar: &Bar,
@@ -1323,6 +1487,7 @@ fn protective_gap_exit(
     }
 }
 
+#[allow(dead_code)]
 fn protective_intrabar_exit(
     position: &OpenPosition,
     bar: &Bar,
@@ -1404,10 +1569,18 @@ fn close_position(
     });
 }
 
+#[allow(dead_code)]
 fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f64 {
     match side {
         PositionSide::Long => bid_price,
         PositionSide::Short => bid_price + spread_price,
+    }
+}
+
+fn market_exit_base_quote(side: PositionSide, quote: &QuoteBar) -> f64 {
+    match side {
+        PositionSide::Long => quote.bid_open,
+        PositionSide::Short => quote.ask_open,
     }
 }
 
@@ -1423,6 +1596,7 @@ fn profit_currency_to_account(price: f64, broker: &SymbolSpecification) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 fn liquidation_equity(
     position: &OpenPosition,
     bar: &Bar,
@@ -1443,6 +1617,54 @@ fn liquidation_equity(
         * position.volume;
     let exit_commission = position.volume * config.costs.commission_per_lot_round_turn / 2.0;
     balance + gross - exit_commission
+}
+
+fn liquidation_equity_quote(
+    position: &OpenPosition,
+    quote: &QuoteBar,
+    balance: f64,
+    broker: &SymbolSpecification,
+    config: &JudgeConfig,
+) -> f64 {
+    let exit_price = match position.side {
+        PositionSide::Long => quote.bid_close,
+        PositionSide::Short => quote.ask_close,
+    };
+    let direction = match position.side {
+        PositionSide::Long => 1.0,
+        PositionSide::Short => -1.0,
+    };
+    let gross = (exit_price - position.entry_price)
+        * direction
+        * broker.contract_size
+        * profit_currency_to_account(exit_price, broker)
+        * position.volume;
+    let exit_commission = position.volume * config.costs.commission_per_lot_round_turn / 2.0;
+    balance + gross - exit_commission
+}
+
+fn derive_quote_bars(
+    bars: &[Bar],
+    broker: &SymbolSpecification,
+    costs: &CostModel,
+) -> Result<Vec<QuoteBar>, JudgeError> {
+    bars.iter()
+        .map(|bar| {
+            let spread = resolve_spread(bar, broker, costs)?.points * broker.point;
+            Ok(QuoteBar {
+                timestamp_ms: bar.timestamp_ms,
+                bid_open: bar.open,
+                bid_high: bar.high,
+                bid_low: bar.low,
+                bid_close: bar.close,
+                ask_open: bar.open + spread,
+                ask_high: bar.high + spread,
+                ask_low: bar.low + spread,
+                ask_close: bar.close + spread,
+                tick_count: bar.tick_volume,
+            })
+        })
+        .collect()
 }
 
 fn calculate_metrics(
@@ -1610,6 +1832,8 @@ pub enum JudgeError {
     InvalidDecisionTimeframe,
     #[error("execution data must be M1; observed median interval was {observed_ms}ms")]
     InvalidM1Timeframe { observed_ms: i64 },
+    #[error("quote sidecar mismatch: {0}")]
+    QuoteDatasetMismatch(String),
     #[error("M1 data has no bar at decision open {timestamp_ms}")]
     MissingM1Open { timestamp_ms: i64 },
     #[error(
@@ -1697,6 +1921,44 @@ mod tests {
         assert_eq!(judge.trades[0].exit_reason, ExitReason::TakeProfit);
         assert_eq!(judge.trades[0].exit_timestamp_ms, FIXTURE_BASE_MS + 300_000);
         assert_eq!(judge.telemetry.same_minute_stop_target_collisions, 0);
+    }
+
+    #[test]
+    fn quote_side_pending_triggers_use_ask_for_long_and_bid_for_short() {
+        let quote = QuoteBar {
+            timestamp_ms: FIXTURE_BASE_MS,
+            bid_open: 99.0,
+            bid_high: 101.0,
+            bid_low: 98.0,
+            bid_close: 100.0,
+            ask_open: 100.0,
+            ask_high: 102.0,
+            ask_low: 99.0,
+            ask_close: 101.0,
+            tick_count: 10,
+        };
+        let long_stop = PendingOrder {
+            side: PositionSide::Long,
+            kind: PendingKind::Stop,
+            expiry_decision_index: 1,
+            activation_price: 101.5,
+            stop_loss: 98.0,
+            take_profit: 105.0,
+            stop_distance: 2.0,
+            volume: 1.0,
+        };
+        let short_stop = PendingOrder {
+            side: PositionSide::Short,
+            kind: PendingKind::Stop,
+            expiry_decision_index: 1,
+            activation_price: 98.5,
+            stop_loss: 102.0,
+            take_profit: 95.0,
+            stop_distance: 2.0,
+            volume: 1.0,
+        };
+        assert_eq!(pending_fill_price(&long_stop, &quote), Some(101.5));
+        assert_eq!(pending_fill_price(&short_stop, &quote), Some(98.5));
     }
 
     #[test]

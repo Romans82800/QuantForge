@@ -95,11 +95,7 @@ pub fn favorable_sample_from_m1_window(
 }
 
 /// Ratchet a peak favorable price (max for long, min for short).
-pub fn ratchet_favorable_peak(
-    side: PositionSide,
-    peak: Option<f64>,
-    sample: f64,
-) -> Option<f64> {
+pub fn ratchet_favorable_peak(side: PositionSide, peak: Option<f64>, sample: f64) -> Option<f64> {
     if !sample.is_finite() {
         return peak;
     }
@@ -187,28 +183,16 @@ mod tests {
     #[test]
     fn entry_bar_uses_close_not_high() {
         let completed = bar(60_000, 100.0, 110.0, 99.0, 101.0);
-        let sample = favorable_sample_from_decision_bar(
-            PositionSide::Long,
-            &completed,
-            0.0,
-            1,
-            1,
-        )
-        .unwrap();
+        let sample =
+            favorable_sample_from_decision_bar(PositionSide::Long, &completed, 0.0, 1, 1).unwrap();
         assert_eq!(sample, 101.0);
     }
 
     #[test]
     fn later_bar_uses_high() {
         let completed = bar(120_000, 100.0, 110.0, 99.0, 101.0);
-        let sample = favorable_sample_from_decision_bar(
-            PositionSide::Long,
-            &completed,
-            0.0,
-            1,
-            2,
-        )
-        .unwrap();
+        let sample =
+            favorable_sample_from_decision_bar(PositionSide::Long, &completed, 0.0, 1, 2).unwrap();
         assert_eq!(sample, 110.0);
     }
 

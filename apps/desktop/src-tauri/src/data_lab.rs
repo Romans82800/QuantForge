@@ -1,8 +1,9 @@
 use csv::{ReaderBuilder, StringRecord, Trim};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
-    Bar, BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
-    build_timeframe_from_m1, infer_median_interval_ms, parse_source_timestamp,
+    Bar, BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, QuoteBar, QuoteBarDataset,
+    SourceTimezone, build_timeframe_from_m1, infer_median_interval_ms, parse_source_timestamp,
+    quote_bar_content_hash,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -36,6 +37,12 @@ pub struct DataLabView {
     input_was_sorted: bool,
     delimiter: String,
     source_timezone: String,
+    /// The execution-feed class inferred from importer metadata. Midpoint
+    /// packs remain readable for diagnostics, but are never eligible for a
+    /// certified discovery run.
+    feed_mode: String,
+    quote_path: Option<String>,
+    certification_ready: bool,
     first_timestamp_ms: i64,
     last_timestamp_ms: i64,
     quality: QualityView,
@@ -64,6 +71,9 @@ pub struct MarketFileImportView {
     pub m1_metadata_path: Option<String>,
     pub h1_path: Option<String>,
     pub h1_metadata_path: Option<String>,
+    pub quote_path: Option<String>,
+    pub quote_metadata_path: Option<String>,
+    pub price_basis: Option<String>,
     pub status: String,
     pub message: Option<String>,
 }
@@ -125,6 +135,45 @@ fn inspect_data_sync(request: &DataLabRequest) -> Result<DataLabView, String> {
         .map(|path| load_bound_broker(path, loaded.metadata.as_ref()))
         .transpose()?;
     let metadata = loaded.metadata.as_ref();
+    let import_kind = metadata
+        .and_then(|value| value.properties.get("import_kind"))
+        .map(String::as_str);
+    let price_basis = metadata
+        .and_then(|value| value.properties.get("price_basis"))
+        .map(String::as_str);
+    let is_midpoint = price_basis.is_some_and(|value| value.eq_ignore_ascii_case("midpoint"))
+        || import_kind.is_some_and(|value| value.to_ascii_lowercase().contains("midpoint"));
+    let is_canonical_quotes = price_basis.is_some_and(|value| {
+        value.eq_ignore_ascii_case("bid") || value.eq_ignore_ascii_case("bid_ask")
+    }) && import_kind
+        .is_some_and(|value| value.to_ascii_lowercase().contains("bid_ask"));
+    let feed_mode = if is_canonical_quotes {
+        "canonical_bid_ask"
+    } else if is_midpoint {
+        "diagnostic_midpoint"
+    } else {
+        "legacy_ohlc"
+    };
+    let quote_path = if is_canonical_quotes {
+        let data_path = Path::new(&request.data_path);
+        let stem = data_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let mut candidates = vec![data_path.with_file_name(format!("{stem}.quotes.csv"))];
+        for suffix in ["_H1", "_M15"] {
+            if let Some(base) = stem.strip_suffix(suffix) {
+                candidates.push(data_path.with_file_name(format!("{base}_M1.quotes.csv")));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| display_path(&candidate))
+    } else {
+        None
+    };
+    let certification_ready = is_canonical_quotes && quote_path.is_some() && broker.is_some();
     let first_timestamp_ms = loaded
         .dataset
         .bars
@@ -167,18 +216,22 @@ fn inspect_data_sync(request: &DataLabRequest) -> Result<DataLabView, String> {
         input_was_sorted: loaded.dataset.input_was_sorted,
         delimiter: loaded.dataset.delimiter.to_string(),
         source_timezone: loaded.dataset.source_timezone.clone(),
+        feed_mode: feed_mode.into(),
+        quote_path,
+        certification_ready,
         first_timestamp_ms,
         last_timestamp_ms,
-        discover_ready: quality.grade != QualityGrade::Fail && broker.is_some(),
+        discover_ready: quality.grade != QualityGrade::Fail && broker.is_some() && !is_midpoint,
         quality: QualityView::from(&quality),
     })
 }
 
 /// Import a folder of broker exports without making the user hand-bind every
-/// file.  IC Markets' downloadable `*_TickData.csv` files are aggregated to
-/// midpoint M1 bars and then to H1 bars using the same Rust aggregation path
-/// used by Discover.  Non-market CSVs (trade lists, Databento files, etc.) are
-/// reported as skipped rather than accidentally being treated as prices.
+/// file. IC Markets' downloadable `*_TickData.csv` files are aggregated to
+/// bid M1 bars and a sidecar carrying the matching bid/ask OHLC quotes. H1 is
+/// always derived from the canonical bid M1 stream. Non-market CSVs (trade
+/// lists, Databento files, etc.) are reported as skipped rather than
+/// accidentally being treated as prices.
 #[tauri::command]
 pub async fn import_market_folder(
     request: MarketFolderImportRequest,
@@ -247,6 +300,9 @@ pub fn import_market_folder_sync(
                     m1_metadata_path: None,
                     h1_path: None,
                     h1_metadata_path: None,
+                    quote_path: None,
+                    quote_metadata_path: None,
+                    price_basis: None,
                     status: "error".into(),
                     message: Some(error),
                 });
@@ -446,6 +502,9 @@ fn import_market_file(
             m1_metadata_path: Some(display_path(&m1_metadata_path)),
             h1_path: Some(display_path(&h1_path)),
             h1_metadata_path: Some(display_path(&h1_metadata_path)),
+            quote_path: None,
+            quote_metadata_path: None,
+            price_basis: Some("source_ohlc".into()),
             status: "imported".into(),
             message: None,
         })
@@ -469,6 +528,9 @@ fn import_market_file(
             m1_metadata_path: None,
             h1_path: Some(display_path(&h1_path)),
             h1_metadata_path: Some(display_path(&h1_metadata_path)),
+            quote_path: None,
+            quote_metadata_path: None,
+            price_basis: Some("source_ohlc".into()),
             status: "imported".into(),
             message: None,
         })
@@ -601,6 +663,9 @@ fn import_headerless_m1_file(
         m1_metadata_path: Some(display_path(&m1_metadata_path)),
         h1_path: Some(display_path(&h1_path)),
         h1_metadata_path: Some(display_path(&h1_metadata_path)),
+        quote_path: None,
+        quote_metadata_path: None,
+        price_basis: Some("source_ohlc".into()),
         status: "imported".into(),
         message: None,
     })
@@ -630,9 +695,7 @@ fn import_tick_file(
         let timestamp_text = tick_timestamp(&record, columns, index + 2)?;
         let timestamp_ms = match parse_source_timestamp(&timestamp_text, timezone) {
             Ok(value) => value,
-            Err(reason)
-                if reason.contains("daylight-saving") || reason.contains("ambiguous") =>
-            {
+            Err(reason) if reason.contains("daylight-saving") || reason.contains("ambiguous") => {
                 // ICMarkets/EST+7 follows New York DST under a +7 wall shift.
                 // Quote dumps occasionally stamp the spring-forward gap; skip.
                 continue;
@@ -650,9 +713,11 @@ fn import_tick_file(
         previous_timestamp = Some(timestamp_ms);
         let ask = parse_market_number(&record, columns.ask, index + 2, "ASK")?;
         let bid = parse_market_number(&record, columns.bid, index + 2, "BID")?;
-        let price = (ask + bid) / 2.0;
-        if !price.is_finite() {
-            return Err(format!("tick row {} has a non-finite price", index + 2));
+        if !ask.is_finite() || !bid.is_finite() || ask < bid {
+            return Err(format!(
+                "tick row {} has invalid bid/ask geometry",
+                index + 2
+            ));
         }
         let volume = columns
             .volume
@@ -662,16 +727,21 @@ fn import_tick_file(
         let bucket = timestamp_ms - timestamp_ms.rem_euclid(60_000);
         buckets
             .entry(bucket)
-            .and_modify(|bar| bar.push(price, volume))
-            .or_insert_with(|| TickBar::new(price, volume));
+            .and_modify(|bar| bar.push(bid, ask, volume))
+            .or_insert_with(|| TickBar::new(bid, ask, volume));
         source_rows += 1;
     }
     if buckets.is_empty() {
         return Err("tick CSV contains no usable rows".into());
     }
+    let mut quote_bars = Vec::with_capacity(buckets.len());
     let bars: Vec<Bar> = buckets
         .into_iter()
-        .map(|(timestamp_ms, bar)| bar.finish(timestamp_ms))
+        .map(|(timestamp_ms, bar)| {
+            let (price_bar, quote_bar) = bar.finish(timestamp_ms);
+            quote_bars.push(quote_bar);
+            price_bar
+        })
         .collect();
     let data_hash = quantforge_data::bar_content_hash(&bars);
     let dataset = BarDataset {
@@ -691,7 +761,15 @@ fn import_tick_file(
         "M1",
         source_path,
         timezone,
-        "tick_midpoint",
+        "tick_bid_ask",
+    )?;
+    let (quote_path, quote_metadata_path) = write_quote_bars(
+        &quote_bars,
+        source_rows,
+        output_directory,
+        &base_stem,
+        source_path,
+        timezone,
     )?;
     let h1 =
         build_timeframe_from_m1(&dataset, 3_600_000, None).map_err(|error| error.to_string())?;
@@ -702,7 +780,7 @@ fn import_tick_file(
         "H1",
         source_path,
         timezone,
-        "tick_midpoint_aggregated",
+        "tick_bid_ask_aggregated",
     )?;
     Ok(MarketFileImportView {
         source_path: display_path(source_path),
@@ -714,9 +792,12 @@ fn import_tick_file(
         m1_metadata_path: Some(display_path(&m1_metadata_path)),
         h1_path: Some(display_path(&h1_path)),
         h1_metadata_path: Some(display_path(&h1_metadata_path)),
+        quote_path: Some(display_path(&quote_path)),
+        quote_metadata_path: Some(display_path(&quote_metadata_path)),
+        price_basis: Some("bid".into()),
         status: "imported".into(),
         message: Some(
-            "Ask/Bid midpoint aggregated to 1-minute bars; H1 is derived from the same M1 stream"
+            "Bid M1 bars plus matching Ask/Bid quote sidecar; H1 is derived from the canonical bid M1 stream"
                 .into(),
         ),
     })
@@ -724,40 +805,139 @@ fn import_tick_file(
 
 #[derive(Debug, Clone, Copy)]
 struct TickBar {
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
+    bid_open: f64,
+    bid_high: f64,
+    bid_low: f64,
+    bid_close: f64,
+    ask_open: f64,
+    ask_high: f64,
+    ask_low: f64,
+    ask_close: f64,
     volume: u64,
+    tick_count: u64,
 }
 impl TickBar {
-    fn new(price: f64, volume: u64) -> Self {
+    fn new(bid: f64, ask: f64, volume: u64) -> Self {
         Self {
-            open: price,
-            high: price,
-            low: price,
-            close: price,
+            bid_open: bid,
+            bid_high: bid,
+            bid_low: bid,
+            bid_close: bid,
+            ask_open: ask,
+            ask_high: ask,
+            ask_low: ask,
+            ask_close: ask,
             volume,
+            tick_count: 1,
         }
     }
-    fn push(&mut self, price: f64, volume: u64) {
-        self.high = self.high.max(price);
-        self.low = self.low.min(price);
-        self.close = price;
+    fn push(&mut self, bid: f64, ask: f64, volume: u64) {
+        self.bid_high = self.bid_high.max(bid);
+        self.bid_low = self.bid_low.min(bid);
+        self.bid_close = bid;
+        self.ask_high = self.ask_high.max(ask);
+        self.ask_low = self.ask_low.min(ask);
+        self.ask_close = ask;
         self.volume = self.volume.saturating_add(volume);
+        self.tick_count = self.tick_count.saturating_add(1);
     }
-    fn finish(self, timestamp_ms: i64) -> Bar {
-        Bar {
+    fn finish(self, timestamp_ms: i64) -> (Bar, QuoteBar) {
+        let price = Bar {
             timestamp_ms,
-            open: self.open,
-            high: self.high,
-            low: self.low,
-            close: self.close,
+            open: self.bid_open,
+            high: self.bid_high,
+            low: self.bid_low,
+            close: self.bid_close,
             tick_volume: self.volume,
             real_volume: 0,
             spread_points: None,
-        }
+        };
+        let quote = QuoteBar {
+            timestamp_ms,
+            bid_open: self.bid_open,
+            bid_high: self.bid_high,
+            bid_low: self.bid_low,
+            bid_close: self.bid_close,
+            ask_open: self.ask_open,
+            ask_high: self.ask_high,
+            ask_low: self.ask_low,
+            ask_close: self.ask_close,
+            tick_count: self.tick_count,
+        };
+        (price, quote)
     }
+}
+
+fn write_quote_bars(
+    bars: &[QuoteBar],
+    source_rows: usize,
+    output_directory: &Path,
+    base_stem: &str,
+    source_path: &Path,
+    timezone: SourceTimezone,
+) -> Result<(PathBuf, PathBuf), String> {
+    let data_path = output_directory.join(format!("{base_stem}_M1.quotes.csv"));
+    let metadata_path = output_directory.join(format!("{base_stem}_M1.quotes.metadata.csv"));
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_path(&data_path)
+        .map_err(|error| format!("cannot write quote sidecar: {error}"))?;
+    writer
+        .write_record([
+            "timestamp_ms",
+            "bid_open",
+            "bid_high",
+            "bid_low",
+            "bid_close",
+            "ask_open",
+            "ask_high",
+            "ask_low",
+            "ask_close",
+            "tick_count",
+        ])
+        .map_err(|error| error.to_string())?;
+    for bar in bars {
+        writer
+            .write_record([
+                bar.timestamp_ms.to_string(),
+                bar.bid_open.to_string(),
+                bar.bid_high.to_string(),
+                bar.bid_low.to_string(),
+                bar.bid_close.to_string(),
+                bar.ask_open.to_string(),
+                bar.ask_high.to_string(),
+                bar.ask_low.to_string(),
+                bar.ask_close.to_string(),
+                bar.tick_count.to_string(),
+            ])
+            .map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    let hash = quote_bar_content_hash(bars);
+    let symbol = base_stem.split('_').next().unwrap_or(base_stem);
+    let mut metadata = csv::Writer::from_path(&metadata_path)
+        .map_err(|error| format!("cannot write quote metadata: {error}"))?;
+    metadata
+        .write_record(["property", "value"])
+        .map_err(|error| error.to_string())?;
+    for (key, value) in [
+        ("schema_version", "1".to_owned()),
+        ("symbol", symbol.to_owned()),
+        ("timeframe", "PERIOD_M1".to_owned()),
+        ("bar_count", bars.len().to_string()),
+        ("source_rows", source_rows.to_string()),
+        ("broker_timezone", timezone.to_string()),
+        ("price_basis", "bid_ask".to_owned()),
+        ("import_kind", "tick_bid_ask_sidecar".to_owned()),
+        ("source_file", display_path(source_path)),
+        ("data_hash", hash.as_str().to_owned()),
+    ] {
+        metadata
+            .write_record([key, value.as_str()])
+            .map_err(|error| error.to_string())?;
+    }
+    metadata.flush().map_err(|error| error.to_string())?;
+    Ok((data_path, metadata_path))
 }
 
 fn write_imported_bars(
@@ -815,11 +995,20 @@ fn write_imported_bars(
         .map_err(|error| format!("cannot write import metadata: {error}"))?;
     let symbol = base_stem.split('_').next().unwrap_or(base_stem);
     let rows = [
+        ("schema_version", "1".to_owned()),
         ("symbol", symbol.to_owned()),
         ("timeframe", format!("PERIOD_{timeframe}")),
         ("bar_count", dataset.bars.len().to_string()),
         ("source_rows", dataset.source_rows.to_string()),
         ("broker_timezone", timezone.to_string()),
+        (
+            "price_basis",
+            if import_kind.contains("bid_ask") {
+                "bid".to_owned()
+            } else {
+                "source_ohlc".to_owned()
+            },
+        ),
         ("import_kind", import_kind.to_owned()),
         ("source_file", display_path(source_path)),
         ("data_hash", dataset.data_hash.as_str().to_owned()),
@@ -893,6 +1082,9 @@ fn skipped_view(
         m1_metadata_path: None,
         h1_path: None,
         h1_metadata_path: None,
+        quote_path: None,
+        quote_metadata_path: None,
+        price_basis: None,
         status: "skipped".into(),
         message: Some(message.into()),
     }
@@ -940,9 +1132,7 @@ fn symbol_from_path(path: &Path) -> Option<String> {
     let first = stem.split('_').next()?.trim();
     if first.len() >= 3
         && first.len() <= 8
-        && first
-            .chars()
-            .all(|value| value.is_ascii_alphanumeric())
+        && first.chars().all(|value| value.is_ascii_alphanumeric())
     {
         return Some(first.to_owned());
     }
@@ -998,6 +1188,30 @@ pub(crate) fn load_data_source(
             .map_err(|error| error.to_string())?;
     }
     Ok(LoadedDataSource { dataset, metadata })
+}
+
+/// Load a bid/ask quote sidecar in the clock used by its bound M1 pack.
+/// Imported packs are normalized to UTC; the capture EA writes raw MT5
+/// server-wall timestamps and therefore needs the metadata timezone mapping.
+pub(crate) fn load_quote_sidecar(
+    path: &Path,
+    metadata: Option<&Mt5ExportMetadata>,
+) -> Result<QuoteBarDataset, String> {
+    let tester_ticks = metadata.is_some_and(|metadata| {
+        metadata
+            .properties
+            .get("execution_model")
+            .is_some_and(|value| value.contains("TESTER_TICKS"))
+    });
+    if tester_ticks {
+        let timezone = metadata
+            .ok_or_else(|| "quote sidecar requires M1 metadata for timezone conversion".to_owned())?
+            .source_timezone()
+            .map_err(|error| error.to_string())?;
+        QuoteBarDataset::load_csv_server_epoch(path, timezone).map_err(|error| error.to_string())
+    } else {
+        QuoteBarDataset::load_csv(path).map_err(|error| error.to_string())
+    }
 }
 
 /// SQX-style: build decision bars from M1. Optional exported H1 supplies the open grid

@@ -11,10 +11,7 @@ pub fn zscore_series(values: &[f64], period: usize) -> Vec<f64> {
             output[index] = 0.0;
             continue;
         }
-        let mean = values[index + 1 - period..=index]
-            .iter()
-            .sum::<f64>()
-            / period as f64;
+        let mean = values[index + 1 - period..=index].iter().sum::<f64>() / period as f64;
         let variance = values[index + 1 - period..=index]
             .iter()
             .map(|value| {

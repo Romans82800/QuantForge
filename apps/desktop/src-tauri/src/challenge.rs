@@ -156,7 +156,9 @@ fn expand_strategy_input(path: &str) -> Result<Vec<String>, String> {
             paths.push(strategy_path.to_owned());
         }
         if paths.is_empty() {
-            return Err(format!("{path} is a batch index with an empty strategies list"));
+            return Err(format!(
+                "{path} is a batch index with an empty strategies list"
+            ));
         }
         return Ok(paths);
     }
@@ -250,7 +252,7 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
             },
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: crate::discover::entry_window(
                 request.entry_window_start_hour,
                 request.entry_window_end_hour,

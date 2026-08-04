@@ -1,20 +1,22 @@
-use crate::data_lab::{build_decision_from_m1, display_path, load_bound_broker, load_data_source};
-use crate::databank::{verify_artifact, EvolveArtifact};
+use crate::data_lab::{
+    build_decision_from_m1, display_path, load_bound_broker, load_data_source, load_quote_sidecar,
+};
+use crate::databank::{EvolveArtifact, verify_artifact};
 use quantforge_data::{
-    bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms, BarDataset,
+    BarDataset, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
 use quantforge_discover::{
-    evolve_new_with_pack, run_condition_bakeoff as evolve_condition_bakeoff, ConditionBakeoffConfig,
-    ConditionBakeoffReport, Databank, DiscoverConfig, DiscoverRunMode, GateConfig, PackSymbol,
-    SearchRangeProfile, UniversalGrammarConfig, DEFAULT_FX_PACK,
+    ConditionBakeoffConfig, ConditionBakeoffReport, DEFAULT_FX_PACK, Databank, DiscoverConfig,
+    DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, UniversalGrammarConfig,
+    evolve_new_with_pack_and_quotes, run_condition_bakeoff as evolve_condition_bakeoff,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
-use quantforge_storage::{write_json_new, write_json_versioned, RunManifest, RunRecipe};
+use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -480,7 +482,9 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
     };
     let root = source
         .ancestors()
-        .find(|candidate| candidate.file_name().and_then(|name| name.to_str()) == Some("QuantForge"))
+        .find(|candidate| {
+            candidate.file_name().and_then(|name| name.to_str()) == Some("QuantForge")
+        })
         .map(Path::to_path_buf)
         .or_else(|| source.parent().map(Path::to_path_buf))
         .ok_or_else(|| "cannot derive an archive directory from decision OHLC path".to_owned())?;
@@ -656,6 +660,31 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
+/// pack. Decision-timeframe paths are allowed here because H1/M15 packs are
+/// derived from the same M1 stream and therefore share its sibling sidecar.
+fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
+    let path = Path::new(m1_path);
+    let stem = path.file_stem()?.to_str()?;
+    let mut candidates = vec![path.with_file_name(format!("{stem}.quotes.csv"))];
+    for suffix in ["_H1", "_M15"] {
+        if let Some(base) = stem.strip_suffix(suffix) {
+            candidates.push(path.with_file_name(format!("{base}_M1.quotes.csv")));
+        }
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMetadata>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let price_basis = metadata.properties.get("price_basis");
+    let import_kind = metadata.properties.get("import_kind");
+    price_basis.is_some_and(|value| value.eq_ignore_ascii_case("bid"))
+        && import_kind.is_some_and(|value| value.to_ascii_lowercase().contains("bid_ask"))
+}
+
 fn run_discovery(
     request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
@@ -676,6 +705,22 @@ fn run_discovery(
         request.m1_metadata_path.as_deref(),
         request.m1_source_timezone.as_deref(),
     )?;
+    let quote_path = infer_quote_path(&request.m1_data_path);
+    let quote_dataset = quote_path
+        .as_ref()
+        .map(|path| load_quote_sidecar(path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1.dataset)
+            .map_err(|error| format!("quote sidecar does not match M1 data: {error}"))?;
+    } else if metadata_is_canonical_bid_ask(m1.metadata.as_ref()) {
+        return Err(
+            "canonical bid/ask M1 metadata is present but its .quotes.csv sidecar was not found"
+                .into(),
+        );
+    }
     let quality = quantforge_data::DataQualityReport::analyze(&loaded.dataset);
     if quality.grade == quantforge_data::QualityGrade::Fail {
         return Err(format!(
@@ -782,10 +827,11 @@ fn run_discovery(
                 // Default to 6-of-N when a pack is supplied and the UI left the gate unset.
                 config.multi_symbol_minimum_pass = 6.min(pack.len() + 1);
             }
-            let bank = evolve_new_with_pack(
+            let bank = evolve_new_with_pack_and_quotes(
                 new_dataset,
                 oos1_ref,
                 m1_eval,
+                quote_dataset.as_ref(),
                 &broker,
                 &pack,
                 &broker.symbol,
@@ -909,11 +955,12 @@ fn run_discovery(
         )?;
 
         bank = session
-            .advance(
+            .advance_with_quotes(
                 bank,
                 evaluation_dataset,
                 evaluation_oos1,
                 evaluation_m1,
+                quote_dataset.as_ref(),
                 &broker,
                 &pack,
                 &broker.symbol,
@@ -1076,10 +1123,7 @@ fn finish_discovery(
         .target_databank_elites
         .is_some_and(|target| bank.elites.len() >= target);
     view.phase = if quota_complete {
-        format!(
-            "Quota complete · {} databank elites",
-            bank.elites.len()
-        )
+        format!("Quota complete · {} databank elites", bank.elites.len())
     } else if stop_was_early(completed_now, soft_budget, run_until_stopped) {
         "Stopped and checkpointed".into()
     } else {
@@ -1202,10 +1246,7 @@ fn write_discover_checkpoint(
         ),
         // Discover seals research-grade until at least one elite survives the
         // post-breed M1 pipeline into the databank.
-        (
-            "research_grade".into(),
-            json!(bank.elites.is_empty()),
-        ),
+        ("research_grade".into(), json!(bank.elites.is_empty())),
         ("simple_exits".into(), json!(bank.config.simple_exits)),
         (
             "max_one_entry_per_day".into(),
@@ -1641,7 +1682,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
                 max_spread_points: request.max_spread_points,
                 include_costs_in_risk: true,
             },
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: entry_window(
                 request.entry_window_start_hour,
                 request.entry_window_end_hour,
@@ -2141,10 +2182,12 @@ mod tests {
         };
         let clipped = clip_dataset_to_window(&m1, &h1).expect("clip");
         assert_eq!(clipped.bars.len(), 120);
-        assert!(clipped
-            .bars
-            .iter()
-            .any(|bar| (bar.high - 1.2).abs() < 1e-12));
+        assert!(
+            clipped
+                .bars
+                .iter()
+                .any(|bar| (bar.high - 1.2).abs() < 1e-12)
+        );
     }
 
     #[test]

@@ -42,7 +42,8 @@ pub fn liquidity_sweep_score_series(bars: &[Bar], period: usize) -> Vec<f64> {
         let bar = &bars[index];
         if last_swing_low > 0.0 && bar.low < last_swing_low && bar.close > last_swing_low {
             output[index] = 1.0;
-        } else if last_swing_high > 0.0 && bar.high > last_swing_high && bar.close < last_swing_high {
+        } else if last_swing_high > 0.0 && bar.high > last_swing_high && bar.close < last_swing_high
+        {
             output[index] = -1.0;
         }
     }

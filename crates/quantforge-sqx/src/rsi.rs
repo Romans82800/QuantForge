@@ -23,10 +23,8 @@ pub fn rsi_series(values: &[f64], period: usize) -> Vec<f64> {
 
     for index in period + 1..len {
         let change = values[index] - values[index - 1];
-        average_gain =
-            (average_gain * (period - 1) as f64 + change.max(0.0)) / period as f64;
-        average_loss =
-            (average_loss * (period - 1) as f64 + (-change).max(0.0)) / period as f64;
+        average_gain = (average_gain * (period - 1) as f64 + change.max(0.0)) / period as f64;
+        average_loss = (average_loss * (period - 1) as f64 + (-change).max(0.0)) / period as f64;
         output[index] = rsi_value(average_gain, average_loss);
     }
     output

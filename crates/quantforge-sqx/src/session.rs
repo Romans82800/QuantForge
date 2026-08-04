@@ -36,9 +36,15 @@ pub fn session_range_series(
             if index + 1 >= start + range_bars {
                 let window = &bars[start..start + range_bars];
                 frozen = Some(if high {
-                    window.iter().map(|bar| bar.high).fold(f64::NEG_INFINITY, f64::max)
+                    window
+                        .iter()
+                        .map(|bar| bar.high)
+                        .fold(f64::NEG_INFINITY, f64::max)
                 } else {
-                    window.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min)
+                    window
+                        .iter()
+                        .map(|bar| bar.low)
+                        .fold(f64::INFINITY, f64::min)
                 });
             }
         }

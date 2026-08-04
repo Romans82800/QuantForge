@@ -176,8 +176,10 @@ mod tests {
     #[test]
     fn window_longer_than_the_series_keeps_the_zero_warmup() {
         assert_eq!(rolling_extreme(&wave(5), 10, true), vec![0.0; 5]);
-        assert!(rolling_extreme(&wave(5), 0, true)
-            .iter()
-            .all(|value| value.is_nan()));
+        assert!(
+            rolling_extreme(&wave(5), 0, true)
+                .iter()
+                .all(|value| value.is_nan())
+        );
     }
 }

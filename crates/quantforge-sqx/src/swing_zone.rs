@@ -29,12 +29,10 @@ pub fn swing_base_zone_series(
             if pivot >= swing_left {
                 let is_swing_low = (1..=swing_left)
                     .all(|offset| bars[pivot].low <= bars[pivot - offset].low)
-                    && (1..=swing_right)
-                        .all(|offset| bars[pivot].low < bars[pivot + offset].low);
+                    && (1..=swing_right).all(|offset| bars[pivot].low < bars[pivot + offset].low);
                 let is_swing_high = (1..=swing_left)
                     .all(|offset| bars[pivot].high >= bars[pivot - offset].high)
-                    && (1..=swing_right)
-                        .all(|offset| bars[pivot].high > bars[pivot + offset].high);
+                    && (1..=swing_right).all(|offset| bars[pivot].high > bars[pivot + offset].high);
                 let use_pivot = if zone_high {
                     is_swing_low
                 } else {

@@ -116,10 +116,15 @@ fn discover_profile_library_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn load_search_range_library(app: &AppHandle) -> Result<SearchRangeLibrary, String> {
     let path = search_range_library_path(app)?;
     if !path.exists() {
-        return Ok(SearchRangeLibrary { schema_version: 1, profiles: Vec::new() });
+        return Ok(SearchRangeLibrary {
+            schema_version: 1,
+            profiles: Vec::new(),
+        });
     }
-    serde_json::from_slice(&fs::read(&path).map_err(|error| format!("cannot read search profiles: {error}"))?)
-        .map_err(|error| format!("search profiles are invalid: {error}"))
+    serde_json::from_slice(
+        &fs::read(&path).map_err(|error| format!("cannot read search profiles: {error}"))?,
+    )
+    .map_err(|error| format!("search profiles are invalid: {error}"))
 }
 
 fn save_search_range_library(app: &AppHandle, library: &SearchRangeLibrary) -> Result<(), String> {
@@ -162,7 +167,8 @@ fn load_library(app: &AppHandle) -> Result<AssetLibrary, String> {
         });
     }
     let bytes = fs::read(&path).map_err(|error| format!("cannot read asset library: {error}"))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("asset library is invalid JSON: {error}"))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("asset library is invalid JSON: {error}"))
 }
 
 fn save_library(app: &AppHandle, library: &AssetLibrary) -> Result<(), String> {
@@ -255,7 +261,11 @@ fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
         let h1_meta = h1.with_extension("metadata.csv");
         let m1 = pack_root.join(format!("{DEMO_PREFIX}{symbol}{M1_SUFFIX}"));
         let m1_meta = m1.with_extension("metadata.csv");
-        if !(h1.is_file() && h1_meta.is_file() && m1.is_file() && m1_meta.is_file() && broker_path.is_file())
+        if !(h1.is_file()
+            && h1_meta.is_file()
+            && m1.is_file()
+            && m1_meta.is_file()
+            && broker_path.is_file())
         {
             continue;
         }
@@ -312,7 +322,10 @@ pub fn save_search_range_profile(
     if profile.name.trim().is_empty() {
         return Err("profile name is required".into());
     }
-    profile.ranges.validate().map_err(|error| error.to_string())?;
+    profile
+        .ranges
+        .validate()
+        .map_err(|error| error.to_string())?;
     let mut library = load_search_range_library(&app)?;
     let id = if profile.id.trim().is_empty() {
         format!("range-{}", chrono::Utc::now().timestamp_millis())
@@ -336,7 +349,10 @@ pub fn save_search_range_profile(
 }
 
 #[tauri::command]
-pub fn delete_search_range_profile(app: AppHandle, id: String) -> Result<Vec<SavedSearchRangeProfile>, String> {
+pub fn delete_search_range_profile(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<SavedSearchRangeProfile>, String> {
     let mut library = load_search_range_library(&app)?;
     let before = library.profiles.len();
     library.profiles.retain(|profile| profile.id != id);
@@ -388,7 +404,10 @@ pub fn save_discover_profile(
 }
 
 #[tauri::command]
-pub fn delete_discover_profile(app: AppHandle, id: String) -> Result<Vec<SavedDiscoverProfile>, String> {
+pub fn delete_discover_profile(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<SavedDiscoverProfile>, String> {
     let mut library = load_discover_profile_library(&app)?;
     let before = library.profiles.len();
     library.profiles.retain(|profile| profile.id != id);

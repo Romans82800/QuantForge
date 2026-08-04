@@ -283,6 +283,14 @@ main { min-width: 0; }
 .gate-pass { color: var(--green); border-color: var(--green); }
 .gate-pending { color: #718090; border-color: #3b4653; }
 .ir-tree { margin: 0; padding: 14px; color: #9fc7c3; background: #0a1016; font: 8px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: auto; min-height: 490px; }
+.mq5-source-view { min-width: 0; background: #0a1016; }
+.mq5-source-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.mq5-source-toolbar div { min-width: 0; display: grid; gap: 4px; }
+.mq5-source-toolbar strong { color: #d7e0e8; font-size: 11px; }
+.mq5-source-toolbar small { overflow: hidden; color: #718294; font: 8px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.mq5-source-toolbar label { display: grid; gap: 4px; color: #718294; font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+.mq5-source-toolbar select { min-width: 82px; }
+.mq5-source { min-height: 620px; max-height: min(72vh, 900px); color: #a9d9d3; white-space: pre; }
 
 .tool-content, .discover-layout { padding: 16px 18px 34px; }
 

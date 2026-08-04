@@ -53,11 +53,7 @@ mod tests {
 
     #[test]
     fn expanding_window_before_period() {
-        let bars = vec![
-            bar(1.0, 1.1, 0.9),
-            bar(1.1, 1.2, 1.0),
-            bar(1.0, 1.15, 0.95),
-        ];
+        let bars = vec![bar(1.0, 1.1, 0.9), bar(1.1, 1.2, 1.0), bar(1.0, 1.15, 0.95)];
         let atr = atr_series(&bars, 14);
         assert!(atr.iter().all(|value| value.is_finite() && *value > 0.0));
     }

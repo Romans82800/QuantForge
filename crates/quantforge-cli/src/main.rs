@@ -2,8 +2,8 @@ use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
-    BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
-    bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
+    BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, QuoteBarDataset,
+    SourceTimezone, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
 use quantforge_discover::{
     ConditionBakeoffConfig, Databank, DiscoverConfig, DiscoverRunMode, GateConfig,
@@ -427,6 +427,14 @@ struct JudgeArgs {
         conflicts_with = "m1_source_timezone"
     )]
     m1_metadata: Option<PathBuf>,
+    /// Bid/ask M1 quote sidecar emitted by the MT5 capture EA. Without it the
+    /// run remains legacy diagnostic mode and uses the configured fallback.
+    #[arg(long)]
+    quote_path: Option<PathBuf>,
+    /// Timezone of raw MT5 capture timestamps. Omit for normalized imported
+    /// sidecars, which are already UTC.
+    #[arg(long, value_name = "IANA_TIMEZONE")]
+    quote_source_timezone: Option<SourceTimezone>,
     #[arg(long)]
     strategy: PathBuf,
     #[arg(long)]
@@ -530,6 +538,9 @@ struct ParityArgs {
     /// Tester metadata CSV emitted by the generated EA.
     #[arg(long)]
     mt5_metadata: PathBuf,
+    /// Bid/ask M1 quote sidecar captured by the tester EA.
+    #[arg(long)]
+    quote_path: Option<PathBuf>,
     /// Broker timezone used to localize MT5 DEAL_TIME_MSC into UTC
     /// (same token as bar ingestion, e.g. `ICMarkets/EST+7`).
     #[arg(long)]
@@ -552,6 +563,9 @@ struct ParityArgs {
     trade_timestamp_tolerance_ms: i64,
     #[arg(long, default_value_t = 0.90)]
     minimum_aligned_trade_fraction: f64,
+    /// Certification profile. Disable only for a legacy diagnostic compare.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    strict_one_to_one: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1299,7 +1313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     max_spread_points,
                     include_costs_in_risk: true,
                 },
-                indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+                indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
                 entry_window: quantforge_eval::EntryWindow::new(
                     entry_window_start_hour,
                     entry_window_end_hour,
@@ -1417,7 +1431,8 @@ fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn E
     let (m1, _) = load_source(&m1_source)?;
     let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
     broker.validate()?;
-    let search_dataset = development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
+    let search_dataset =
+        development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let oos1 = oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let mut discover = DiscoverConfig {
         run_mode: DiscoverRunMode::FastScout,
@@ -1486,7 +1501,8 @@ fn methodology_research_command(args: MethodologyResearchArgs) -> Result<(), Box
     let (_m1, _) = load_source(&m1_source)?;
     let broker: SymbolSpecification = serde_json::from_slice(&fs::read(&args.broker)?)?;
     broker.validate()?;
-    let search_dataset = development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
+    let search_dataset =
+        development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let oos1 = oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let mut scout = ScoutConfig::default();
     scout.costs.commission_per_lot_round_turn = args.commission_per_lot_round_turn;
@@ -1727,7 +1743,7 @@ fn challenge_command(args: ChallengeArgs) -> Result<(), Box<dyn Error>> {
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: quantforge_eval::EntryWindow::new(
                 args.entry_window_start_hour,
                 args.entry_window_end_hour,
@@ -1927,7 +1943,7 @@ fn sealed_final_command(args: SealedFinalArgs) -> Result<(), Box<dyn Error>> {
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: quantforge_eval::EntryWindow::new(
                 args.entry_window_start_hour,
                 args.entry_window_end_hour,
@@ -3361,13 +3377,35 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
             include_costs_in_risk: true,
         },
         allow_execution_gaps: args.allow_execution_gaps,
-        indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+        indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
         entry_window: quantforge_eval::EntryWindow::new(
             args.entry_window_start_hour,
             args.entry_window_end_hour,
         ),
     };
-    let result = evaluate_strategy_m1(&strategy, &decision_dataset, &m1_dataset, &broker, &config)?;
+    let quote_dataset = args
+        .quote_path
+        .as_deref()
+        .map(|path| {
+            if let Some(timezone) = args.quote_source_timezone {
+                Ok(QuoteBarDataset::load_csv_server_epoch(path, timezone)?)
+            } else {
+                load_quote_sidecar(path, m1_metadata.as_ref())
+            }
+        })
+        .transpose()?;
+    let result = if let Some(quotes) = quote_dataset.as_ref() {
+        quantforge_tick::evaluate_strategy_m1_with_quotes(
+            &strategy,
+            &decision_dataset,
+            &m1_dataset,
+            quotes,
+            &broker,
+            &config,
+        )?
+    } else {
+        evaluate_strategy_m1(&strategy, &decision_dataset, &m1_dataset, &broker, &config)?
+    };
     let combined_data_hash = quantforge_core::stable_json_hash(&BTreeMap::from([
         ("decision", &decision_dataset.data_hash),
         ("m1", &m1_dataset.data_hash),
@@ -3394,6 +3432,27 @@ fn judge_command(args: JudgeArgs) -> Result<(), Box<dyn Error>> {
                     json!(&decision_dataset.data_hash),
                 ),
                 ("m1_data_hash".into(), json!(&m1_dataset.data_hash)),
+                (
+                    "quote_source".into(),
+                    args.quote_path
+                        .as_deref()
+                        .map(display_path)
+                        .map(|path| json!(path))
+                        .unwrap_or(Value::Null),
+                ),
+                (
+                    "quote_source_timezone".into(),
+                    args.quote_source_timezone
+                        .map(|timezone| json!(timezone.name()))
+                        .unwrap_or(Value::Null),
+                ),
+                (
+                    "quote_data_hash".into(),
+                    quote_dataset
+                        .as_ref()
+                        .map(|quotes| json!(&quotes.data_hash))
+                        .unwrap_or(Value::Null),
+                ),
                 ("decision_quality".into(), json!(decision_quality.grade)),
                 ("m1_quality".into(), json!(m1_quality.grade)),
             ]),
@@ -3509,7 +3568,7 @@ fn export_command(args: ExportArgs) -> Result<(), Box<dyn Error>> {
         estimated_slippage_points_per_side: args.slippage_points_per_side,
         commission_per_lot_round_turn: args.commission_per_lot_round_turn,
         allow_live_trading_default: false,
-        export_style: ExportStyle::Sqx,
+        export_style: ExportStyle::Quantforge,
         entry_window_start_hour: args.entry_window_start_hour,
         entry_window_end_hour: args.entry_window_end_hour,
         tester: TesterConfig {
@@ -3593,13 +3652,9 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
     let (reference, data_hash, grammar_version, strategy_fingerprint, broker_spec_hash) =
         if let Ok(judge) = read_json::<JudgeArtifactInput>(&args.scout_result) {
             if judge.strategy_fingerprint != evidence.strategy_fingerprint {
-                return Err(
-                    "Judge result and MQL5 evidence reference different strategies".into(),
-                );
+                return Err("Judge result and MQL5 evidence reference different strategies".into());
             }
-            if judge.manifest.recipe.broker_spec_hash.as_ref()
-                != Some(&evidence.broker_spec_hash)
-            {
+            if judge.manifest.recipe.broker_spec_hash.as_ref() != Some(&evidence.broker_spec_hash) {
                 return Err(
                     "Judge result and MQL5 evidence reference different broker profiles".into(),
                 );
@@ -3614,13 +3669,9 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
         } else {
             let scout: ScoutArtifactInput = read_json(&args.scout_result)?;
             if scout.strategy_fingerprint != evidence.strategy_fingerprint {
-                return Err(
-                    "Scout result and MQL5 evidence reference different strategies".into(),
-                );
+                return Err("Scout result and MQL5 evidence reference different strategies".into());
             }
-            if scout.manifest.recipe.broker_spec_hash.as_ref()
-                != Some(&evidence.broker_spec_hash)
-            {
+            if scout.manifest.recipe.broker_spec_hash.as_ref() != Some(&evidence.broker_spec_hash) {
                 return Err(
                     "Scout result and MQL5 evidence reference different broker profiles".into(),
                 );
@@ -3644,27 +3695,101 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
     evidence.mandatory_stop_loss &= protective_calls;
     evidence.mandatory_take_profit &= protective_calls;
     let mt5_metadata = load_mt5_tester_metadata(&args.mt5_metadata)?;
-    mt5_metadata.validate_evidence(&evidence)?;
-    let broker_timezone = args.broker_timezone.clone().or_else(|| {
-        mt5_metadata
+    let quote_data_hash = if args.strict_one_to_one {
+        let execution_policy_hash = mt5_metadata
             .properties
-            .get("broker_timezone")
-            .cloned()
-    });
+            .get("execution_policy_hash")
+            .ok_or("MT5 metadata is missing execution_policy_hash; rerun the capture EA")?;
+        if execution_policy_hash != evidence.execution_policy_hash.as_str() {
+            return Err("MT5 metadata execution_policy_hash does not match export evidence".into());
+        }
+        let quote_path = args.quote_path.as_deref().ok_or(
+            "strict parity certification requires --quote-path for the bid/ask M1 sidecar",
+        )?;
+        let quotes =
+            load_mt5_quote_sidecar(quote_path, &mt5_metadata, args.broker_timezone.as_deref())?;
+        if quotes.bars.len() < 2 {
+            return Err("quote sidecar contains fewer than two M1 bars".into());
+        }
+        let tester_model = mt5_metadata
+            .properties
+            .get("tester_model")
+            .ok_or("MT5 metadata is missing tester_model; rerun the capture EA")?
+            .parse::<u8>()
+            .map_err(|_| "MT5 metadata tester_model is not an integer")?;
+        if tester_model != evidence.config.tester.model {
+            return Err(format!(
+                "MT5 tester model {tester_model} does not match export model {}",
+                evidence.config.tester.model
+            )
+            .into());
+        }
+        if evidence.config.timeframe.eq_ignore_ascii_case("M1") && tester_model != 1 {
+            return Err(
+                "strict M1 parity requires MT5 Model=1; Model=4 is reserved for a real-tick audit"
+                    .into(),
+            );
+        }
+        if mt5_metadata
+            .properties
+            .get("price_basis")
+            .map(String::as_str)
+            != Some("bid_ask")
+        {
+            return Err("MT5 metadata is not bound to bid/ask quote capture".into());
+        }
+        Some(quotes.data_hash)
+    } else {
+        args.quote_path
+            .as_deref()
+            .map(|path| {
+                load_mt5_quote_sidecar(path, &mt5_metadata, args.broker_timezone.as_deref())
+            })
+            .transpose()?
+            .map(|quotes| quotes.data_hash)
+    };
+    mt5_metadata.validate_evidence(&evidence)?;
+    let broker_timezone = args
+        .broker_timezone
+        .clone()
+        .or_else(|| mt5_metadata.properties.get("broker_timezone").cloned());
     let external = load_mt5_tester_run_in_timezone(
         &args.mt5_deals,
         &args.mt5_equity,
         args.initial_balance,
         broker_timezone.as_deref(),
     )?;
-    let tolerances = ParityTolerances {
-        trade_count_relative: args.trade_count_relative,
-        trade_count_absolute: args.trade_count_absolute,
-        net_profit_relative: args.net_profit_relative,
-        max_drawdown_relative: args.max_drawdown_relative,
-        max_equity_divergence_percent: args.max_equity_divergence_percent,
-        trade_timestamp_tolerance_ms: args.trade_timestamp_tolerance_ms,
-        minimum_aligned_trade_fraction: args.minimum_aligned_trade_fraction,
+    let tolerances = if args.strict_one_to_one {
+        let mut strict = ParityTolerances::strict_one_to_one();
+        strict.price_tolerance = Some(
+            mt5_metadata
+                .properties
+                .get("point")
+                .ok_or("MT5 metadata is missing point; rerun the capture EA")?
+                .parse::<f64>()
+                .map_err(|_| "MT5 metadata point is not numeric")?,
+        );
+        strict.volume_tolerance = Some(
+            mt5_metadata
+                .properties
+                .get("volume_step")
+                .ok_or("MT5 metadata is missing volume_step; rerun the capture EA")?
+                .parse::<f64>()
+                .map_err(|_| "MT5 metadata volume_step is not numeric")?,
+        );
+        strict
+    } else {
+        ParityTolerances {
+            trade_count_relative: args.trade_count_relative,
+            trade_count_absolute: args.trade_count_absolute,
+            net_profit_relative: args.net_profit_relative,
+            max_drawdown_relative: args.max_drawdown_relative,
+            max_equity_divergence_percent: args.max_equity_divergence_percent,
+            trade_timestamp_tolerance_ms: args.trade_timestamp_tolerance_ms,
+            minimum_aligned_trade_fraction: args.minimum_aligned_trade_fraction,
+            price_tolerance: None,
+            volume_tolerance: None,
+        }
     };
     let report = compare_runs(&reference, &external, &evidence, tolerances)?;
     let manifest = RunManifest::new(
@@ -3684,22 +3809,42 @@ fn parity_command(args: ParityArgs) -> Result<(), Box<dyn Error>> {
                 ("mt5_deals".into(), json!(display_path(&args.mt5_deals))),
                 ("mt5_equity".into(), json!(display_path(&args.mt5_equity))),
                 (
+                    "quote_source".into(),
+                    args.quote_path
+                        .as_deref()
+                        .map(|path| json!(display_path(path)))
+                        .unwrap_or(Value::Null),
+                ),
+                (
+                    "quote_data_hash".into(),
+                    quote_data_hash
+                        .as_ref()
+                        .map(|hash| json!(hash))
+                        .unwrap_or(Value::Null),
+                ),
+                (
                     "mt5_metadata".into(),
                     json!(display_path(&args.mt5_metadata)),
                 ),
-                (
-                    "broker_timezone".into(),
-                    json!(broker_timezone),
-                ),
-                (
-                    "reference_engine".into(),
-                    json!(reference.engine),
-                ),
+                ("broker_timezone".into(), json!(broker_timezone)),
+                ("reference_engine".into(), json!(reference.engine)),
                 (
                     "strategy_fingerprint".into(),
                     json!(&evidence.strategy_fingerprint),
                 ),
                 ("source_hash".into(), json!(&evidence.source_hash)),
+                (
+                    "execution_policy_hash".into(),
+                    json!(&evidence.execution_policy_hash),
+                ),
+                (
+                    "parity_profile".into(),
+                    json!(if args.strict_one_to_one {
+                        "strict_one_to_one"
+                    } else {
+                        "diagnostic_tolerance"
+                    }),
+                ),
                 (
                     "protocol".into(),
                     json!(quantforge_parity::PARITY_PROTOCOL_VERSION),
@@ -4633,7 +4778,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
                 max_spread_points: args.max_spread_points,
                 include_costs_in_risk: true,
             },
-            indicator_engine: quantforge_eval::IndicatorEngine::Sqx,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
             entry_window: quantforge_eval::EntryWindow::new(
                 args.entry_window_start_hour,
                 args.entry_window_end_hour,
@@ -4834,6 +4979,46 @@ fn load_source(
         metadata.validate_dataset(&dataset)?;
     }
     Ok((dataset, metadata))
+}
+
+/// Load either a normalized imported sidecar (already UTC) or the raw sidecar
+/// emitted by the MT5 capture EA.  MT5 serializes `datetime`/`DEAL_TIME_MSC`
+/// values using broker-server wall time in the epoch field, so tester captures
+/// must be converted with the same timezone as the M1 pack before comparison.
+fn load_quote_sidecar(
+    path: &Path,
+    metadata: Option<&Mt5ExportMetadata>,
+) -> Result<QuoteBarDataset, Box<dyn Error>> {
+    let tester_ticks = metadata.is_some_and(|metadata| {
+        metadata
+            .properties
+            .get("execution_model")
+            .is_some_and(|value| value.contains("TESTER_TICKS"))
+    });
+    if tester_ticks {
+        let timezone = metadata
+            .ok_or("quote sidecar requires M1 metadata for timezone conversion")?
+            .source_timezone()?;
+        Ok(QuoteBarDataset::load_csv_server_epoch(path, timezone)?)
+    } else {
+        Ok(QuoteBarDataset::load_csv(path)?)
+    }
+}
+
+fn load_mt5_quote_sidecar(
+    path: &Path,
+    metadata: &Mt5TesterMetadata,
+    timezone_override: Option<&str>,
+) -> Result<QuoteBarDataset, Box<dyn Error>> {
+    let timezone = match timezone_override {
+        Some(timezone) => timezone.parse::<SourceTimezone>()?,
+        None => metadata
+            .properties
+            .get("broker_timezone")
+            .ok_or("MT5 metadata is missing broker_timezone")?
+            .parse::<SourceTimezone>()?,
+    };
+    Ok(QuoteBarDataset::load_csv_server_epoch(path, timezone)?)
 }
 
 fn display_path(path: &Path) -> String {

@@ -72,7 +72,7 @@ impl Default for ScoutConfig {
             initial_balance: 100_000.0,
             same_bar_policy: SameBarPolicy::Conservative,
             costs: CostModel::default(),
-            indicator_engine: IndicatorEngine::Sqx,
+            indicator_engine: IndicatorEngine::Mt5,
             entry_window: EntryWindow::default(),
             abandon_above_drawdown_percent: None,
         }

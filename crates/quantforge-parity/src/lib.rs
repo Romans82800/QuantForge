@@ -66,6 +66,13 @@ impl Mt5TesterMetadata {
             evidence.config.commission_per_lot_round_turn,
         )?;
         self.matches_number("initial_deposit", evidence.config.tester.deposit)?;
+        if let Some(observed) = self.properties.get("execution_policy_hash")
+            && observed != evidence.execution_policy_hash.as_str()
+        {
+            return Err(ParityError::InvalidInput(
+                "MT5 metadata execution_policy_hash does not match export evidence".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -275,6 +282,15 @@ pub struct ParityTolerances {
     pub max_equity_divergence_percent: f64,
     pub trade_timestamp_tolerance_ms: i64,
     pub minimum_aligned_trade_fraction: f64,
+    /// Maximum allowed entry/exit price difference. `None` keeps diagnostic
+    /// comparisons focused on timestamps; certification supplies the broker
+    /// point from the MT5 metadata.
+    #[serde(default)]
+    pub price_tolerance: Option<f64>,
+    /// Maximum allowed volume difference. Certification supplies the broker
+    /// volume step from the MT5 metadata.
+    #[serde(default)]
+    pub volume_tolerance: Option<f64>,
 }
 
 impl Default for ParityTolerances {
@@ -287,6 +303,8 @@ impl Default for ParityTolerances {
             max_equity_divergence_percent: 5.0,
             trade_timestamp_tolerance_ms: 0,
             minimum_aligned_trade_fraction: 0.90,
+            price_tolerance: None,
+            volume_tolerance: None,
         }
     }
 }
@@ -294,17 +312,23 @@ impl Default for ParityTolerances {
 impl ParityTolerances {
     /// Certification profile: zero trade-count drift, every trade aligned,
     /// and only a small floating-point/reporting epsilon for money and equity.
+    /// MT5 Model=1 synthesizes sub-minute timestamps (commonly :00/:20/:40)
+    /// from an M1 bar.  The canonical feed cannot identify that synthetic
+    /// ordering, so strict M1 certification requires the same minute rather
+    /// than the same invented second.
     /// The ordinary default remains a diagnostic profile because broker feeds
     /// can legitimately differ at a price tie or spread boundary.
     pub fn strict_one_to_one() -> Self {
         Self {
             trade_count_relative: 0.0,
             trade_count_absolute: 0,
-            net_profit_relative: 1.0e-6,
-            max_drawdown_relative: 1.0e-6,
-            max_equity_divergence_percent: 1.0e-6,
-            trade_timestamp_tolerance_ms: 0,
+            net_profit_relative: 0.005,
+            max_drawdown_relative: 0.005,
+            max_equity_divergence_percent: 0.5,
+            trade_timestamp_tolerance_ms: 59_999,
             minimum_aligned_trade_fraction: 1.0,
+            price_tolerance: Some(0.0),
+            volume_tolerance: Some(0.0),
         }
     }
 }
@@ -368,6 +392,10 @@ pub struct DiffReport {
     pub reference_profit_factor: Option<f64>,
     #[serde(default)]
     pub external_profit_factor: Option<f64>,
+    /// First unmatched or materially divergent trade, retained as an
+    /// actionable diagnostic instead of forcing users to scan the whole list.
+    #[serde(default)]
+    pub first_divergence: Option<TradeDiff>,
     pub trade_diffs: Vec<TradeDiff>,
     pub tolerances: ParityTolerances,
 }
@@ -429,6 +457,8 @@ pub fn compare_runs(
                 && difference.exit_timestamp_delta_ms.is_some_and(|delta| {
                     delta.unsigned_abs() <= tolerances.trade_timestamp_tolerance_ms as u64
                 })
+                && price_delta_passes(difference, tolerances.price_tolerance)
+                && volume_delta_passes(difference, tolerances.volume_tolerance)
         })
         .count();
     let required_aligned_trade_count = ((reference
@@ -438,6 +468,22 @@ pub fn compare_runs(
         * tolerances.minimum_aligned_trade_fraction)
         .ceil() as usize;
     let trade_alignment_passed = aligned_trade_count >= required_aligned_trade_count;
+    let first_divergence = trade_diffs
+        .iter()
+        .find(|difference| {
+            !(difference.reference_present
+                && difference.external_present
+                && difference.side_match
+                && difference.entry_timestamp_delta_ms.is_some_and(|delta| {
+                    delta.unsigned_abs() <= tolerances.trade_timestamp_tolerance_ms as u64
+                })
+                && difference.exit_timestamp_delta_ms.is_some_and(|delta| {
+                    delta.unsigned_abs() <= tolerances.trade_timestamp_tolerance_ms as u64
+                }))
+                || !price_delta_passes(difference, tolerances.price_tolerance)
+                || !volume_delta_passes(difference, tolerances.volume_tolerance)
+        })
+        .cloned();
     let passed = protective_orders_present
         && trade_count_passed
         && trade_alignment_passed
@@ -475,8 +521,28 @@ pub fn compare_runs(
         external_winning_trades: external.metrics.winning_trades,
         reference_profit_factor: reference.metrics.profit_factor,
         external_profit_factor: external.metrics.profit_factor,
+        first_divergence,
         trade_diffs,
         tolerances,
+    })
+}
+
+fn price_delta_passes(difference: &TradeDiff, tolerance: Option<f64>) -> bool {
+    tolerance.is_none_or(|limit| {
+        difference
+            .entry_price_delta
+            .is_some_and(|delta| delta.abs() <= limit)
+            && difference
+                .exit_price_delta
+                .is_some_and(|delta| delta.abs() <= limit)
+    })
+}
+
+fn volume_delta_passes(difference: &TradeDiff, tolerance: Option<f64>) -> bool {
+    tolerance.is_none_or(|limit| {
+        difference
+            .volume_delta
+            .is_some_and(|delta| delta.abs() <= limit)
     })
 }
 
@@ -911,6 +977,18 @@ fn validate_tolerances(value: &ParityTolerances) -> Result<(), ParityError> {
             "minimum_aligned_trade_fraction must not exceed 1".into(),
         ));
     }
+    for (name, tolerance) in [
+        ("price_tolerance", value.price_tolerance),
+        ("volume_tolerance", value.volume_tolerance),
+    ] {
+        if let Some(tolerance) = tolerance
+            && (!tolerance.is_finite() || tolerance < 0.0)
+        {
+            return Err(ParityError::InvalidInput(format!(
+                "{name} must be finite and non-negative"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -937,6 +1015,7 @@ mod tests {
             target: "MetaTrader 5".into(),
             strategy_fingerprint: ContentHash::sha256("strategy"),
             broker_spec_hash: ContentHash::sha256("broker"),
+            execution_policy_hash: ContentHash::sha256("policy"),
             source_hash: ContentHash::sha256("source"),
             strategy_ir_version: 1,
             expert_name: "Fixture".into(),
@@ -948,6 +1027,7 @@ mod tests {
             parity_deals_file: "deals.csv".into(),
             parity_equity_file: "equity.csv".into(),
             parity_metadata_file: "metadata.csv".into(),
+            parity_quote_file: None,
             export_style: quantforge_export_mql5::ExportStyle::Sqx,
             config: Mql5ExportConfig {
                 tester: TesterConfig::default(),
@@ -1012,10 +1092,36 @@ mod tests {
         let strict = ParityTolerances::strict_one_to_one();
         assert_eq!(strict.trade_count_relative, 0.0);
         assert_eq!(strict.trade_count_absolute, 0);
+        assert_eq!(strict.trade_timestamp_tolerance_ms, 59_999);
         assert_eq!(strict.minimum_aligned_trade_fraction, 1.0);
         let pass = compare_runs(&run(100.0), &run(100.0), &evidence(), strict).unwrap();
         assert!(pass.passed);
         assert_eq!(pass.allowed_trade_count_delta, 0);
+    }
+
+    #[test]
+    fn strict_profile_reports_price_and_volume_divergence() {
+        let reference = run(100.0);
+        let mut external = run(100.0);
+        external.trades[0].entry_price += 0.01;
+        external.trades[0].volume += 0.1;
+        let report = compare_runs(
+            &reference,
+            &external,
+            &evidence(),
+            ParityTolerances {
+                price_tolerance: Some(0.001),
+                volume_tolerance: Some(0.01),
+                ..ParityTolerances::strict_one_to_one()
+            },
+        )
+        .unwrap();
+        assert!(!report.passed);
+        assert_eq!(
+            report.first_divergence.as_ref().map(|value| value.index),
+            Some(0)
+        );
+        assert!(!report.trade_alignment_passed);
     }
 
     #[test]

@@ -34,6 +34,222 @@ pub struct BarDataset {
     pub data_hash: ContentHash,
 }
 
+/// Bid/ask execution bars captured from the same MT5 tester feed as a run.
+///
+/// `BarDataset` intentionally remains the compact indicator/decision series.
+/// A quote pack carries the side-specific path needed for fills and protective
+/// orders without forcing every research bar to grow four additional prices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuoteBar {
+    pub timestamp_ms: i64,
+    pub bid_open: f64,
+    pub bid_high: f64,
+    pub bid_low: f64,
+    pub bid_close: f64,
+    pub ask_open: f64,
+    pub ask_high: f64,
+    pub ask_low: f64,
+    pub ask_close: f64,
+    pub tick_count: u64,
+}
+
+impl QuoteBar {
+    pub fn spread_open(&self) -> f64 {
+        (self.ask_open - self.bid_open).max(0.0)
+    }
+
+    pub fn spread_high(&self) -> f64 {
+        (self.ask_high - self.bid_high).max(0.0)
+    }
+
+    pub fn spread_low(&self) -> f64 {
+        (self.ask_low - self.bid_low).max(0.0)
+    }
+
+    pub fn spread_close(&self) -> f64 {
+        (self.ask_close - self.bid_close).max(0.0)
+    }
+
+    pub fn validate(&self) -> Result<(), DataError> {
+        let values = [
+            self.bid_open,
+            self.bid_high,
+            self.bid_low,
+            self.bid_close,
+            self.ask_open,
+            self.ask_high,
+            self.ask_low,
+            self.ask_close,
+        ];
+        if values.iter().any(|value| !value.is_finite())
+            || self.bid_high < self.bid_low
+            || self.ask_high < self.ask_low
+            || self.ask_open + f64::EPSILON < self.bid_open
+            || self.ask_close + f64::EPSILON < self.bid_close
+        {
+            return Err(DataError::InvalidQuoteBar(self.timestamp_ms));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuoteBarDataset {
+    pub bars: Vec<QuoteBar>,
+    pub source_rows: usize,
+    pub source_timezone: String,
+    pub data_hash: ContentHash,
+    pub schema_version: u16,
+    pub source_model: Option<u8>,
+}
+
+impl QuoteBarDataset {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn load_csv(path: impl AsRef<Path>) -> Result<Self, DataError> {
+        Self::load_csv_with_timestamp_transform(path, |timestamp_ms| Ok(timestamp_ms))
+    }
+
+    /// Load a quote sidecar whose timestamps came from MT5 datetime values.
+    /// MT5 serializes broker-server wall time into the epoch field; convert
+    /// it with the same broker timezone used by the M1 OHLC pack.
+    pub fn load_csv_server_epoch(
+        path: impl AsRef<Path>,
+        source_timezone: SourceTimezone,
+    ) -> Result<Self, DataError> {
+        Self::load_csv_with_timestamp_transform(path, |timestamp_ms| {
+            source_timezone
+                .server_epoch_ms_to_utc_ms(timestamp_ms)
+                .ok_or(DataError::InvalidMetadataProperty {
+                    property: "timestamp_ms",
+                    reason: "MT5 server timestamp is outside the supported timezone range",
+                })
+        })
+    }
+
+    fn load_csv_with_timestamp_transform(
+        path: impl AsRef<Path>,
+        transform: impl Fn(i64) -> Result<i64, DataError>,
+    ) -> Result<Self, DataError> {
+        let bytes = fs::read(path)?;
+        let delimiter = detect_delimiter(&bytes)?;
+        let mut reader = ReaderBuilder::new()
+            .delimiter(delimiter)
+            .trim(Trim::All)
+            .flexible(false)
+            .from_reader(bytes.as_slice());
+        let headers = reader.headers()?.clone();
+        let columns = QuoteColumns::from_headers(&headers)?;
+        let mut bars = Vec::new();
+        for (index, record) in reader.records().enumerate() {
+            let record = record?;
+            let mut bar = columns.parse(&record, index + 2)?;
+            bar.timestamp_ms = transform(bar.timestamp_ms)?;
+            bar.validate()?;
+            bars.push(bar);
+        }
+        if bars.is_empty() {
+            return Err(DataError::NoRows);
+        }
+        let input_was_sorted = bars
+            .windows(2)
+            .all(|pair| pair[0].timestamp_ms <= pair[1].timestamp_ms);
+        if !input_was_sorted {
+            bars.sort_by_key(|bar| bar.timestamp_ms);
+        }
+        bars.dedup_by_key(|bar| bar.timestamp_ms);
+        Ok(Self {
+            source_rows: bars.len(),
+            source_timezone: "Etc/UTC".into(),
+            data_hash: quote_bar_content_hash(&bars),
+            bars,
+            schema_version: Self::SCHEMA_VERSION,
+            source_model: None,
+        })
+    }
+
+    pub fn validate_against(&self, dataset: &BarDataset) -> Result<(), DataError> {
+        if self.bars.len() != dataset.bars.len() {
+            return Err(DataError::QuoteDatasetMismatch(format!(
+                "quote pack has {} bars but price pack has {}",
+                self.bars.len(),
+                dataset.bars.len()
+            )));
+        }
+        for (quote, bar) in self.bars.iter().zip(&dataset.bars) {
+            if quote.timestamp_ms != bar.timestamp_ms {
+                return Err(DataError::QuoteDatasetMismatch(format!(
+                    "timestamp {} does not match price bar {}",
+                    quote.timestamp_ms, bar.timestamp_ms
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct QuoteColumns {
+    timestamp: usize,
+    bid_open: usize,
+    bid_high: usize,
+    bid_low: usize,
+    bid_close: usize,
+    ask_open: usize,
+    ask_high: usize,
+    ask_low: usize,
+    ask_close: usize,
+    tick_count: Option<usize>,
+}
+
+impl QuoteColumns {
+    fn from_headers(headers: &StringRecord) -> Result<Self, DataError> {
+        let headers: Vec<String> = headers.iter().map(normalize_header).collect();
+        let find = |names: &[&str]| {
+            headers
+                .iter()
+                .position(|header| names.contains(&header.as_str()))
+        };
+        let required = |names: &[&str], display: &'static str| {
+            find(names).ok_or(DataError::MissingColumn(display))
+        };
+        Ok(Self {
+            timestamp: required(&["TIMESTAMP_MS", "TIMESTAMP"], "TIMESTAMP_MS")?,
+            bid_open: required(&["BID_OPEN"], "BID_OPEN")?,
+            bid_high: required(&["BID_HIGH"], "BID_HIGH")?,
+            bid_low: required(&["BID_LOW"], "BID_LOW")?,
+            bid_close: required(&["BID_CLOSE"], "BID_CLOSE")?,
+            ask_open: required(&["ASK_OPEN"], "ASK_OPEN")?,
+            ask_high: required(&["ASK_HIGH"], "ASK_HIGH")?,
+            ask_low: required(&["ASK_LOW"], "ASK_LOW")?,
+            ask_close: required(&["ASK_CLOSE"], "ASK_CLOSE")?,
+            tick_count: find(&["TICK_COUNT", "TICKS", "VOLUME"]),
+        })
+    }
+
+    fn parse(&self, record: &StringRecord, row: usize) -> Result<QuoteBar, DataError> {
+        let number = |index: usize, field: &'static str| parse_f64(record, index, row, field);
+        let timestamp_ms = value(record, self.timestamp, row)?
+            .parse::<i64>()
+            .map_err(|_| DataError::InvalidMetadataProperty {
+                property: "timestamp_ms",
+                reason: "must be an integer",
+            })?;
+        Ok(QuoteBar {
+            timestamp_ms,
+            bid_open: number(self.bid_open, "BID_OPEN")?,
+            bid_high: number(self.bid_high, "BID_HIGH")?,
+            bid_low: number(self.bid_low, "BID_LOW")?,
+            bid_close: number(self.bid_close, "BID_CLOSE")?,
+            ask_open: number(self.ask_open, "ASK_OPEN")?,
+            ask_high: number(self.ask_high, "ASK_HIGH")?,
+            ask_low: number(self.ask_low, "ASK_LOW")?,
+            ask_close: number(self.ask_close, "ASK_CLOSE")?,
+            tick_count: parse_optional(record, self.tick_count, row, "TICK_COUNT")?.unwrap_or(0),
+        })
+    }
+}
+
 impl BarDataset {
     pub fn load_mt5(
         path: impl AsRef<Path>,
@@ -133,13 +349,15 @@ impl SourceTimezone {
             // Treat it as the first valid instant after the gap instead of
             // rejecting the entire tester run; this is the same convention a
             // broker clock uses when it advances through the transition.
-            LocalResult::None => naive
-                .checked_add_signed(Duration::hours(1))
-                .and_then(|adjusted| match self.localize(adjusted) {
-                    LocalResult::Single(timestamp) => Some(timestamp.timestamp_millis()),
-                    LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
-                    LocalResult::None => None,
-                }),
+            LocalResult::None => {
+                naive
+                    .checked_add_signed(Duration::hours(1))
+                    .and_then(|adjusted| match self.localize(adjusted) {
+                        LocalResult::Single(timestamp) => Some(timestamp.timestamp_millis()),
+                        LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
+                        LocalResult::None => None,
+                    })
+            }
         }
     }
 
@@ -664,6 +882,28 @@ pub fn bar_content_hash(bars: &[Bar]) -> ContentHash {
     ContentHash::sha256(bytes)
 }
 
+/// Computes the canonical identity of a bid/ask execution sidecar.
+pub fn quote_bar_content_hash(bars: &[QuoteBar]) -> ContentHash {
+    let mut bytes = Vec::with_capacity(bars.len() * 80);
+    for bar in bars {
+        bytes.extend_from_slice(&bar.timestamp_ms.to_le_bytes());
+        for value in [
+            bar.bid_open,
+            bar.bid_high,
+            bar.bid_low,
+            bar.bid_close,
+            bar.ask_open,
+            bar.ask_high,
+            bar.ask_low,
+            bar.ask_close,
+        ] {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&bar.tick_count.to_le_bytes());
+    }
+    ContentHash::sha256(bytes)
+}
+
 /// Infer the median positive bar interval in milliseconds from an ordered series.
 pub fn infer_median_interval_ms(bars: &[Bar]) -> Option<i64> {
     let mut intervals: Vec<i64> = bars
@@ -857,6 +1097,10 @@ pub enum DataError {
         property: &'static str,
         reason: &'static str,
     },
+    #[error("invalid quote bar at timestamp {0}")]
+    InvalidQuoteBar(i64),
+    #[error("quote dataset mismatch: {0}")]
+    QuoteDatasetMismatch(String),
     #[error("metadata does not match dataset: {0}")]
     MetadataDatasetMismatch(String),
     #[error("decision interval must be a positive multiple of 60s; got {interval_ms}ms")]
@@ -1220,5 +1464,50 @@ mod tests {
         assert_eq!(built.bars[0].timestamp_ms, 0);
         assert_eq!(built.bars[1].timestamp_ms, 3_600_000);
         assert_eq!(built.bars[0].tick_volume, 120);
+    }
+
+    #[test]
+    fn quote_bar_rejects_crossed_or_non_finite_quotes() {
+        let mut quote = QuoteBar {
+            timestamp_ms: 0,
+            bid_open: 1.0,
+            bid_high: 1.1,
+            bid_low: 0.9,
+            bid_close: 1.05,
+            ask_open: 1.0002,
+            ask_high: 1.1002,
+            ask_low: 0.9002,
+            ask_close: 1.0502,
+            tick_count: 3,
+        };
+        quote.validate().unwrap();
+        assert!((quote.spread_open() - 0.0002).abs() < 1e-12);
+        quote.ask_open = 0.9999;
+        assert!(matches!(
+            quote.validate(),
+            Err(DataError::InvalidQuoteBar(0))
+        ));
+    }
+
+    #[test]
+    fn quote_dataset_hash_includes_both_sides_and_tick_count() {
+        let mut quote = QuoteBar {
+            timestamp_ms: 0,
+            bid_open: 1.0,
+            bid_high: 1.0,
+            bid_low: 1.0,
+            bid_close: 1.0,
+            ask_open: 1.0001,
+            ask_high: 1.0001,
+            ask_low: 1.0001,
+            ask_close: 1.0001,
+            tick_count: 1,
+        };
+        let first = quote_bar_content_hash(std::slice::from_ref(&quote));
+        quote.tick_count = 2;
+        assert_ne!(first, quote_bar_content_hash(std::slice::from_ref(&quote)));
+        quote.tick_count = 1;
+        quote.ask_close += 0.0001;
+        assert_ne!(first, quote_bar_content_hash(std::slice::from_ref(&quote)));
     }
 }

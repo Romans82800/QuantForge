@@ -24,6 +24,7 @@ import {
   exportEliteEas,
   getDiscoverJob,
   getElitePartitionEquity,
+  getEliteMql5Source,
   inspectData,
   importMarketFolder,
   inspectVault,
@@ -61,6 +62,7 @@ import type {
   DiscoverRequest,
   DiscoverRunModeId,
   EliteDetail,
+  EliteMql5SourceView,
   EliteRow,
   FidelityDemoView,
   EliteSort,
@@ -282,7 +284,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [entryFilter, setEntryFilter] = useState("all");
   const [sort, setSort] = useState<EliteSort>("evidence");
-  const [detailTab, setDetailTab] = useState<"overview" | "ir">("overview");
+  const [detailTab, setDetailTab] = useState<"overview" | "ir" | "mq5">("overview");
   const [discoverPreset, setDiscoverPreset] = useState<Partial<DiscoverRequest>>({});
   const [judgePreset, setJudgePreset] = useState<Partial<JudgeRequest>>({});
   const [exportPreset, setExportPreset] = useState<Partial<ExportRequest>>({});
@@ -2607,7 +2609,7 @@ function DataLabWorkspace({
           <div><p className="eyebrow">IC Markets import</p><h2>Bring in broker CSVs</h2></div>
           <span className="read-only-badge">Safe copy</span>
         </div>
-        <p className="immutable-note">Choose a Downloads folder. QuantForge scans it recursively, ignores trade lists and unrelated schemas, aggregates <code>Time,Ask,Bid,Volume</code> ticks to midpoint M1 bars, then derives H1 from that same stream.</p>
+        <p className="immutable-note">Choose a Downloads folder. QuantForge scans it recursively, ignores trade lists and unrelated schemas, preserves bid/ask quotes in a canonical M1 sidecar, and derives H1 from the bid M1 stream.</p>
         <div className="form-stack compact">
           <PathField label="CSV folder" path={importDirectory} choose={() => chooseDirectory("Choose IC Markets CSV folder")} onChange={setImportDirectory} required />
           <PathField label="Output folder (optional)" path={importOutputDirectory} choose={() => chooseDirectory("Choose import output folder")} onChange={setImportOutputDirectory} />
@@ -2617,7 +2619,7 @@ function DataLabWorkspace({
       </section>
       {importReport && <section className="panel import-results">
         <div className="panel-heading"><div><p className="eyebrow">Import complete</p><h2>{formatNumber(importReport.importedCount)} datasets ready</h2></div><span className="read-only-badge">{formatNumber(importReport.skippedCount)} skipped</span></div>
-        <p className="immutable-note">Output: <code>{importReport.outputDirectory}</code>. Select an imported row to load its M1/H1 path into the diagnostics form.</p>
+        <p className="immutable-note">Output: <code>{importReport.outputDirectory}</code>. Tick imports produce a bid M1 CSV plus a matching <code>.quotes.csv</code> sidecar; select a row to load its canonical path into diagnostics.</p>
         <div className="import-file-list">{importReport.files.map((file) => <div className={`import-file-row import-${file.status}`} key={file.sourcePath}><div><strong>{file.symbol ?? "Unknown"}</strong><span>{file.kind} · {file.status}{file.bars ? ` · ${formatNumber(file.bars)} M1 bars` : ""}</span>{file.message && <small>{file.message}</small>}</div><div className="button-row">{file.status === "imported" && <button type="button" className="secondary" onClick={() => useImportedFile(file)}>Use</button>}</div></div>)}</div>
       </section>}
       <section className="panel setup-panel">
@@ -2685,8 +2687,9 @@ function DataReport({ report, onUse }: { report: DataLabView; onUse: () => void 
         <div className={`quality-orb quality-${q.grade}`}><strong>{q.score}</strong><span>{q.grade}</span></div>
         <div>
           <p className="eyebrow">Quality assessment</p>
-          <h2>{report.discoverReady ? "Bound and ready for discovery" : q.grade === "fail" ? "Source is blocked" : "Broker binding still required"}</h2>
+          <h2>{report.discoverReady ? "Bound and ready for discovery" : report.feedMode === "diagnostic_midpoint" ? "Diagnostic-only midpoint feed" : q.grade === "fail" ? "Source is blocked" : "Broker binding still required"}</h2>
           <p>{formatNumber(report.bars)} normalized bars from {new Date(report.firstTimestampMs).toLocaleString()} to {new Date(report.lastTimestampMs).toLocaleString()}.</p>
+          <p className="immutable-note">Feed: <code>{report.feedMode}</code>{report.quotePath ? <> · quote sidecar: <code>{report.quotePath}</code></> : " · no bid/ask sidecar bound"}</p>
         </div>
         <button className="primary" disabled={!report.discoverReady} onClick={onUse}>Use in Discover</button>
       </section>
@@ -2695,6 +2698,7 @@ function DataReport({ report, onUse }: { report: DataLabView; onUse: () => void 
         <Kpi label="Interval" value={q.expectedIntervalSeconds ? `${q.expectedIntervalSeconds}s` : "Unknown"} note={`Delimiter ${JSON.stringify(report.delimiter)}`} />
         <Kpi label="Symbol / timeframe" value={`${report.symbol ?? "—"} · ${report.timeframe ?? "—"}`} note={report.brokerProfile ?? "No broker profile bound"} />
         <Kpi label="Ordering" value={report.inputWasSorted ? "Sorted" : "Normalized"} note={report.sourceTimezone} />
+        <Kpi label="Certification" value={report.certificationReady ? "Bid/ask ready" : "Diagnostic only"} note={report.feedMode} />
       </section>
       <section className="report-grid">
         <article className="panel issue-panel">
@@ -2997,7 +3001,7 @@ function DiscoverWorkspace({
   const [liveDetailOpen, setLiveDetailOpen] = useState(false);
   const [liveDetailLoading, setLiveDetailLoading] = useState(false);
   const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
-  const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir">("overview");
+  const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir" | "mq5">("overview");
   const lastDatabankCountRef = useRef(0);
   const liveReloadBusyRef = useRef(false);
   const active = job?.status === "running" || job?.status === "paused";
@@ -4226,7 +4230,7 @@ function JudgePanel({
   onError: (message: string | null) => void;
   preset: Partial<JudgeRequest>;
 }) {
-  const [form, setForm] = useState<JudgeRequest>({ decisionDataPath: "", decisionMetadataPath: null, decisionSourceTimezone: "Etc/UTC", m1DataPath: "", m1MetadataPath: null, m1SourceTimezone: "Etc/UTC", splitPlanPath: null, strategyPath: "", brokerPath: "", outputPath: "", commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000, entryWindowStartHour: 2, entryWindowEndHour: 19 });
+  const [form, setForm] = useState<JudgeRequest>({ decisionDataPath: "", decisionMetadataPath: null, decisionSourceTimezone: "Etc/UTC", m1DataPath: "", m1MetadataPath: null, m1SourceTimezone: "Etc/UTC", quotePath: null, splitPlanPath: null, strategyPath: "", brokerPath: "", outputPath: "", commissionPerLotRoundTurn: 7, slippagePointsPerSide: 0, fallbackSpreadPoints: null, maxSpreadPoints: null, initialBalance: 100000, entryWindowStartHour: 2, entryWindowEndHour: 19 });
   const [result, setResult] = useState<JudgeView | null>(null); const [busy, setBusy] = useState(false);
   useEffect(() => {
     setForm((current) => ({ ...current, ...preset }));
@@ -4253,12 +4257,13 @@ function JudgePanel({
           selectedDataPath={form.decisionDataPath}
         />
         <PathField label="Split plan (uses validation only)" path={form.splitPlanPath ?? ""} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value || null)} />
+        <PathField label="M1 bid/ask quote sidecar (required for certification)" path={form.quotePath ?? ""} choose={() => chooseTesterCsv("Choose M1 quote sidecar")} onChange={(value) => update("quotePath", value || null)} />
         <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
         <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
         <PathField label="New Judge artifact" path={form.outputPath} choose={() => chooseOutputJson("Save Judge artifact", "judge.json")} onChange={(value) => update("outputPath", value)} required />
       </div>
       <div className="numeric-grid"><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Slippage / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value ?? 0)} step={.1} /><NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} /><NumberField label="Entry window start (broker)" value={form.entryWindowStartHour ?? 2} onChange={(value) => update("entryWindowStartHour", Math.min(23, Math.max(0, value ?? 2)))} min={0} /><NumberField label="Entry window end (broker, exclusive)" value={form.entryWindowEndHour ?? 19} onChange={(value) => update("entryWindowEndHour", Math.min(24, Math.max(1, value ?? 19)))} min={1} /></div>
-      <div className="form-footer"><p>M1 files contain only minutes that received ticks. Gaps pass only when H1 and M1 volumes reconcile exactly; missing tick history remains a hard failure.</p><button className="primary" disabled={busy || !form.decisionDataPath || !form.m1DataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Replaying…" : "Run M1 Judge"}</button></div>
+      <div className="form-footer"><p>M1 files are bid OHLC. Supplying the matching quote sidecar makes fills and management use exact MT5 bid/ask chronology; without it the replay is diagnostic-only.</p><button className="primary" disabled={busy || !form.decisionDataPath || !form.m1DataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Replaying…" : "Run M1 Judge"}</button></div>
     </section>
     {result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">M1 Judge</p><h2>Execution chronology replayed</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /><Kpi label="Decision / M1 bars" value={`${formatNumber(result.decisionBars)} / ${formatNumber(result.m1Bars)}`} note={`${formatNumber(result.verifiedNoTickMinutes)} verified no-tick min`} /><Kpi label="Managed exits" value={formatNumber(result.partialExits + result.endOfDayFlattens)} note={`${result.breakEvenMoves} BE · ${result.trailingMoves} trail`} /></div><ArtifactPath label="Judge artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No M1 replay yet" copy="Use matching decision-timeframe and M1 exports with their metadata files. The Judge enforces pending-order chronology and every active trade-management gene." />}
   </div>;
@@ -4282,11 +4287,11 @@ function ExportPanel({
 }
 
 function ParityComparePanel({ onError }: { onError: (message: string | null) => void }) {
-  const [form, setForm] = useState<ParityRequest>({ referencePath: "", evidencePath: "", mq5Path: "", mt5DealsPath: "", mt5EquityPath: "", mt5MetadataPath: "", outputPath: "", initialBalance: 100000, tradeCountRelative: .1, tradeCountAbsolute: 3, netProfitRelative: .15, maxDrawdownRelative: .15, maxEquityDivergencePercent: 5, tradeTimestampToleranceMs: 0, minimumAlignedTradeFraction: .9, strictOneToOne: true });
+  const [form, setForm] = useState<ParityRequest>({ referencePath: "", evidencePath: "", mq5Path: "", mt5DealsPath: "", mt5EquityPath: "", mt5MetadataPath: "", quotePath: null, outputPath: "", initialBalance: 100000, tradeCountRelative: .1, tradeCountAbsolute: 3, netProfitRelative: .15, maxDrawdownRelative: .15, maxEquityDivergencePercent: 5, tradeTimestampToleranceMs: 0, minimumAlignedTradeFraction: .9, strictOneToOne: true });
   const [result, setResult] = useState<ParityView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof ParityRequest>(key: K, value: ParityRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await compareExternalParity(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><label className="check-field"><input type="checkbox" checked={form.strictOneToOne !== false} onChange={(event) => update("strictOneToOne", event.target.checked)} /><span>Certification mode: require one-to-one MT5 deals and equity (recommended)</span></label><details className="advanced-settings"><summary>Diagnostic tolerances (only used when certification mode is off)</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash and tester metadata must match the evidence card before any comparison is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "")} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Win rate" value={`${formatNumber(result.referenceWinRate, 1)}% / ${formatNumber(result.externalWinRate, 1)}%`} note={`${formatNumber(result.referenceWinningTrades)} / ${formatNumber(result.externalWinningTrades)} wins`} /><Kpi label="Profit factor" value={`${result.referenceProfitFactor === null ? "—" : formatNumber(result.referenceProfitFactor, 2)} / ${result.externalProfitFactor === null ? "—" : formatNumber(result.externalProfitFactor, 2)}`} note="QuantForge / MT5" /><Kpi label="Recovery factor" value={`${result.referenceRecoveryFactor === null ? "—" : formatNumber(result.referenceRecoveryFactor, 2)} / ${result.externalRecoveryFactor === null ? "—" : formatNumber(result.externalRecoveryFactor, 2)}`} note={result.recoveryFactorPassed ? "QF / MT5 · gate passed" : "QF / MT5 · gate failed"} /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="MT5 bid/ask M1 quote sidecar (required for certification)" path={form.quotePath ?? ""} choose={() => chooseTesterCsv("Choose MT5 quote sidecar")} onChange={(value) => update("quotePath", value || null)} /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><label className="check-field"><input type="checkbox" checked={form.strictOneToOne !== false} onChange={(event) => update("strictOneToOne", event.target.checked)} /><span>Certification mode: require one-to-one MT5 deals, equity and quote sidecar (recommended)</span></label><details className="advanced-settings"><summary>Diagnostic tolerances (only used when certification mode is off)</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash, tester metadata and quote feed must match the evidence card before certification is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "") || (form.strictOneToOne !== false && !form.quotePath)} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Win rate" value={`${formatNumber(result.referenceWinRate, 1)}% / ${formatNumber(result.externalWinRate, 1)}%`} note={`${formatNumber(result.referenceWinningTrades)} / ${formatNumber(result.externalWinningTrades)} wins`} /><Kpi label="Profit factor" value={`${result.referenceProfitFactor === null ? "—" : formatNumber(result.referenceProfitFactor, 2)} / ${result.externalProfitFactor === null ? "—" : formatNumber(result.externalProfitFactor, 2)}`} note="QuantForge / MT5" /><Kpi label="Recovery factor" value={`${result.referenceRecoveryFactor === null ? "—" : formatNumber(result.referenceRecoveryFactor, 2)} / ${result.externalRecoveryFactor === null ? "—" : formatNumber(result.externalRecoveryFactor, 2)}`} note={result.recoveryFactorPassed ? "QF / MT5 · gate passed" : "QF / MT5 · gate failed"} /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
 }
 
 function IndicatorParityPanel({ onError }: { onError: (message: string | null) => void }) {
@@ -4844,11 +4849,14 @@ function EliteInspector({
   onError: (message: string | null) => void;
   onParity: (fingerprint: string) => Promise<void>;
   onOpenResearch?: (fingerprint: string) => void;
-  tab: "overview" | "ir";
-  onTab: (tab: "overview" | "ir") => void;
+  tab: "overview" | "ir" | "mq5";
+  onTab: (tab: "overview" | "ir" | "mq5") => void;
 }) {
   const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
   const [partitionBusy, setPartitionBusy] = useState(false);
+  const [mq5View, setMq5View] = useState<EliteMql5SourceView | null>(null);
+  const [mq5Busy, setMq5Busy] = useState(false);
+  const [mq5Timeframe, setMq5Timeframe] = useState<"M1" | "M15" | "H1">("H1");
 
   useEffect(() => {
     if (!detail || tab !== "overview") {
@@ -4872,6 +4880,29 @@ function EliteInspector({
       cancelled = true;
     };
   }, [detail?.fingerprint, tab, onError]);
+
+  useEffect(() => {
+    if (!detail || tab !== "mq5") {
+      setMq5View(null);
+      return;
+    }
+    let cancelled = false;
+    setMq5Busy(true);
+    setMq5View(null);
+    void getEliteMql5Source(detail.fingerprint, mq5Timeframe)
+      .then((next) => {
+        if (!cancelled) setMq5View(next);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setMq5Busy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.fingerprint, tab, mq5Timeframe, onError]);
 
   const displayMetrics = partitionView
     ? {
@@ -4911,6 +4942,7 @@ function EliteInspector({
           <div className="tabs">
             <button className={tab === "overview" ? "active" : ""} onClick={() => onTab("overview")}>Overview</button>
             <button className={tab === "ir" ? "active" : ""} onClick={() => onTab("ir")}>IR tree</button>
+            <button className={tab === "mq5" ? "active" : ""} onClick={() => onTab("mq5")}>MQL5 source</button>
             <button onClick={() => void exportEliteStrategy(detail.fingerprint).catch((reason) => onError(String(reason)))}>Export IR</button>
             <button onClick={() => void exportEliteEas([detail.fingerprint], "H1", 42_424_242).catch((reason) => onError(String(reason)))}>Export MQ5</button>
             <button onClick={() => void promoteEliteToVault(detail.fingerprint).catch((reason) => onError(String(reason)))}>Stage for certification</button>
@@ -4990,8 +5022,35 @@ function EliteInspector({
                 <span className="gate-pending">External parity unknown</span>
               </div>
             </div>
-          ) : (
+          ) : tab === "ir" ? (
             <pre className="ir-tree">{JSON.stringify(detail.strategyIr, null, 2)}</pre>
+          ) : (
+            <div className="mq5-source-view">
+              <div className="mq5-source-toolbar">
+                <div>
+                  <strong>{mq5View?.expertName ?? "Generating QuantForge expert…"}</strong>
+                  <small>
+                    {mq5View
+                      ? `${mq5View.exportStyle} · SHA-256 ${mq5View.sourceHash}`
+                      : "The preview is generated from this elite and the loaded broker profile."}
+                  </small>
+                </div>
+                <label>
+                  Timeframe
+                  <select
+                    value={mq5Timeframe}
+                    onChange={(event) => setMq5Timeframe(event.target.value as "M1" | "M15" | "H1")}
+                  >
+                    <option value="M1">M1</option>
+                    <option value="M15">M15</option>
+                    <option value="H1">H1</option>
+                  </select>
+                </label>
+              </div>
+              {mq5Busy || !mq5View
+                ? <div className="inspector-loading">Generating deterministic MQL5 preview…</div>
+                : <pre className="ir-tree mq5-source"><code>{mq5View.source}</code></pre>}
+            </div>
           )}
         </>
       )}
@@ -5152,8 +5211,8 @@ function EliteDetailModal({
   onClose: () => void;
   onError: (message: string | null) => void;
   onParity: (fingerprint: string) => Promise<void>;
-  tab: "overview" | "ir";
-  onTab: (tab: "overview" | "ir") => void;
+  tab: "overview" | "ir" | "mq5";
+  onTab: (tab: "overview" | "ir" | "mq5") => void;
 }) {
   const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
   const [partitionBusy, setPartitionBusy] = useState(false);

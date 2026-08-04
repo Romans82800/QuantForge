@@ -2,7 +2,7 @@ use crate::model::{
     ExportBundle, ExportError, ExportEvidenceCard, ExportStyle, ExportSupportFile, Mql5ExportConfig,
 };
 use crate::{EXPORT_SCHEMA_VERSION, EXPORT_TARGET};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use quantforge_broker::{SymbolSpecification, TradeMode};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_ir::{
@@ -51,6 +51,13 @@ pub fn generate_bundle(
     let strategy_fingerprint = strategy.structural_fingerprint(FloatPolicy::default())?;
     let broker_spec_hash = broker.content_hash()?;
     let fingerprint_short = &strategy_fingerprint.as_str()[..12];
+    let execution_policy_hash = ContentHash::sha256(
+        format!(
+            "{:?}|{:?}|{:?}",
+            strategy.entry.order, strategy.manage, config.tester
+        )
+        .as_bytes(),
+    );
     let parity_prefix = format!("QuantForge\\QF_{fingerprint_short}");
     let template = match config.export_style {
         ExportStyle::Quantforge => TEMPLATE,
@@ -90,6 +97,11 @@ pub fn generate_bundle(
         ("@@PARITY_PREFIX@@", mql_string(&parity_prefix)),
         ("@@STRATEGY_FINGERPRINT@@", strategy_fingerprint.to_string()),
         ("@@BROKER_FINGERPRINT@@", broker_spec_hash.to_string()),
+        (
+            "@@EXECUTION_POLICY_FINGERPRINT@@",
+            execution_policy_hash.to_string(),
+        ),
+        ("@@TESTER_MODEL@@", config.tester.model.to_string()),
         (
             "@@LONG_SIGNAL@@",
             strategy
@@ -139,10 +151,7 @@ pub fn generate_bundle(
         ("@@TRAILING_KIND@@", trailing_kind(&strategy).to_string()),
         ("@@TRAILING_ACTIVATE_R@@", trailing_activate_r(&strategy)),
         ("@@TRAILING_DISTANCE@@", trailing_distance(&strategy)),
-        (
-            "@@EOD_HOUR@@",
-            strategy.manage.end_of_day_hour.to_string(),
-        ),
+        ("@@EOD_HOUR@@", strategy.manage.end_of_day_hour.to_string()),
         (
             "@@FLATTEN_EOD@@",
             if strategy.manage.flatten_end_of_day {
@@ -172,6 +181,8 @@ pub fn generate_bundle(
         ("@@FINGERPRINT_SHORT@@", fingerprint_short.into()),
         ("@@SYMBOL@@", mql_string(&broker.symbol)),
         ("@@BROKER_TICK_SIZE@@", mql_double(broker.tick_size)),
+        ("@@BROKER_POINT@@", mql_double(broker.point)),
+        ("@@BROKER_VOLUME_STEP@@", mql_double(broker.volume_step)),
         ("@@BROKER_TICK_VALUE@@", mql_double(broker.tick_value)),
         ("@@BROKER_TIMEZONE@@", broker.timezone.clone()),
     ] {
@@ -191,6 +202,7 @@ pub fn generate_bundle(
         target: EXPORT_TARGET.into(),
         strategy_fingerprint,
         broker_spec_hash,
+        execution_policy_hash,
         source_hash,
         strategy_ir_version: strategy.version,
         expert_name: config.expert_name.clone(),
@@ -202,6 +214,7 @@ pub fn generate_bundle(
         parity_deals_file: format!("{parity_prefix}_deals.csv"),
         parity_equity_file: format!("{parity_prefix}_equity.csv"),
         parity_metadata_file: format!("{parity_prefix}_metadata.csv"),
+        parity_quote_file: Some(format!("{parity_prefix}_M1.quotes.csv")),
         export_style: config.export_style,
         config: config.clone(),
     };
@@ -596,10 +609,9 @@ fn indicator_expr(indicator: &IndicatorExpr, extra_shift: &str) -> String {
             shift,
             extra_shift
         ),
-        IndicatorExpr::IchimokuTenkan { period, shift } => format!(
-            "QFIchimokuTenkan({},({}+{}))",
-            period, shift, extra_shift
-        ),
+        IndicatorExpr::IchimokuTenkan { period, shift } => {
+            format!("QFIchimokuTenkan({},({}+{}))", period, shift, extra_shift)
+        }
         IndicatorExpr::IchimokuKijun { period, shift } => {
             format!("QFIchimokuKijun({},({}+{}))", period, shift, extra_shift)
         }
@@ -1017,12 +1029,13 @@ mod tests {
                 .contains("g_trade.Buy(volume,_Symbol,0.0,stop,target")
         );
         assert!(first.source.contains("QFCrossAbove"));
-        assert!(first.source.contains("SqATR"));
-        assert!(first.source.contains("checkBarOpen"));
-        assert!(first.source.contains("sqPrice"));
-        assert!(first.source.contains("sqValid"));
-        assert!(!first.source.contains("#include \"sqx_runtime.mqh\""));
-        assert!(first.source.contains("LongEntrySignal"));
+        assert!(first.source.contains("QFATR"));
+        assert!(first.source.contains("void OnTick()"));
+        assert!(first.source.contains("QFPrice"));
+        assert!(first.source.contains("QFValid"));
+        assert!(!first.source.contains("SqATR"));
+        assert!(!first.source.contains("iCustom("));
+        assert!(first.source.contains("QFLongSignal"));
         assert!(first.source.contains("g_decision_bars_seen<320"));
         assert!(!first.source.contains("@@"));
         assert!(first.evidence.mandatory_stop_loss);
@@ -1043,7 +1056,14 @@ mod tests {
             .unwrap();
             // Every handle must come from a cache lookup, never from a bare
             // constructor inside a per-tick accessor.
-            for constructor in ["iCustom(", "iMA(", "iRSI(", "iATR(", "iStdDev(", "iADXWilder("] {
+            for constructor in [
+                "iCustom(",
+                "iMA(",
+                "iRSI(",
+                "iATR(",
+                "iStdDev(",
+                "iADXWilder(",
+            ] {
                 let creations = bundle.source.matches(constructor).count();
                 let cache_stores = bundle
                     .source
@@ -1073,7 +1093,10 @@ mod tests {
             crate::suggested_expert_name("XAU/USD", "", 42),
             "XAU_USD_m42"
         );
-        assert_eq!(crate::suggested_expert_name("30YR", "g1-1", 7), "QF_30YR_g1_1");
+        assert_eq!(
+            crate::suggested_expert_name("30YR", "g1-1", 7),
+            "QF_30YR_g1_1"
+        );
         for name in [
             crate::suggested_expert_name("EURUSD", "g898-84", 1),
             crate::suggested_expert_name("", "", 1),
@@ -1110,10 +1133,13 @@ mod tests {
             },
             right: NumericExpr::Constant { value: 55.0 },
         });
-        let bundle =
-            generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
+        let bundle = generate_bundle(&strategy, &broker(), &Mql5ExportConfig::default()).unwrap();
         assert!(bundle.source.contains("position_type == POSITION_TYPE_BUY"));
-        assert!(bundle.source.contains("position_type == POSITION_TYPE_SELL"));
+        assert!(
+            bundle
+                .source
+                .contains("position_type == POSITION_TYPE_SELL")
+        );
         assert!(bundle.source.contains("45.000000000000"));
         assert!(bundle.source.contains("55.000000000000"));
         assert!(!bundle.source.contains("@@"));
@@ -1161,7 +1187,8 @@ mod tests {
         assert!(bundle.source.contains("QFBodyRangeRatio"));
         assert!(bundle.source.contains("QFLiquiditySweepScore"));
         assert!(bundle.source.contains("QFSessionRangeHigh"));
-        assert!(!bundle.support_files.is_empty());
+        assert!(bundle.support_files.is_empty());
+        assert!(!bundle.source.contains("Sq"));
         assert!(!bundle.source.contains("@@"));
     }
 
@@ -1199,11 +1226,9 @@ mod tests {
         assert!(bundle.source.contains("QFInMandatoryEntryWindow"));
         assert!(bundle.source.contains("InpEntryWindowStartHour=2"));
         assert!(bundle.source.contains("InpEntryWindowEndHour=19"));
-        assert!(
-            bundle
-                .source
-                .contains("current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour")
-        );
+        assert!(bundle.source.contains(
+            "current.hour>=InpEntryWindowStartHour && current.hour<InpEntryWindowEndHour"
+        ));
         assert!(bundle.source.contains("QFMarkEntrySignalTaken"));
     }
 
@@ -1217,7 +1242,11 @@ mod tests {
         let bundle = generate_bundle(&strategy(), &broker(), &config).unwrap();
         assert!(bundle.source.contains("InpEntryWindowStartHour=2"));
         assert!(bundle.source.contains("InpEntryWindowEndHour=23"));
-        assert!(bundle.set_file.contains("InpEntryWindowEndHour=23||23||1||23||N"));
+        assert!(
+            bundle
+                .set_file
+                .contains("InpEntryWindowEndHour=23||23||1||23||N")
+        );
     }
 
     #[test]
