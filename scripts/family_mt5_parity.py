@@ -25,6 +25,7 @@ BROKER = PACK / f"{SYMBOL}.broker.json"
 TZ = "ICMarkets/EST+7"
 COMMISSION = 7.0
 RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / SYMBOL
+TIMEFRAME = "H1"
 QF = ROOT / "target/release/quantforge"
 WINE = Path("/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine")
 WINEPREFIX = Path.home() / "Library/Application Support/net.metaquotes.wine.metatrader5"
@@ -154,7 +155,7 @@ def acceptable(ref: int, ext: int) -> bool:
 
 
 def find_sequence_with_trades(
-    family: str, mode: str, work: Path, h1: Path, from_date: str, to_date: str
+    family: str, mode: str, work: Path, decision_data: Path, from_date: str, to_date: str
 ) -> int:
     """Pick first seed sequence with enough Scout trades for a meaningful compare."""
     for sequence in range(0, 24):
@@ -167,7 +168,7 @@ def find_sequence_with_trades(
             [
                 str(QF),
                 "scout",
-                str(h1),
+                str(decision_data),
                 "--source-timezone",
                 TZ,
                 "--strategy",
@@ -221,9 +222,10 @@ def run_case(
     m1 = work / f"{SYMBOL}_M1.tsv"
     slice_tsv(H1, h1, from_date, to_date)
     slice_tsv(M1, m1, from_date, to_date)
+    decision_data = h1 if TIMEFRAME == "H1" else m1
 
     if sequence is None:
-        sequence = find_sequence_with_trades(family, mode, work, h1, from_date, to_date)
+        sequence = find_sequence_with_trades(family, mode, work, decision_data, from_date, to_date)
 
     strategy = work / "strategy.ir.json"
     emit_strategy(family, mode, strategy, sequence)
@@ -241,7 +243,7 @@ def run_case(
         [
             str(QF),
             "scout",
-            str(h1),
+            str(decision_data),
             "--source-timezone",
             TZ,
             "--strategy",
@@ -261,7 +263,7 @@ def run_case(
         [
             str(QF),
             "judge",
-            str(h1),
+            str(decision_data),
             "--source-timezone",
             TZ,
             "--m1",
@@ -319,7 +321,7 @@ def run_case(
             "--expert-directory",
             "QuantForge",
             "--timeframe",
-            "H1",
+            TIMEFRAME,
             "--from-date",
             from_date,
             "--to-date",
@@ -329,7 +331,11 @@ def run_case(
             "--deposit",
             "100000",
             "--tester-model",
-            "1",
+            # QF's reference engine is an M1 OHLC replay, not a real-tick
+            # stream.  MT5 model 2 (1-minute OHLC) is the only tester mode
+            # with the same information set; model 1 would introduce
+            # intrabar ticks and make a 1:1 M1 comparison impossible.
+            "2" if TIMEFRAME == "M1" else "1",
             "--compile",
         ],
         capture_output=True,
@@ -467,7 +473,7 @@ def run_case(
 
 
 def main() -> int:
-    global PACK, SYMBOL, H1, M1, BROKER, COMMISSION, RUN_ROOT
+    global PACK, SYMBOL, H1, M1, BROKER, COMMISSION, RUN_ROOT, TIMEFRAME
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-date", default="2024.01.01")
     parser.add_argument("--to-date", default="2024.07.01")
@@ -493,6 +499,12 @@ def main() -> int:
     )
     parser.add_argument("--continue", dest="cont", action="store_true")
     parser.add_argument("--force", action="store_true", help="rerun even if prior PASS")
+    parser.add_argument(
+        "--timeframe",
+        choices=("H1", "M1"),
+        default="H1",
+        help="decision and MT5 tester timeframe; M1 compares the direct M1 QF replay with an M1 EA",
+    )
     args = parser.parse_args()
 
     SYMBOL = args.symbol.upper()
@@ -501,7 +513,8 @@ def main() -> int:
     M1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_M1_2020_present.tsv"
     BROKER = PACK / f"{SYMBOL}.broker.json"
     COMMISSION = args.commission
-    RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / SYMBOL
+    TIMEFRAME = args.timeframe
+    RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / TIMEFRAME / SYMBOL
     for required in (H1, M1, BROKER):
         if not required.is_file():
             parser.error(f"missing asset input: {required}")

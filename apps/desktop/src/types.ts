@@ -939,6 +939,10 @@ export interface ParityView {
   externalWinningTrades: number;
   referenceProfitFactor: number | null;
   externalProfitFactor: number | null;
+  referenceRecoveryFactor: number | null;
+  externalRecoveryFactor: number | null;
+  recoveryFactorDeltaRelative: number | null;
+  recoveryFactorPassed: boolean;
 }
 
 export interface IndicatorParityRequest {

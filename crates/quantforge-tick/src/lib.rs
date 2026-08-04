@@ -6,7 +6,7 @@
 use chrono::Timelike;
 use quantforge_broker::{BrokerClock, BrokerSpecError, SwapMode, SymbolSpecification, TradeMode};
 use quantforge_core::FloatPolicy;
-use quantforge_data::{forward_fill_zero_spreads, Bar, BarDataset};
+use quantforge_data::{Bar, BarDataset, forward_fill_zero_spreads};
 use quantforge_eval::{
     BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason, FeatureCache,
     PositionSide, ScoutConfig, SpreadSource, Trade, accrue_swap, equity_sharpe_ratio,
@@ -26,6 +26,10 @@ pub const ENGINE_TIER: &str = "m1-judge";
 // Must match the execution gate in quantforge-eval and the generated MQL5
 // template. MT5 has pre-test indicator history while an imported pack does not.
 const PARITY_SIGNAL_WARMUP_BARS: usize = 320;
+/// Matches the default leverage embedded by the MT5 exporter/tester pack.
+/// The broker profile stores raw initial margin per lot; divide by this
+/// leverage before deciding whether a fixed-risk order can be afforded.
+const PARITY_TESTER_LEVERAGE: f64 = 100.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeConfig {
@@ -85,6 +89,8 @@ pub struct JudgeTelemetry {
     pub skipped_for_spread: usize,
     pub skipped_for_broker_stop_level: usize,
     pub skipped_below_minimum_volume: usize,
+    #[serde(default)]
+    pub skipped_insufficient_margin: usize,
     pub pending_orders_placed: usize,
     pub pending_orders_filled: usize,
     pub pending_orders_expired: usize,
@@ -223,11 +229,8 @@ pub fn evaluate_strategy_m1(
             std::borrow::Cow::Borrowed(&m1_dataset.bars)
         };
     let m1_bars: &[Bar] = &m1_bars_owned;
-    let mut features = FeatureCache::with_engine(
-        decision_bars,
-        &broker.timezone,
-        config.indicator_engine,
-    )?;
+    let mut features =
+        FeatureCache::with_engine(decision_bars, &broker.timezone, config.indicator_engine)?;
     let mut balance = config.initial_balance;
     let mut position: Option<OpenPosition> = None;
     let mut pending: Option<PendingOrder> = None;
@@ -295,8 +298,7 @@ pub fn evaluate_strategy_m1(
         // M1 window for the just-completed decision bar (set at end of prior loop).
         let previous_execution_bars = last_execution_bars;
         let current_local = broker_clock.local_datetime(opening_minute.timestamp_ms)?;
-        let in_close_blackout =
-            current_local.hour() >= strategy.manage.end_of_day_hour as u32;
+        let in_close_blackout = current_local.hour() >= strategy.manage.end_of_day_hour as u32;
         let in_entry_window = config.entry_window.contains(current_local.hour());
         let day_key = current_local.date();
         if active_entry_day != Some(day_key) {
@@ -391,40 +393,38 @@ pub fn evaluate_strategy_m1(
         }
 
         if !closed_this_decision && let Some(open) = position.as_ref() {
-            let event = if let Some(event) =
-                protective_gap_exit(open, opening_minute, opening_spread_price, broker)
-            {
-                Some(event)
-            } else if let Some(exit) = match open.side {
-                PositionSide::Long => strategy.long_exit(),
-                PositionSide::Short => strategy.short_exit(),
-            }
-                && features.evaluate_bool(exit, decision_index)?
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(
-                        open.side,
-                        opening_minute.open,
-                        opening_spread_price,
-                    ),
-                    reason: ExitReason::Indicator,
-                })
-            } else if strategy
-                .manage
-                .time_stop_bars
-                .is_some_and(|limit| decision_index - open.entry_decision_index >= limit as usize)
-            {
-                Some(ExitEvent {
-                    base_price: market_exit_base(
-                        open.side,
-                        opening_minute.open,
-                        opening_spread_price,
-                    ),
-                    reason: ExitReason::TimeStop,
-                })
-            } else {
-                None
-            };
+            let event =
+                if let Some(event) =
+                    protective_gap_exit(open, opening_minute, opening_spread_price, broker)
+                {
+                    Some(event)
+                } else if let Some(exit) = match open.side {
+                    PositionSide::Long => strategy.long_exit(),
+                    PositionSide::Short => strategy.short_exit(),
+                } && features.evaluate_bool(exit, decision_index)?
+                {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(
+                            open.side,
+                            opening_minute.open,
+                            opening_spread_price,
+                        ),
+                        reason: ExitReason::Indicator,
+                    })
+                } else if strategy.manage.time_stop_bars.is_some_and(|limit| {
+                    decision_index - open.entry_decision_index >= limit as usize
+                }) {
+                    Some(ExitEvent {
+                        base_price: market_exit_base(
+                            open.side,
+                            opening_minute.open,
+                            opening_spread_price,
+                        ),
+                        reason: ExitReason::TimeStop,
+                    })
+                } else {
+                    None
+                };
             if let Some(event) = event {
                 let open = position.take().expect("position was checked above");
                 close_position(
@@ -599,13 +599,7 @@ pub fn evaluate_strategy_m1(
                     protective_intrabar_exit(open, minute, spread_price, broker, &mut telemetry)
                 } else {
                     protective_gap_exit(open, minute, spread_price, broker).or_else(|| {
-                        protective_intrabar_exit(
-                            open,
-                            minute,
-                            spread_price,
-                            broker,
-                            &mut telemetry,
-                        )
+                        protective_intrabar_exit(open, minute, spread_price, broker, &mut telemetry)
                     })
                 };
                 if let Some(event) = event {
@@ -739,6 +733,14 @@ fn open_position(
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
+    let margin_reference_price = match side {
+        PositionSide::Long => bar.open + spread_price,
+        PositionSide::Short => bar.open,
+    };
+    if !margin_is_affordable(balance, volume, broker, margin_reference_price) {
+        telemetry.skipped_insufficient_margin += 1;
+        return Ok(None);
+    }
 
     let slippage = config.costs.adverse_slippage_points_per_side * broker.point;
     let intended_entry_price = normalize_price(
@@ -882,6 +884,10 @@ fn place_pending_order(
         telemetry.skipped_below_minimum_volume += 1;
         return Ok(None);
     };
+    if !margin_is_affordable(balance, volume, broker, activation_price) {
+        telemetry.skipped_insufficient_margin += 1;
+        return Ok(None);
+    }
     Ok(Some(PendingOrder {
         side,
         kind,
@@ -958,9 +964,7 @@ fn fill_pending_order(
     );
     let stop_loss = normalize_price(order.stop_loss, broker);
     let take_profit = normalize_price(order.take_profit, broker);
-    let initial_risk_distance = (entry_price - stop_loss)
-        .abs()
-        .max(order.stop_distance);
+    let initial_risk_distance = (entry_price - stop_loss).abs().max(order.stop_distance);
     OpenPosition {
         side: order.side,
         entry_decision_index: decision_index,
@@ -1036,6 +1040,29 @@ fn normalize_volume(raw_volume: f64, broker: &SymbolSpecification) -> Option<f64
     let steps = (raw_volume / broker.volume_step + 1.0e-12).floor();
     let volume = (steps * broker.volume_step).min(broker.volume_max);
     (volume + 1.0e-12 >= broker.volume_min).then_some(volume)
+}
+
+fn margin_is_affordable(
+    balance: f64,
+    volume: f64,
+    broker: &SymbolSpecification,
+    reference_price: f64,
+) -> bool {
+    if !balance.is_finite() || balance <= 0.0 || !reference_price.is_finite() {
+        return false;
+    }
+    // Some MT5 symbols (notably indices and crypto) omit an initial-margin
+    // value from the exported broker profile. In that case use the standard
+    // contract-value/leverage estimate so QF cannot keep opening fixed-risk
+    // orders after MT5 would reject them for insufficient free margin.
+    let raw_margin_per_lot = broker
+        .margin_initial_per_lot
+        .unwrap_or(broker.contract_size * reference_price);
+    if !raw_margin_per_lot.is_finite() || raw_margin_per_lot <= 0.0 {
+        return false;
+    }
+    let required = raw_margin_per_lot / PARITY_TESTER_LEVERAGE * volume;
+    required.is_finite() && balance + 1.0e-9 >= required
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1779,8 +1806,7 @@ mod tests {
         let decisions = dataset(
             (0..8)
                 .map(|index| {
-                    let mut decision =
-                        bar(base + index * 3_600_000, 100.0, 101.0, 99.0, 100.0, 0);
+                    let mut decision = bar(base + index * 3_600_000, 100.0, 101.0, 99.0, 100.0, 0);
                     decision.tick_volume = 60;
                     decision
                 })

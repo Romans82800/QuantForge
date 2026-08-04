@@ -153,14 +153,8 @@ pub struct ParityMetrics {
 /// MT5 counts a closing deal as a profit trade when its net profit is strictly
 /// above zero, so a break-even exit is neither a win nor a loss.
 fn classify_trades(trades: &[ParityTrade]) -> (usize, usize, f64, Option<f64>) {
-    let winning = trades
-        .iter()
-        .filter(|trade| trade.net_profit > 0.0)
-        .count();
-    let losing = trades
-        .iter()
-        .filter(|trade| trade.net_profit < 0.0)
-        .count();
+    let winning = trades.iter().filter(|trade| trade.net_profit > 0.0).count();
+    let losing = trades.iter().filter(|trade| trade.net_profit < 0.0).count();
     let win_rate = if trades.is_empty() {
         0.0
     } else {
@@ -255,6 +249,22 @@ impl ParityRun {
     }
 }
 
+impl ParityMetrics {
+    /// MT5's recovery factor is net profit divided by absolute equity maximum
+    /// drawdown.  Keep this derived from the parity metrics so QF and MT5 are
+    /// compared using exactly the same definition rather than trusting either
+    /// engine's headline statistic.
+    pub fn recovery_factor(&self) -> f64 {
+        if self.max_drawdown > 0.0 {
+            self.net_profit / self.max_drawdown
+        } else if self.net_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            self.net_profit
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ParityTolerances {
@@ -327,6 +337,17 @@ pub struct DiffReport {
     pub max_drawdown_delta: f64,
     pub max_drawdown_delta_relative: f64,
     pub max_drawdown_passed: bool,
+    /// Recovery factor is a first-class parity diagnostic and gate. A large
+    /// QF RF collapsing in MT5 is a real economic mismatch even when return
+    /// and trade count happen to be within tolerance.
+    #[serde(default)]
+    pub reference_recovery_factor: Option<f64>,
+    #[serde(default)]
+    pub external_recovery_factor: Option<f64>,
+    #[serde(default)]
+    pub recovery_factor_delta_relative: Option<f64>,
+    #[serde(default)]
+    pub recovery_factor_passed: bool,
     pub max_equity_path_divergence: f64,
     pub max_equity_path_divergence_percent: f64,
     pub equity_path_passed: bool,
@@ -374,6 +395,18 @@ pub fn compare_runs(
         relative_delta(max_drawdown_delta, reference.metrics.max_drawdown);
     let max_drawdown_passed = max_drawdown_delta_relative <= tolerances.max_drawdown_relative;
 
+    let reference_recovery_factor = reference.metrics.recovery_factor();
+    let external_recovery_factor = external.metrics.recovery_factor();
+    let recovery_factor_delta_relative =
+        relative_delta_with_nonfinite(external_recovery_factor, reference_recovery_factor);
+    // Use the stricter of the existing money tolerances. This keeps the public
+    // parity configuration backwards-compatible while preventing a silent RF
+    // collapse from passing the old return/DD gates.
+    let recovery_factor_tolerance = tolerances
+        .net_profit_relative
+        .min(tolerances.max_drawdown_relative);
+    let recovery_factor_passed = recovery_factor_delta_relative <= recovery_factor_tolerance;
+
     let max_equity_path_divergence = equity_divergence(reference, external, 256);
     let max_equity_path_divergence_percent = if reference.metrics.initial_balance > 0.0 {
         max_equity_path_divergence / reference.metrics.initial_balance * 100.0
@@ -410,6 +443,7 @@ pub fn compare_runs(
         && trade_alignment_passed
         && net_profit_passed
         && max_drawdown_passed
+        && recovery_factor_passed
         && equity_path_passed;
 
     Ok(DiffReport {
@@ -425,6 +459,10 @@ pub fn compare_runs(
         max_drawdown_delta,
         max_drawdown_delta_relative,
         max_drawdown_passed,
+        reference_recovery_factor: finite_value(reference_recovery_factor),
+        external_recovery_factor: finite_value(external_recovery_factor),
+        recovery_factor_delta_relative: finite_value(recovery_factor_delta_relative),
+        recovery_factor_passed,
         max_equity_path_divergence,
         max_equity_path_divergence_percent,
         equity_path_passed,
@@ -471,15 +509,14 @@ pub fn load_mt5_tester_run_in_timezone(
     let mut equity = load_equity(equity_path.as_ref())?;
     if let Some(timezone) = timezone {
         for deal in &mut deals {
-            deal.timestamp_ms = timezone.server_epoch_ms_to_utc_ms(deal.timestamp_ms).ok_or_else(
-                || {
+            deal.timestamp_ms = timezone
+                .server_epoch_ms_to_utc_ms(deal.timestamp_ms)
+                .ok_or_else(|| {
                     ParityError::InvalidInput(format!(
                         "cannot localize MT5 deal timestamp {} with {}",
-                        deal.timestamp_ms,
-                        timezone
+                        deal.timestamp_ms, timezone
                     ))
-                },
-            )?;
+                })?;
         }
         for point in &mut equity {
             point.timestamp_ms = timezone
@@ -719,8 +756,7 @@ fn align_trades(reference: &ParityRun, external: &ParityRun) -> Vec<TradeDiff> {
             let better = match best {
                 None => true,
                 Some((best_time, best_price, _)) => {
-                    time_delta < best_time
-                        || (time_delta == best_time && price_delta < best_price)
+                    time_delta < best_time || (time_delta == best_time && price_delta < best_price)
                 }
             };
             if better {
@@ -831,6 +867,18 @@ fn resample_balance(values: &[f64], points: usize) -> Vec<f64> {
 
 fn relative_delta(delta: f64, reference: f64) -> f64 {
     delta.abs() / reference.abs().max(1.0)
+}
+
+fn relative_delta_with_nonfinite(value: f64, reference: f64) -> f64 {
+    match (value.is_finite(), reference.is_finite()) {
+        (true, true) => relative_delta(value - reference, reference),
+        (false, false) if value.is_sign_positive() == reference.is_sign_positive() => 0.0,
+        _ => f64::INFINITY,
+    }
+}
+
+fn finite_value(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 fn validate_tolerances(value: &ParityTolerances) -> Result<(), ParityError> {
@@ -968,6 +1016,24 @@ mod tests {
         let pass = compare_runs(&run(100.0), &run(100.0), &evidence(), strict).unwrap();
         assert!(pass.passed);
         assert_eq!(pass.allowed_trade_count_delta, 0);
+    }
+
+    #[test]
+    fn recovery_factor_collapse_is_reported_and_gated() {
+        let mut reference = run(100.0);
+        let mut external = run(100.0);
+        // Same realised return and trade, but MT5 has five times the equity
+        // drawdown: RF falls from 10 to 2. The diagnostic DD tolerance is
+        // deliberately loose here so this assertion isolates the RF gate.
+        reference.metrics.max_drawdown = 10.0;
+        external.metrics.max_drawdown = 50.0;
+        let mut tolerances = ParityTolerances::default();
+        tolerances.max_drawdown_relative = 10.0;
+        let report = compare_runs(&reference, &external, &evidence(), tolerances).unwrap();
+        assert_eq!(report.reference_recovery_factor, Some(10.0));
+        assert_eq!(report.external_recovery_factor, Some(2.0));
+        assert!(!report.recovery_factor_passed);
+        assert!(!report.passed);
     }
 
     #[test]

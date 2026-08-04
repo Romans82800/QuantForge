@@ -1,4 +1,4 @@
-use crate::data_lab::{display_path, load_bound_broker, load_data_source, build_decision_from_m1};
+use crate::data_lab::{build_decision_from_m1, display_path, load_bound_broker, load_data_source};
 use crate::workflow::{
     ChallengeArtifact, IndicatorParityArtifact, JudgeArtifact, ParityArtifact, ScoutArtifactInput,
     ensure_new, manifest, read_json, recipe_path, write_json_new, write_text_new,
@@ -154,6 +154,10 @@ pub struct ParityView {
     external_winning_trades: usize,
     reference_profit_factor: Option<f64>,
     external_profit_factor: Option<f64>,
+    reference_recovery_factor: Option<f64>,
+    external_recovery_factor: Option<f64>,
+    recovery_factor_delta_relative: Option<f64>,
+    recovery_factor_passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -442,35 +446,34 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
     let out = ensure_new(&request.output_path, "parity artifact")?;
     let reference_bytes = fs::read(&request.reference_path)
         .map_err(|error| format!("cannot read parity reference: {error}"))?;
-    let (reference_manifest, reference_fingerprint, reference) = if let Ok(judge) =
-        serde_json::from_slice::<JudgeArtifact>(&reference_bytes)
-    {
-        (
-            judge.manifest,
-            judge.strategy_fingerprint,
-            ParityRun::from_judge(&judge.result),
-        )
-    } else if let Ok(scout) = serde_json::from_slice::<ScoutArtifactInput>(&reference_bytes) {
-        (
-            scout.manifest,
-            scout.strategy_fingerprint,
-            ParityRun::from_scout(&scout.result),
-        )
-    } else {
-        let challenge: ChallengeArtifact = serde_json::from_slice(&reference_bytes)
-            .map_err(|error| {
-                format!("reference is neither Judge, Scout, nor Challenge JSON: {error}")
-            })?;
-        challenge
-            .report
-            .validate_integrity()
-            .map_err(|error| error.to_string())?;
-        (
-            challenge.manifest,
-            challenge.report.binding.strategy_fingerprint,
-            ParityRun::from_scout(&challenge.report.baseline),
-        )
-    };
+    let (reference_manifest, reference_fingerprint, reference) =
+        if let Ok(judge) = serde_json::from_slice::<JudgeArtifact>(&reference_bytes) {
+            (
+                judge.manifest,
+                judge.strategy_fingerprint,
+                ParityRun::from_judge(&judge.result),
+            )
+        } else if let Ok(scout) = serde_json::from_slice::<ScoutArtifactInput>(&reference_bytes) {
+            (
+                scout.manifest,
+                scout.strategy_fingerprint,
+                ParityRun::from_scout(&scout.result),
+            )
+        } else {
+            let challenge: ChallengeArtifact =
+                serde_json::from_slice(&reference_bytes).map_err(|error| {
+                    format!("reference is neither Judge, Scout, nor Challenge JSON: {error}")
+                })?;
+            challenge
+                .report
+                .validate_integrity()
+                .map_err(|error| error.to_string())?;
+            (
+                challenge.manifest,
+                challenge.report.binding.strategy_fingerprint,
+                ParityRun::from_scout(&challenge.report.baseline),
+            )
+        };
     let mut evidence: quantforge_export_mql5::ExportEvidenceCard =
         read_json(&request.evidence_path)?;
     if reference_fingerprint != evidence.strategy_fingerprint
@@ -596,6 +599,10 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         external_winning_trades: artifact.report.external_winning_trades,
         reference_profit_factor: artifact.report.reference_profit_factor,
         external_profit_factor: artifact.report.external_profit_factor,
+        reference_recovery_factor: artifact.report.reference_recovery_factor,
+        external_recovery_factor: artifact.report.external_recovery_factor,
+        recovery_factor_delta_relative: artifact.report.recovery_factor_delta_relative,
+        recovery_factor_passed: artifact.report.recovery_factor_passed,
     })
 }
 
