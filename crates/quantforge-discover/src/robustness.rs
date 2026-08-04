@@ -43,6 +43,14 @@ pub enum RobustnessReject {
 pub struct RobustnessConfig {
     pub folds: usize,
     pub monte_carlo_trials: usize,
+    /// Moving-block length for trade-resampling Monte Carlo (default 5).
+    pub monte_carlo_block_length: usize,
+    /// Fraction of trades removed from each MC path (default 0.10).
+    pub monte_carlo_skip_trade_probability: f64,
+    /// P80 net-profit retention vs baseline required to pass (default 0.60).
+    pub monte_carlo_minimum_p80_profit_retention: f64,
+    /// P95 simulated drawdown may not exceed this multiple of baseline DD.
+    pub monte_carlo_max_drawdown_ratio: f64,
     pub neighborhood_samples: usize,
     pub seed: u64,
     pub initial_balance: f64,
@@ -213,23 +221,23 @@ pub fn run_m1_predeposit_robustness(
         .map(|trade| trade.net_profit)
         .collect();
     let maximum_p95_drawdown_percent =
-        baseline.metrics.max_drawdown_percent * MONTE_CARLO_MAX_DRAWDOWN_RATIO;
+        baseline.metrics.max_drawdown_percent * config.monte_carlo_max_drawdown_ratio;
     let mut mc = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.initial_balance,
         config.monte_carlo_trials,
-        5,
-        MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+        config.monte_carlo_block_length.max(1),
+        config.monte_carlo_skip_trade_probability,
         config.seed,
         0.0,
         maximum_p95_drawdown_percent,
         baseline.metrics.net_profit,
-        MONTE_CARLO_P80_PROFIT_RETENTION,
+        config.monte_carlo_minimum_p80_profit_retention,
     );
     mc.baseline_max_drawdown_percent = baseline.metrics.max_drawdown_percent;
-    mc.maximum_drawdown_ratio = MONTE_CARLO_MAX_DRAWDOWN_RATIO;
-    // Require a non-negative median path and the shared P80 retention gate
-    // (p80_net_profit >= 60% of baseline net profit) encoded in `mc.passed`.
+    mc.maximum_drawdown_ratio = config.monte_carlo_max_drawdown_ratio;
+    // Require a non-negative median path and the configured P80 retention gate
+    // encoded in `mc.passed`.
     if !mc.passed || mc.median_net_profit < 0.0 {
         return Err(RobustnessReject::MonteCarlo);
     }

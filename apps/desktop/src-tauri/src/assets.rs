@@ -33,6 +33,7 @@ pub struct SymbolPack {
     metadata_path: String,
     m1_data_path: String,
     m1_metadata_path: String,
+    quote_path: Option<String>,
     broker_path: String,
     default_databank_path: String,
     pack_root: String,
@@ -269,6 +270,7 @@ fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
         {
             continue;
         }
+        let quote_path = infer_pack_quote_path(&m1);
         let default_databank_path = quantforge_runs_root()
             .join(&symbol)
             .join("Databank")
@@ -279,6 +281,7 @@ fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
             metadata_path: canonical_display(&h1_meta),
             m1_data_path: canonical_display(&m1),
             m1_metadata_path: canonical_display(&m1_meta),
+            quote_path: quote_path.as_ref().map(|path| canonical_display(path)),
             broker_path: canonical_display(&broker_path),
             default_databank_path: default_databank_path.display().to_string(),
             pack_root: canonical_display(pack_root),
@@ -292,6 +295,12 @@ fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
         ));
     }
     Ok(symbols)
+}
+
+fn infer_pack_quote_path(m1_path: &Path) -> Option<PathBuf> {
+    let stem = m1_path.file_stem()?.to_str()?;
+    let candidate = m1_path.with_file_name(format!("{stem}.quotes.csv"));
+    candidate.is_file().then_some(candidate)
 }
 
 fn canonical_display(path: &Path) -> String {

@@ -246,11 +246,29 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
             request.entry_window_end_hour,
         ),
     };
-    let quote_dataset = request
+    let inferred_quote = request
         .quote_path
         .as_deref()
-        .map(|path| load_quote_sidecar(path, m1.metadata.as_ref()))
+        .map(PathBuf::from)
+        .or_else(|| crate::discover::infer_quote_path_public(&request.m1_data_path));
+    let quote_dataset = inferred_quote
+        .as_ref()
+        .map(|path| load_quote_sidecar(&path.display().to_string(), m1.metadata.as_ref()))
         .transpose()?;
+    let pending_entry = matches!(
+        strategy.entry.order,
+        quantforge_ir::EntryOrderPolicy::Stop { .. } | quantforge_ir::EntryOrderPolicy::Limit { .. }
+    );
+    if pending_entry && quote_dataset.is_none() {
+        return Err(format!(
+            "stop/limit strategies require a bid/ask M1 quote sidecar for Judge certification \
+             (place {}.quotes.csv beside the M1 pack, or re-import ticks with qf-import-market)",
+            Path::new(&request.m1_data_path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("M1")
+        ));
+    }
     let result = if let Some(quotes) = quote_dataset.as_ref() {
         evaluate_strategy_m1_with_quotes(
             &strategy,
@@ -303,10 +321,9 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
             ("m1_data_hash".into(), json!(&m1.dataset.data_hash)),
             (
                 "quote_source".into(),
-                request
-                    .quote_path
-                    .as_deref()
-                    .map(recipe_path)
+                inferred_quote
+                    .as_ref()
+                    .map(|path| recipe_path(&path.display().to_string()))
                     .unwrap_or(serde_json::Value::Null),
             ),
             (

@@ -116,7 +116,7 @@ export async function exportEliteEas(
   timeframe: string,
   baseMagic: number,
 ): Promise<BatchEaExportView | null> {
-  const directory = await chooseDirectory("Choose an empty folder for the EA batch");
+  const directory = await chooseDirectory("Choose a folder for MQ5 experts");
   if (!directory) return null;
   const request: BatchEaExportRequest = {
     fingerprints,

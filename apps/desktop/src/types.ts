@@ -50,6 +50,8 @@ export interface SymbolPack {
   metadataPath: string;
   m1DataPath: string;
   m1MetadataPath: string;
+  /** Bid/ask M1 quote sidecar when present beside the pack M1 file. */
+  quotePath: string | null;
   brokerPath: string;
   defaultDatabankPath: string;
   packRoot: string;
@@ -541,6 +543,10 @@ export interface DiscoverRequest {
   requireM1Robustness: boolean | null;
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
+  robustnessMonteCarloBlockLength: number | null;
+  robustnessMonteCarloSkipTradeProbability: number | null;
+  robustnessMonteCarloP80ProfitRetention: number | null;
+  robustnessMonteCarloMaxDrawdownRatio: number | null;
   robustnessNeighborhoodSamples: number | null;
   robustnessPerturbationFraction: number | null;
   minimumNeighborhoodSurvivalFraction: number | null;
@@ -710,6 +716,8 @@ export interface ChallengeRequest {
   entryWindowEndHour: number | null;
   folds: number;
   monteCarloTrials: number;
+  monteCarloBlockLength: number;
+  monteCarloMinimumP80ProfitRetention: number;
   neighborhoodSamples: number;
   seed: number;
 }

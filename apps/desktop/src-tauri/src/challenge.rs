@@ -42,8 +42,20 @@ pub struct ChallengeRequest {
     entry_window_end_hour: Option<u32>,
     folds: usize,
     monte_carlo_trials: usize,
+    #[serde(default = "default_challenge_monte_carlo_block_length")]
+    monte_carlo_block_length: usize,
+    #[serde(default = "default_challenge_monte_carlo_p80_retention")]
+    monte_carlo_minimum_p80_profit_retention: f64,
     neighborhood_samples: usize,
     seed: u64,
+}
+
+fn default_challenge_monte_carlo_block_length() -> usize {
+    5
+}
+
+fn default_challenge_monte_carlo_p80_retention() -> f64 {
+    quantforge_quality::MONTE_CARLO_P80_PROFIT_RETENTION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -262,6 +274,10 @@ fn run_challenge_sync(request: &ChallengeRequest) -> Result<ChallengeView, Strin
         },
         folds: request.folds,
         monte_carlo_trials: request.monte_carlo_trials,
+        monte_carlo_block_length: request.monte_carlo_block_length.max(1),
+        monte_carlo_minimum_p80_profit_retention: request
+            .monte_carlo_minimum_p80_profit_retention
+            .clamp(0.0, 1.0),
         neighborhood_samples: request.neighborhood_samples,
         evaluations_touched: request.evaluations_touched,
         seed: request.seed,

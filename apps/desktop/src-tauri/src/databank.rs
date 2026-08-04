@@ -805,6 +805,19 @@ fn run_elite_robustness_sync(
                 .into(),
         );
     }
+    let pending_entry = matches!(
+        snapshot.elite.strategy.entry.order,
+        quantforge_ir::EntryOrderPolicy::Stop { .. }
+            | quantforge_ir::EntryOrderPolicy::Limit { .. }
+    ) || snapshot.config.allow_stop_entries
+        || snapshot.config.allow_limit_entries;
+    if pending_entry && quote_dataset.is_none() {
+        return Err(
+            "stop/limit strategies require a bid/ask M1 quote sidecar for Results robustness \
+             (re-import ticks with qf-import-market and install_icmarkets_pack.py)"
+                .into(),
+        );
+    }
     let broker = load_bound_broker(&snapshot.broker, decision_source.metadata.as_ref())?;
     load_bound_broker(&snapshot.broker, m1_source.metadata.as_ref())?;
 
@@ -832,6 +845,16 @@ fn run_elite_robustness_sync(
     let config = RobustnessConfig {
         folds,
         monte_carlo_trials,
+        monte_carlo_block_length: snapshot.config.robustness_monte_carlo_block_length,
+        monte_carlo_skip_trade_probability: snapshot
+            .config
+            .robustness_monte_carlo_skip_trade_probability,
+        monte_carlo_minimum_p80_profit_retention: snapshot
+            .config
+            .robustness_monte_carlo_p80_profit_retention,
+        monte_carlo_max_drawdown_ratio: snapshot
+            .config
+            .robustness_monte_carlo_max_drawdown_ratio,
         neighborhood_samples,
         seed: snapshot.config.seed,
         initial_balance: snapshot.config.scout.initial_balance,
@@ -900,16 +923,20 @@ fn run_elite_robustness_sync(
                 ("folds".into(), json!(folds)),
                 ("monte_carlo_trials".into(), json!(monte_carlo_trials)),
                 (
+                    "monte_carlo_block_length".into(),
+                    json!(config.monte_carlo_block_length),
+                ),
+                (
                     "monte_carlo_skip_trade_probability".into(),
-                    json!(quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY),
+                    json!(config.monte_carlo_skip_trade_probability),
                 ),
                 (
                     "monte_carlo_minimum_p80_profit_retention".into(),
-                    json!(quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION),
+                    json!(config.monte_carlo_minimum_p80_profit_retention),
                 ),
                 (
                     "monte_carlo_max_drawdown_ratio".into(),
-                    json!(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
+                    json!(config.monte_carlo_max_drawdown_ratio),
                 ),
                 ("neighborhood_samples".into(), json!(neighborhood_samples)),
                 (
@@ -1020,7 +1047,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::MonteCarlo => (
             "monte_carlo",
-            "Failed the block-bootstrap Monte Carlo requirement (P80 net profit must keep ≥60% of baseline).",
+            "Failed the block-bootstrap Monte Carlo requirement (P80 net-profit retention vs baseline).",
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",
@@ -1403,19 +1430,6 @@ fn export_elite_eas_to(
             directory.display()
         )));
     }
-    if directory
-        .read_dir()
-        .map_err(DesktopError::Io)?
-        .next()
-        .transpose()
-        .map_err(DesktopError::Io)?
-        .is_some()
-    {
-        return Err(DesktopError::InvalidExport(format!(
-            "{} is not empty; choose an empty folder",
-            directory.display()
-        )));
-    }
     let unique: std::collections::BTreeSet<_> = request.fingerprints.iter().collect();
     if unique.len() != request.fingerprints.len() {
         return Err(DesktopError::InvalidExport(
@@ -1444,7 +1458,7 @@ fn export_elite_eas_to(
     let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
     let broker = load_bound_broker(&loaded.broker, None).map_err(DesktopError::InvalidExport)?;
     let costs = &loaded.bank.config.scout.costs;
-    let mut exports = Vec::with_capacity(request.fingerprints.len());
+    let mut planned = Vec::with_capacity(request.fingerprints.len());
     let mut used_names = std::collections::BTreeSet::new();
     for (offset, fingerprint) in request.fingerprints.iter().enumerate() {
         let elite = loaded
@@ -1493,99 +1507,32 @@ fn export_elite_eas_to(
         };
         let bundle = generate_bundle(&elite.strategy, &broker, &config)
             .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-        let strategy_path = directory.join(format!("{expert_name}.strategy.ir.json"));
         let source_path = directory.join(format!("{expert_name}.mq5"));
-        let settings_path = directory.join(format!("{expert_name}.set"));
-        let tester_path = directory.join(format!("{expert_name}.tester.ini"));
-        let evidence_path = directory.join(format!("{expert_name}.evidence.json"));
-        exports.push((
-            elite,
-            expert_name,
-            config.magic,
-            bundle,
-            strategy_path,
-            source_path,
-            settings_path,
-            tester_path,
-            evidence_path,
-        ));
-    }
-    let index_path = directory.join("quantforge-ea-batch.json");
-    if index_path.exists() {
-        return Err(DesktopError::InvalidExport(format!(
-            "{} already exists; choose an empty folder",
-            index_path.display()
-        )));
+        if source_path.exists() {
+            return Err(DesktopError::InvalidExport(format!(
+                "{} already exists; rename or remove it, then export again",
+                source_path.display()
+            )));
+        }
+        planned.push((expert_name, bundle, source_path));
     }
 
-    for (elite, _, _, bundle, strategy, source, settings, tester, evidence) in &exports {
-        quantforge_storage::write_json_new(strategy, &elite.strategy)
-            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    // Bulk strategy export is MQ5-only: no .set, tester.ini, evidence, IR, or
+    // batch index. The folder may already contain other files.
+    let mut expert_paths = Vec::with_capacity(planned.len());
+    for (_, bundle, source) in &planned {
         write_text_new(source, &bundle.source)
             .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-        for support in &bundle.support_files {
-            let path = directory.join(&support.relative_path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-            }
-            write_text_new(&path, &support.contents)
-                .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-        }
-        write_text_new(settings, &bundle.set_file)
-            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-        write_text_new(tester, &bundle.tester_ini)
-            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
-        quantforge_storage::write_json_new(evidence, &bundle.evidence)
-            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+        expert_paths.push(canonical_display(source));
     }
-    let index = serde_json::json!({
-        "schema_version": 1,
-        "kind": "quantforge-mql5-ea-batch",
-        "purpose": "research export; generated experts default to live trading disabled",
-        "grammar_version": loaded.bank.grammar_version,
-        "data_hash": loaded.bank.data_hash,
-        "execution_data_hash": loaded.bank.execution_data_hash,
-        "broker_spec_hash": loaded.bank.broker_spec_hash,
-        "timeframe": request.timeframe,
-        "tester_model": "1 minute OHLC",
-        "strategies": exports.iter().map(|(elite, expert_name, magic, _, strategy, source, settings, tester, evidence)| serde_json::json!({
-            "fingerprint": elite.structural_fingerprint,
-            "strategy_id": elite.strategy.id,
-            "entry_conditions": elite.niche.entry_conditions,
-            "exit_conditions": elite.descriptor.exit_conditions,
-            "grade": "illuminated",
-            "magic": magic,
-            "expert_name": expert_name,
-            "strategy_ir": canonical_display(strategy),
-            "source": canonical_display(source),
-            "settings": canonical_display(settings),
-            "tester": canonical_display(tester),
-            "evidence": canonical_display(evidence),
-        })).collect::<Vec<_>>(),
-    });
-    quantforge_storage::write_json_new(&index_path, &index)
-        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
 
     Ok(BatchEaExportView {
         directory: canonical_display(directory),
-        index_path: canonical_display(&index_path),
-        expert_paths: exports
-            .iter()
-            .map(|(_, _, _, _, _, source, _, _, _)| canonical_display(source))
-            .collect(),
-        settings_paths: exports
-            .iter()
-            .map(|(_, _, _, _, _, _, settings, _, _)| canonical_display(settings))
-            .collect(),
-        tester_paths: exports
-            .iter()
-            .map(|(_, _, _, _, _, _, _, tester, _)| canonical_display(tester))
-            .collect(),
-        evidence_paths: exports
-            .iter()
-            .map(|(_, _, _, _, _, _, _, _, evidence)| canonical_display(evidence))
-            .collect(),
+        index_path: String::new(),
+        expert_paths,
+        settings_paths: Vec::new(),
+        tester_paths: Vec::new(),
+        evidence_paths: Vec::new(),
     })
 }
 

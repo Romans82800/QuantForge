@@ -637,6 +637,18 @@ pub struct DiscoverConfig {
     pub robustness_folds: usize,
     #[serde(default = "default_robustness_monte_carlo_trials")]
     pub robustness_monte_carlo_trials: usize,
+    /// Moving-block length for Discover Monte Carlo trade resampling.
+    #[serde(default = "default_robustness_monte_carlo_block_length")]
+    pub robustness_monte_carlo_block_length: usize,
+    /// Fraction of trades skipped on each MC path (SQX-style trade manipulation).
+    #[serde(default = "default_robustness_monte_carlo_skip_trade_probability")]
+    pub robustness_monte_carlo_skip_trade_probability: f64,
+    /// P80 net-profit retention floor vs baseline (default 0.60).
+    #[serde(default = "default_robustness_monte_carlo_p80_profit_retention")]
+    pub robustness_monte_carlo_p80_profit_retention: f64,
+    /// Cap on P95 MC drawdown as a multiple of baseline max DD (default 1.75).
+    #[serde(default = "default_robustness_monte_carlo_max_drawdown_ratio")]
+    pub robustness_monte_carlo_max_drawdown_ratio: f64,
     #[serde(default = "default_robustness_neighborhood_samples")]
     pub robustness_neighborhood_samples: usize,
     /// Size of the ±% jitter applied to every numeric gene when probing the
@@ -713,6 +725,22 @@ fn default_robustness_monte_carlo_trials() -> usize {
     250
 }
 
+fn default_robustness_monte_carlo_block_length() -> usize {
+    5
+}
+
+fn default_robustness_monte_carlo_skip_trade_probability() -> f64 {
+    crate::robustness::MONTE_CARLO_SKIP_TRADE_PROBABILITY
+}
+
+fn default_robustness_monte_carlo_p80_profit_retention() -> f64 {
+    crate::robustness::MONTE_CARLO_P80_PROFIT_RETENTION
+}
+
+fn default_robustness_monte_carlo_max_drawdown_ratio() -> f64 {
+    crate::robustness::MONTE_CARLO_MAX_DRAWDOWN_RATIO
+}
+
 fn default_robustness_neighborhood_samples() -> usize {
     8
 }
@@ -779,6 +807,13 @@ impl Default for DiscoverConfig {
             require_m1_robustness: default_require_m1_robustness(),
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
+            robustness_monte_carlo_block_length: default_robustness_monte_carlo_block_length(),
+            robustness_monte_carlo_skip_trade_probability:
+                default_robustness_monte_carlo_skip_trade_probability(),
+            robustness_monte_carlo_p80_profit_retention:
+                default_robustness_monte_carlo_p80_profit_retention(),
+            robustness_monte_carlo_max_drawdown_ratio:
+                default_robustness_monte_carlo_max_drawdown_ratio(),
             robustness_neighborhood_samples: default_robustness_neighborhood_samples(),
             robustness_perturbation_fraction: default_robustness_perturbation_fraction(),
             minimum_neighborhood_survival_fraction: default_minimum_neighborhood_survival_fraction(
@@ -956,11 +991,40 @@ impl DiscoverConfig {
                     "robustness_folds must be at least 2".into(),
                 ));
             }
-            if self.robustness_monte_carlo_trials == 0 || self.robustness_neighborhood_samples == 0
+            if self.robustness_monte_carlo_trials == 0
+                || self.robustness_monte_carlo_block_length == 0
+                || self.robustness_neighborhood_samples == 0
             {
                 return Err(DiscoverError::InvalidConfig(
-                    "robustness Monte Carlo trials and neighborhood samples must be positive"
+                    "robustness Monte Carlo trials, block length and neighborhood samples must be positive"
                         .into(),
+                ));
+            }
+            if !self
+                .robustness_monte_carlo_skip_trade_probability
+                .is_finite()
+                || !(0.0..1.0).contains(&self.robustness_monte_carlo_skip_trade_probability)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_monte_carlo_skip_trade_probability must be finite and in [0, 1)"
+                        .into(),
+                ));
+            }
+            if !self
+                .robustness_monte_carlo_p80_profit_retention
+                .is_finite()
+                || !(0.0..=1.0).contains(&self.robustness_monte_carlo_p80_profit_retention)
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_monte_carlo_p80_profit_retention must be finite and between 0 and 1"
+                        .into(),
+                ));
+            }
+            if !self.robustness_monte_carlo_max_drawdown_ratio.is_finite()
+                || self.robustness_monte_carlo_max_drawdown_ratio < 1.0
+            {
+                return Err(DiscoverError::InvalidConfig(
+                    "robustness_monte_carlo_max_drawdown_ratio must be finite and >= 1".into(),
                 ));
             }
             if !self.minimum_neighborhood_survival_fraction.is_finite()

@@ -61,6 +61,22 @@ def install_symbol(staging: Path, pack: Path, symbol: str, stem: str) -> None:
     shutil.copy2(m1_meta, m1_tsv.with_suffix(".metadata.csv"))
     shutil.copy2(h1_meta, h1_tsv.with_suffix(".metadata.csv"))
 
+    # Bid/ask quote sidecar from tick_bid_ask import (required for stop/limit Judge).
+    quotes_csv = staging / f"{stem}_M1.quotes.csv"
+    quotes_meta = staging / f"{stem}_M1.quotes.metadata.csv"
+    pack_quotes = pack / f"{PACK_PREFIX}{symbol}_M1{PACK_SUFFIX}.quotes.csv"
+    pack_quotes_meta = pack / f"{PACK_PREFIX}{symbol}_M1{PACK_SUFFIX}.quotes.metadata.csv"
+    if quotes_csv.exists():
+        shutil.copy2(quotes_csv, pack_quotes)
+        if quotes_meta.exists():
+            shutil.copy2(quotes_meta, pack_quotes_meta)
+        print(f"  + quote sidecar {pack_quotes.name}")
+    else:
+        for stale in (pack_quotes, pack_quotes_meta):
+            if stale.exists():
+                stale.unlink()
+        print(f"  ! no quote sidecar for {symbol} (stop/limit certification unavailable)")
+
     # Stamp symbol into metadata if import used MARKET / wrong stem.
     for meta_path in (
         m1_tsv.with_suffix(".metadata.csv"),

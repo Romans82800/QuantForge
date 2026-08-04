@@ -524,6 +524,11 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     crate::robustness::RobustnessConfig {
         folds: config.robustness_folds,
         monte_carlo_trials: config.robustness_monte_carlo_trials,
+        monte_carlo_block_length: config.robustness_monte_carlo_block_length,
+        monte_carlo_skip_trade_probability: config.robustness_monte_carlo_skip_trade_probability,
+        monte_carlo_minimum_p80_profit_retention: config
+            .robustness_monte_carlo_p80_profit_retention,
+        monte_carlo_max_drawdown_ratio: config.robustness_monte_carlo_max_drawdown_ratio,
         neighborhood_samples: config.robustness_neighborhood_samples,
         seed: config.seed,
         initial_balance: config.scout.initial_balance,
@@ -1466,6 +1471,13 @@ mod tests {
             require_m1_robustness: true,
             robustness_folds: 3,
             robustness_monte_carlo_trials: 50,
+            robustness_monte_carlo_block_length: 5,
+            robustness_monte_carlo_skip_trade_probability:
+                crate::robustness::MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+            robustness_monte_carlo_p80_profit_retention:
+                crate::robustness::MONTE_CARLO_P80_PROFIT_RETENTION,
+            robustness_monte_carlo_max_drawdown_ratio:
+                crate::robustness::MONTE_CARLO_MAX_DRAWDOWN_RATIO,
             robustness_neighborhood_samples: 2,
             robustness_perturbation_fraction: 0.20,
             minimum_neighborhood_survival_fraction: 0.7,

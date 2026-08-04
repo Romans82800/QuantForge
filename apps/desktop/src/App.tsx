@@ -389,6 +389,11 @@ function App() {
     );
   }
 
+  function selectAllElites() {
+    setBatchMessage(null);
+    setBatchSelection(new Set(filtered.map((row) => row.fingerprint)));
+  }
+
   async function exportSelectedElites() {
     setBatchBusy(true);
     setBatchMessage(null);
@@ -419,7 +424,7 @@ function App() {
       );
       if (result) {
         setBatchMessage(
-          `Exported ${result.expertPaths.length} MT5 EAs, tester presets, evidence cards, and a batch index to ${result.directory}. Live trading is disabled in every EA.`,
+          `Exported ${result.expertPaths.length} MQ5 experts to ${result.directory}. Live trading is disabled in every EA.`,
         );
       }
     } catch (reason) {
@@ -479,7 +484,11 @@ function App() {
     setBatchBusy(true);
     try {
       const result = await exportEliteEas([fingerprint], batchEaTimeframe, batchEaMagic);
-      if (result) setStripMessage(`Exported MQ5 pack → ${result.directory}`);
+      if (result) {
+        setStripMessage(
+          `Exported ${result.expertPaths.length} MQ5 expert(s) → ${result.directory}`,
+        );
+      }
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -888,6 +897,13 @@ function App() {
                       </button>
                       <button
                         className="secondary"
+                        disabled={filtered.length === 0}
+                        onClick={selectAllElites}
+                      >
+                        Select all
+                      </button>
+                      <button
+                        className="secondary"
                         disabled={batchSelection.size === 0}
                         onClick={() => setBatchSelection(new Set())}
                       >
@@ -933,10 +949,11 @@ function App() {
                     </div>
                   </div>
                   <p className="batch-message">
-                    EA batch writes one .mq5, .set, real-tick tester preset, evidence card, and
-                    strategy IR per selected strategy. Every item is named
-                    <code>SYMBOL_ENTRYCONDITIONS_UNIQUE_NUMBER</code>; that final number is also its distinct
-                    magic number. Live trading is off. Choose the strategy’s decision timeframe.
+                    EA batch writes one <code>.mq5</code> per selected strategy (no .set, tester.ini,
+                    evidence, or IR). Folder may already have other files; existing matching
+                    <code>.mq5</code> names fail instead of overwriting. Experts are named
+                    <code>SYMBOL_ENTRYCONDITIONS_UNIQUE_NUMBER</code>; that final number is also the
+                    magic. Live trading is off. Choose the strategy’s decision timeframe.
                   </p>
                   {batchMessage && <p className="batch-message">{batchMessage}</p>}
                   <EliteTable
@@ -2965,6 +2982,10 @@ function DiscoverWorkspace({
     requireM1Robustness: true,
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
+    robustnessMonteCarloBlockLength: 5,
+    robustnessMonteCarloSkipTradeProbability: 0.10,
+    robustnessMonteCarloP80ProfitRetention: 0.60,
+    robustnessMonteCarloMaxDrawdownRatio: 1.75,
     robustnessNeighborhoodSamples: 8,
     robustnessPerturbationFraction: 0.2,
     minimumNeighborhoodSurvivalFraction: 0.7,
@@ -3521,6 +3542,7 @@ function DiscoverWorkspace({
                 <label className="field-row"><span>Decision metadata</span><code>{form.metadataPath || "—"}</code></label>
                 <label className="field-row"><span>M1</span><code>{form.m1DataPath || "—"}</code></label>
                 <label className="field-row"><span>M1 metadata</span><code>{form.m1MetadataPath || "—"}</code></label>
+                <label className="field-row"><span>Quote sidecar</span><code>{form.m1DataPath ? (form.m1DataPath.replace(/\.(tsv|csv)$/i, "") + ".quotes.csv") : "—"}</code></label>
                 <label className="field-row"><span>Broker</span><code>{form.brokerPath || "—"}</code></label>
               </div>
             </details>
@@ -3610,6 +3632,30 @@ function DiscoverWorkspace({
                 <div className="numeric-grid">
                   <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
+                  <NumberField label="MC block length" value={form.robustnessMonteCarloBlockLength} onChange={(value) => update("robustnessMonteCarloBlockLength", value)} min={1} />
+                  <NumberField
+                    label="MC P80 retention (0–1)"
+                    value={form.robustnessMonteCarloP80ProfitRetention}
+                    onChange={(value) => update("robustnessMonteCarloP80ProfitRetention", value)}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                  />
+                  <NumberField
+                    label="MC skip-trade prob"
+                    value={form.robustnessMonteCarloSkipTradeProbability}
+                    onChange={(value) => update("robustnessMonteCarloSkipTradeProbability", value)}
+                    min={0}
+                    max={0.99}
+                    step={0.01}
+                  />
+                  <NumberField
+                    label="MC max DD ratio"
+                    value={form.robustnessMonteCarloMaxDrawdownRatio}
+                    onChange={(value) => update("robustnessMonteCarloMaxDrawdownRatio", value)}
+                    min={1}
+                    step={0.05}
+                  />
                   <NumberField label="Param samples" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
                   <NumberField
                     label="Param jitter ±% (SQX default 20)"
@@ -3621,6 +3667,7 @@ function DiscoverWorkspace({
                   />
                   <NumberField label="Multi-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
                 </div>
+                <p className="immutable-note">Monte Carlo settings seal into the databank with the rest of Discover config. Stop/limit search requires a bid/ask <code>.quotes.csv</code> sidecar beside M1.</p>
                 {perturbationError(form) && <p className="field-error">{perturbationError(form)}</p>}
               </details>
               <details className="advanced-settings">
@@ -3652,8 +3699,8 @@ function DiscoverWorkspace({
               <summary>Entry order types — sampled in equal shares</summary>
               <p className="immutable-note">{entryOrderSummary(form)}</p>
               <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-stop / sell-stop entry <small>(H1 invents fills; databank still requires post-breed M1)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-limit / sell-limit entry <small>(same: post-breed M1 into databank)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-stop / sell-stop entry <small>(requires bid/ask quote sidecar for Discover + Judge)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-limit / sell-limit entry <small>(requires bid/ask quote sidecar for Discover + Judge)</small></span></label>
               {entryOrderError(form) && <p className="field-error">{entryOrderError(form)}</p>}
             </details>
             <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day)</span></label>
@@ -4117,7 +4164,7 @@ function DiscoverContractSummary({
         <SummaryLine label="IS / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
         <SummaryLine label="OOS1 expectancy" value={`≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× IS`} />
-        <SummaryLine label="Robustness" value={`${form.robustnessFolds ?? 0} WFO · ${form.robustnessMonteCarloTrials ?? 0} MC · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
+        <SummaryLine label="Robustness" value={`${form.robustnessFolds ?? 0} WFO · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
         <SummaryLine label="OOS2" value="Sealed · display only" accent />
       </div>
 
@@ -4251,6 +4298,7 @@ function JudgePanel({
               m1DataPath: symbol.m1DataPath,
               m1MetadataPath: symbol.m1MetadataPath,
               m1SourceTimezone: null,
+              quotePath: symbol.quotePath,
               brokerPath: symbol.brokerPath,
             }));
           }}
@@ -4263,7 +4311,7 @@ function JudgePanel({
         <PathField label="New Judge artifact" path={form.outputPath} choose={() => chooseOutputJson("Save Judge artifact", "judge.json")} onChange={(value) => update("outputPath", value)} required />
       </div>
       <div className="numeric-grid"><NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value ?? 0)} step={.01} /><NumberField label="Slippage / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value ?? 0)} step={.1} /><NumberField label="Initial balance" value={form.initialBalance} onChange={(value) => update("initialBalance", value ?? 100000)} min={1} /><NumberField label="Entry window start (broker)" value={form.entryWindowStartHour ?? 2} onChange={(value) => update("entryWindowStartHour", Math.min(23, Math.max(0, value ?? 2)))} min={0} /><NumberField label="Entry window end (broker, exclusive)" value={form.entryWindowEndHour ?? 19} onChange={(value) => update("entryWindowEndHour", Math.min(24, Math.max(1, value ?? 19)))} min={1} /></div>
-      <div className="form-footer"><p>M1 files are bid OHLC. Supplying the matching quote sidecar makes fills and management use exact MT5 bid/ask chronology; without it the replay is diagnostic-only.</p><button className="primary" disabled={busy || !form.decisionDataPath || !form.m1DataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Replaying…" : "Run M1 Judge"}</button></div>
+      <div className="form-footer"><p>M1 files are bid OHLC. The matching <code>.quotes.csv</code> sidecar is required for stop/limit certification and for strict MT5 parity; without it the replay is diagnostic-only (synthetic ask = bid + spread).</p><button className="primary" disabled={busy || !form.decisionDataPath || !form.m1DataPath || !form.strategyPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Replaying…" : "Run M1 Judge"}</button></div>
     </section>
     {result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">M1 Judge</p><h2>Execution chronology replayed</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={formatNumber(result.trades)} note={`${formatNumber(result.returnPercent, 2)}% return`} /><Kpi label="Drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note={`PF ${result.profitFactor === null ? "∞" : formatNumber(result.profitFactor, 2)}`} /><Kpi label="Decision / M1 bars" value={`${formatNumber(result.decisionBars)} / ${formatNumber(result.m1Bars)}`} note={`${formatNumber(result.verifiedNoTickMinutes)} verified no-tick min`} /><Kpi label="Managed exits" value={formatNumber(result.partialExits + result.endOfDayFlattens)} note={`${result.breakEvenMoves} BE · ${result.trailingMoves} trail`} /></div><ArtifactPath label="Judge artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No M1 replay yet" copy="Use matching decision-timeframe and M1 exports with their metadata files. The Judge enforces pending-order chronology and every active trade-management gene." />}
   </div>;

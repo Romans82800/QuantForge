@@ -4760,6 +4760,13 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         require_m1_robustness: true,
         robustness_folds: 3,
         robustness_monte_carlo_trials: 250,
+        robustness_monte_carlo_block_length: 5,
+        robustness_monte_carlo_skip_trade_probability:
+            quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+        robustness_monte_carlo_p80_profit_retention:
+            quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION,
+        robustness_monte_carlo_max_drawdown_ratio:
+            quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO,
         robustness_neighborhood_samples: 8,
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction

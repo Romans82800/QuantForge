@@ -111,6 +111,10 @@ pub struct DiscoverRequest {
     require_m1_robustness: Option<bool>,
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
+    robustness_monte_carlo_block_length: Option<usize>,
+    robustness_monte_carlo_skip_trade_probability: Option<f64>,
+    robustness_monte_carlo_p80_profit_retention: Option<f64>,
+    robustness_monte_carlo_max_drawdown_ratio: Option<f64>,
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
@@ -638,6 +642,16 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.require_m1_robustness.is_some(),
             request.robustness_folds.is_some(),
             request.robustness_monte_carlo_trials.is_some(),
+            request.robustness_monte_carlo_block_length.is_some(),
+            request
+                .robustness_monte_carlo_skip_trade_probability
+                .is_some(),
+            request
+                .robustness_monte_carlo_p80_profit_retention
+                .is_some(),
+            request
+                .robustness_monte_carlo_max_drawdown_ratio
+                .is_some(),
             request.robustness_neighborhood_samples.is_some(),
             request.robustness_perturbation_fraction.is_some(),
             request.commission_per_lot_round_turn.is_some(),
@@ -663,6 +677,10 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
 /// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
 /// pack. Decision-timeframe paths are allowed here because H1/M15 packs are
 /// derived from the same M1 stream and therefore share its sibling sidecar.
+pub fn infer_quote_path_public(m1_path: &str) -> Option<PathBuf> {
+    infer_quote_path(m1_path)
+}
+
 fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
     let path = Path::new(m1_path);
     let stem = path.file_stem()?.to_str()?;
@@ -671,6 +689,10 @@ fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
         if let Some(base) = stem.strip_suffix(suffix) {
             candidates.push(path.with_file_name(format!("{base}_M1.quotes.csv")));
         }
+    }
+    // Also accept short EURUSD_M1.quotes.csv siblings next to pack M1 files.
+    if let Some(symbol) = stem.split('_').find(|part| part.len() >= 6) {
+        candidates.push(path.with_file_name(format!("{symbol}_M1.quotes.csv")));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
@@ -718,6 +740,16 @@ fn run_discovery(
     } else if metadata_is_canonical_bid_ask(m1.metadata.as_ref()) {
         return Err(
             "canonical bid/ask M1 metadata is present but its .quotes.csv sidecar was not found"
+                .into(),
+        );
+    }
+    let wants_pending = request.allow_stop_entries.unwrap_or(false)
+        || request.allow_limit_entries.unwrap_or(false);
+    if wants_pending && quote_dataset.is_none() {
+        return Err(
+            "stop/limit Discover requires a bid/ask M1 quote sidecar beside the M1 pack \
+             (re-import ticks with qf-import-market, then scripts/install_icmarkets_pack.py). \
+             Without it pending fills are not MT5-certifiable"
                 .into(),
         );
     }
@@ -1662,6 +1694,18 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
+        robustness_monte_carlo_block_length: request
+            .robustness_monte_carlo_block_length
+            .unwrap_or(5),
+        robustness_monte_carlo_skip_trade_probability: request
+            .robustness_monte_carlo_skip_trade_probability
+            .unwrap_or(quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY),
+        robustness_monte_carlo_p80_profit_retention: request
+            .robustness_monte_carlo_p80_profit_retention
+            .unwrap_or(quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION),
+        robustness_monte_carlo_max_drawdown_ratio: request
+            .robustness_monte_carlo_max_drawdown_ratio
+            .unwrap_or(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
         robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(8),
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
@@ -1985,6 +2029,10 @@ mod tests {
             require_m1_robustness: Some(false),
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),
+            robustness_monte_carlo_block_length: Some(5),
+            robustness_monte_carlo_skip_trade_probability: Some(0.10),
+            robustness_monte_carlo_p80_profit_retention: Some(0.60),
+            robustness_monte_carlo_max_drawdown_ratio: Some(1.75),
             robustness_neighborhood_samples: Some(2),
             robustness_perturbation_fraction: Some(0.20),
             minimum_neighborhood_survival_fraction: Some(0.0),
