@@ -22,3 +22,4 @@
 /mql5/QuantForge/*.tester.ini
 /mql5/QuantForge/*.evidence.json
 /mql5/QuantForge/sqx_runtime.mqh
+/apps/desktop/update_css.py
