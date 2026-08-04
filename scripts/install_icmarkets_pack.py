@@ -81,6 +81,20 @@ def install_symbol(staging: Path, pack: Path, symbol: str, stem: str) -> None:
 def ensure_broker(pack: Path, symbol: str) -> None:
     dest = pack / f"{symbol}.broker.json"
     if dest.exists():
+        # Re-imports must also repair the two fields that materially change
+        # risk sizing/session coverage for crypto.  Older packs were cloned
+        # from XAUUSD and therefore carried a $1 tick value, one-contract
+        # geometry and weekday-only sessions.
+        if symbol == "BTCUSD":
+            data = json.loads(dest.read_text(encoding="utf-8"))
+            changed = False
+            for key, value in (("tick_value", 0.01), ("contract_size", 1.0), ("sessions", [])):
+                if data.get(key) != value:
+                    data[key] = value
+                    changed = True
+            if changed:
+                dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                print(f"repaired broker geometry {dest.name}")
         return
     template_symbol = TEMPLATE_MAP.get(symbol, "GBPUSD")
     if not (pack / f"{template_symbol}.broker.json").exists():
