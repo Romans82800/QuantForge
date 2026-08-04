@@ -11,3 +11,14 @@
 /runs/
 /ICMarkets_EST7_2020_present
 /data/icmarkets-est7-2020-present
+/imported-data/
+/dist/data-pack/
+
+# Local build and export output; source remains under crates/apps/scripts.
+/dist/
+/docs/quantforge-databauunk.json*
+/mql5/QuantForge/*.mq5
+/mql5/QuantForge/*.set
+/mql5/QuantForge/*.tester.ini
+/mql5/QuantForge/*.evidence.json
+/mql5/QuantForge/sqx_runtime.mqh

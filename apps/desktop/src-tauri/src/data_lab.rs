@@ -1,9 +1,11 @@
+use csv::{ReaderBuilder, StringRecord, Trim};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
-    BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
-    build_timeframe_from_m1, infer_median_interval_ms,
+    Bar, BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, SourceTimezone,
+    build_timeframe_from_m1, infer_median_interval_ms, parse_source_timestamp,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,47 @@ pub struct DataLabView {
     last_timestamp_ms: i64,
     quality: QualityView,
     discover_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketFolderImportRequest {
+    pub source_directory: String,
+    pub output_directory: Option<String>,
+    pub source_timezone: String,
+    #[serde(default = "default_true")]
+    pub aggregate_ticks_to_bars: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketFileImportView {
+    pub source_path: String,
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub source_rows: usize,
+    pub bars: usize,
+    pub m1_path: Option<String>,
+    pub m1_metadata_path: Option<String>,
+    pub h1_path: Option<String>,
+    pub h1_metadata_path: Option<String>,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketFolderImportView {
+    pub source_directory: String,
+    pub output_directory: String,
+    pub source_timezone: String,
+    pub files: Vec<MarketFileImportView>,
+    pub imported_count: usize,
+    pub skipped_count: usize,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -129,6 +172,805 @@ fn inspect_data_sync(request: &DataLabRequest) -> Result<DataLabView, String> {
         discover_ready: quality.grade != QualityGrade::Fail && broker.is_some(),
         quality: QualityView::from(&quality),
     })
+}
+
+/// Import a folder of broker exports without making the user hand-bind every
+/// file.  IC Markets' downloadable `*_TickData.csv` files are aggregated to
+/// midpoint M1 bars and then to H1 bars using the same Rust aggregation path
+/// used by Discover.  Non-market CSVs (trade lists, Databento files, etc.) are
+/// reported as skipped rather than accidentally being treated as prices.
+#[tauri::command]
+pub async fn import_market_folder(
+    request: MarketFolderImportRequest,
+) -> Result<MarketFolderImportView, String> {
+    tauri::async_runtime::spawn_blocking(move || import_market_folder_sync(&request))
+        .await
+        .map_err(|error| format!("market import task failed: {error}"))?
+}
+
+pub fn import_market_folder_sync(
+    request: &MarketFolderImportRequest,
+) -> Result<MarketFolderImportView, String> {
+    let source_directory = PathBuf::from(request.source_directory.trim());
+    if !source_directory.is_dir() {
+        return Err(format!(
+            "market-data folder does not exist: {}",
+            source_directory.display()
+        ));
+    }
+    let timezone: SourceTimezone = request
+        .source_timezone
+        .parse()
+        .map_err(|error: quantforge_data::DataError| error.to_string())?;
+    let output_directory = request
+        .output_directory
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_import_directory);
+    fs::create_dir_all(&output_directory)
+        .map_err(|error| format!("cannot create import directory: {error}"))?;
+
+    let mut paths = Vec::new();
+    collect_market_files(&source_directory, &mut paths)?;
+    paths.sort();
+    let mut files = Vec::with_capacity(paths.len());
+    let mut imported_count = 0;
+    let mut skipped_count = 0;
+
+    for source_path in paths {
+        let result = import_market_file(
+            &source_path,
+            &output_directory,
+            timezone,
+            request.aggregate_ticks_to_bars,
+        );
+        match result {
+            Ok(mut view) => {
+                if view.status == "imported" {
+                    imported_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                view.source_path = display_path(&source_path);
+                files.push(view);
+            }
+            Err(error) => {
+                skipped_count += 1;
+                files.push(MarketFileImportView {
+                    source_path: display_path(&source_path),
+                    symbol: symbol_from_path(&source_path),
+                    kind: "unknown".into(),
+                    source_rows: 0,
+                    bars: 0,
+                    m1_path: None,
+                    m1_metadata_path: None,
+                    h1_path: None,
+                    h1_metadata_path: None,
+                    status: "error".into(),
+                    message: Some(error),
+                });
+            }
+        }
+    }
+
+    Ok(MarketFolderImportView {
+        source_directory: display_path(&source_directory),
+        output_directory: display_path(&output_directory),
+        source_timezone: timezone.to_string(),
+        files,
+        imported_count,
+        skipped_count,
+    })
+}
+
+fn default_import_directory() -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("Documents")
+        .join("QuantForge")
+        .join("imported-data")
+        .join(stamp.to_string())
+}
+
+fn collect_market_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read folder entry: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_market_files(&path, output)?;
+        } else if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt")
+            })
+        {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TickColumns {
+    date: Option<usize>,
+    time: Option<usize>,
+    timestamp: Option<usize>,
+    ask: usize,
+    bid: usize,
+    volume: Option<usize>,
+}
+
+impl TickColumns {
+    fn from_headers(headers: &StringRecord) -> Option<Self> {
+        let headers: Vec<String> = headers.iter().map(normalize_market_header).collect();
+        let find = |names: &[&str]| {
+            headers
+                .iter()
+                .position(|value| names.contains(&value.as_str()))
+        };
+        let ask = find(&["ASK"])?;
+        let bid = find(&["BID"])?;
+        let date = find(&["DATE"]);
+        let time = find(&["TIME"]);
+        let timestamp = find(&["DATETIME", "TIMESTAMP", "DATE_TIME"])
+            .or_else(|| date.is_none().then_some(time).flatten());
+        if timestamp.is_none() && (date.is_none() || time.is_none()) {
+            return None;
+        }
+        Some(Self {
+            date,
+            time,
+            timestamp,
+            ask,
+            bid,
+            volume: find(&["VOLUME", "VOL", "TICKVOL", "TICK_VOLUME"]),
+        })
+    }
+}
+
+fn import_market_file(
+    source_path: &Path,
+    output_directory: &Path,
+    timezone: SourceTimezone,
+    aggregate_ticks_to_bars: bool,
+) -> Result<MarketFileImportView, String> {
+    let bytes = fs::read(source_path).map_err(|error| format!("cannot read source: {error}"))?;
+    let delimiter = detect_market_delimiter(&bytes)?;
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .trim(Trim::All)
+        .flexible(true)
+        .from_reader(bytes.as_slice());
+    let headers = reader
+        .headers()
+        .map_err(|error| format!("invalid CSV header: {error}"))?
+        .clone();
+    let normalized: Vec<String> = headers.iter().map(normalize_market_header).collect();
+    let symbol = symbol_from_headers(&normalized).or_else(|| symbol_from_path(source_path));
+
+    // Databento's multi-symbol OHLCV export has price columns but is not an
+    // IC Markets/MT5 source. It must not silently enter a broker data pack.
+    if normalized.iter().any(|value| value == "RTYPE")
+        && normalized.iter().any(|value| value == "PUBLISHER_ID")
+    {
+        return Ok(skipped_view(
+            source_path,
+            symbol,
+            "unsupported",
+            "Databento multi-symbol OHLCV export",
+        ));
+    }
+
+    if let Some(columns) = TickColumns::from_headers(&headers) {
+        if !aggregate_ticks_to_bars {
+            return Ok(skipped_view(
+                source_path,
+                symbol,
+                "tick",
+                "tick aggregation is disabled",
+            ));
+        }
+        return import_tick_file(
+            source_path,
+            output_directory,
+            timezone,
+            symbol,
+            delimiter,
+            columns,
+        );
+    }
+
+    // HISTDATA and a few broker download tools emit headerless
+    // `DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOLUME` rows. The first row is exposed as
+    // the CSV header by the reader above, so detect it before normal OHLC
+    // classification and reopen the file with `has_headers(false)`.
+    if looks_like_headerless_m1_row(&headers, timezone) {
+        return import_headerless_m1_file(
+            source_path,
+            output_directory,
+            timezone,
+            symbol,
+            delimiter,
+        );
+    }
+
+    let has_ohlc = ["OPEN", "HIGH", "LOW", "CLOSE"]
+        .into_iter()
+        .all(|name| normalized.iter().any(|value| value == name));
+    if !has_ohlc {
+        return Ok(skipped_view(
+            source_path,
+            symbol,
+            "unknown",
+            "header is not an OHLC or IC Markets tick export",
+        ));
+    }
+
+    let dataset = BarDataset::load_mt5(source_path, timezone).map_err(|error| error.to_string())?;
+    let interval_ms = infer_median_interval_ms(&dataset.bars).unwrap_or_default();
+    let base_stem = unique_import_stem(output_directory, symbol.as_deref().unwrap_or("MARKET"));
+    if interval_ms <= 60_000 {
+        let (m1_path, m1_metadata_path) = write_imported_bars(
+            &dataset,
+            output_directory,
+            &base_stem,
+            "M1",
+            source_path,
+            timezone,
+            "ohlc",
+        )?;
+        let h1 = build_timeframe_from_m1(&dataset, 3_600_000, None)
+            .map_err(|error| error.to_string())?;
+        let (h1_path, h1_metadata_path) = write_imported_bars(
+            &h1,
+            output_directory,
+            &base_stem,
+            "H1",
+            source_path,
+            timezone,
+            "ohlc_aggregated",
+        )?;
+        Ok(MarketFileImportView {
+            source_path: display_path(source_path),
+            symbol,
+            kind: "ohlc_m1".into(),
+            source_rows: dataset.source_rows,
+            bars: dataset.bars.len(),
+            m1_path: Some(display_path(&m1_path)),
+            m1_metadata_path: Some(display_path(&m1_metadata_path)),
+            h1_path: Some(display_path(&h1_path)),
+            h1_metadata_path: Some(display_path(&h1_metadata_path)),
+            status: "imported".into(),
+            message: None,
+        })
+    } else if interval_ms == 3_600_000 {
+        let (h1_path, h1_metadata_path) = write_imported_bars(
+            &dataset,
+            output_directory,
+            &base_stem,
+            "H1",
+            source_path,
+            timezone,
+            "ohlc",
+        )?;
+        Ok(MarketFileImportView {
+            source_path: display_path(source_path),
+            symbol,
+            kind: "ohlc_h1".into(),
+            source_rows: dataset.source_rows,
+            bars: dataset.bars.len(),
+            m1_path: None,
+            m1_metadata_path: None,
+            h1_path: Some(display_path(&h1_path)),
+            h1_metadata_path: Some(display_path(&h1_metadata_path)),
+            status: "imported".into(),
+            message: None,
+        })
+    } else {
+        Ok(skipped_view(
+            source_path,
+            symbol,
+            "ohlc",
+            &format!("unsupported source interval: {interval_ms}ms"),
+        ))
+    }
+}
+
+fn looks_like_headerless_m1_row(record: &StringRecord, timezone: SourceTimezone) -> bool {
+    if record.len() < 6 {
+        return false;
+    }
+    let Some(date) = record.get(0) else {
+        return false;
+    };
+    let Some(time) = record.get(1) else {
+        return false;
+    };
+    if parse_source_timestamp(&format!("{date} {time}"), timezone).is_err() {
+        return false;
+    }
+    (2..=5).all(|index| {
+        record
+            .get(index)
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some()
+    })
+}
+
+fn import_headerless_m1_file(
+    source_path: &Path,
+    output_directory: &Path,
+    timezone: SourceTimezone,
+    symbol: Option<String>,
+    delimiter: u8,
+) -> Result<MarketFileImportView, String> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .trim(Trim::All)
+        .flexible(true)
+        .from_path(source_path)
+        .map_err(|error| format!("cannot open headerless OHLC CSV: {error}"))?;
+    let mut bars_by_timestamp = BTreeMap::new();
+    let mut source_rows = 0;
+    for (index, record) in reader.records().enumerate() {
+        let record =
+            record.map_err(|error| format!("OHLC row {} is invalid: {error}", index + 1))?;
+        if record.len() < 6 {
+            return Err(format!("OHLC row {} has fewer than six fields", index + 1));
+        }
+        let timestamp_text = format!(
+            "{} {}",
+            record.get(0).unwrap_or_default(),
+            record.get(1).unwrap_or_default()
+        );
+        let timestamp_ms = parse_source_timestamp(&timestamp_text, timezone)
+            .map_err(|reason| format!("OHLC row {} has invalid timestamp: {reason}", index + 1))?;
+        let open = parse_market_number(&record, 2, index + 1, "OPEN")?;
+        let high = parse_market_number(&record, 3, index + 1, "HIGH")?;
+        let low = parse_market_number(&record, 4, index + 1, "LOW")?;
+        let close = parse_market_number(&record, 5, index + 1, "CLOSE")?;
+        let tick_volume = record
+            .get(6)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        bars_by_timestamp.insert(
+            timestamp_ms,
+            Bar {
+                timestamp_ms,
+                open,
+                high,
+                low,
+                close,
+                tick_volume,
+                real_volume: 0,
+                spread_points: None,
+            },
+        );
+        source_rows += 1;
+    }
+    if bars_by_timestamp.is_empty() {
+        return Err("headerless OHLC CSV contains no rows".into());
+    }
+    let bars: Vec<Bar> = bars_by_timestamp.into_values().collect();
+    let bar_count = bars.len();
+    let data_hash = quantforge_data::bar_content_hash(&bars);
+    let dataset = BarDataset {
+        bars,
+        source_rows,
+        duplicate_rows_removed: source_rows.saturating_sub(bar_count),
+        input_was_sorted: true,
+        delimiter: delimiter as char,
+        source_timezone: timezone.to_string(),
+        data_hash,
+    };
+    let base_stem = unique_import_stem(output_directory, symbol.as_deref().unwrap_or("MARKET"));
+    let (m1_path, m1_metadata_path) = write_imported_bars(
+        &dataset,
+        output_directory,
+        &base_stem,
+        "M1",
+        source_path,
+        timezone,
+        "ohlc_headerless",
+    )?;
+    let h1 =
+        build_timeframe_from_m1(&dataset, 3_600_000, None).map_err(|error| error.to_string())?;
+    let (h1_path, h1_metadata_path) = write_imported_bars(
+        &h1,
+        output_directory,
+        &base_stem,
+        "H1",
+        source_path,
+        timezone,
+        "ohlc_headerless_aggregated",
+    )?;
+    Ok(MarketFileImportView {
+        source_path: display_path(source_path),
+        symbol,
+        kind: "ohlc_m1_headerless".into(),
+        source_rows,
+        bars: dataset.bars.len(),
+        m1_path: Some(display_path(&m1_path)),
+        m1_metadata_path: Some(display_path(&m1_metadata_path)),
+        h1_path: Some(display_path(&h1_path)),
+        h1_metadata_path: Some(display_path(&h1_metadata_path)),
+        status: "imported".into(),
+        message: None,
+    })
+}
+
+fn import_tick_file(
+    source_path: &Path,
+    output_directory: &Path,
+    timezone: SourceTimezone,
+    symbol: Option<String>,
+    delimiter: u8,
+    columns: TickColumns,
+) -> Result<MarketFileImportView, String> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .trim(Trim::All)
+        .flexible(true)
+        .from_path(source_path)
+        .map_err(|error| format!("cannot open tick CSV: {error}"))?;
+    let mut buckets: BTreeMap<i64, TickBar> = BTreeMap::new();
+    let mut source_rows = 0;
+    let mut input_was_sorted = true;
+    let mut previous_timestamp = None;
+    for (index, record) in reader.records().enumerate() {
+        let record =
+            record.map_err(|error| format!("tick row {} is invalid: {error}", index + 2))?;
+        let timestamp_text = tick_timestamp(&record, columns, index + 2)?;
+        let timestamp_ms = match parse_source_timestamp(&timestamp_text, timezone) {
+            Ok(value) => value,
+            Err(reason)
+                if reason.contains("daylight-saving") || reason.contains("ambiguous") =>
+            {
+                // ICMarkets/EST+7 follows New York DST under a +7 wall shift.
+                // Quote dumps occasionally stamp the spring-forward gap; skip.
+                continue;
+            }
+            Err(reason) => {
+                return Err(format!(
+                    "tick row {} has invalid timestamp {timestamp_text}: {reason}",
+                    index + 2
+                ));
+            }
+        };
+        if previous_timestamp.is_some_and(|value| timestamp_ms < value) {
+            input_was_sorted = false;
+        }
+        previous_timestamp = Some(timestamp_ms);
+        let ask = parse_market_number(&record, columns.ask, index + 2, "ASK")?;
+        let bid = parse_market_number(&record, columns.bid, index + 2, "BID")?;
+        let price = (ask + bid) / 2.0;
+        if !price.is_finite() {
+            return Err(format!("tick row {} has a non-finite price", index + 2));
+        }
+        let volume = columns
+            .volume
+            .and_then(|column| record.get(column))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        let bucket = timestamp_ms - timestamp_ms.rem_euclid(60_000);
+        buckets
+            .entry(bucket)
+            .and_modify(|bar| bar.push(price, volume))
+            .or_insert_with(|| TickBar::new(price, volume));
+        source_rows += 1;
+    }
+    if buckets.is_empty() {
+        return Err("tick CSV contains no usable rows".into());
+    }
+    let bars: Vec<Bar> = buckets
+        .into_iter()
+        .map(|(timestamp_ms, bar)| bar.finish(timestamp_ms))
+        .collect();
+    let data_hash = quantforge_data::bar_content_hash(&bars);
+    let dataset = BarDataset {
+        bars,
+        source_rows,
+        duplicate_rows_removed: 0,
+        input_was_sorted,
+        delimiter: delimiter as char,
+        source_timezone: timezone.to_string(),
+        data_hash,
+    };
+    let base_stem = unique_import_stem(output_directory, symbol.as_deref().unwrap_or("MARKET"));
+    let (m1_path, m1_metadata_path) = write_imported_bars(
+        &dataset,
+        output_directory,
+        &base_stem,
+        "M1",
+        source_path,
+        timezone,
+        "tick_midpoint",
+    )?;
+    let h1 =
+        build_timeframe_from_m1(&dataset, 3_600_000, None).map_err(|error| error.to_string())?;
+    let (h1_path, h1_metadata_path) = write_imported_bars(
+        &h1,
+        output_directory,
+        &base_stem,
+        "H1",
+        source_path,
+        timezone,
+        "tick_midpoint_aggregated",
+    )?;
+    Ok(MarketFileImportView {
+        source_path: display_path(source_path),
+        symbol,
+        kind: "tick".into(),
+        source_rows,
+        bars: dataset.bars.len(),
+        m1_path: Some(display_path(&m1_path)),
+        m1_metadata_path: Some(display_path(&m1_metadata_path)),
+        h1_path: Some(display_path(&h1_path)),
+        h1_metadata_path: Some(display_path(&h1_metadata_path)),
+        status: "imported".into(),
+        message: Some(
+            "Ask/Bid midpoint aggregated to 1-minute bars; H1 is derived from the same M1 stream"
+                .into(),
+        ),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TickBar {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: u64,
+}
+impl TickBar {
+    fn new(price: f64, volume: u64) -> Self {
+        Self {
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume,
+        }
+    }
+    fn push(&mut self, price: f64, volume: u64) {
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume = self.volume.saturating_add(volume);
+    }
+    fn finish(self, timestamp_ms: i64) -> Bar {
+        Bar {
+            timestamp_ms,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            tick_volume: self.volume,
+            real_volume: 0,
+            spread_points: None,
+        }
+    }
+}
+
+fn write_imported_bars(
+    dataset: &BarDataset,
+    output_directory: &Path,
+    base_stem: &str,
+    timeframe: &str,
+    source_path: &Path,
+    timezone: SourceTimezone,
+    import_kind: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let data_path = output_directory.join(format!("{base_stem}_{timeframe}.csv"));
+    let metadata_path = output_directory.join(format!("{base_stem}_{timeframe}.metadata.csv"));
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_path(&data_path)
+        .map_err(|error| format!("cannot write imported data: {error}"))?;
+    writer
+        .write_record([
+            "<DATE>",
+            "<TIME>",
+            "<OPEN>",
+            "<HIGH>",
+            "<LOW>",
+            "<CLOSE>",
+            "<TICKVOL>",
+            "<VOL>",
+            "<SPREAD>",
+        ])
+        .map_err(|error| error.to_string())?;
+    for bar in &dataset.bars {
+        let stamp = timezone
+            .format_source_timestamp(bar.timestamp_ms)
+            .ok_or_else(|| "cannot format imported timestamp".to_owned())?;
+        let (date, time) = stamp
+            .split_once(' ')
+            .ok_or_else(|| "formatted timestamp is invalid".to_owned())?;
+        let row = [
+            date.to_owned(),
+            time.to_owned(),
+            bar.open.to_string(),
+            bar.high.to_string(),
+            bar.low.to_string(),
+            bar.close.to_string(),
+            bar.tick_volume.to_string(),
+            bar.real_volume.to_string(),
+            bar.spread_points.unwrap_or(0).to_string(),
+        ];
+        writer
+            .write_record(row)
+            .map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    let mut metadata = csv::Writer::from_path(&metadata_path)
+        .map_err(|error| format!("cannot write import metadata: {error}"))?;
+    let symbol = base_stem.split('_').next().unwrap_or(base_stem);
+    let rows = [
+        ("symbol", symbol.to_owned()),
+        ("timeframe", format!("PERIOD_{timeframe}")),
+        ("bar_count", dataset.bars.len().to_string()),
+        ("source_rows", dataset.source_rows.to_string()),
+        ("broker_timezone", timezone.to_string()),
+        ("import_kind", import_kind.to_owned()),
+        ("source_file", display_path(source_path)),
+        ("data_hash", dataset.data_hash.as_str().to_owned()),
+    ];
+    metadata
+        .write_record(["property", "value"])
+        .map_err(|error| error.to_string())?;
+    for (key, value) in rows {
+        metadata
+            .write_record([key, value.as_str()])
+            .map_err(|error| error.to_string())?;
+    }
+    metadata.flush().map_err(|error| error.to_string())?;
+    Ok((data_path, metadata_path))
+}
+
+fn tick_timestamp(
+    record: &StringRecord,
+    columns: TickColumns,
+    row: usize,
+) -> Result<String, String> {
+    if let Some(index) = columns.timestamp {
+        return record
+            .get(index)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("tick row {row} is short"));
+    }
+    let date = record
+        .get(
+            columns
+                .date
+                .ok_or_else(|| format!("tick row {row} has no date"))?,
+        )
+        .ok_or_else(|| format!("tick row {row} is short"))?;
+    let time = record
+        .get(
+            columns
+                .time
+                .ok_or_else(|| format!("tick row {row} has no time"))?,
+        )
+        .ok_or_else(|| format!("tick row {row} is short"))?;
+    Ok(format!("{date} {time}"))
+}
+
+fn parse_market_number(
+    record: &StringRecord,
+    column: usize,
+    row: usize,
+    field: &str,
+) -> Result<f64, String> {
+    let raw = record
+        .get(column)
+        .ok_or_else(|| format!("tick row {row} is short"))?;
+    raw.parse::<f64>()
+        .map_err(|_| format!("tick row {row} has invalid {field}: {raw}"))
+}
+
+fn skipped_view(
+    source_path: &Path,
+    symbol: Option<String>,
+    kind: &str,
+    message: &str,
+) -> MarketFileImportView {
+    MarketFileImportView {
+        source_path: display_path(source_path),
+        symbol,
+        kind: kind.into(),
+        source_rows: 0,
+        bars: 0,
+        m1_path: None,
+        m1_metadata_path: None,
+        h1_path: None,
+        h1_metadata_path: None,
+        status: "skipped".into(),
+        message: Some(message.into()),
+    }
+}
+
+fn detect_market_delimiter(bytes: &[u8]) -> Result<u8, String> {
+    let line = bytes
+        .split(|byte| *byte == b'\n' || *byte == b'\r')
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "CSV is empty".to_owned())?;
+    [b',', b'\t', b';']
+        .into_iter()
+        .max_by_key(|delimiter| line.iter().filter(|byte| **byte == *delimiter).count())
+        .filter(|delimiter| line.iter().filter(|byte| **byte == *delimiter).count() > 0)
+        .ok_or_else(|| "could not detect CSV delimiter".to_owned())
+}
+
+fn normalize_market_header(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character| character == '<' || character == '>')
+        .replace([' ', '-'], "_")
+        .to_ascii_uppercase()
+}
+
+fn symbol_from_headers(headers: &[String]) -> Option<String> {
+    let _ = headers;
+    None
+}
+
+fn symbol_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy().to_ascii_uppercase();
+    for token in stem.split('_').rev() {
+        let token = token.trim_matches(|value: char| !value.is_ascii_alphanumeric());
+        if (token.len() == 6 && token.chars().all(|value| value.is_ascii_alphabetic()))
+            || matches!(
+                token,
+                "NAS100" | "US100" | "US500" | "XAUUSD" | "BTCUSD" | "XTIUSD" | "US30" | "DE40"
+            )
+        {
+            return Some(token.to_owned());
+        }
+    }
+    // Fallback: SYMBOL_TickData / SYMBOL_M1 style stems.
+    let first = stem.split('_').next()?.trim();
+    if first.len() >= 3
+        && first.len() <= 8
+        && first
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric())
+    {
+        return Some(first.to_owned());
+    }
+    None
+}
+
+fn unique_import_stem(output_directory: &Path, symbol: &str) -> String {
+    let clean: String = symbol
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect();
+    for index in 1..10_000 {
+        let suffix = if index == 1 {
+            String::new()
+        } else {
+            format!("_{index}")
+        };
+        if !output_directory
+            .join(format!("{clean}{suffix}_M1.csv"))
+            .exists()
+            && !output_directory
+                .join(format!("{clean}{suffix}_H1.csv"))
+                .exists()
+        {
+            return format!("{clean}{suffix}");
+        }
+    }
+    format!("{clean}_import")
 }
 
 pub(crate) fn load_data_source(
@@ -317,5 +1159,69 @@ mod tests {
             .err()
             .expect("missing timezone authority must fail");
         assert!(error.contains("exactly one metadata file or source timezone"));
+    }
+
+    #[test]
+    fn imports_ic_markets_tick_csv_to_m1_and_h1_with_metadata() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("EURUSD_TickData.csv");
+        fs::write(
+            &source,
+            concat!(
+                "Time,Ask,Bid,Volume\n",
+                "2020.01.02 00:00:01,1.1002,1.1000,1\n",
+                "2020.01.02 00:00:30,1.1004,1.1001,2\n",
+                "2020.01.02 00:01:02,1.1001,1.0999,1\n",
+            ),
+        )
+        .unwrap();
+        let output = directory.path().join("out");
+        let report = import_market_folder_sync(&MarketFolderImportRequest {
+            source_directory: directory.path().display().to_string(),
+            output_directory: Some(output.display().to_string()),
+            source_timezone: "ICMarkets/EST+7".into(),
+            aggregate_ticks_to_bars: true,
+        })
+        .expect("tick import should succeed");
+        assert_eq!(report.imported_count, 1);
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.status == "imported")
+            .unwrap();
+        assert_eq!(file.symbol.as_deref(), Some("EURUSD"));
+        assert_eq!(file.bars, 2);
+        let m1 = BarDataset::load_mt5(
+            file.m1_path.as_ref().unwrap(),
+            "ICMarkets/EST+7".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m1.bars.len(), 2);
+        assert!(file.h1_path.is_some());
+    }
+
+    #[test]
+    fn imports_headerless_histdata_m1_csv() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("DAT_MT_EURUSD_M1_2000.csv");
+        fs::write(
+            &source,
+            concat!(
+                "2000.05.30,17:27,0.930200,0.930200,0.930200,0.930200,0\n",
+                "2000.05.30,17:28,0.930200,0.930300,0.930100,0.930250,1\n",
+            ),
+        )
+        .unwrap();
+        let output = directory.path().join("out");
+        let report = import_market_folder_sync(&MarketFolderImportRequest {
+            source_directory: directory.path().display().to_string(),
+            output_directory: Some(output.display().to_string()),
+            source_timezone: "Etc/UTC".into(),
+            aggregate_ticks_to_bars: true,
+        })
+        .expect("headerless import should succeed");
+        assert_eq!(report.imported_count, 1);
+        assert_eq!(report.files[0].kind, "ohlc_m1_headerless");
+        assert_eq!(report.files[0].bars, 2);
     }
 }

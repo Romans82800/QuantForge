@@ -2547,6 +2547,7 @@ name = "quantforge-desktop"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "csv",
  "quantforge-broker",
  "quantforge-core",
  "quantforge-data",

@@ -171,6 +171,8 @@ pub fn generate_bundle(
         ),
         ("@@FINGERPRINT_SHORT@@", fingerprint_short.into()),
         ("@@SYMBOL@@", mql_string(&broker.symbol)),
+        ("@@BROKER_TICK_SIZE@@", mql_double(broker.tick_size)),
+        ("@@BROKER_TICK_VALUE@@", mql_double(broker.tick_value)),
         ("@@BROKER_TIMEZONE@@", broker.timezone.clone()),
     ] {
         source = source.replace(placeholder, &value);

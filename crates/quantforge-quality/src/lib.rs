@@ -7,10 +7,12 @@ mod sealed;
 pub use challenge::{
     CHALLENGE_REPORT_SCHEMA_VERSION, ChallengeBlocker, ChallengeConfig, ChallengeError,
     ChallengeReport, CostShockPoint, CostShockReport, MONTE_CARLO_P80_PROFIT_RETENTION,
+    MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_SKIP_TRADE_PROBABILITY,
     MonteCarloReport, MultipleTestingReport, ParameterNeighbor, ParameterNeighborhoodReport,
     PurgedFoldReport, SelectionBiasLevel, deflated_trade_sharpe, expected_max_lucky_sharpe,
     monte_carlo_from_trade_profits, monte_carlo_trade_resampling_with_skip,
-    passes_p80_profit_retention, perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
+    parameter_permutation_neighbors, passes_p80_profit_retention, perturb_strategy_parameters,
+    run_challenge, trade_sharpe_proxy,
 };
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,

@@ -12,6 +12,8 @@ import type {
   ChallengeView,
   DataLabRequest,
   DataLabView,
+  MarketFolderImportRequest,
+  MarketFolderImportView,
   DeployRequest,
   DeployView,
   DiscoverJobView,
@@ -167,6 +169,10 @@ export function chooseNewDatabank(): Promise<string | null> {
 
 export function inspectData(request: DataLabRequest): Promise<DataLabView> {
   return invoke<DataLabView>("inspect_data", { request });
+}
+
+export function importMarketFolder(request: MarketFolderImportRequest): Promise<MarketFolderImportView> {
+  return invoke<MarketFolderImportView>("import_market_folder", { request });
 }
 
 export function startDiscover(request: DiscoverRequest): Promise<DiscoverJobView> {

@@ -1209,8 +1209,10 @@ fn realize_exit_volume(
         PositionSide::Long => 1.0,
         PositionSide::Short => -1.0,
     };
-    let gross_profit = (exit_price - position.entry_price) * direction / broker.tick_size
-        * broker.tick_value
+    let gross_profit = (exit_price - position.entry_price)
+        * direction
+        * broker.contract_size
+        * profit_currency_to_account(exit_price, broker)
         * volume;
     let exit_commission = volume * config.costs.commission_per_lot_round_turn / 2.0;
     *balance += gross_profit - exit_commission;
@@ -1382,6 +1384,18 @@ fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f6
     }
 }
 
+/// Match MT5's dynamic quote-to-account conversion for account-base crosses
+/// while keeping account-quoted instruments at a one-to-one conversion.
+fn profit_currency_to_account(price: f64, broker: &SymbolSpecification) -> f64 {
+    if broker.profit_currency == broker.account_currency {
+        1.0
+    } else if broker.base_currency == broker.account_currency && price.is_finite() && price > 0.0 {
+        1.0 / price
+    } else {
+        broker.tick_value / (broker.tick_size * broker.contract_size)
+    }
+}
+
 fn liquidation_equity(
     position: &OpenPosition,
     bar: &Bar,
@@ -1395,8 +1409,10 @@ fn liquidation_equity(
         PositionSide::Long => 1.0,
         PositionSide::Short => -1.0,
     };
-    let gross = (exit_price - position.entry_price) * direction / broker.tick_size
-        * broker.tick_value
+    let gross = (exit_price - position.entry_price)
+        * direction
+        * broker.contract_size
+        * profit_currency_to_account(exit_price, broker)
         * position.volume;
     let exit_commission = position.volume * config.costs.commission_per_lot_round_turn / 2.0;
     balance + gross - exit_commission

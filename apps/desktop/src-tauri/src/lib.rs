@@ -1,6 +1,6 @@
 mod assets;
 mod challenge;
-mod data_lab;
+pub mod data_lab;
 mod databank;
 mod deploy;
 mod discover;
@@ -41,6 +41,7 @@ pub fn run() {
             databank::promote_elite_to_vault,
             databank::run_fidelity_demo,
             data_lab::inspect_data,
+            data_lab::import_market_folder,
             discover::start_discover,
             discover::run_condition_bakeoff,
             discover::get_discover_job,

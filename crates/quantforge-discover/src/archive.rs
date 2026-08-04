@@ -32,14 +32,15 @@ pub(crate) fn deposit_to_accepted_pool(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    // Breeding pot is a bag: fingerprint dedup + correlation only.
-    // Niche competition is databank-only — rejecting "niche not improved" during
-    // fill was starving Initial pot while deposit-gate passers piled up as rejects.
-    deposit_into_breeding_pool(
+    // Breeding pot is a bag: fingerprint dedup + correlation only. Strategies
+    // with the same behaviour niche are allowed to stack.
+    deposit_into_stack(
         &mut bank.accepted_pool,
         &mut bank.accepted_coverage_map,
         bank.config.correlation_threshold,
         candidate,
+        DepositDecision::AcceptedToPot,
+        DepositDecision::ReplacedInPot,
     )
 }
 
@@ -50,7 +51,9 @@ pub(crate) fn deposit_to_databank(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    deposit_into_map_elites(
+    // Databank stacks like the pot — no MAP-Elites niche replacement. Niche
+    // labels stay as descriptive metadata only.
+    deposit_into_stack(
         &mut bank.elites,
         &mut bank.coverage_map,
         bank.config.correlation_threshold,
@@ -60,12 +63,14 @@ pub(crate) fn deposit_to_databank(
     )
 }
 
-/// Fingerprint-keyed breeding bag (no niche uniqueness).
-fn deposit_into_breeding_pool(
+/// Fingerprint-keyed stacking bag (no niche uniqueness / replacement).
+fn deposit_into_stack(
     entries: &mut Vec<Elite>,
     coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
     correlation_threshold: f64,
     candidate: CandidateEvaluation,
+    accepted: DepositDecision,
+    replaced: DepositDecision,
 ) -> Result<DepositDecision, quantforge_ir::IrError> {
     let fingerprint = candidate
         .strategy
@@ -118,7 +123,7 @@ fn deposit_into_breeding_pool(
             discovered_generation: candidate.generation,
         };
         refresh_fingerprint_coverage_map(entries, coverage_map);
-        return Ok(DepositDecision::ReplacedInPot);
+        return Ok(replaced);
     }
 
     if maximum_correlation > correlation_threshold {
@@ -147,107 +152,7 @@ fn deposit_into_breeding_pool(
         discovered_generation: candidate.generation,
     });
     refresh_fingerprint_coverage_map(entries, coverage_map);
-    Ok(DepositDecision::AcceptedToPot)
-}
-
-fn deposit_into_map_elites(
-    entries: &mut Vec<Elite>,
-    coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
-    correlation_threshold: f64,
-    candidate: CandidateEvaluation,
-    accepted: DepositDecision,
-    replaced: DepositDecision,
-) -> Result<DepositDecision, quantforge_ir::IrError> {
-    let fingerprint = candidate
-        .strategy
-        .structural_fingerprint(FloatPolicy::default())?;
-    let descriptor = descriptor(&candidate.strategy, &candidate.result);
-    let niche = niche_key(&descriptor);
-    let evidence = evidence(&candidate.strategy, &candidate.result);
-    let signature = equity_signature(&candidate.result, 64);
-    let maximum_correlation = entries
-        .iter()
-        .filter(|elite| elite.structural_fingerprint != fingerprint)
-        .map(|elite| correlation(&signature, &elite.equity_signature))
-        .fold(0.0_f64, f64::max);
-    let novelty = quantized(1.0 - maximum_correlation.clamp(0.0, 1.0));
-    let complexity = candidate.strategy.complexity().score;
-
-    let fingerprint_index = entries
-        .iter()
-        .position(|elite| elite.structural_fingerprint == fingerprint);
-    if let Some(index) = fingerprint_index {
-        let existing = &entries[index];
-        if !better_than(
-            &evidence,
-            novelty,
-            complexity,
-            candidate.result.metrics.trade_count,
-            existing,
-        ) {
-            return Ok(DepositDecision::RejectedClone);
-        }
-    }
-
-    let elite = Elite {
-        strategy: candidate.strategy,
-        structural_fingerprint: fingerprint.clone(),
-        descriptor,
-        niche: niche.clone(),
-        evidence,
-        novelty,
-        complexity,
-        metrics: candidate.result.metrics,
-        is_expectancy: candidate.is_expectancy,
-        oos1_expectancy: candidate.oos1_expectancy,
-        oos1_expectancy_ratio: candidate.oos1_expectancy_ratio,
-        observed_trade_sharpe: candidate.observed_trade_sharpe,
-        expected_max_lucky_sharpe: candidate.expected_max_lucky_sharpe,
-        deflated_trade_sharpe: candidate.deflated_trade_sharpe,
-        multi_symbol_results: candidate.multi_symbol_results,
-        gate_results: candidate.gate_results,
-        robustness: candidate.robustness,
-        equity_signature: signature,
-        discovered_generation: candidate.generation,
-    };
-
-    if let Some(index) = entries.iter().position(|value| value.niche == niche) {
-        if fingerprint_index == Some(index) {
-            entries[index] = elite;
-            refresh_niche_coverage_map(entries, coverage_map);
-            return Ok(replaced);
-        }
-        if better_than(
-            &elite.evidence,
-            elite.novelty,
-            elite.complexity,
-            elite.metrics.trade_count,
-            &entries[index],
-        ) {
-            if let Some(fingerprint_index) = fingerprint_index {
-                entries.remove(fingerprint_index);
-            }
-            let index = entries
-                .iter()
-                .position(|value| value.niche == niche)
-                .expect("destination niche existed before fingerprint removal");
-            entries[index] = elite;
-            refresh_niche_coverage_map(entries, coverage_map);
-            Ok(replaced)
-        } else {
-            Ok(DepositDecision::RejectedNicheNotImproved)
-        }
-    } else if maximum_correlation > correlation_threshold {
-        Ok(DepositDecision::RejectedCorrelated)
-    } else {
-        if let Some(fingerprint_index) = fingerprint_index {
-            entries.remove(fingerprint_index);
-        }
-        entries.push(elite);
-        entries.sort_by(|left, right| left.niche.cmp(&right.niche));
-        refresh_niche_coverage_map(entries, coverage_map);
-        Ok(accepted)
-    }
+    Ok(accepted)
 }
 
 pub(crate) fn passes_gates(result: &ScoutResult, config: &DiscoverConfig) -> bool {
@@ -431,21 +336,6 @@ fn better_than(
         .then_with(|| champion.complexity.cmp(&complexity))
         .then_with(|| trade_count.cmp(&champion.metrics.trade_count))
         .is_gt()
-}
-
-fn refresh_niche_coverage_map(
-    entries: &[Elite],
-    coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
-) {
-    *coverage_map = entries
-        .iter()
-        .map(|elite| {
-            (
-                niche_label(&elite.niche),
-                elite.structural_fingerprint.clone(),
-            )
-        })
-        .collect();
 }
 
 fn refresh_fingerprint_coverage_map(
@@ -703,5 +593,60 @@ mod tests {
         assert_eq!(second, DepositDecision::AcceptedToPot);
         assert_eq!(bank.accepted_pool.len(), 2);
         assert_eq!(bank.accepted_coverage_map.len(), 2);
+    }
+
+    #[test]
+    fn databank_stacks_distinct_strategies_in_the_same_niche() {
+        let mut bank = bank(0.99);
+        let first = deposit_to_databank(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(11, 0),
+                result: profitable_result(),
+                generation: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, DepositDecision::AcceptedToDatabank);
+
+        let mut second_result = profitable_result();
+        for (index, point) in second_result.equity.iter_mut().enumerate() {
+            point.equity = 100_000.0 + (index as f64).sin() * 300.0 + index as f64 * 5.0;
+        }
+        second_result.metrics.return_percent = 1.8;
+        let second = deposit_to_databank(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(11, 4),
+                result: second_result,
+                generation: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(second, DepositDecision::AcceptedToDatabank);
+        assert_eq!(bank.elites.len(), 2);
+        assert_eq!(bank.coverage_map.len(), 2);
+        assert_ne!(
+            bank.elites[0].structural_fingerprint,
+            bank.elites[1].structural_fingerprint
+        );
     }
 }

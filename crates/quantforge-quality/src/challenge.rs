@@ -20,6 +20,10 @@ pub const CHALLENGE_REPORT_SCHEMA_VERSION: u16 = 1;
 /// Default Monte Carlo gate: the 80th percentile of resampled net profit must
 /// retain at least this fraction of the baseline (original) net profit.
 pub const MONTE_CARLO_P80_PROFIT_RETENTION: f64 = 0.60;
+/// Fraction of trades removed from each moving-block Monte Carlo path.
+pub const MONTE_CARLO_SKIP_TRADE_PROBABILITY: f64 = 0.10;
+/// P95 simulated drawdown may not exceed this multiple of the baseline max DD.
+pub const MONTE_CARLO_MAX_DRAWDOWN_RATIO: f64 = 1.75;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -262,6 +266,12 @@ pub struct MonteCarloReport {
     pub minimum_p05_net_profit: f64,
     #[serde(default)]
     pub maximum_p95_drawdown_percent: f64,
+    /// Baseline max drawdown used to derive the P95 limit. Older evidence has
+    /// zero here and remains readable, but cannot claim the ratio-based gate.
+    #[serde(default)]
+    pub baseline_max_drawdown_percent: f64,
+    #[serde(default = "default_monte_carlo_max_drawdown_ratio")]
+    pub maximum_drawdown_ratio: f64,
     /// Required fraction of [`Self::baseline_net_profit`] that
     /// [`Self::p80_net_profit`] must retain.
     #[serde(default = "default_minimum_p80_profit_retention")]
@@ -285,6 +295,10 @@ pub struct MonteCarloReport {
 
 fn default_minimum_p80_profit_retention() -> f64 {
     MONTE_CARLO_P80_PROFIT_RETENTION
+}
+
+fn default_monte_carlo_max_drawdown_ratio() -> f64 {
+    MONTE_CARLO_MAX_DRAWDOWN_RATIO
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -442,16 +456,53 @@ impl ChallengeReport {
         let monte_carlo_passed = self.baseline.metrics.trade_count > 0
             && self.monte_carlo.p05_net_profit >= self.config.monte_carlo_minimum_p05_net_profit
             && self.monte_carlo.p95_drawdown_percent
-                <= self.config.monte_carlo_maximum_p95_drawdown_percent
+                <= self.monte_carlo.maximum_p95_drawdown_percent
             && passes_p80_profit_retention(
                 self.monte_carlo.p80_net_profit,
                 self.baseline.metrics.net_profit,
                 self.config.monte_carlo_minimum_p80_profit_retention,
             );
-        if self.monte_carlo.method != "moving_block_trade_bootstrap_v1"
+        let method_supported = matches!(
+            self.monte_carlo.method.as_str(),
+            "moving_block_trade_bootstrap_v1" | "moving_block_trade_resampling_with_skip_v1"
+        );
+        let skip_matches_method = if self.monte_carlo.method
+            == "moving_block_trade_resampling_with_skip_v1"
+        {
+            (self.monte_carlo.skip_trade_probability - MONTE_CARLO_SKIP_TRADE_PROBABILITY).abs()
+                < 1e-12
+        } else {
+            self.monte_carlo.skip_trade_probability.abs() < 1e-12
+        };
+        let dynamic_dd_metadata_is_consistent = if self.monte_carlo.method
+            == "moving_block_trade_resampling_with_skip_v1"
+        {
+            self.monte_carlo.baseline_max_drawdown_percent
+                .is_finite()
+                && self.monte_carlo.maximum_drawdown_ratio
+                    .is_finite()
+                && (self.monte_carlo.baseline_max_drawdown_percent
+                    - self.baseline.metrics.max_drawdown_percent)
+                    .abs()
+                    < 1e-9
+                && (self.monte_carlo.maximum_drawdown_ratio
+                    - MONTE_CARLO_MAX_DRAWDOWN_RATIO)
+                    .abs()
+                    < 1e-12
+                && (self.monte_carlo.maximum_p95_drawdown_percent
+                    - self.baseline.metrics.max_drawdown_percent
+                        * MONTE_CARLO_MAX_DRAWDOWN_RATIO)
+                    .abs()
+                    < 1e-9
+        } else {
+            true
+        };
+        if !method_supported
             || self.monte_carlo.seed != self.config.seed
             || self.monte_carlo.trials != self.config.monte_carlo_trials
             || self.monte_carlo.block_length != self.config.monte_carlo_block_length
+            || !skip_matches_method
+            || !dynamic_dd_metadata_is_consistent
             || !same_float(
                 self.monte_carlo.minimum_p80_profit_retention,
                 self.config.monte_carlo_minimum_p80_profit_retention,
@@ -874,6 +925,8 @@ pub fn monte_carlo_trade_resampling_with_skip(
         skip_trade_probability,
         minimum_p05_net_profit,
         maximum_p95_drawdown_percent,
+        baseline_max_drawdown_percent: 0.0,
+        maximum_drawdown_ratio: MONTE_CARLO_MAX_DRAWDOWN_RATIO,
         minimum_p80_profit_retention,
         baseline_net_profit,
         p05_net_profit,
@@ -907,18 +960,23 @@ fn run_monte_carlo(baseline: &ScoutResult, config: &ChallengeConfig) -> MonteCar
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
-    monte_carlo_trade_resampling_with_skip(
+    let maximum_p95_drawdown_percent = baseline.metrics.max_drawdown_percent
+        * MONTE_CARLO_MAX_DRAWDOWN_RATIO;
+    let mut report = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.scout.initial_balance,
         config.monte_carlo_trials,
         config.monte_carlo_block_length,
-        0.0,
+        MONTE_CARLO_SKIP_TRADE_PROBABILITY,
         config.seed,
         config.monte_carlo_minimum_p05_net_profit,
-        config.monte_carlo_maximum_p95_drawdown_percent,
+        maximum_p95_drawdown_percent,
         baseline.metrics.net_profit,
         config.monte_carlo_minimum_p80_profit_retention,
-    )
+    );
+    report.baseline_max_drawdown_percent = baseline.metrics.max_drawdown_percent;
+    report.maximum_drawdown_ratio = MONTE_CARLO_MAX_DRAWDOWN_RATIO;
+    report
 }
 
 fn moving_block_sample(values: &[f64], block_length: usize, rng: &mut ChaCha8Rng) -> Vec<f64> {
@@ -1152,6 +1210,123 @@ fn perturb_strategy(
     let neighbor = neighbor.canonicalized(FloatPolicy::default())?;
     neighbor.validate_export_safe(quantforge_ir::IrLimits::default())?;
     Ok(neighbor)
+}
+
+/// Build a small, deterministic system-parameter permutation battery.  Unlike
+/// the randomized neighbourhood sampler, each returned candidate changes one
+/// execution parameter at a time in the negative and positive direction.  It
+/// is deliberately compact: the goal is to detect a knife-edge parameter, not
+/// to re-optimise the strategy on the validation set.
+pub fn parameter_permutation_neighbors(
+    strategy: &StrategyIr,
+    fraction: f64,
+) -> Result<Vec<StrategyIr>, ChallengeError> {
+    let fraction = fraction.clamp(0.01, 0.95);
+    let mut neighbors = Vec::new();
+    let mut add = |label: &str, mutator: &dyn Fn(&mut StrategyIr, f64)| -> Result<(), ChallengeError> {
+        for (direction, factor) in [("lo", 1.0 - fraction), ("hi", 1.0 + fraction)] {
+            let mut neighbor = strategy.clone();
+            neighbor.id = format!("{}-perm-{label}-{direction}", strategy.id);
+            mutator(&mut neighbor, factor);
+            let neighbor = neighbor.canonicalized(FloatPolicy::default())?;
+            neighbor.validate_export_safe(quantforge_ir::IrLimits::default())?;
+            neighbors.push(neighbor);
+        }
+        Ok(())
+    };
+    add("sl", &|candidate, factor| match &mut candidate.stops.stop_loss {
+        StopLossPolicy::AtrMultiple { multiplier, .. }
+        | StopLossPolicy::RangeMultiple { multiplier, .. } => {
+            *multiplier = (*multiplier * factor).clamp(0.05, 20.0)
+        }
+        StopLossPolicy::FixedPoints { points } => *points = (*points * factor).max(0.01),
+    })?;
+    add("tp", &|candidate, factor| match &mut candidate.stops.take_profit {
+        TakeProfitPolicy::RiskMultiple { multiple } => {
+            *multiple = (*multiple * factor).clamp(0.05, 20.0)
+        }
+        TakeProfitPolicy::AtrMultiple { multiplier, .. } => {
+            *multiplier = (*multiplier * factor).clamp(0.05, 20.0)
+        }
+        TakeProfitPolicy::FixedPoints { points } => *points = (*points * factor).max(0.01),
+    })?;
+    add("atr", &|candidate, factor| {
+        let scale = |period: &mut u16| {
+            *period = (f64::from(*period) * factor).round().clamp(2.0, 500.0) as u16;
+        };
+        match &mut candidate.stops.stop_loss {
+            StopLossPolicy::AtrMultiple { period, .. }
+            | StopLossPolicy::RangeMultiple { period, .. } => scale(period),
+            StopLossPolicy::FixedPoints { .. } => {}
+        }
+        if let TakeProfitPolicy::AtrMultiple { period, .. } = &mut candidate.stops.take_profit {
+            scale(period);
+        }
+        match &mut candidate.entry.order {
+            EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+                if let EntryDistancePolicy::AtrMultiple { period, .. }
+                | EntryDistancePolicy::RangeMultiple { period, .. } = distance
+                {
+                    scale(period);
+                }
+            }
+            EntryOrderPolicy::Market => {}
+        }
+        if let Some(TrailingPolicy::AtrMultiple { period, .. }) = &mut candidate.manage.trailing {
+            scale(period);
+        }
+    })?;
+    add("entry", &|candidate, factor| {
+        if let EntryOrderPolicy::Stop { distance, expiry_bars }
+        | EntryOrderPolicy::Limit { distance, expiry_bars } = &mut candidate.entry.order
+        {
+            match distance {
+                EntryDistancePolicy::FixedPoints { points } => {
+                    *points = (*points * factor).max(0.01)
+                }
+                EntryDistancePolicy::AtrMultiple { multiplier, .. }
+                | EntryDistancePolicy::RangeMultiple { multiplier, .. } => {
+                    *multiplier = (*multiplier * factor).clamp(0.01, 20.0)
+                }
+            }
+            *expiry_bars = (f64::from(*expiry_bars) * factor).round().clamp(1.0, 500.0) as u16;
+        }
+    })?;
+    add("manage", &|candidate, factor| {
+        if let Some(value) = &mut candidate.manage.break_even_at_r {
+            *value = (*value * factor).clamp(0.05, 20.0);
+        }
+        if let Some(trailing) = &mut candidate.manage.trailing {
+            match trailing {
+                TrailingPolicy::RiskMultiple {
+                    activate_at_r,
+                    distance_r,
+                } => {
+                    *activate_at_r = (*activate_at_r * factor).clamp(0.05, 20.0);
+                    *distance_r = (*distance_r * factor).clamp(0.05, 20.0);
+                }
+                TrailingPolicy::AtrMultiple {
+                    activate_at_r,
+                    multiplier,
+                    ..
+                } => {
+                    *activate_at_r = (*activate_at_r * factor).clamp(0.05, 20.0);
+                    *multiplier = (*multiplier * factor).clamp(0.05, 20.0);
+                }
+            }
+        }
+        if let Some(bars) = &mut candidate.manage.time_stop_bars {
+            *bars = (f64::from(*bars) * factor).round().clamp(1.0, 5000.0) as u16;
+        }
+    })?;
+    for index in 0..strategy.manage.partial_exits.len() {
+        add(&format!("partial{index}"), &|candidate, factor| {
+            if let Some(partial) = candidate.manage.partial_exits.get_mut(index) {
+                partial.at_r = (partial.at_r * factor).clamp(0.05, 20.0);
+            }
+        })?;
+    }
+    Ok(neighbors)
 }
 
 fn perturb_bool(expression: &mut BoolExpr, fraction: f64, rng: &mut ChaCha8Rng) {
@@ -1606,6 +1781,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parameter_permutation_is_deterministic_and_keeps_fixed_risk() {
+        let first = parameter_permutation_neighbors(&strategy(), 0.30).unwrap();
+        let second = parameter_permutation_neighbors(&strategy(), 0.30).unwrap();
+        assert_eq!(first, second);
+        assert!(first.len() >= 8);
+        assert!(first.iter().all(|neighbor| {
+            matches!(neighbor.risk, RiskPolicy::FixedCurrency { amount } if amount == 1.0)
+        }));
+        assert!(first.iter().any(|neighbor| neighbor.id.contains("perm-sl-lo")));
+        assert!(first.iter().any(|neighbor| neighbor.id.contains("perm-tp-hi")));
+    }
+
     fn config() -> ChallengeConfig {
         ChallengeConfig {
             folds: 4,
@@ -1671,6 +1859,7 @@ mod tests {
 
     #[test]
     fn monte_carlo_pass_requires_p80_retention_of_baseline_net_profit() {
+        // Identical positive fills → every resample keeps full baseline; P80 retains 100%.
         let strong = [100.0; 20];
         let baseline: f64 = strong.iter().sum();
         let passed = monte_carlo_trade_resampling_with_skip(
@@ -1686,10 +1875,16 @@ mod tests {
             0.60,
         );
         assert!(passed.passed);
-        assert!((passed.p80_net_profit - baseline).abs() < 1e-9);
+        assert!(
+            (passed.p80_net_profit - baseline).abs() < 1e-9,
+            "identical fills should keep P80 at baseline, got {}",
+            passed.p80_net_profit
+        );
         assert_eq!(passed.minimum_p80_profit_retention, 0.60);
         assert_eq!(passed.baseline_net_profit, baseline);
 
+        // Same fills with trade removal: P80 falls below the original total, so
+        // demanding full retention fails while the 60% default still passes.
         let skipped = monte_carlo_trade_resampling_with_skip(
             &strong,
             10_000.0,

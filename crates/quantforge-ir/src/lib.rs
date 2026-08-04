@@ -298,6 +298,48 @@ impl IndicatorExpr {
         key
     }
 
+    /// QuantForge's deliberately compact indicator notation.  It is a stable
+    /// human-facing token for logs and strategy cards, while the typed enum
+    /// remains the executable source of truth.  Example:
+    /// `i{ema:p=20:s=1:src=close}` or `i{adx:p=14:s=1}`.
+    pub fn compact_token(&self) -> String {
+        let Ok(serde_json::Value::Object(mut fields)) = serde_json::to_value(self) else {
+            return "i{unknown}".into();
+        };
+        let operator = fields
+            .remove("operator")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let mut values = Vec::new();
+        for (key, value) in fields {
+            let short_key = match key.as_str() {
+                "source" => "src",
+                "period" => "p",
+                "shift" => "s",
+                "atr_period" => "atrp",
+                "range_bars" => "bars",
+                "start_hour" => "h",
+                "fast_period" => "fast",
+                "slow_period" => "slow",
+                "signal_period" => "sig",
+                "deviation" => "dev",
+                "tenkan_period" => "tenkan",
+                "kijun_period" => "kijun",
+                "senkou_period" => "senkou",
+                "smoothing" => "smooth",
+                "factor" => "factor",
+                _ => key.as_str(),
+            };
+            let rendered = match value {
+                serde_json::Value::String(value) => value,
+                serde_json::Value::Number(value) => value.to_string(),
+                _ => value.to_string(),
+            };
+            values.push(format!("{short_key}={rendered}"));
+        }
+        format!("i{{{operator}:{}}}", values.join(":"))
+    }
+
     /// Representative lookback and bar shift, used for IR validation and by the
     /// evaluator to resolve reads against completed bars.
     pub fn period_and_shift(&self) -> (u16, u16) {
@@ -1435,5 +1477,17 @@ mod tests {
             complexity.score,
             complexity.node_count + complexity.parameter_count
         );
+    }
+
+    #[test]
+    fn compact_indicator_tokens_are_short_and_stable() {
+        let token = IndicatorExpr::Ema {
+            source: PriceField::Close,
+            period: 20,
+            shift: 1,
+        }
+        .compact_token();
+        assert_eq!(token, "i{ema:p=20:s=1:src=close}");
+        assert!(token.len() < 32);
     }
 }

@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "quantforge-desktop"
 path = "src/main.rs"
 
+[[bin]]
+name = "qf-import-market"
+path = "src/bin/qf_import_market.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
@@ -29,6 +33,7 @@ quantforge-quality.workspace = true
 quantforge-storage.workspace = true
 quantforge-tick.workspace = true
 chrono.workspace = true
+csv.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

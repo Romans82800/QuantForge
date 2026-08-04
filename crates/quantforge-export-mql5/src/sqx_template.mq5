@@ -452,13 +452,23 @@ bool QFOpenOrder(const bool buy)
                                          : intended_entry+stop_distance,_Digits);
    const double target=NormalizeDouble(buy ? intended_entry+target_distance
                                            : intended_entry-target_distance,_Digits);
-   double loss_per_lot=0.0;
-   const ENUM_ORDER_TYPE market_type=buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   if(!OrderCalcProfit(market_type,_Symbol,1.0,intended_entry,stop,loss_per_lot))
-      return false;
-   loss_per_lot=MathAbs(loss_per_lot);
-   const double tick_size=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
-   const double tick_value=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   // Keep risk sizing identical to the QuantForge evaluator by using the
+   // bound broker geometry.  Runtime OrderCalcProfit can differ between
+   // terminals (especially indices/crypto), so it remains only a fallback
+   // when an exported profile is incomplete.
+   const double bound_tick_size=@@BROKER_TICK_SIZE@@;
+   const double bound_tick_value=@@BROKER_TICK_VALUE@@;
+   const double tick_size=bound_tick_size;
+   const double tick_value=bound_tick_value;
+   double loss_per_lot=stop_distance/tick_size*tick_value;
+   if(tick_size<=0.0 || tick_value<=0.0 || !MathIsValidNumber(loss_per_lot))
+   {
+      loss_per_lot=0.0;
+      const ENUM_ORDER_TYPE market_type=buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      if(!OrderCalcProfit(market_type,_Symbol,1.0,intended_entry,stop,loss_per_lot))
+         return false;
+      loss_per_lot=MathAbs(loss_per_lot);
+   }
    if(tick_size<=0.0 || tick_value<=0.0)
       return false;
    const double slippage_cost=2.0*InpEstimatedSlippagePointsPerSide*_Point/tick_size*tick_value;

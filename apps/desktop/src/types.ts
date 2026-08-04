@@ -245,6 +245,8 @@ export interface RobustnessEvidence {
     skip_trade_probability?: number;
     minimum_p05_net_profit?: number;
     maximum_p95_drawdown_percent?: number;
+    baseline_max_drawdown_percent?: number;
+    maximum_drawdown_ratio?: number;
     minimum_p80_profit_retention?: number;
     baseline_net_profit?: number;
     p05_net_profit: number;
@@ -256,6 +258,7 @@ export interface RobustnessEvidence {
     passed: boolean;
   };
   parameter_neighborhood: {
+    method?: string;
     perturbation_fraction: number;
     samples_requested: number;
     samples_evaluated: number;
@@ -381,6 +384,36 @@ export interface DataLabView {
   lastTimestampMs: number;
   quality: DataQualityView;
   discoverReady: boolean;
+}
+
+export interface MarketFolderImportRequest {
+  sourceDirectory: string;
+  outputDirectory: string | null;
+  sourceTimezone: string;
+  aggregateTicksToBars: boolean;
+}
+
+export interface MarketFileImportView {
+  sourcePath: string;
+  symbol: string | null;
+  kind: string;
+  sourceRows: number;
+  bars: number;
+  m1Path: string | null;
+  m1MetadataPath: string | null;
+  h1Path: string | null;
+  h1MetadataPath: string | null;
+  status: string;
+  message: string | null;
+}
+
+export interface MarketFolderImportView {
+  sourceDirectory: string;
+  outputDirectory: string;
+  sourceTimezone: string;
+  files: MarketFileImportView[];
+  importedCount: number;
+  skippedCount: number;
 }
 
 export type DiscoverMode = "new" | "continue";
@@ -883,6 +916,7 @@ export interface ParityRequest {
   maxEquityDivergencePercent: number;
   tradeTimestampToleranceMs: number;
   minimumAlignedTradeFraction: number;
+  strictOneToOne?: boolean;
 }
 
 export interface ParityView {

@@ -82,10 +82,11 @@ pub struct DiscoverRequest {
     deposit_minimum_return_drawdown: Option<f64>,
     minimum_m1_return_retention: Option<f64>,
     oos1_expectancy_retention: Option<f64>,
-    /// SQX Selected-TF style when false (default): skip M1 during Discover.
+    /// Downstream preference only — Discover never runs M1. When true, portfolio
+    /// / export may insist on an explicit M1 fidelity pass after the run.
     require_m1_precision: Option<bool>,
     /// Legacy selected-TF compatibility profile. Explicit feature toggles below
-    /// take precedence and require direct M1 precision.
+    /// take precedence; they widen search without forcing M1 during Discover.
     simple_exits: Option<bool>,
     allow_break_even: Option<bool>,
     allow_trailing_stops: Option<bool>,
@@ -770,7 +771,7 @@ fn run_discovery(
                 job,
                 "Evaluating initial grammar population",
                 &format!(
-                    "IS {decision_timeframe} search with matching-timeframe multi-symbol screen, OOS1 pick, and M1 robustness."
+                    "H1 gates fill the breeding pot only. After breeding unlocks: OOS1 → M1 robustness → M1 fidelity → databank."
                 ),
             )?;
             let mut config = new_config(&request)?;
@@ -904,7 +905,7 @@ fn run_discovery(
         update_phase(
             job,
             &phase_label,
-            "Candidates enter the pot on Selected-TF IS evidence. M1 precision, robustness and OOS1 (≥0.7× IS) then gate databank promotion only.",
+            "Candidates enter the pot on Selected-TF H1 gates only. After breeding unlocks: OOS1 databank gate → M1 robustness → M1 fidelity → databank (M1 metrics only).",
         )?;
 
         bank = session
@@ -1025,7 +1026,7 @@ fn finish_discovery(
         view.status = "completed";
         view.phase = "Completed with an empty bank".into();
         view.message = format!(
-            "No elites passed H1 → M1 → OOS1 after {} evaluations across {} generations. {funnel} Keep searching, loosen gates, or check data.",
+            "No elites passed the post-breed pipeline (OOS1 → M1 robustness → M1) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
             bank.evaluation_count, completed_now
         );
         view.output_path = None;
@@ -1199,7 +1200,12 @@ fn write_discover_checkpoint(
             "require_m1_precision".into(),
             json!(bank.config.require_m1_precision),
         ),
-        ("research_grade".into(), json!(false)),
+        // Discover seals research-grade until at least one elite survives the
+        // post-breed M1 pipeline into the databank.
+        (
+            "research_grade".into(),
+            json!(bank.elites.is_empty()),
+        ),
         ("simple_exits".into(), json!(bank.config.simple_exits)),
         (
             "max_one_entry_per_day".into(),
@@ -1207,6 +1213,10 @@ fn write_discover_checkpoint(
         ),
         (
             "m1_fidelity_verified".into(),
+            json!(bank.elites.iter().any(|elite| elite.robustness.is_some())),
+        ),
+        (
+            "require_m1_robustness".into(),
             json!(bank.config.require_m1_robustness),
         ),
     ]);
@@ -1377,8 +1387,27 @@ fn normalize_split_fractions(
     validation_fraction: f64,
     sealed_fraction: f64,
 ) -> Result<(f64, f64), String> {
-    let validation = validation_fraction.clamp(0.05, 0.4);
-    let sealed = sealed_fraction.clamp(0.05, 0.4);
+    if validation_fraction.is_finite()
+        && sealed_fraction.is_finite()
+        && validation_fraction + sealed_fraction >= 0.9
+    {
+        return Err(format!(
+            "validation ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for IS"
+        ));
+    }
+    // Fractions are part of the persisted experiment contract.  Silently
+    // clamping a saved value changes the intended IS/OOS split and can make a
+    // result appear comparable when it was actually evaluated on a different
+    // sample.  Reject invalid input explicitly instead.
+    if !validation_fraction.is_finite()
+        || !sealed_fraction.is_finite()
+        || !(0.05..=0.4).contains(&validation_fraction)
+        || !(0.05..=0.4).contains(&sealed_fraction)
+    {
+        return Err("validation and sealed fractions must each be between 5% and 40%".into());
+    }
+    let validation = validation_fraction;
+    let sealed = sealed_fraction;
     if validation + sealed >= 0.9 {
         return Err(format!(
             "validation ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for IS"
@@ -1571,7 +1600,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
-        require_m1_precision: request.require_m1_precision.unwrap_or(false),
+        require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
@@ -1790,12 +1819,12 @@ fn update_bank(
         )
     } else {
         format!(
-            "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} (M1+WFO+MC only). {} · {}",
+            "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (OOS1→robustness→M1). {} · {}",
             if breeding_active {
-                "Breeding unlocked; random fill continues".to_owned()
+                "Breeding unlocked — databank pipeline active".to_owned()
             } else {
                 format!(
-                    "{} more pot elites until breeding",
+                    "{} more pot elites until breeding (no databank yet)",
                     mutate_after.saturating_sub(pot_elites)
                 )
             },

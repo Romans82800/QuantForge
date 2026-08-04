@@ -1,4 +1,4 @@
-use crate::archive::{niche_key, niche_label};
+use crate::archive::niche_key;
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_eval::{BacktestMetrics, EvalError, ScoutConfig};
@@ -156,22 +156,24 @@ pub struct SearchRangeProfile {
 }
 
 impl Default for SearchRangeProfile {
-    /// Compact H1/M15 plateau: tight periods (10–20) suited to hourly research.
+    /// Compact H1/M15 plateau: bounded ranges, not fixed constants.  The
+    /// researcher can widen these in the settings wall, while the default
+    /// still keeps the first pass on a local volatility/indicator plateau.
     fn default() -> Self {
         Self::h1_compact()
     }
 }
 
 impl SearchRangeProfile {
-    /// Current QuantForge H1/M15 default — tight indicator periods and modest
-    /// stop/target bands so the search stays on a local plateau.
+    /// Current QuantForge H1/M15 default.  ATR lookback and target geometry
+    /// are genes; there is no implicit ``14 ATR / 1.5R`` rule.
     pub fn h1_compact() -> Self {
         Self {
             indicator_period: SearchRange::new(10.0, 20.0, 1.0),
-            atr_period: SearchRange::new(14.0, 14.0, 1.0),
-            atr_stop_multiple: SearchRange::new(1.5, 4.0, 0.25),
-            atr_target_multiple: SearchRange::new(2.0, 6.0, 0.5),
-            risk_target_multiple: SearchRange::new(1.5, 4.5, 0.25),
+            atr_period: SearchRange::new(10.0, 20.0, 1.0),
+            atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.25),
+            atr_target_multiple: SearchRange::new(1.0, 6.0, 0.5),
+            risk_target_multiple: SearchRange::new(0.75, 4.5, 0.25),
             pending_distance_atr: SearchRange::new(0.25, 2.0, 0.25),
             pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
             time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
@@ -515,7 +517,7 @@ pub struct SearchFamilySpec {
     pub complexity_penalty_weight: f64,
 }
 
-/// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite + M1 gates;
+/// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite stacking + Selected-TF;
 /// Quota Harvest = ~20 databank elites per family without chasing pot 300.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -577,16 +579,18 @@ pub struct DiscoverConfig {
     /// candidate may enter the databank (promotion-grade IS/OOS1/OOS2 workflow).
     #[serde(default = "default_oos1_expectancy_retention")]
     pub oos1_expectancy_retention: f64,
-    /// When false (SQX Selected-TF style), Discover deposits from H1/IS only and
-    /// defers M1 path fidelity to a later fidelity demo. Research-grade until verified.
+    /// Preference / seal flag: databank elites are M1-promoted after breeding.
+    /// Discover always runs the M1 fidelity + robustness battery on the
+    /// post-breed databank path (SQX structure); this does not gate the pot.
     #[serde(default = "default_require_m1_precision")]
     pub require_m1_precision: bool,
     /// Prefer stop/limit pendings, ATR/R SL-TP, no trailing/BE/partials, and a
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
-    /// Individually opt-in execution genes.  They are off in the selected-TF
-    /// high-parity profile and require direct M1 precision when enabled.
+    /// Individually opt-in execution genes. Off in the high-parity Selected-TF
+    /// baseline; enabling them widens search and makes M1/MT5 final gates more
+    /// important — they do not block Discover breeding.
     #[serde(default)]
     pub allow_break_even: bool,
     #[serde(default)]
@@ -612,8 +616,8 @@ pub struct DiscoverConfig {
     #[serde(default = "default_max_one_entry_per_day")]
     pub max_one_entry_per_day: bool,
     /// Keep random-filling the initial accepted pot until it holds this many
-    /// strategies, then unlock crossover/mutation from that pot. Databank size
-    /// is independent and only grows with M1-robust survivors.
+    /// strategies, then unlock crossover/mutation from that pot. Databank
+    /// promotion (OOS1 → robustness → M1) starts only after this unlock.
     #[serde(
         default = "default_mutate_after_elites",
         alias = "mutate_after_generation"
@@ -625,8 +629,8 @@ pub struct DiscoverConfig {
     /// Rayon worker threads for candidate evaluation. `0` = all logical CPUs.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
-    /// After IS scout + OOS1 pass, require M1 walk-forward / Monte Carlo /
-    /// ±param neighborhood before a candidate may enter the databank (not the pot).
+    /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
+    /// neighborhood battery before databank admission. Pot fill never waits on this.
     #[serde(default = "default_require_m1_robustness")]
     pub require_m1_robustness: bool,
     #[serde(default = "default_robustness_folds")]
@@ -666,8 +670,8 @@ fn default_oos1_expectancy_retention() -> f64 {
 }
 
 fn default_require_m1_precision() -> bool {
-    // SQX builds on Selected TF first; M1 is a later retest.
-    false
+    // Post-breed databank path always promotes on M1 evidence.
+    true
 }
 
 fn default_simple_exits() -> bool {
@@ -697,6 +701,7 @@ fn default_worker_threads() -> usize {
 }
 
 fn default_require_m1_robustness() -> bool {
+    // Post-breed databank path always runs the M1 robustness battery.
     true
 }
 
@@ -793,8 +798,7 @@ impl DiscoverConfig {
             DiscoverRunMode::FastScout => {
                 self.initial_candidates = self.initial_candidates.clamp(40, 80);
                 self.batch_size = self.batch_size.clamp(20, 40);
-                self.require_m1_precision = false;
-                self.require_m1_robustness = false;
+                // Pot-only scout: stop before breeding so M1/databank never starts.
                 self.simple_exits = !self.has_complex_execution();
                 if self.early_stop_pot_elites.is_none() {
                     self.early_stop_pot_elites = Some(8);
@@ -812,13 +816,14 @@ impl DiscoverConfig {
             }
             DiscoverRunMode::QuotaHarvest => {
                 // ~20 databank elites: seed-heavy, softer param neighborhood,
-                // stop on databank quota — not pot 300.
+                // stop on databank quota — not pot 300. Databank still requires
+                // post-breed OOS1 → robustness → M1 (never H1-only elites).
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
                     self.simple_exits = false;
                 }
-                self.require_m1_precision = false;
+                self.require_m1_precision = true;
                 self.require_m1_robustness = true;
                 self.initial_candidates = self.initial_candidates.max(1000);
                 self.batch_size = self.batch_size.max(300);
@@ -869,11 +874,8 @@ impl DiscoverConfig {
                 "enable at least one entry order kind: market, stop or limit".into(),
             ));
         }
-        if self.has_complex_execution() && !self.require_m1_precision {
-            return Err(DiscoverError::InvalidConfig(
-                "break-even, trailing, partial and pending-entry genes require M1 precision".into(),
-            ));
-        }
+        // Stop/limit/BE/trail/partials are free to search on Selected-TF for the pot.
+        // After breeding unlocks, databank admission always runs OOS1 → robustness → M1.
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
@@ -1133,6 +1135,10 @@ pub struct ParameterNeighborhoodSample {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParameterNeighborhoodEvidence {
+    /// `systematic_axis` means each execution parameter was tested at both
+    /// sides of the configured perturbation band; older databanks omit this.
+    #[serde(default)]
+    pub method: String,
     pub perturbation_fraction: f64,
     pub samples_requested: usize,
     /// Samples that produced a canonical, evaluable neighbour.
@@ -1333,7 +1339,7 @@ pub struct Databank {
     pub config: DiscoverConfig,
     pub completed_generations: u64,
     pub evaluation_count: u64,
-    /// Initial accepted pot used for breeding (IS+OOS1+deposit gates only).
+    /// Initial accepted pot used for breeding (H1 / Selected-TF gates only).
     #[serde(default)]
     pub accepted_pool: Vec<Elite>,
     #[serde(default)]
@@ -1382,16 +1388,38 @@ impl Databank {
                     .into(),
             ));
         }
+        // Elites used to be MAP-Elites (niche-keyed coverage). Validate against a
+        // fingerprint stack view so older databanks keep loading after the change.
+        let elite_coverage: BTreeMap<_, _> = self
+            .elites
+            .iter()
+            .map(|elite| {
+                (
+                    elite.structural_fingerprint.to_string(),
+                    elite.structural_fingerprint.clone(),
+                )
+            })
+            .collect();
+        let pot_coverage: BTreeMap<_, _> = self
+            .accepted_pool
+            .iter()
+            .map(|elite| {
+                (
+                    elite.structural_fingerprint.to_string(),
+                    elite.structural_fingerprint.clone(),
+                )
+            })
+            .collect();
         validate_archive_entries(
             &self.elites,
-            &self.coverage_map,
+            &elite_coverage,
             &self.config,
             self.completed_generations,
-            ArchiveKind::MapElites,
+            ArchiveKind::BreedingBag,
         )?;
         validate_archive_entries(
             &self.accepted_pool,
-            &self.accepted_coverage_map,
+            &pot_coverage,
             &self.config,
             self.completed_generations,
             ArchiveKind::BreedingBag,
@@ -1401,7 +1429,6 @@ impl Databank {
 }
 
 enum ArchiveKind {
-    MapElites,
     BreedingBag,
 }
 
@@ -1442,9 +1469,6 @@ fn validate_archive_entries(
                 if (amount - crate::FIXED_RISK_PER_TRADE).abs() <= 1.0e-9
         );
         let coverage_ok = match kind {
-            ArchiveKind::MapElites => {
-                coverage_map.get(&niche_label(&elite.niche)) == Some(&elite.structural_fingerprint)
-            }
             ArchiveKind::BreedingBag => {
                 coverage_map.get(&elite.structural_fingerprint.to_string())
                     == Some(&elite.structural_fingerprint)

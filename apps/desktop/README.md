@@ -30,6 +30,14 @@ Challenge, one-shot sealed final, M1 Judge, guarded MQL5 export, external and
 indicator parity, paper incubation, evidence assembly, Certified Vault
 admission, portfolio packing and deployment-pack generation.
 
+Data Manager also imports IC Markets downloads directly. Choose the Downloads
+folder and QuantForge recursively recognizes `Time,Ask,Bid,Volume` tick CSVs,
+aggregates their Ask/Bid midpoint to M1 bars, derives H1 from that M1 stream,
+and writes companion metadata under a timestamped output directory. Unrelated
+CSV schemas are listed as skipped. The generated bars are research-ready but
+still need a real MT5 broker profile before Discover can run; the importer
+does not invent contract size, point value, sessions or commission settings.
+
 The Databank workspace supports checkbox selection, deterministic top-N
 selection and no-clobber batch export. A batch folder contains one exact
 `*.strategy.ir.json` artifact per selected elite plus

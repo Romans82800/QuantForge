@@ -189,13 +189,15 @@ fn verify_databank(
     {
         return Err("portfolio requires an intact, promotion-grade databank".into());
     }
+    // Final parity gate: Discover stacks Selected-TF elites; Portfolio requires
+    // an explicit M1 fidelity pass (Results → M1 fidelity), not a preference flag.
     let fidelity_verified = matches!(
         artifact.manifest.recipe.config.get("m1_fidelity_verified"),
         Some(serde_json::Value::Bool(true))
-    ) || bank.config.require_m1_precision;
+    );
     if !fidelity_verified {
         return Err(
-            "databank is research-grade (H1 scout only). Run Fidelity demo (M1 retest) before Portfolio."
+            "databank is research-grade (Selected-TF Discover only). Run Results → M1 fidelity gate before Portfolio."
                 .into(),
         );
     }

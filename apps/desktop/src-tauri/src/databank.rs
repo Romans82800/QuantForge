@@ -872,6 +872,10 @@ fn run_elite_robustness_sync(
                     "monte_carlo_minimum_p80_profit_retention".into(),
                     json!(quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION),
                 ),
+                (
+                    "monte_carlo_max_drawdown_ratio".into(),
+                    json!(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
+                ),
                 ("neighborhood_samples".into(), json!(neighborhood_samples)),
                 (
                     "parameter_perturbation_fraction".into(),
@@ -1897,23 +1901,17 @@ fn workspace_view(
 }
 
 pub(crate) fn artifact_is_research_grade(artifact: &EvolveArtifact) -> bool {
-    if artifact_m1_fidelity_verified(artifact) {
-        return false;
-    }
-    if matches!(
-        artifact.manifest.recipe.config.get("research_grade"),
-        Some(Value::Bool(false))
-    ) {
-        return false;
-    }
-    !artifact.databank.config.require_m1_precision
+    // Selected-TF Discover banks stay research-grade until the M1 fidelity
+    // final gate stamps `m1_fidelity_verified`. Preference flags alone do not
+    // promote a bank (SQX RetestWithHigherPrecision pattern).
+    !artifact_m1_fidelity_verified(artifact)
 }
 
 pub(crate) fn artifact_m1_fidelity_verified(artifact: &EvolveArtifact) -> bool {
     matches!(
         artifact.manifest.recipe.config.get("m1_fidelity_verified"),
         Some(Value::Bool(true))
-    ) || artifact.databank.config.require_m1_precision
+    )
 }
 
 fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {

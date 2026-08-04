@@ -6,7 +6,15 @@ use quantforge_core::FloatPolicy;
 use quantforge_data::{BarDataset, bar_content_hash, infer_median_interval_ms};
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
-use quantforge_quality::{monte_carlo_trade_resampling_with_skip, perturb_strategy_parameters};
+use quantforge_quality::{
+    monte_carlo_trade_resampling_with_skip, parameter_permutation_neighbors,
+    perturb_strategy_parameters,
+};
+
+pub use quantforge_quality::{
+    MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
+    MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+};
 
 use crate::model::{
     M1RetentionEvidence, ParameterNeighborhoodEvidence, ParameterNeighborhoodSample,
@@ -70,10 +78,7 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 /// parameter-sensitivity default: wide enough to expose a knife-edge fit, narrow
 /// enough that a genuinely robust plateau survives.
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
-/// SQX-style trade manipulation: each resampled path loses 15% of fills.
-pub const MONTE_CARLO_SKIP_TRADE_PROBABILITY: f64 = 0.15;
-/// Re-export of the shared Monte Carlo P80 net-profit retention floor (60%).
-pub use quantforge_quality::MONTE_CARLO_P80_PROFIT_RETENTION;
+/// SQX-style trade manipulation: each resampled path removes 10% of fills.
 
 /// M1 baseline → SQX retention vs H1 → WFO/MC/params.
 pub fn run_m1_predeposit_robustness(
@@ -190,7 +195,9 @@ pub fn run_m1_predeposit_robustness(
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
-    let mc = monte_carlo_trade_resampling_with_skip(
+    let maximum_p95_drawdown_percent = baseline.metrics.max_drawdown_percent
+        * MONTE_CARLO_MAX_DRAWDOWN_RATIO;
+    let mut mc = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.initial_balance,
         config.monte_carlo_trials,
@@ -198,10 +205,12 @@ pub fn run_m1_predeposit_robustness(
         MONTE_CARLO_SKIP_TRADE_PROBABILITY,
         config.seed,
         0.0,
-        config.maximum_drawdown_percent.max(35.0),
+        maximum_p95_drawdown_percent,
         baseline.metrics.net_profit,
         MONTE_CARLO_P80_PROFIT_RETENTION,
     );
+    mc.baseline_max_drawdown_percent = baseline.metrics.max_drawdown_percent;
+    mc.maximum_drawdown_ratio = MONTE_CARLO_MAX_DRAWDOWN_RATIO;
     // Require a non-negative median path and the shared P80 retention gate
     // (p80_net_profit >= 60% of baseline net profit) encoded in `mc.passed`.
     if !mc.passed || mc.median_net_profit < 0.0 {
@@ -211,15 +220,26 @@ pub fn run_m1_predeposit_robustness(
     let mut surviving = 0usize;
     let mut evaluated_samples = 0usize;
     let mut neighborhood_samples = Vec::with_capacity(config.neighborhood_samples);
+    // Test deterministic one-axis low/high permutations first.  A joint
+    // seeded perturbation fills any remaining budget, preserving the existing
+    // fast/deep runtime presets while making the result a real plateau test.
+    let mut permutation_neighbors = parameter_permutation_neighbors(
+        strategy,
+        config.parameter_perturbation_fraction,
+    )
+    .unwrap_or_default()
+    .into_iter();
     for sample in 0..config.neighborhood_samples {
-        let Ok(neighbor) = perturb_strategy_parameters(
-            strategy,
-            config.parameter_perturbation_fraction,
-            sample,
-            config.seed,
-        ) else {
-            continue;
-        };
+        let neighbor = permutation_neighbors.next().or_else(|| {
+            perturb_strategy_parameters(
+                strategy,
+                config.parameter_perturbation_fraction,
+                sample,
+                config.seed,
+            )
+            .ok()
+        });
+        let Some(neighbor) = neighbor else { continue };
         let Ok(result) = evaluate_strategy_m1(&neighbor, is_decision, m1_dataset, broker, &judge)
         else {
             continue;
@@ -281,6 +301,7 @@ pub fn run_m1_predeposit_robustness(
             walk_forward: walk_forward_evidence,
             monte_carlo: mc,
             parameter_neighborhood: ParameterNeighborhoodEvidence {
+                method: "systematic_axis_plus_seeded_joint".into(),
                 perturbation_fraction: config.parameter_perturbation_fraction,
                 samples_requested: config.neighborhood_samples,
                 samples_evaluated: evaluated_samples,

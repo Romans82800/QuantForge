@@ -111,6 +111,18 @@ artifact validation and the desktop workflow—not profitable performance. Its
 elites can have zero trades and therefore zero QD score. Use complete broker
 history and promotion-grade gates for actual research.
 
+## IC Markets data pack
+
+The local pack lives at `ICMarkets_EST7_2020_present/` (gitignored; ~3.2 GB with
+M1). Download the published assets from the
+[data-icmarkets-est7-20260803](https://github.com/Romans82800/QuantForge/releases/tag/data-icmarkets-est7-20260803)
+release and extract into `~/Documents/QuantForge/ICMarkets_EST7_2020_present/`
+(or set `QUANTFORGE_DATA_PACK`).
+
+Source files named `*_TickData.csv` are Ask/Bid quote dumps (often several rows
+per minute), not OHLC. QuantForge aggregates midpoint quotes to M1, then builds
+H1. Timezone: `ICMarkets/EST+7`. Raw ~6.8 GB CSVs are not stored in git.
+
 ## Build
 
 ```sh

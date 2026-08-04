@@ -37,16 +37,18 @@ pub use permutation::{
     PermutationNullConfig, PermutationNullReport, run_permutation_null, stationary_bootstrap_bars,
 };
 pub use robustness::{
-    MONTE_CARLO_P80_PROFIT_RETENTION, MONTE_CARLO_SKIP_TRADE_PROBABILITY,
+    MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
+    MONTE_CARLO_SKIP_TRADE_PROBABILITY,
     PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessConfig, RobustnessOutcome,
     RobustnessReject, run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;
-/// Family-free typed block grammar: completed-bar signals, next-open market
-/// entry, ATR-period 14 protective exits, mandatory M1 promotion checks and
+/// Family-free typed block grammar: completed-bar signals, next-open entries,
+/// searchable ATR/R exit geometry, mandatory M1 promotion checks and
 /// MAP-Elites niching on the entry-condition count.
 pub const GRAMMAR_VERSION: &str = "universal-v6-condition-count";
 pub const FIXED_RISK_PER_TRADE: f64 = 1_000.0;
-/// Frozen ATR lookback inside institutional Search Families.
+/// Legacy fallback used by older methodology artifacts. New Discover runs use
+/// the sealed SearchRangeProfile ATR period instead of freezing this value.
 pub const FROZEN_ATR_PERIOD: u16 = 14;

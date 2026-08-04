@@ -25,6 +25,7 @@ import {
   getDiscoverJob,
   getElitePartitionEquity,
   inspectData,
+  importMarketFolder,
   inspectVault,
   listSymbols,
   listDiscoverProfiles,
@@ -53,6 +54,7 @@ import type {
   AssembleEvidenceRequest,
   DatabankWorkspace,
   DataLabView,
+  MarketFolderImportView,
   DeployRequest,
   DeployView,
   DiscoverJobView,
@@ -139,9 +141,9 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
 ];
 
 const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
-  indicatorPeriod: { minimum: 10, maximum: 20, step: 1 }, atrPeriod: { minimum: 14, maximum: 14, step: 1 },
-  atrStopMultiple: { minimum: 1.5, maximum: 4, step: .25 }, atrTargetMultiple: { minimum: 2, maximum: 6, step: .5 },
-  riskTargetMultiple: { minimum: 1.5, maximum: 4.5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
+  indicatorPeriod: { minimum: 10, maximum: 20, step: 1 }, atrPeriod: { minimum: 10, maximum: 20, step: 1 },
+  atrStopMultiple: { minimum: 1, maximum: 4, step: .25 }, atrTargetMultiple: { minimum: 1, maximum: 6, step: .5 },
+  riskTargetMultiple: { minimum: .75, maximum: 4.5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
   pendingExpiryBars: { minimum: 2, maximum: 8, step: 1 }, timeStopBars: { minimum: 4, maximum: 16, step: 1 },
   rsiUpper: { minimum: 52, maximum: 65, step: 1 }, rsiLower: { minimum: 20, maximum: 40, step: 1 }, adxThreshold: { minimum: 20, maximum: 35, step: 1 },
   rocThreshold: { minimum: .1, maximum: 2.5, step: .1 }, percentileLow: { minimum: 5, maximum: 25, step: 1 },
@@ -1379,7 +1381,7 @@ function ResultsDetailPage({
               className={robustnessMode === "deep" ? "active" : ""}
               disabled={robustnessBusy}
               onClick={() => setRobustnessMode("deep")}
-              title="At least 5 folds, 1,000 Monte Carlo trials and 20 parameter neighbours"
+              title="More folds, neighbours and Monte Carlo resampling; gates remain fixed"
             >
               Deep
             </button>
@@ -1810,7 +1812,10 @@ function MonteCarloPanel({
             }`,
           ],
           ["Baseline net profit", baseline != null ? `$${formatNumber(baseline)}` : "—"],
-          ["Drawdown criterion", `P95 ≤ ${(evidence.maximum_p95_drawdown_percent ?? 0).toFixed(2)}%`],
+          [
+            "Drawdown criterion",
+            `P95 ≤ ${(evidence.maximum_p95_drawdown_percent ?? 0).toFixed(2)}% (${((evidence.maximum_drawdown_ratio ?? 1.75) * 100).toFixed(0)}% of baseline)`,
+          ],
           ["P95 drawdown", `${evidence.p95_drawdown_percent.toFixed(2)}%`],
           ["Worst drawdown", `${evidence.worst_drawdown_percent.toFixed(2)}%`],
           ["Seed", String(evidence.seed)],
@@ -2032,9 +2037,10 @@ function ParameterNeighborhoodPanel({
             </table>
           </div>
           <p className="param-hist-caption">
-            One bar per group of neighbours, so a tall single bar means the plateau is flat and a
-            wide spread means small parameter changes move the result. The dashed line is the
-            original strategy: sitting at the edge of the spread is the warning sign.
+            {evidence.method === "systematic_axis_plus_seeded_joint"
+              ? "Each execution axis is tested at both sides of the band before joint perturbations. "
+              : "One bar per group of neighbours, so a tall single bar means the plateau is flat and a wide spread means small parameter changes move the result. "}
+            The dashed line is the original strategy: sitting at the edge of the spread is the warning sign.
           </p>
           <div className="param-hist-grid">
             {distributionMetrics.map((metric) => (
@@ -2539,6 +2545,11 @@ function DataLabWorkspace({
   const [sourceTimezone, setSourceTimezone] = useState("Etc/UTC");
   const [brokerPath, setBrokerPath] = useState("");
   const [report, setReport] = useState<DataLabView | null>(null);
+  const [importDirectory, setImportDirectory] = useState("");
+  const [importOutputDirectory, setImportOutputDirectory] = useState("");
+  const [importTimezone, setImportTimezone] = useState("ICMarkets/EST+7");
+  const [importReport, setImportReport] = useState<MarketFolderImportView | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function analyze() {
@@ -2560,8 +2571,55 @@ function DataLabWorkspace({
     }
   }
 
+  async function importFolder() {
+    if (!importDirectory) return;
+    setImportBusy(true);
+    setImportReport(null);
+    onError(null);
+    try {
+      const imported = await importMarketFolder({
+        sourceDirectory: importDirectory,
+        outputDirectory: importOutputDirectory || null,
+        sourceTimezone: importTimezone,
+        aggregateTicksToBars: true,
+      });
+      setImportReport(imported);
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function useImportedFile(file: MarketFolderImportView["files"][number]) {
+    const data = file.m1Path ?? file.h1Path;
+    const metadata = file.m1MetadataPath ?? file.h1MetadataPath;
+    if (data) setDataPath(data);
+    if (metadata) setMetadataPath(metadata);
+    setReport(null);
+    onError(null);
+  }
+
   return (
     <div className="tool-content">
+      <section className="panel setup-panel import-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">IC Markets import</p><h2>Bring in broker CSVs</h2></div>
+          <span className="read-only-badge">Safe copy</span>
+        </div>
+        <p className="immutable-note">Choose a Downloads folder. QuantForge scans it recursively, ignores trade lists and unrelated schemas, aggregates <code>Time,Ask,Bid,Volume</code> ticks to midpoint M1 bars, then derives H1 from that same stream.</p>
+        <div className="form-stack compact">
+          <PathField label="CSV folder" path={importDirectory} choose={() => chooseDirectory("Choose IC Markets CSV folder")} onChange={setImportDirectory} required />
+          <PathField label="Output folder (optional)" path={importOutputDirectory} choose={() => chooseDirectory("Choose import output folder")} onChange={setImportOutputDirectory} />
+          <label className="field-row"><span>Broker wall-clock</span><select value={importTimezone} onChange={(event) => setImportTimezone(event.target.value)}><option value="ICMarkets/EST+7">ICMarkets / EST+7 (recommended)</option><option value="Etc/UTC">UTC</option></select></label>
+        </div>
+        <div className="form-footer"><p>Existing files are never overwritten; each import receives a timestamped output directory when none is chosen.</p><button className="primary" disabled={importBusy || !importDirectory} onClick={importFolder}>{importBusy ? "Scanning and converting…" : "Import market CSVs"}</button></div>
+      </section>
+      {importReport && <section className="panel import-results">
+        <div className="panel-heading"><div><p className="eyebrow">Import complete</p><h2>{formatNumber(importReport.importedCount)} datasets ready</h2></div><span className="read-only-badge">{formatNumber(importReport.skippedCount)} skipped</span></div>
+        <p className="immutable-note">Output: <code>{importReport.outputDirectory}</code>. Select an imported row to load its M1/H1 path into the diagnostics form.</p>
+        <div className="import-file-list">{importReport.files.map((file) => <div className={`import-file-row import-${file.status}`} key={file.sourcePath}><div><strong>{file.symbol ?? "Unknown"}</strong><span>{file.kind} · {file.status}{file.bars ? ` · ${formatNumber(file.bars)} M1 bars` : ""}</span>{file.message && <small>{file.message}</small>}</div><div className="button-row">{file.status === "imported" && <button type="button" className="secondary" onClick={() => useImportedFile(file)}>Use</button>}</div></div>)}</div>
+      </section>}
       <section className="panel setup-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">Source binding</p><h2>Inspect an MT5 OHLC export</h2></div>
@@ -2578,6 +2636,9 @@ function DataLabWorkspace({
             }}
             selectedDataPath={dataPath}
           />
+          <PathField label="Decision / imported OHLC" path={dataPath} choose={chooseDataFile} onChange={setDataPath} required />
+          <PathField label="Metadata (optional if timezone is set)" path={metadataPath} choose={chooseMetadataFile} onChange={setMetadataPath} />
+          <PathField label="Broker profile" path={brokerPath} choose={chooseBrokerFile} onChange={setBrokerPath} required />
           <details className="advanced-settings">
             <summary>Bound paths (auto-filled)</summary>
             <div className="form-stack compact">
@@ -2881,7 +2942,7 @@ function DiscoverWorkspace({
     depositMinimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.80,
     oos1ExpectancyRetention: 0.7,
-    requireM1Precision: false,
+    requireM1Precision: true,
     simpleExits: true,
     allowBreakEven: false,
     allowTrailingStops: false,
@@ -3389,6 +3450,7 @@ function DiscoverWorkspace({
                         robustnessNeighborhoodSamples: 5,
                         minimumNeighborhoodSurvivalFraction: 0.5,
                         requireM1Robustness: true,
+                        requireM1Precision: true,
                         simpleExits: true,
                       }))
                     }
@@ -3508,7 +3570,7 @@ function DiscoverWorkspace({
               </details>
               <details className="advanced-settings" open>
                 <summary>Deposit gates — enter the initial pot</summary>
-                <p className="immutable-note">Selected-TF metrics to join the breeding pot. Databank needs M1 IS robustness then OOS1 ≥0.7×.</p>
+                <p className="immutable-note">Selected-TF metrics to join the breeding pot. Nothing enters the databank yet — that waits until breeding unlocks.</p>
                 <div className="numeric-grid">
                   <NumberField label="Minimum trades" value={form.depositMinimumTrades} onChange={(value) => update("depositMinimumTrades", value)} min={0} />
                   <NumberField label="Maximum drawdown %" value={form.depositMaximumDrawdownPercent} onChange={(value) => update("depositMaximumDrawdownPercent", value)} step={0.1} />
@@ -3536,9 +3598,10 @@ function DiscoverWorkspace({
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
-                <summary>M1 robustness — on IS, before OOS1</summary>
-                <p className="immutable-note">{`Pot = Selected-TF breeding bag only. M1 retention, walk-forward, Monte Carlo (15% trade removal), ±${perturbationPercent(form)}% parameter neighbourhood, and OOS1 ≥0.7× run only when promoting pot members into the databank. OOS2 is never used in Discover.`}</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require M1 WFO + MC + param neighborhood for databank (not the pot)</span></label>
+                <summary>Post-breed databank pipeline — starts only after breeding</summary>
+                <p className="immutable-note">{`SQX structure: H1 pot → breed → OOS1 databank gate → robustness (WFO/MC/±${perturbationPercent(form)}%) → M1 fidelity → databank (M1 metrics only). Never runs before the pot unlocks breeding. Never archives Selected-TF equity into the databank.`}</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>M1 robustness battery on databank path (WFO / Monte Carlo / param plateau)</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (SQX RetestWithHigherPrecision bands)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
@@ -3561,7 +3624,7 @@ function DiscoverWorkspace({
                 <div className="numeric-grid">
                   <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
                   <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
-                  <NumberField label="Minimum M1 return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
+                  <NumberField label="M1 fidelity min return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
                   <NumberField label="OOS1 expectancy retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
                   <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                   <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
@@ -3573,21 +3636,20 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">SQX-style default: Selected-TF H1/M15 scout fills the pot. Databank promotion still requires M1 fidelity and robustness; OOS2 is never used in Discover.</p>
-            <label className="check-field discover-split"><input type="checkbox" checked={!(form.requireM1Precision ?? false)} onChange={(event) => update("requireM1Precision", !event.target.checked)} /><span>Fast Selected-TF scout (no extra M1 precision gate before the databank)</span></label>
+            <p className="immutable-note">SQX structure: H1 gates fill the breeding pot only. After breeding starts: OOS1 databank gate → robustness → M1 → databank. Selected-TF strategies never enter the databank. OOS2 is never used in Discover.</p>
             <details className="advanced-settings" open>
-              <summary>Execution modules — individually parity-gated</summary>
-              <p className="immutable-note">Disabled is the high-parity baseline. Enabling any module makes it a distinct search gene and automatically requires M1 precision before databank promotion. The pot still fills on Selected-TF evidence alone. Final promotion still needs an MT5 tick-parity run.</p>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Break-even stop move</span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Trailing stop</span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Partial exit</span></label>
+              <summary>Execution modules — search genes (pot only until breeding)</summary>
+              <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
             </details>
             <details className="advanced-settings" open>
               <summary>Entry order types — sampled in equal shares</summary>
               <p className="immutable-note">{entryOrderSummary(form)}</p>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false, requireM1Precision: event.target.checked ? current.requireM1Precision : true }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-stop / sell-stop entry <small>(experimental; weaker in current OOS screen)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits, requireM1Precision: event.target.checked ? true : current.requireM1Precision }))} /><span>Buy-limit / sell-limit entry <small>(test independently; preferred over stops in current screen)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowMarketEntries ?? true} onChange={(event) => setForm((current) => ({ ...current, allowMarketEntries: event.target.checked, simpleExits: event.target.checked ? current.simpleExits : false }))} /><span>Market entry at bar open <small>(highest H1↔M1 agreement)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowStopEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowStopEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-stop / sell-stop entry <small>(H1 invents fills; databank still requires post-breed M1)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowLimitEntries ?? false} onChange={(event) => setForm((current) => ({ ...current, allowLimitEntries: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Buy-limit / sell-limit entry <small>(same: post-breed M1 into databank)</small></span></label>
               {entryOrderError(form) && <p className="field-error">{entryOrderError(form)}</p>}
             </details>
             <label className="check-field discover-split"><input type="checkbox" checked={form.maxOneEntryPerDay ?? true} onChange={(event) => update("maxOneEntryPerDay", event.target.checked)} /><span>Max one fill/day (first market or pending fill locks the day)</span></label>
@@ -3618,7 +3680,7 @@ function DiscoverWorkspace({
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: hypothesis → H1/M15 scout → deposit gate → pot (breeding bag, Selected-TF evidence only) → M1 precision + robustness on pot members → OOS1 (≥0.7× IS expectancy) → databank (MAP-Elites niches). Expectancy in R ($1,000 risk). Methodology Researcher (full recipe grid + FDR) is not shipped yet — use Condition Bakeoff under Results.</p>
+          <p>Pipeline: H1 gates → pot (breed) → [after breeding] OOS1 databank gate → robustness → M1 → databank. Nothing enters the databank before breeding. Expectancy in R ($1,000 risk).</p>
           <button
             className="primary"
             disabled={
@@ -3664,18 +3726,20 @@ function DiscoverWorkspace({
               }
               note={
                 job?.targetDatabankElites
-                  ? "Quota target · M1 + WFO + MC + params"
-                  : "Passed M1 + WFO + MC + params"
+                  ? "Quota · post-breed M1 only"
+                  : job?.breedingActive
+                    ? "Post-breed OOS1→robustness→M1"
+                    : "Empty until breeding unlocks"
               }
             />
-            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note="Eligible for M1 promotion" />
+            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for databank pipeline" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
             <Kpi label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0, 0)} note={`${formatNumber(job?.acceptsPerHour ?? 0, 1)} accepts/hr · ${job?.workerThreads ?? "—"} threads`} />
             <Kpi label="QD score" value={formatNumber(job?.qdScore ?? 0, 2)} note="Databank evidence mass" />
           </div>
           <div className="reject-funnel">
             <p className="eyebrow">Reject reasons</p>
-            <p className="funnel-group-label">Pot gates — Selected-TF only</p>
+            <p className="funnel-group-label">H1 pot gates — before breeding</p>
             <ul>
               <li><span>Scout gate</span><strong>{formatNumber(job?.rejectedGate ?? 0)}</strong></li>
               <li><span>Deposit gate</span><strong>{formatNumber(job?.rejectedDepositGate ?? 0)}</strong></li>
@@ -3684,14 +3748,13 @@ function DiscoverWorkspace({
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
             </ul>
-            <p className="funnel-group-label">Databank gates — run after the pot deposit</p>
+            <p className="funnel-group-label">Post-breed databank pipeline — after breeding unlocks</p>
             <ul>
-              <li><span>M1 precision</span><strong>{formatNumber(job?.rejectedPrecision ?? 0)}</strong></li>
-              <li><span>M1 retention (80/80/130)</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
+              <li><span>OOS1 databank gate</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
               <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
               <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
               <li><span>Param plateau</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
-              <li><span>OOS1 pick</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
               <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
             </ul>
             {job?.bestIsExpectancy != null && (
@@ -4219,11 +4282,11 @@ function ExportPanel({
 }
 
 function ParityComparePanel({ onError }: { onError: (message: string | null) => void }) {
-  const [form, setForm] = useState<ParityRequest>({ referencePath: "", evidencePath: "", mq5Path: "", mt5DealsPath: "", mt5EquityPath: "", mt5MetadataPath: "", outputPath: "", initialBalance: 100000, tradeCountRelative: .1, tradeCountAbsolute: 3, netProfitRelative: .15, maxDrawdownRelative: .15, maxEquityDivergencePercent: 5, tradeTimestampToleranceMs: 0, minimumAlignedTradeFraction: .9 });
+  const [form, setForm] = useState<ParityRequest>({ referencePath: "", evidencePath: "", mq5Path: "", mt5DealsPath: "", mt5EquityPath: "", mt5MetadataPath: "", outputPath: "", initialBalance: 100000, tradeCountRelative: .1, tradeCountAbsolute: 3, netProfitRelative: .15, maxDrawdownRelative: .15, maxEquityDivergencePercent: 5, tradeTimestampToleranceMs: 0, minimumAlignedTradeFraction: .9, strictOneToOne: true });
   const [result, setResult] = useState<ParityView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof ParityRequest>(key: K, value: ParityRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await compareExternalParity(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><details className="advanced-settings"><summary>Parity tolerances</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash and tester metadata must match the evidence card before any comparison is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "")} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Win rate" value={`${formatNumber(result.referenceWinRate, 1)}% / ${formatNumber(result.externalWinRate, 1)}%`} note={`${formatNumber(result.referenceWinningTrades)} / ${formatNumber(result.externalWinningTrades)} wins`} /><Kpi label="Profit factor" value={`${result.referenceProfitFactor === null ? "—" : formatNumber(result.referenceProfitFactor, 2)} / ${result.externalProfitFactor === null ? "—" : formatNumber(result.externalProfitFactor, 2)}`} note="QuantForge / MT5" /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">External truth</p><h2>Compare QuantForge with MT5 Strategy Tester</h2></div></div><div className="form-stack compact"><PathField label="Scout reference artifact" path={form.referencePath} choose={() => chooseJsonFile("Choose Scout artifact")} onChange={(value) => update("referencePath", value)} required /><PathField label="Export evidence" path={form.evidencePath} choose={() => chooseJsonFile("Choose export evidence")} onChange={(value) => update("evidencePath", value)} required /><PathField label="Generated MQL5" path={form.mq5Path} choose={chooseMql5File} onChange={(value) => update("mq5Path", value)} required /><PathField label="MT5 deals CSV" path={form.mt5DealsPath} choose={() => chooseTesterCsv("Choose MT5 deals export")} onChange={(value) => update("mt5DealsPath", value)} required /><PathField label="MT5 equity CSV" path={form.mt5EquityPath} choose={() => chooseTesterCsv("Choose MT5 equity export")} onChange={(value) => update("mt5EquityPath", value)} required /><PathField label="MT5 parity metadata" path={form.mt5MetadataPath} choose={() => chooseTesterCsv("Choose MT5 parity metadata")} onChange={(value) => update("mt5MetadataPath", value)} required /><PathField label="New parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save parity artifact", "parity.json")} onChange={(value) => update("outputPath", value)} required /></div><label className="check-field"><input type="checkbox" checked={form.strictOneToOne !== false} onChange={(event) => update("strictOneToOne", event.target.checked)} /><span>Certification mode: require one-to-one MT5 deals and equity (recommended)</span></label><details className="advanced-settings"><summary>Diagnostic tolerances (only used when certification mode is off)</summary><div className="numeric-grid"><NumberField label="Trade count relative" value={form.tradeCountRelative} onChange={(value) => update("tradeCountRelative", value ?? .1)} step={.01} /><NumberField label="Trade count absolute" value={form.tradeCountAbsolute} onChange={(value) => update("tradeCountAbsolute", value ?? 3)} min={0} /><NumberField label="Net profit relative" value={form.netProfitRelative} onChange={(value) => update("netProfitRelative", value ?? .15)} step={.01} /><NumberField label="Drawdown relative" value={form.maxDrawdownRelative} onChange={(value) => update("maxDrawdownRelative", value ?? .15)} step={.01} /><NumberField label="Equity divergence %" value={form.maxEquityDivergencePercent} onChange={(value) => update("maxEquityDivergencePercent", value ?? 5)} step={.1} /><NumberField label="Aligned fraction" value={form.minimumAlignedTradeFraction} onChange={(value) => update("minimumAlignedTradeFraction", value ?? .9)} step={.01} /></div></details><div className="form-footer"><p>The source hash and tester metadata must match the evidence card before any comparison is accepted.</p><button className="primary" disabled={busy || Object.entries(form).some(([key, value]) => key.endsWith("Path") && value === "")} onClick={run}>{busy ? "Reconciling…" : "Compare MT5 run"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">External parity</p><h2>{result.passed ? "MT5 parity passed" : "Execution diff exceeds tolerance"}</h2></div><span className="grade-pill">{result.grade}</span></div><div className="job-kpis"><Kpi label="Trades" value={`${result.referenceTrades} / ${result.externalTrades}`} note="QuantForge / MT5" /><Kpi label="Aligned" value={`${result.alignedTrades} / ${result.requiredAlignedTrades}`} note="Required minimum" /><Kpi label="Win rate" value={`${formatNumber(result.referenceWinRate, 1)}% / ${formatNumber(result.externalWinRate, 1)}%`} note={`${formatNumber(result.referenceWinningTrades)} / ${formatNumber(result.externalWinningTrades)} wins`} /><Kpi label="Profit factor" value={`${result.referenceProfitFactor === null ? "—" : formatNumber(result.referenceProfitFactor, 2)} / ${result.externalProfitFactor === null ? "—" : formatNumber(result.externalProfitFactor, 2)}`} note="QuantForge / MT5" /><Kpi label="Profit delta" value={`${formatNumber(result.netProfitDeltaRelative * 100, 2)}%`} note="Relative" /><Kpi label="Equity divergence" value={`${formatNumber(result.equityDivergencePercent, 2)}%`} note={result.protectiveOrdersPresent ? "Stops verified" : "Stops missing"} /></div><ArtifactPath label="Parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No external run compared" copy="Run the generated EA in MT5 Strategy Tester, then select its deals, equity and metadata exports here. Passing output becomes the external parity gate." />}</div>;
 }
 
 function IndicatorParityPanel({ onError }: { onError: (message: string | null) => void }) {
@@ -4474,16 +4537,16 @@ function FidelityDemoPanel({
     <section className="panel fidelity-panel">
       <div className="panel-heading">
         <div>
-          <p className="eyebrow">SQX RetestWithHigherPrecision</p>
-          <h2>Fidelity demo (M1)</h2>
+          <p className="eyebrow">Final parity gate · SQX RetestWithHigherPrecision</p>
+          <h2>M1 fidelity (after Discover)</h2>
         </div>
         <button className="primary" disabled={busy} onClick={() => void run()}>
-          {busy ? "Retesting…" : "Run M1 fidelity demo"}
+          {busy ? "Retesting…" : "Run M1 fidelity gate"}
         </button>
       </div>
       <p className="immutable-note">
-        Research bank from an H1/M15 scout. Retest elites on M1 with strict bands (≥90% return, ≥80% trades, DD ≤130% of Selected TF).
-        Passers are written to a new promotion-grade databank.
+        Selected-TF elites only. Retest on M1 with strict bands (≥90% return, ≥80% trades, DD ≤130% of Selected TF).
+        This is the final parity filter — not part of Discover breeding. Passers write a promotion-grade databank.
       </p>
       {result && (
         <div className="fidelity-results">

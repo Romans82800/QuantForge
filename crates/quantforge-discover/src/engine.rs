@@ -10,12 +10,12 @@ use crate::model::{
 use crate::multi_symbol::{screen_multi_symbol, PackSymbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
-use quantforge_data::BarDataset;
+use quantforge_data::{BarDataset, bar_content_hash};
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
-use quantforge_eval::{ScoutResult, ScoutTelemetry};
+use quantforge_eval::ScoutResult;
 use quantforge_ir::StrategyIr;
 use quantforge_quality::{deflated_trade_sharpe, expected_max_lucky_sharpe, trade_sharpe_proxy};
-use quantforge_tick::{evaluate_strategy_m1, JudgeConfig};
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -78,59 +78,12 @@ fn evaluate_and_deposit(
     let owned_gates = bank.config.gates.clone();
     let gates = &owned_gates;
     let discover_config = &bank.config;
-    let minimum_return_retention = bank.config.precision.minimum_return_retention;
     let oos1_retention = bank.config.oos1_expectancy_retention;
-    let require_m1 = bank.config.require_m1_precision;
-    let require_robustness = bank.config.require_m1_robustness;
     let multi_symbol_minimum = bank.config.multi_symbol_minimum_pass;
     let minimum_deflated = bank.config.minimum_deflated_trade_sharpe;
+    let require_m1_robustness = bank.config.require_m1_robustness;
     let evaluations_touched = bank.evaluation_count.max(1);
-    let robustness = crate::robustness::RobustnessConfig {
-        folds: bank.config.robustness_folds,
-        monte_carlo_trials: bank.config.robustness_monte_carlo_trials,
-        neighborhood_samples: bank.config.robustness_neighborhood_samples,
-        seed: bank.config.seed,
-        initial_balance: scout.initial_balance,
-        costs: scout.costs.clone(),
-        entry_window: scout.entry_window,
-        minimum_return_retention,
-        minimum_fold_trades: bank.config.deposit_gates.minimum_trades.clamp(1, 2),
-        minimum_return_percent: bank.config.deposit_gates.minimum_return_percent,
-        minimum_profit_factor: bank.config.deposit_gates.minimum_profit_factor.min(1.0),
-        maximum_drawdown_percent: bank.config.deposit_gates.maximum_drawdown_percent.max(30.0),
-        minimum_passing_fold_fraction: 0.6,
-        minimum_neighborhood_survival_fraction: bank
-            .config
-            .minimum_neighborhood_survival_fraction
-            .clamp(0.25, 1.0),
-        parameter_perturbation_fraction: bank.config.robustness_perturbation_fraction,
-        adx_period_min: bank
-            .config
-            .search_ranges
-            .indicator_period
-            .minimum
-            .round()
-            .max(2.0) as u16,
-        adx_period_max: bank
-            .config
-            .search_ranges
-            .indicator_period
-            .maximum
-            .round()
-            .max(2.0) as u16,
-        adx_period_step: bank
-            .config
-            .search_ranges
-            .indicator_period
-            .step
-            .round()
-            .max(1.0) as u16,
-        adx_threshold_min: bank.config.search_ranges.adx_threshold.minimum,
-        adx_threshold_max: bank.config.search_ranges.adx_threshold.maximum,
-        adx_threshold_step: bank.config.search_ranges.adx_threshold.step,
-        calendar_year_folds: bank.config.calendar_year_folds,
-        indicator_engine: scout.indicator_engine,
-    };
+    let robustness = robustness_config_from_discover(&bank.config);
     let evaluate_batch = || {
         candidates
             .into_par_iter()
@@ -182,8 +135,8 @@ fn evaluate_and_deposit(
                         }
                     }
 
-                    // Pot admission is Selected-TF only. M1 precision, M1 robustness
-                    // and OOS1 are databank gates and run after the pot deposit.
+                    // Pot admission is Selected-TF / H1 only. Databank promotion
+                    // (OOS1 → robustness → M1) waits until breeding unlocks.
                     if !crate::archive::passes_gate_config(&coarse, &discover_config.deposit_gates)
                     {
                         return Ok(CandidateOutcome::DepositGateRejected);
@@ -208,8 +161,7 @@ fn evaluate_and_deposit(
         None => evaluate_batch(),
     };
 
-    // Pass 1: fill the breeding pot from Selected-TF survivors only. Heavy M1
-    // promotion never blocks pot admission or serializes pot growth.
+    // Pass 1: H1 gates → breeding pot only. Never touch the databank here.
     let mut pot_promotions = Vec::new();
     for (strategy, result) in evaluated {
         bank.evaluation_count += 1;
@@ -278,132 +230,126 @@ fn evaluate_and_deposit(
         }
     }
 
-    if pot_promotions.is_empty() {
+    // SQX structure: fill the pot on H1 before breeding. Only after breeding
+    // unlocks does the databank pipeline run:
+    //   databank gates (OOS1) → robustness → M1 → databank (M1 metrics only).
+    let breeding_unlocked = bank.accepted_pool.len() >= bank.config.mutate_after_elites;
+    if !breeding_unlocked || pot_promotions.is_empty() {
         return Ok(());
     }
 
-    // Pass 2: databank promotion battery in parallel. Pot already holds every
-    // Selected-TF acceptor; only promotion-grade elites reach MAP-Elites.
+    let deposit_gates = bank.config.deposit_gates.clone();
+    let multi_symbol_minimum_pass = bank.config.multi_symbol_minimum_pass;
+    let minimum_deflated_trade_sharpe = bank.config.minimum_deflated_trade_sharpe;
+    // OOS1 must be checked with the same M1 chronology that is ultimately
+    // archived.  The selected-timeframe check below remains a cheap first
+    // filter, while this joined IS+OOS1 replay prevents an H1-only survivor
+    // from entering the M1 databank with a negative first holdout.
+    let m1_oos1_decision = oos1_dataset.map(|oos1| join_datasets(dataset, oos1));
     let promote_one = |pot_evaluation: CandidateEvaluation| -> PromotionOutcome {
         let strategy = &pot_evaluation.strategy;
-        // Standalone M1 precision check for runs that want M1 fidelity without the
-        // full battery. The battery already enforces retention, so never run both.
-        let precise_only = if require_m1 && !require_robustness {
-            let precise = match evaluate_strategy_m1(
-                strategy,
-                dataset,
-                m1_dataset,
-                broker,
-                &JudgeConfig {
-                    initial_balance: scout.initial_balance,
-                    costs: scout.costs.clone(),
-                    allow_execution_gaps: false,
-                    indicator_engine: scout.indicator_engine,
-                    entry_window: scout.entry_window,
-                },
-            ) {
-                Ok(precise) => precise,
+        let h1_is_expectancy = pot_evaluation.is_expectancy;
+
+        // Databank gate: Selected-TF OOS1 retention before paying for M1.
+        let (oos1_expectancy, oos1_expectancy_ratio) = if let Some(oos1) = oos1_dataset {
+            match evaluate_strategy_cached(strategy, oos1, broker, &scout, indicator_cache) {
+                Ok(oos1_result) => {
+                    let oos1_expectancy = oos1_result.metrics.expectancy;
+                    if !passes_oos1_pick(h1_is_expectancy, oos1_expectancy, oos1_retention) {
+                        return PromotionOutcome::Oos1Rejected;
+                    }
+                    let ratio = (h1_is_expectancy > 0.0)
+                        .then_some(oos1_expectancy / h1_is_expectancy)
+                        .filter(|value| value.is_finite());
+                    (Some(oos1_expectancy), ratio)
+                }
                 Err(error) => {
                     return PromotionOutcome::EvaluationError {
                         message: error.to_string(),
-                    }
+                    };
                 }
-            };
-            let precise_result = ScoutResult {
-                trades: precise.trades,
-                equity: precise.equity,
-                metrics: precise.metrics,
-                telemetry: ScoutTelemetry::default(),
-            };
-            let coarse_return = pot_evaluation.result.metrics.return_percent;
-            let retention = if coarse_return > 0.0 {
-                precise_result.metrics.return_percent / coarse_return
-            } else if precise_result.metrics.return_percent >= coarse_return {
-                1.0
-            } else {
-                0.0
-            };
-            if !precision_passes(
-                &precise_result.metrics,
-                retention,
-                gates,
-                minimum_return_retention,
-            ) {
-                return PromotionOutcome::PrecisionRejected;
             }
-            Some(precise_result)
         } else {
-            None
+            (None, None)
         };
-        let databank_gate = if require_robustness {
-            crate::robustness::run_m1_predeposit_robustness(
+
+        // Robustness battery + M1 fidelity. Databank archives the M1 result —
+        // never Selected-TF equity/metrics.  A caller may explicitly disable
+        // the expensive battery for smoke tests or a deliberately cheap scout;
+        // that still evaluates the candidate on M1, it simply records no
+        // robustness evidence.  The production default keeps the full battery.
+        let m1_outcome = if require_m1_robustness {
+            match crate::robustness::run_m1_predeposit_robustness(
                 strategy,
                 dataset,
                 m1_dataset,
                 broker,
                 &robustness,
                 &pot_evaluation.result.metrics,
-            )
+            ) {
+                Err(reject) => return PromotionOutcome::RobustnessRejected { reject },
+                Ok(outcome) => (outcome.result, outcome.evidence),
+            }
         } else {
-            Ok(crate::robustness::RobustnessOutcome {
-                result: precise_only.unwrap_or_else(|| pot_evaluation.result.clone()),
-                evidence: None,
-            })
-        };
-        match databank_gate {
-            Err(reject) => PromotionOutcome::RobustnessRejected { reject },
-            Ok(outcome) => {
-                let robustness_evidence = outcome.evidence.clone();
-                let m1_is_result = outcome.result;
-                if let Some(oos1) = oos1_dataset {
-                    match evaluate_strategy_m1(
-                        strategy,
-                        oos1,
-                        m1_dataset,
-                        broker,
-                        &JudgeConfig {
-                            initial_balance: scout.initial_balance,
-                            costs: scout.costs.clone(),
-                            allow_execution_gaps: false,
-                            indicator_engine: scout.indicator_engine,
-                            entry_window: scout.entry_window,
-                        },
-                    ) {
-                        Ok(oos1_result) => {
-                            let oos1_expectancy = oos1_result.metrics.expectancy;
-                            let oos1_ok = passes_oos1_pick(
-                                m1_is_result.metrics.expectancy,
-                                oos1_expectancy,
-                                oos1_retention,
-                            );
-                            let oos1_expectancy_ratio = (m1_is_result.metrics.expectancy > 0.0)
-                                .then_some(oos1_expectancy / m1_is_result.metrics.expectancy)
-                                .filter(|value| value.is_finite());
-                            if !oos1_ok {
-                                return PromotionOutcome::Oos1Rejected;
-                            }
-                            PromotionOutcome::Ready {
-                                pot_evaluation,
-                                m1_is_result,
-                                oos1_expectancy: Some(oos1_expectancy),
-                                oos1_expectancy_ratio,
-                                robustness_evidence,
-                            }
-                        }
-                        Err(error) => PromotionOutcome::EvaluationError {
-                            message: error.to_string(),
-                        },
-                    }
-                } else {
-                    PromotionOutcome::Ready {
-                        pot_evaluation,
-                        m1_is_result,
-                        oos1_expectancy: None,
-                        oos1_expectancy_ratio: None,
-                        robustness_evidence,
+            match evaluate_strategy_cached(strategy, m1_dataset, broker, &scout, indicator_cache) {
+                Err(error) => {
+                    return PromotionOutcome::EvaluationError {
+                        message: error.to_string(),
                     }
                 }
+                Ok(result) => (result, None),
             }
+        };
+        let (archived_oos1_expectancy, archived_oos1_ratio) = if let Some(m1_oos1_decision) = m1_oos1_decision.as_ref() {
+            let oos1_start_ms = oos1_dataset
+                .and_then(|data| data.bars.first())
+                .map(|bar| bar.timestamp_ms)
+                .expect("OOS1 dataset must contain at least one bar");
+            let judge = JudgeConfig {
+                initial_balance: robustness.initial_balance,
+                costs: robustness.costs.clone(),
+                allow_execution_gaps: false,
+                indicator_engine: robustness.indicator_engine,
+                entry_window: robustness.entry_window,
+            };
+            let m1_oos1_replay = match evaluate_strategy_m1(
+                strategy,
+                m1_oos1_decision,
+                m1_dataset,
+                broker,
+                &judge,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    return PromotionOutcome::EvaluationError {
+                        message: format!("M1 OOS1 replay failed: {error}"),
+                    };
+                }
+            };
+            let m1_is_expectancy = expectancy_before(&m1_oos1_replay.trades, oos1_start_ms);
+            let m1_oos1_expectancy = expectancy_from(&m1_oos1_replay.trades, oos1_start_ms);
+            if !passes_oos1_pick(m1_is_expectancy, m1_oos1_expectancy, oos1_retention) {
+                return PromotionOutcome::Oos1Rejected;
+            }
+            let m1_oos1_ratio = (m1_is_expectancy > 0.0)
+                .then_some(m1_oos1_expectancy / m1_is_expectancy)
+                .filter(|value| value.is_finite());
+            // Archive the M1 OOS1 evidence, rather than the preliminary
+            // Selected-TF figure, so the Databank table and full-run chart
+            // describe the very gate that admitted the strategy.
+            (Some(m1_oos1_expectancy), m1_oos1_ratio)
+        } else {
+            (oos1_expectancy, oos1_expectancy_ratio)
+        };
+        if !crate::archive::passes_gate_config(&m1_outcome.0, &deposit_gates) {
+            return PromotionOutcome::DatabankGateRejected;
+        }
+        PromotionOutcome::Ready {
+            pot_evaluation,
+            m1_result: m1_outcome.0,
+            robustness: m1_outcome.1,
+            oos1_expectancy: archived_oos1_expectancy,
+            oos1_expectancy_ratio: archived_oos1_ratio,
         }
     };
 
@@ -420,9 +366,15 @@ fn evaluate_and_deposit(
             .collect::<Vec<_>>(),
     };
 
-    // Pass 3: sequential databank deposits + telemetry (archive is not Sync).
+    // Sequential databank deposits + telemetry (archive is not Sync).
     for outcome in promotion_outcomes {
         match outcome {
+            PromotionOutcome::Oos1Rejected => {
+                bank.telemetry.record(DepositDecision::RejectedOos1);
+            }
+            PromotionOutcome::DatabankGateRejected => {
+                bank.telemetry.record(DepositDecision::RejectedDepositGate);
+            }
             PromotionOutcome::RobustnessRejected { reject } => match reject {
                 crate::robustness::RobustnessReject::M1Fidelity => {
                     bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
@@ -438,12 +390,6 @@ fn evaluate_and_deposit(
                         .record(DepositDecision::RejectedParamNeighborhood);
                 }
             },
-            PromotionOutcome::PrecisionRejected => {
-                bank.telemetry.record(DepositDecision::RejectedPrecision);
-            }
-            PromotionOutcome::Oos1Rejected => {
-                bank.telemetry.record(DepositDecision::RejectedOos1);
-            }
             PromotionOutcome::EvaluationError { message } => {
                 *bank
                     .telemetry
@@ -454,30 +400,31 @@ fn evaluate_and_deposit(
             }
             PromotionOutcome::Ready {
                 pot_evaluation,
-                m1_is_result,
+                m1_result,
+                robustness,
                 oos1_expectancy,
                 oos1_expectancy_ratio,
-                robustness_evidence,
             } => {
                 let multi_symbol_results = pot_evaluation.multi_symbol_results.clone();
                 let deflated_trade_sharpe = pot_evaluation.deflated_trade_sharpe;
+                let m1_expectancy = m1_result.metrics.expectancy;
                 let bank_evaluation = CandidateEvaluation {
-                    result: m1_is_result.clone(),
-                    is_expectancy: m1_is_result.metrics.expectancy,
+                    result: m1_result,
+                    is_expectancy: m1_expectancy,
                     oos1_expectancy,
                     oos1_expectancy_ratio,
                     gate_results: build_gate_results(
-                        m1_is_result.metrics.expectancy,
+                        m1_expectancy,
                         oos1_expectancy,
                         oos1_expectancy_ratio,
                         true,
                         None,
                         &multi_symbol_results,
-                        bank.config.multi_symbol_minimum_pass,
+                        multi_symbol_minimum_pass,
                         deflated_trade_sharpe,
-                        bank.config.minimum_deflated_trade_sharpe,
+                        minimum_deflated_trade_sharpe,
                     ),
-                    robustness: robustness_evidence,
+                    robustness,
                     ..pot_evaluation
                 };
                 let bank_decision = deposit_to_databank(bank, bank_evaluation)?;
@@ -488,22 +435,92 @@ fn evaluate_and_deposit(
     Ok(())
 }
 
+/// Concatenates consecutive chronological partitions for an M1 replay without
+/// exposing the sealed OOS2 partition to the promotion gate.
+fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
+    let mut bars = Vec::with_capacity(first.bars.len() + second.bars.len());
+    bars.extend_from_slice(&first.bars);
+    bars.extend_from_slice(&second.bars);
+    BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: first.delimiter,
+        source_timezone: first.source_timezone.clone(),
+        bars,
+    }
+}
+
+fn expectancy_before(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
+    expectancy_for(trades, |entry| entry < timestamp_ms)
+}
+
+fn expectancy_from(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
+    expectancy_for(trades, |entry| entry >= timestamp_ms)
+}
+
+fn expectancy_for(trades: &[quantforge_eval::Trade], include: impl Fn(i64) -> bool) -> f64 {
+    let mut profit = 0.0;
+    let mut count = 0usize;
+    for trade in trades {
+        if include(trade.entry_timestamp_ms) {
+            profit += trade.net_profit;
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { profit / count as f64 }
+}
+
 enum PromotionOutcome {
+    Oos1Rejected,
+    DatabankGateRejected,
     RobustnessRejected {
         reject: crate::robustness::RobustnessReject,
     },
-    PrecisionRejected,
-    Oos1Rejected,
     EvaluationError {
         message: String,
     },
     Ready {
         pot_evaluation: CandidateEvaluation,
-        m1_is_result: ScoutResult,
+        m1_result: ScoutResult,
+        robustness: Option<crate::model::RobustnessEvidence>,
         oos1_expectancy: Option<f64>,
         oos1_expectancy_ratio: Option<f64>,
-        robustness_evidence: Option<crate::model::RobustnessEvidence>,
     },
+}
+
+fn robustness_config_from_discover(
+    config: &DiscoverConfig,
+) -> crate::robustness::RobustnessConfig {
+    let search = &config.search_ranges;
+    crate::robustness::RobustnessConfig {
+        folds: config.robustness_folds,
+        monte_carlo_trials: config.robustness_monte_carlo_trials,
+        neighborhood_samples: config.robustness_neighborhood_samples,
+        seed: config.seed,
+        initial_balance: config.scout.initial_balance,
+        costs: config.scout.costs.clone(),
+        entry_window: config.scout.entry_window,
+        minimum_return_retention: config.precision.minimum_return_retention,
+        minimum_fold_trades: config.deposit_gates.minimum_trades.clamp(1, 2),
+        minimum_return_percent: config.deposit_gates.minimum_return_percent,
+        minimum_profit_factor: config.deposit_gates.minimum_profit_factor.min(1.0),
+        maximum_drawdown_percent: config.deposit_gates.maximum_drawdown_percent.max(30.0),
+        minimum_passing_fold_fraction: 0.6,
+        minimum_neighborhood_survival_fraction: config
+            .minimum_neighborhood_survival_fraction
+            .clamp(0.25, 1.0),
+        parameter_perturbation_fraction: config.robustness_perturbation_fraction,
+        adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
+        adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
+        adx_period_step: search.indicator_period.step.round().max(1.0) as u16,
+        adx_threshold_min: search.adx_threshold.minimum,
+        adx_threshold_max: search.adx_threshold.maximum,
+        adx_threshold_step: search.adx_threshold.step,
+        indicator_engine: config.scout.indicator_engine,
+        calendar_year_folds: config.calendar_year_folds,
+    }
 }
 
 /// Promotion pick gate: OOS1 expectancy must retain at least `retention` of IS
@@ -963,7 +980,9 @@ fn enforce_execution_feature_flags(
         } => (distance.clone(), *expiry_bars),
         EntryOrderPolicy::Market => (
             EntryDistancePolicy::AtrMultiple {
-                period: crate::FROZEN_ATR_PERIOD,
+                // This is only a temporary value for the market branch.  The
+                // search-range pass has already assigned the actual ATR gene.
+                period: config.search_ranges.atr_period.minimum.round().max(1.0) as u16,
                 multiplier: 0.5,
             },
             4,
@@ -1024,10 +1043,10 @@ fn enforce_execution_feature_flags(
 /// Selected-timeframe compatibility profile.
 ///
 /// Signals use completed bars and entries occur at the next bar open. Market
-/// entries avoid inventing an unknowable intrabar path for stop/limit fills,
-/// which is the largest source of Selected-TF versus M1 divergence. Pending
-/// orders remain supported by IR, evaluators and exporters, but are reserved
-/// for workflows that discover and validate directly on M1/ticks.
+/// entries avoid inventing an unknowable intrabar path for stop/limit fills.
+/// Pending entries remain searchable on Selected-TF; M1 fidelity / MT5 parity
+/// are final gates after Discover (SQX RetestWithHigherPrecision pattern), not
+/// admission blockers during breeding.
 fn enforce_simple_exits(strategy: &mut StrategyIr, ranges: &crate::model::SearchRangeProfile) {
     strategy.entry.order = quantforge_ir::EntryOrderPolicy::Market;
     strategy.manage.trailing = None;
@@ -1038,18 +1057,27 @@ fn enforce_simple_exits(strategy: &mut StrategyIr, ranges: &crate::model::Search
         ranges.time_stop_bars.maximum.round().clamp(1.0, 16.0) as u16,
     );
     strategy.manage.time_stop_bars = Some(bars);
-    // Point stops are not cross-symbol portable; force ATR multiples at frozen period.
+    // Point stops are not cross-symbol portable; force ATR multiples while
+    // preserving the candidate's searchable ATR lookback.
+    let atr_period = |period: u16| {
+        (f64::from(period).clamp(ranges.atr_period.minimum, ranges.atr_period.maximum)
+            / ranges.atr_period.step)
+            .round()
+            .mul_add(ranges.atr_period.step, ranges.atr_period.minimum)
+            .round()
+            .max(1.0) as u16
+    };
     strategy.stops.stop_loss = match &strategy.stops.stop_loss {
-        quantforge_ir::StopLossPolicy::AtrMultiple { multiplier, .. } => {
+        quantforge_ir::StopLossPolicy::AtrMultiple { period, multiplier } => {
             quantforge_ir::StopLossPolicy::AtrMultiple {
-                period: ranges.atr_period.minimum.round().max(1.0) as u16,
+                period: atr_period(*period),
                 multiplier: clamp_to_range(*multiplier, &ranges.atr_stop_multiple),
             }
         }
         quantforge_ir::StopLossPolicy::FixedPoints { .. }
         | quantforge_ir::StopLossPolicy::RangeMultiple { .. } => {
             quantforge_ir::StopLossPolicy::AtrMultiple {
-                period: ranges.atr_period.minimum.round().max(1.0) as u16,
+                period: atr_period(ranges.atr_period.minimum.round().max(1.0) as u16),
                 multiplier: clamp_to_range(2.0, &ranges.atr_stop_multiple),
             }
         }
@@ -1060,9 +1088,9 @@ fn enforce_simple_exits(strategy: &mut StrategyIr, ranges: &crate::model::Search
                 multiple: clamp_to_range(*multiple, &ranges.risk_target_multiple),
             }
         }
-        quantforge_ir::TakeProfitPolicy::AtrMultiple { multiplier, .. } => {
+        quantforge_ir::TakeProfitPolicy::AtrMultiple { period, multiplier } => {
             quantforge_ir::TakeProfitPolicy::AtrMultiple {
-                period: ranges.atr_period.minimum.round().max(1.0) as u16,
+                period: atr_period(*period),
                 multiplier: clamp_to_range(*multiplier, &ranges.atr_target_multiple),
             }
         }
@@ -1288,7 +1316,7 @@ mod tests {
             },
             search_ranges: crate::model::SearchRangeProfile::default(),
             oos1_expectancy_retention: 0.0,
-            require_m1_precision: false,
+            require_m1_precision: true,
             simple_exits: true,
             allow_break_even: false,
             allow_trailing_stops: false,
@@ -1300,10 +1328,12 @@ mod tests {
             end_of_day_hour: 23,
             // Fixture series is short; pendings need multiple fills/day to illuminate niches.
             max_one_entry_per_day: false,
-            mutate_after_elites: 0,
+            // Keep breeding locked in unit fixtures so tests exercise the H1 pot
+            // path without paying for the post-breed M1 robustness battery.
+            mutate_after_elites: 10_000,
             random_fill_fraction: 0.0,
             worker_threads: 1,
-            require_m1_robustness: false,
+            require_m1_robustness: true,
             robustness_folds: 3,
             robustness_monte_carlo_trials: 50,
             robustness_neighborhood_samples: 2,
@@ -1327,12 +1357,12 @@ mod tests {
         let first = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
         let second = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
         assert_eq!(first, second);
-        assert!(first.coverage() >= 4);
+        assert!(first.pot_size() >= 4);
+        assert!(first.elites.is_empty(), "databank stays empty before breeding");
         assert_eq!(first.evaluation_count, 64);
         let non_market: Vec<_> = first
-            .elites
+            .accepted_pool
             .iter()
-            .chain(first.accepted_pool.iter())
             .filter(|elite| {
                 !matches!(
                     elite.strategy.entry.order,
@@ -1349,7 +1379,22 @@ mod tests {
     }
 
     #[test]
-    fn m1_precision_gates_the_databank_but_never_the_pot() {
+    fn pot_fills_without_databank_before_breeding() {
+        let dataset = dataset();
+        let bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 2).unwrap();
+        assert!(
+            !bank.accepted_pool.is_empty(),
+            "H1 gates should fill the breeding pot"
+        );
+        assert!(
+            bank.elites.is_empty(),
+            "nothing enters the databank before breeding unlocks"
+        );
+        bank.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn m1_precision_flag_does_not_change_selected_tf_pot() {
         let dataset = dataset();
         let mut precise_config = config();
         precise_config.require_m1_precision = true;
@@ -1369,10 +1414,8 @@ mod tests {
             pot_of(&scout),
             "pot admission must depend on Selected-TF evidence only"
         );
-        assert!(
-            precise.elites.len() <= scout.elites.len(),
-            "M1 precision may only remove databank elites"
-        );
+        assert!(precise.elites.is_empty());
+        assert!(scout.elites.is_empty());
         precise.validate_integrity().unwrap();
     }
 
@@ -1415,7 +1458,8 @@ mod tests {
         let dataset = dataset();
         let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 1).unwrap();
         bank.validate_integrity().unwrap();
-        bank.elites[0].structural_fingerprint = ContentHash::sha256("tampered");
+        assert!(!bank.accepted_pool.is_empty());
+        bank.accepted_pool[0].structural_fingerprint = ContentHash::sha256("tampered");
         assert!(bank.validate_integrity().is_err());
     }
 
@@ -1526,10 +1570,11 @@ mod tests {
     }
 
     #[test]
-    fn complex_execution_requires_m1_precision() {
+    fn complex_execution_no_longer_requires_m1_during_discover() {
         let mut config = DiscoverConfig::default();
         config.allow_trailing_stops = true;
-        assert!(config.validate().is_err());
+        config.require_m1_precision = false;
+        config.validate().unwrap();
     }
 
     #[test]

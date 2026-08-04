@@ -13,14 +13,16 @@ use rand_chacha::ChaCha8Rng;
 
 /// Institutional indicator-period ladder (Search Families).
 const PERIODS: [u16; 3] = [10, 14, 20];
-/// ATR / R-multiple ladder in 0.25 steps (cross-symbol comparable).
-/// Floor 1.5× matches SQX Build MinSLATRMultiple for Selected-TF-safe stops.
+/// ATR / R-multiple ladder in 0.25 steps (cross-symbol comparable).  These
+/// are proposal values only; the sealed SearchRangeProfile remains the source
+/// of truth for the actual gene space.
 const ATR_STOP_MULTIPLIERS: [f64; 11] =
-    [1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0];
-/// TP floor 2.0× — SQX USDJPY builds used MinPT ≥ 60 pips / ≥2 ATR.
-const ATR_TP_MULTIPLIERS: [f64; 9] = [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
+    [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0];
+const ATR_TP_MULTIPLIERS: [f64; 11] =
+    [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
 const ATR_ENTRY_MULTIPLIERS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
-const RISK_MULTIPLES: [f64; 9] = [1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5];
+const RISK_MULTIPLES: [f64; 12] =
+    [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5];
 const ATR_TRAIL_MULTIPLIERS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5];
 const R_ACTIVATE: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 const R_DISTANCE: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
@@ -2744,29 +2746,19 @@ fn choose_period(rng: &mut ChaCha8Rng) -> u16 {
     PERIODS[rng.gen_range(0..PERIODS.len())]
 }
 
-fn choose_atr_period(_rng: &mut ChaCha8Rng) -> u16 {
-    // Institutional Search Families freeze ATR lookback.
-    FROZEN_ATR_PERIOD
+fn choose_atr_period(rng: &mut ChaCha8Rng) -> u16 {
+    // Institutional families start from a compact proposal ladder.  The
+    // settings-wall range is applied immediately before evaluation, so this
+    // seed value is never a hidden fixed parameter.
+    choose_period(rng)
 }
 
 fn freeze_atr_period(strategy: &mut StrategyIr) {
-    if let StopLossPolicy::AtrMultiple { period, .. } = &mut strategy.stops.stop_loss {
-        *period = FROZEN_ATR_PERIOD;
-    }
-    if let TakeProfitPolicy::AtrMultiple { period, .. } = &mut strategy.stops.take_profit {
-        *period = FROZEN_ATR_PERIOD;
-    }
-    match &mut strategy.entry.order {
-        EntryOrderPolicy::Market => {}
-        EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
-            if let EntryDistancePolicy::AtrMultiple { period, .. } = distance {
-                *period = FROZEN_ATR_PERIOD;
-            }
-        }
-    }
-    if let Some(TrailingPolicy::AtrMultiple { period, .. }) = &mut strategy.manage.trailing {
-        *period = FROZEN_ATR_PERIOD;
-    }
+    // Kept as a compatibility shim for callers that still invoke the old
+    // function.  ATR periods are now searchable genes and are assigned by
+    // `apply_search_ranges`; silently overwriting them here caused the old
+    // 14-period/1.5R-looking behaviour.
+    let _ = strategy;
 }
 
 fn choose_from(rng: &mut ChaCha8Rng, ladder: &[f64]) -> f64 {
@@ -2811,13 +2803,13 @@ fn mutate_ladder_value(value: f64, rng: &mut ChaCha8Rng, ladder: &[f64]) -> f64 
 
 fn enforce_atr_relative_policies(strategy: &mut StrategyIr) {
     strategy.stops.stop_loss = match &strategy.stops.stop_loss {
-        StopLossPolicy::AtrMultiple { multiplier, .. } => StopLossPolicy::AtrMultiple {
-            period: FROZEN_ATR_PERIOD,
+        StopLossPolicy::AtrMultiple { period, multiplier } => StopLossPolicy::AtrMultiple {
+            period: snap_period(*period),
             multiplier: snap_to_ladder(*multiplier, &ATR_STOP_MULTIPLIERS),
         },
         StopLossPolicy::FixedPoints { .. } | StopLossPolicy::RangeMultiple { .. } => {
             StopLossPolicy::AtrMultiple {
-                period: FROZEN_ATR_PERIOD,
+                period: choose_period(&mut ChaCha8Rng::seed_from_u64(14)),
                 multiplier: 2.0,
             }
         }
@@ -2826,8 +2818,8 @@ fn enforce_atr_relative_policies(strategy: &mut StrategyIr) {
         TakeProfitPolicy::RiskMultiple { multiple } => TakeProfitPolicy::RiskMultiple {
             multiple: snap_to_ladder(*multiple, &RISK_MULTIPLES),
         },
-        TakeProfitPolicy::AtrMultiple { multiplier, .. } => TakeProfitPolicy::AtrMultiple {
-            period: FROZEN_ATR_PERIOD,
+        TakeProfitPolicy::AtrMultiple { period, multiplier } => TakeProfitPolicy::AtrMultiple {
+            period: snap_period(*period),
             multiplier: snap_to_ladder(*multiplier, &ATR_TP_MULTIPLIERS),
         },
         TakeProfitPolicy::FixedPoints { .. } => TakeProfitPolicy::RiskMultiple { multiple: 2.0 },
@@ -2995,10 +2987,7 @@ mod tests {
             assert_eq!(classify_family(&child), FamilyStyle::DonchianBreakout);
             assert!(matches!(
                 child.stops.stop_loss,
-                StopLossPolicy::AtrMultiple {
-                    period: FROZEN_ATR_PERIOD,
-                    ..
-                }
+                StopLossPolicy::AtrMultiple { period, .. } if (10..=20).contains(&period)
             ));
             assert!(matches!(
                 child.entry.order,
@@ -3008,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn institutional_seeds_are_pending_only_with_frozen_atr() {
+    fn institutional_seeds_are_pending_only_with_searchable_atr() {
         let population: Vec<_> = (0..64)
             .map(|index| generate_seed_for_family(91, index, SearchFamily::TrendPullback))
             .collect();
@@ -3020,13 +3009,7 @@ mod tests {
                 && value.manage.trailing.is_none()
                 && value.manage.break_even_at_r.is_none()
                 && value.manage.partial_exits.is_empty()
-                && matches!(
-                    value.stops.stop_loss,
-                    StopLossPolicy::AtrMultiple {
-                        period: FROZEN_ATR_PERIOD,
-                        ..
-                    }
-                )
+                && matches!(value.stops.stop_loss, StopLossPolicy::AtrMultiple { period, .. } if (10..=20).contains(&period))
         }));
         let stops = population
             .iter()

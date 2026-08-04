@@ -18,10 +18,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "ICMarkets_EST7_2020_present"
-H1 = PACK / "ICMarketsSC-Demo_AUDUSD_H1_2020_present.tsv"
-M1 = PACK / "ICMarketsSC-Demo_AUDUSD_M1_2020_present.tsv"
-BROKER = PACK / "AUDUSD.broker.json"
+SYMBOL = "AUDUSD"
+H1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_H1_2020_present.tsv"
+M1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_M1_2020_present.tsv"
+BROKER = PACK / f"{SYMBOL}.broker.json"
 TZ = "ICMarkets/EST+7"
+COMMISSION = 7.0
+RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / SYMBOL
 QF = ROOT / "target/release/quantforge"
 WINE = Path("/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine")
 WINEPREFIX = Path.home() / "Library/Application Support/net.metaquotes.wine.metatrader5"
@@ -172,7 +175,7 @@ def find_sequence_with_trades(
                 "--broker",
                 str(BROKER),
                 "--commission-per-lot-round-turn",
-                "7",
+                str(COMMISSION),
                 "--fallback-spread-points",
                 "1",
                 "--initial-balance",
@@ -203,7 +206,7 @@ def run_case(
     force: bool = False,
 ) -> dict:
     tag = f"{family}_{mode}"
-    work = ROOT / "runs" / "family-mt5-parity" / tag
+    work = RUN_ROOT / tag
     summary_file = work / "summary.json"
     if summary_file.exists() and not force:
         prior = json.loads(summary_file.read_text())
@@ -214,8 +217,8 @@ def run_case(
         shutil.rmtree(work)
     work.mkdir(parents=True)
 
-    h1 = work / "AUDUSD_H1.tsv"
-    m1 = work / "AUDUSD_M1.tsv"
+    h1 = work / f"{SYMBOL}_H1.tsv"
+    m1 = work / f"{SYMBOL}_M1.tsv"
     slice_tsv(H1, h1, from_date, to_date)
     slice_tsv(M1, m1, from_date, to_date)
 
@@ -225,7 +228,7 @@ def run_case(
     strategy = work / "strategy.ir.json"
     emit_strategy(family, mode, strategy, sequence)
 
-    expert = f"Fam_{family[:10]}_{mode[:3]}_{sequence}"
+    expert = f"{SYMBOL}_Fam_{family[:10]}_{mode[:3]}_{sequence}"
     # MT5 expert names must be alphanumeric/underscore only.
     expert = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in expert)
 
@@ -246,7 +249,7 @@ def run_case(
             "--broker",
             str(BROKER),
             "--commission-per-lot-round-turn",
-            "7",
+            str(COMMISSION),
             "--fallback-spread-points",
             "1",
             "--initial-balance",
@@ -270,7 +273,7 @@ def run_case(
             "--broker",
             str(BROKER),
             "--commission-per-lot-round-turn",
-            "7",
+            str(COMMISSION),
             "--fallback-spread-points",
             "1",
             "--initial-balance",
@@ -322,7 +325,7 @@ def run_case(
             "--to-date",
             to_date,
             "--commission-per-lot-round-turn",
-            "7",
+            str(COMMISSION),
             "--deposit",
             "100000",
             "--tester-model",
@@ -464,15 +467,44 @@ def run_case(
 
 
 def main() -> int:
+    global PACK, SYMBOL, H1, M1, BROKER, COMMISSION, RUN_ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-date", default="2024.01.01")
     parser.add_argument("--to-date", default="2024.07.01")
     parser.add_argument("--family", action="append", default=[])
     parser.add_argument("--mode", action="append", default=[])
     parser.add_argument("--sequence", type=int, default=None)
+    parser.add_argument(
+        "--symbol",
+        default="AUDUSD",
+        help="symbol in the IC Markets pack (for example AUDUSD, US500 or BTCUSD)",
+    )
+    parser.add_argument(
+        "--pack-dir",
+        type=Path,
+        default=PACK,
+        help="directory containing ICMarketsSC-Demo_<SYMBOL>_{H1,M1}_2020_present.tsv and broker JSON",
+    )
+    parser.add_argument(
+        "--commission",
+        type=float,
+        default=7.0,
+        help="round-turn commission per lot; use 0 for commission-free indices",
+    )
     parser.add_argument("--continue", dest="cont", action="store_true")
     parser.add_argument("--force", action="store_true", help="rerun even if prior PASS")
     args = parser.parse_args()
+
+    SYMBOL = args.symbol.upper()
+    PACK = args.pack_dir.expanduser().resolve()
+    H1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_H1_2020_present.tsv"
+    M1 = PACK / f"ICMarketsSC-Demo_{SYMBOL}_M1_2020_present.tsv"
+    BROKER = PACK / f"{SYMBOL}.broker.json"
+    COMMISSION = args.commission
+    RUN_ROOT = ROOT / "runs" / "family-mt5-parity" / SYMBOL
+    for required in (H1, M1, BROKER):
+        if not required.is_file():
+            parser.error(f"missing asset input: {required}")
 
     families = args.family or FAMILIES
     modes = args.mode or MODES
@@ -506,7 +538,7 @@ def main() -> int:
             continue
         break
 
-    summary_path = ROOT / "runs/family-mt5-parity/SUMMARY.json"
+    summary_path = RUN_ROOT / "SUMMARY.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps({"results": results, "failures": failures}, indent=2))
     print("\nSUMMARY", summary_path)

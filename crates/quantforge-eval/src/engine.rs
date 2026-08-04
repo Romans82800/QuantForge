@@ -1061,8 +1061,10 @@ fn realize_exit_volume(
         PositionSide::Long => 1.0,
         PositionSide::Short => -1.0,
     };
-    let gross_profit = (exit_price - position.entry_price) * direction / broker.tick_size
-        * broker.tick_value
+    let gross_profit = (exit_price - position.entry_price)
+        * direction
+        * broker.contract_size
+        * profit_currency_to_account(exit_price, broker)
         * volume;
     let exit_commission = volume * config.costs.commission_per_lot_round_turn / 2.0;
     *balance += gross_profit - exit_commission;
@@ -1199,6 +1201,23 @@ fn market_exit_base(side: PositionSide, bid_price: f64, spread_price: f64) -> f6
     }
 }
 
+/// Convert one unit of the symbol's profit currency into the account currency
+/// at the actual exit price.  MT5's `OrderCalcProfit` performs this conversion
+/// dynamically; using the profile's snapshot tick value for every bar creates
+/// large drift on JPY crosses as price moves.  For symbols quoted directly in
+/// the account currency (most FX majors, indices and BTCUSD) this is exactly
+/// one.  For USDJPY/other account-base crosses, one quote unit is worth
+/// `1 / price` account units.
+fn profit_currency_to_account(price: f64, broker: &SymbolSpecification) -> f64 {
+    if broker.profit_currency == broker.account_currency {
+        1.0
+    } else if broker.base_currency == broker.account_currency && price.is_finite() && price > 0.0 {
+        1.0 / price
+    } else {
+        broker.tick_value / (broker.tick_size * broker.contract_size)
+    }
+}
+
 fn liquidation_equity(
     position: &OpenPosition,
     bar: &Bar,
@@ -1212,8 +1231,10 @@ fn liquidation_equity(
         PositionSide::Long => 1.0,
         PositionSide::Short => -1.0,
     };
-    let gross = (exit_price - position.entry_price) * direction / broker.tick_size
-        * broker.tick_value
+    let gross = (exit_price - position.entry_price)
+        * direction
+        * broker.contract_size
+        * profit_currency_to_account(exit_price, broker)
         * position.volume;
     let exit_commission = position.volume * config.costs.commission_per_lot_round_turn / 2.0;
     balance + gross - exit_commission
@@ -2024,6 +2045,18 @@ mod tests {
         assert_eq!(result.trades[0].volume, 2.0);
         assert_eq!(result.trades[0].commission, 4.0);
         assert_eq!(result.metrics.ending_balance, 104.0);
+    }
+
+    #[test]
+    fn account_base_crosses_use_dynamic_profit_currency_conversion() {
+        let mut broker = broker();
+        broker.account_currency = "USD".into();
+        broker.base_currency = "USD".into();
+        broker.profit_currency = "JPY".into();
+        broker.contract_size = 100_000.0;
+        broker.tick_size = 0.001;
+        broker.tick_value = 0.613;
+        assert!((profit_currency_to_account(148.0, &broker) - (1.0 / 148.0)).abs() < 1.0e-12);
     }
 
     #[test]

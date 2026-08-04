@@ -127,9 +127,42 @@ impl SourceTimezone {
         match self.localize(naive) {
             LocalResult::Single(timestamp) => Some(timestamp.timestamp_millis()),
             LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
-            LocalResult::None => None,
+            // MT5 serializes the broker's wall clock into an epoch field.  At
+            // the spring DST transition that wall clock can land in the one
+            // skipped hour (for example ICMarkets/EST+7 at 2024-03-10 09:00).
+            // Treat it as the first valid instant after the gap instead of
+            // rejecting the entire tester run; this is the same convention a
+            // broker clock uses when it advances through the transition.
+            LocalResult::None => naive
+                .checked_add_signed(Duration::hours(1))
+                .and_then(|adjusted| match self.localize(adjusted) {
+                    LocalResult::Single(timestamp) => Some(timestamp.timestamp_millis()),
+                    LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
+                    LocalResult::None => None,
+                }),
         }
     }
+
+    /// Render a UTC timestamp back into the broker's wall-clock format.
+    ///
+    /// This is intentionally public so importers can write normalized CSVs in
+    /// the same clock that MT5 exports use.  In particular, ICMarkets/EST+7
+    /// has a broker wall-clock shift layered on top of New York DST.
+    pub fn format_source_timestamp(self, timestamp_ms: i64) -> Option<String> {
+        self.source_wall_time(timestamp_ms)
+            .map(|value| value.format("%Y.%m.%d %H:%M:%S").to_string())
+    }
+}
+
+/// Parse a timestamp using the exact same rules as MT5 bar ingestion.
+///
+/// Kept as a small public wrapper for importers; bar loading itself remains
+/// unchanged and continues to use the private implementation below.
+pub fn parse_source_timestamp(
+    value: &str,
+    source_timezone: SourceTimezone,
+) -> Result<i64, &'static str> {
+    parse_timestamp(value, source_timezone)
 }
 
 impl std::fmt::Display for SourceTimezone {
@@ -972,13 +1005,24 @@ mod tests {
         let server_ms = parse_timestamp("2024.07.08 09:00:00", "Etc/UTC".parse().unwrap()).unwrap();
         let utc_ms = tz.server_epoch_ms_to_utc_ms(server_ms).unwrap();
         // Summer EST+7: server 09:00 ≡ UTC 06:00.
-        assert_eq!(
-            utc_ms,
-            parse_timestamp("2024.07.08 09:00:00", tz).unwrap()
-        );
+        assert_eq!(utc_ms, parse_timestamp("2024.07.08 09:00:00", tz).unwrap());
         assert_eq!(
             utc_ms,
             parse_timestamp("2024.07.08 06:00:00", "Etc/UTC".parse().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn server_epoch_ms_handles_spring_dst_gap() {
+        let tz: SourceTimezone = "ICMarkets/EST+7".parse().unwrap();
+        // 09:00 in the serialized server clock maps to New York 02:00 on the
+        // spring transition, a nonexistent local time.  It must still be
+        // usable for MT5 equity/deal alignment.
+        let server_ms = parse_timestamp("2024.03.10 09:00:00", "Etc/UTC".parse().unwrap()).unwrap();
+        let utc_ms = tz.server_epoch_ms_to_utc_ms(server_ms).unwrap();
+        assert_eq!(
+            utc_ms,
+            parse_timestamp("2024.03.10 07:00:00", "Etc/UTC".parse().unwrap()).unwrap()
         );
     }
 

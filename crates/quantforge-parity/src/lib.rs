@@ -281,6 +281,24 @@ impl Default for ParityTolerances {
     }
 }
 
+impl ParityTolerances {
+    /// Certification profile: zero trade-count drift, every trade aligned,
+    /// and only a small floating-point/reporting epsilon for money and equity.
+    /// The ordinary default remains a diagnostic profile because broker feeds
+    /// can legitimately differ at a price tie or spread boundary.
+    pub fn strict_one_to_one() -> Self {
+        Self {
+            trade_count_relative: 0.0,
+            trade_count_absolute: 0,
+            net_profit_relative: 1.0e-6,
+            max_drawdown_relative: 1.0e-6,
+            max_equity_divergence_percent: 1.0e-6,
+            trade_timestamp_tolerance_ms: 0,
+            minimum_aligned_trade_fraction: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeDiff {
     pub index: usize,
@@ -939,6 +957,17 @@ mod tests {
         let fail = compare_runs(&run(100.0), &run(50.0), &evidence(), Default::default()).unwrap();
         assert!(!fail.passed);
         assert!(!fail.net_profit_passed);
+    }
+
+    #[test]
+    fn strict_profile_is_zero_drift_and_requires_full_alignment() {
+        let strict = ParityTolerances::strict_one_to_one();
+        assert_eq!(strict.trade_count_relative, 0.0);
+        assert_eq!(strict.trade_count_absolute, 0);
+        assert_eq!(strict.minimum_aligned_trade_fraction, 1.0);
+        let pass = compare_runs(&run(100.0), &run(100.0), &evidence(), strict).unwrap();
+        assert!(pass.passed);
+        assert_eq!(pass.allowed_trade_count_delta, 0);
     }
 
     #[test]

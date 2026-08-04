@@ -122,6 +122,14 @@ pub struct ParityRequest {
     max_equity_divergence_percent: f64,
     trade_timestamp_tolerance_ms: i64,
     minimum_aligned_trade_fraction: f64,
+    /// When true, ignore the diagnostic tolerances below and require the
+    /// certification-grade one-to-one profile.
+    #[serde(default = "default_strict_one_to_one")]
+    strict_one_to_one: bool,
+}
+
+fn default_strict_one_to_one() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -476,8 +484,16 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         return Err("MQL5 source hash does not match its evidence card".into());
     }
     let source_text = String::from_utf8(source).map_err(|error| error.to_string())?;
-    let protective_calls = source_text.contains("g_trade.Buy(volume,_Symbol,0.0,stop,target")
-        && source_text.contains("g_trade.Sell(volume,_Symbol,0.0,stop,target");
+    // The template emits the same protective `stop,target` pair for market,
+    // stop-entry and limit-entry calls.  Checking only Buy/Sell used to make
+    // every pending-order export look unprotected to the parity lab.
+    let protective_calls = source_text.contains("stop,target")
+        && (source_text.contains("g_trade.Buy(")
+            || source_text.contains("g_trade.BuyStop")
+            || source_text.contains("g_trade.BuyLimit"))
+        && (source_text.contains("g_trade.Sell(")
+            || source_text.contains("g_trade.SellStop")
+            || source_text.contains("g_trade.SellLimit"));
     evidence.mandatory_stop_loss &= protective_calls;
     evidence.mandatory_take_profit &= protective_calls;
     let metadata =
@@ -496,14 +512,18 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
         broker_timezone.as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    let tolerances = ParityTolerances {
-        trade_count_relative: request.trade_count_relative,
-        trade_count_absolute: request.trade_count_absolute,
-        net_profit_relative: request.net_profit_relative,
-        max_drawdown_relative: request.max_drawdown_relative,
-        max_equity_divergence_percent: request.max_equity_divergence_percent,
-        trade_timestamp_tolerance_ms: request.trade_timestamp_tolerance_ms,
-        minimum_aligned_trade_fraction: request.minimum_aligned_trade_fraction,
+    let tolerances = if request.strict_one_to_one {
+        ParityTolerances::strict_one_to_one()
+    } else {
+        ParityTolerances {
+            trade_count_relative: request.trade_count_relative,
+            trade_count_absolute: request.trade_count_absolute,
+            net_profit_relative: request.net_profit_relative,
+            max_drawdown_relative: request.max_drawdown_relative,
+            max_equity_divergence_percent: request.max_equity_divergence_percent,
+            trade_timestamp_tolerance_ms: request.trade_timestamp_tolerance_ms,
+            minimum_aligned_trade_fraction: request.minimum_aligned_trade_fraction,
+        }
     };
     let report = compare_runs(&reference, &external, &evidence, tolerances)
         .map_err(|error| error.to_string())?;
@@ -532,6 +552,14 @@ fn compare_external_parity_sync(request: &ParityRequest) -> Result<ParityView, S
             (
                 "protocol".into(),
                 json!(quantforge_parity::PARITY_PROTOCOL_VERSION),
+            ),
+            (
+                "parity_profile".into(),
+                json!(if request.strict_one_to_one {
+                    "strict_one_to_one"
+                } else {
+                    "diagnostic_tolerance"
+                }),
             ),
         ]),
     )?;

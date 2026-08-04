@@ -2440,7 +2440,16 @@ select {
 
 .results-analysis-tabs button:hover { color: #d6e2ea; background: #111c25; }
 .results-analysis-tabs button.active { border-color: rgba(64, 216, 197, .42); background: rgba(34, 137, 126, .22); color: #91eadc; }
-.results-analysis-single > .robustness-panel { min-height: min(62vh, 710px); }
+.results-analysis-single > .robustness-panel {
+  min-height: min(62vh, 710px);
+  height: auto;
+  max-height: none;
+  overflow: visible;
+}
+.results-analysis-single .monte-carlo-paths,
+.results-analysis-single .param-distribution {
+  overflow: visible;
+}
 .results-analysis-panel { min-height: min(68vh, 720px); }
 .results-equity-panel.results-analysis-panel .partition-equity { height: auto; min-height: min(58vh, 640px); }
 .results-equity-panel.results-analysis-panel .partition-equity.large .partition-equity-head { display: flex; padding: 12px 14px 6px; }
@@ -2869,6 +2878,16 @@ select {
   .results-kpi-strip {
     grid-template-columns: repeat(11, minmax(0, 1fr));
   }
+}
+
+/* Expanded robustness tabs must grow past the compact overview cards.  The
+   compact card rule intentionally clips at 260px; this later rule keeps the
+   full Monte Carlo paths and parameter histograms reachable by scrolling. */
+section.results-analysis-single > article.robustness-panel {
+  min-height: 0;
+  height: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 @media (max-width: 1240px) {
