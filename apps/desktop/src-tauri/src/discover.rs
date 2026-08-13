@@ -2230,14 +2230,12 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
-        island_count: request.general_island_count.unwrap_or(1)
-            + request.refinement_island_count.unwrap_or(0)
-            + request.exploration_island_count.unwrap_or(0),
+        island_count: request.general_island_count.unwrap_or(1),
         migration_interval: request.migration_interval.unwrap_or(10),
         migration_elites: request.migration_elites.unwrap_or(2),
         general_island_count: request.general_island_count.unwrap_or(0),
-        refinement_island_count: request.refinement_island_count.unwrap_or(0),
-        exploration_island_count: request.exploration_island_count.unwrap_or(0),
+        refinement_island_count: 0,
+        exploration_island_count: 0,
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,

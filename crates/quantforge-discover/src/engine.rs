@@ -1207,7 +1207,6 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
     (0..bank.config.batch_size)
         .map(|index| {
             let island_id = (index % island_count) as u16;
-            let island_role = bank.config.island_role(island_id);
             let sequence = generation
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
@@ -1225,11 +1224,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 apply_search_ranges(&mut seeded, rng, &bank.config.search_ranges);
                 apply_production_policy(seeded, &bank.config)
             };
-            let random_fill = match island_role {
-                crate::model::IslandRole::Exploration => bank.config.random_fill_fraction.max(0.60),
-                crate::model::IslandRole::Refinement => bank.config.random_fill_fraction.min(0.15),
-                crate::model::IslandRole::General => bank.config.random_fill_fraction,
-            };
+            let random_fill = bank.config.random_fill_fraction;
             let keep_filling =
                 !breeding_unlocked || bank.accepted_pool.is_empty() || rng.gen_bool(random_fill);
             if keep_filling {
@@ -1239,11 +1234,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             // A separate exploitation lane starts only from candidates that
             // passed the complete Development battery. It freezes the logical
             // tree and execution modules and perturbs existing numeric genes.
-            let specialist_probability = match island_role {
-                crate::model::IslandRole::Refinement => 0.90,
-                crate::model::IslandRole::General => 0.25,
-                crate::model::IslandRole::Exploration => 0.05,
-            };
+            let specialist_probability = 0.25;
             if !bank.specialist_pool.is_empty() && rng.gen_bool(specialist_probability) {
                 let parent = crate::islands::tournament_in_elites(
                     &bank.specialist_pool,
@@ -1276,17 +1267,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             let mut child = mutate_with_rng(
                 &crossed,
                 &mut rng,
-                match island_role {
-                    crate::model::IslandRole::Exploration => {
-                        bank.config.structural_mutation_probability.max(0.45)
-                    }
-                    crate::model::IslandRole::Refinement => {
-                        bank.config.structural_mutation_probability.min(0.05)
-                    }
-                    crate::model::IslandRole::General => {
-                        bank.config.structural_mutation_probability
-                    }
-                },
+                bank.config.structural_mutation_probability,
                 sequence,
                 false,
                 SearchFamily::Universal,
@@ -2209,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_island_counts_and_migration_controls_are_honored() {
+    fn only_general_islands_and_migration_controls_are_honored() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::HighPerformanceIslands;
         config.general_island_count = 3;
@@ -2218,12 +2199,11 @@ mod tests {
         config.migration_interval = 17;
         config.migration_elites = 3;
         config.apply_run_mode();
-        assert_eq!(config.effective_island_count(), 6);
+        assert_eq!(config.effective_island_count(), 3);
+        assert_eq!(config.refinement_island_count, 0);
+        assert_eq!(config.exploration_island_count, 0);
         assert_eq!(config.migration_interval, 17);
         assert_eq!(config.migration_elites, 3);
-        assert_eq!(config.island_role(0), crate::model::IslandRole::General);
-        assert_eq!(config.island_role(3), crate::model::IslandRole::Refinement);
-        assert_eq!(config.island_role(5), crate::model::IslandRole::Exploration);
     }
 
     #[test]

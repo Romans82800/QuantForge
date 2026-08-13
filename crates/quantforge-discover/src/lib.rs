@@ -26,7 +26,7 @@ pub use methodology::{
 };
 pub use model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError, DiscoverRunMode,
-    DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult, IslandRole,
+    DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult,
     LongShortSkewBucket, M1RetentionEvidence, NicheKey, ParameterNeighborhoodEvidence,
     ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, SearchFamily,
     SearchFamilySpec, SearchRange, SearchRangeProfile, SymbolScreenResult, TRIAL_BUDGET_WARNING,

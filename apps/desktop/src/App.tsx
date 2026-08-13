@@ -3611,8 +3611,8 @@ function DiscoverWorkspace({
                         requireM1Robustness: true,
                         requireM1Precision: true,
                         generalIslandCount: (current.generalIslandCount ?? 0) > 0 ? current.generalIslandCount : 4,
-                        refinementIslandCount: (current.refinementIslandCount ?? 0) > 0 ? current.refinementIslandCount : 2,
-                        explorationIslandCount: (current.explorationIslandCount ?? 0) > 0 ? current.explorationIslandCount : 2,
+                        refinementIslandCount: 0,
+                        explorationIslandCount: 0,
                         migrationInterval: current.migrationInterval ?? 10,
                         migrationElites: current.migrationElites ?? 2,
                       }))
@@ -3629,12 +3629,10 @@ function DiscoverWorkspace({
                 {form.runMode === "high_performance_islands" && (
                   <div className="form-stack compact">
                     <p className="recipe-summary">
-                      General islands evolve structures; refinement islands preserve trees and search parameter plateaus; exploration islands use fresh seeds and stronger structural mutation. Only Development-approved parents migrate. OOS1 and OOS2 never influence evolution.
+                      Independent general islands use the same balanced mutation policy. Controlled migration shares only Development-approved parents; OOS1 and OOS2 never influence evolution.
                     </p>
                     <div className="form-grid universal-grammar-grid">
                       <NumberField label="General islands" value={form.generalIslandCount ?? 4} onChange={(value) => setForm((current) => ({ ...current, generalIslandCount: value ?? 4 }))} min={1} max={32} />
-                      <NumberField label="Refinement islands" value={form.refinementIslandCount ?? 2} onChange={(value) => setForm((current) => ({ ...current, refinementIslandCount: value ?? 0 }))} min={0} max={32} />
-                      <NumberField label="Exploration islands" value={form.explorationIslandCount ?? 2} onChange={(value) => setForm((current) => ({ ...current, explorationIslandCount: value ?? 0 }))} min={0} max={32} />
                       <NumberField label="Migration interval" value={form.migrationInterval ?? 10} onChange={(value) => setForm((current) => ({ ...current, migrationInterval: value ?? 10 }))} min={1} />
                       <NumberField label="Migration elites" value={form.migrationElites ?? 2} onChange={(value) => setForm((current) => ({ ...current, migrationElites: value ?? 2 }))} min={0} max={16} />
                     </div>

@@ -531,13 +531,6 @@ pub enum DiscoverRunMode {
     HighPerformanceIslands,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IslandRole {
-    General,
-    Refinement,
-    Exploration,
-}
-
 /// Named gate outcome persisted on elites for evidence-first promotion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateResult {
@@ -715,12 +708,13 @@ pub struct DiscoverConfig {
     /// Number of leading parents moved from each island at migration.
     #[serde(default = "default_migration_elites")]
     pub migration_elites: usize,
-    /// Role-specific populations. A zero sum falls back to `island_count`
-    /// general islands for backwards-compatible databanks.
+    /// Identical independent structural islands.
     #[serde(default)]
     pub general_island_count: usize,
+    /// Legacy compatibility only; new runs force this to zero.
     #[serde(default)]
     pub refinement_island_count: usize,
+    /// Legacy compatibility only; new runs force this to zero.
     #[serde(default)]
     pub exploration_island_count: usize,
     pub scout: ScoutConfig,
@@ -967,13 +961,15 @@ impl DiscoverConfig {
                     self.minimum_neighborhood_survival_fraction.min(0.5);
             }
             DiscoverRunMode::HighPerformanceIslands => {
-                // Exact lineage topology from the earlier high-output builder:
-                // four isolated populations and deterministic ring migration.
+                // Identical balanced populations with deterministic migration.
+                // Asymmetric refinement/exploration roles encouraged overfitting.
                 self.simple_exits = !self.has_complex_execution();
-                if self.configured_role_island_count() == 0 {
+                self.refinement_island_count = 0;
+                self.exploration_island_count = 0;
+                if self.general_island_count == 0 {
                     self.general_island_count = 4;
                 }
-                self.island_count = self.configured_role_island_count();
+                self.island_count = self.general_island_count;
                 if self.migration_interval == 0 {
                     self.migration_interval = 10;
                 }
@@ -989,8 +985,6 @@ impl DiscoverConfig {
 
     pub fn configured_role_island_count(&self) -> usize {
         self.general_island_count
-            .saturating_add(self.refinement_island_count)
-            .saturating_add(self.exploration_island_count)
     }
 
     pub fn effective_island_count(&self) -> usize {
@@ -999,20 +993,6 @@ impl DiscoverConfig {
             roles
         } else {
             self.island_count.max(1)
-        }
-    }
-
-    pub fn island_role(&self, island_id: u16) -> IslandRole {
-        if self.configured_role_island_count() == 0 {
-            return IslandRole::General;
-        }
-        let id = island_id as usize;
-        if id < self.general_island_count {
-            IslandRole::General
-        } else if id < self.general_island_count + self.refinement_island_count {
-            IslandRole::Refinement
-        } else {
-            IslandRole::Exploration
         }
     }
 
