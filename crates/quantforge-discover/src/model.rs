@@ -579,6 +579,11 @@ pub struct DiscoverConfig {
     /// promotion battery. OOS1 never contributes to breeding or ranking.
     #[serde(default = "default_oos1_expectancy_retention")]
     pub oos1_expectancy_retention: f64,
+    /// Minimum M1 Development expectancy, expressed in R at the immutable
+    /// fixed-risk amount. This is a post-breed databank gate and therefore
+    /// never narrows the random-search reservoir.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub minimum_development_expectancy_r: f64,
     /// Preference / seal flag: databank elites are M1-promoted after breeding.
     /// Discover always runs the M1 fidelity + robustness battery on the
     /// post-breed databank path (SQX structure); this does not gate the pot.
@@ -809,6 +814,7 @@ impl Default for DiscoverConfig {
             precision: PrecisionGateConfig::default(),
             search_ranges: SearchRangeProfile::default(),
             oos1_expectancy_retention: default_oos1_expectancy_retention(),
+            minimum_development_expectancy_r: 0.0,
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
             allow_break_even: false,
@@ -979,6 +985,13 @@ impl DiscoverConfig {
         {
             return Err(DiscoverError::InvalidConfig(
                 "oos1_expectancy_retention must be finite and between 0 and 2".into(),
+            ));
+        }
+        if !self.minimum_development_expectancy_r.is_finite()
+            || self.minimum_development_expectancy_r < 0.0
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "minimum_development_expectancy_r must be finite and non-negative".into(),
             ));
         }
         if !self.gates.maximum_drawdown_percent.is_finite()
@@ -1361,6 +1374,7 @@ pub enum DepositDecision {
     RejectedPrecision,
     RejectedAmbiguous,
     RejectedOos1,
+    RejectedDevelopmentExpectancy,
     RejectedM1Fidelity,
     RejectedWalkForward,
     RejectedMonteCarlo,
@@ -1396,6 +1410,8 @@ pub struct DiscoverTelemetry {
     pub rejected_ambiguous: u64,
     #[serde(default)]
     pub rejected_oos1: u64,
+    #[serde(default)]
+    pub rejected_development_expectancy: u64,
     #[serde(default)]
     pub rejected_m1_fidelity: u64,
     #[serde(default)]
@@ -1454,6 +1470,9 @@ impl DiscoverTelemetry {
             DepositDecision::RejectedPrecision => self.rejected_precision += 1,
             DepositDecision::RejectedAmbiguous => self.rejected_ambiguous += 1,
             DepositDecision::RejectedOos1 => self.rejected_oos1 += 1,
+            DepositDecision::RejectedDevelopmentExpectancy => {
+                self.rejected_development_expectancy += 1;
+            }
             DepositDecision::RejectedM1Fidelity => self.rejected_m1_fidelity += 1,
             DepositDecision::RejectedWalkForward => self.rejected_walk_forward += 1,
             DepositDecision::RejectedMonteCarlo => self.rejected_monte_carlo += 1,

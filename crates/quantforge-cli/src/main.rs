@@ -4732,6 +4732,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         },
         search_ranges: quantforge_discover::SearchRangeProfile::default(),
         oos1_expectancy_retention: 0.7,
+        minimum_development_expectancy_r: 0.0,
         require_m1_precision: false,
         simple_exits: true,
         allow_break_even: false,

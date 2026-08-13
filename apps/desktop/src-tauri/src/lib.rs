@@ -47,6 +47,7 @@ pub fn run() {
             discover::start_discover,
             discover::run_condition_bakeoff,
             discover::get_discover_job,
+            discover::get_discover_live_databank,
             discover::pause_discover,
             discover::resume_discover,
             discover::stop_discover,

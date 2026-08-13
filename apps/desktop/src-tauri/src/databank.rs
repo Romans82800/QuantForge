@@ -1,4 +1,6 @@
-use crate::data_lab::{build_decision_from_m1, load_bound_broker, load_quote_sidecar};
+use crate::data_lab::{
+    build_decision_from_m1, build_decision_from_m1_quotes, load_bound_broker, load_quote_sidecar,
+};
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
@@ -207,6 +209,7 @@ struct RejectionTelemetry {
     #[serde(default)]
     ambiguous: u64,
     oos1: u64,
+    development_expectancy: u64,
     evaluation: u64,
     total: u64,
 }
@@ -451,6 +454,42 @@ fn load_databank_path(
     let artifact_hash = ContentHash::sha256(&bytes);
     let (artifact, legacy_read_only) = parse_evolve_artifact(&bytes)?;
     let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    install_databank_artifact(
+        artifact,
+        legacy_read_only,
+        source_path,
+        artifact_hash,
+        state,
+    )
+}
+
+/// Installs an already-verified in-memory Discover artifact into the regular
+/// Databank state. Live Discover uses this path so its table can refresh from
+/// RAM without forcing a multi-megabyte recovery-checkpoint write for every
+/// promoted strategy.
+pub(crate) fn install_live_databank_artifact(
+    artifact: EvolveArtifact,
+    source_path: PathBuf,
+    state: &DesktopState,
+) -> Result<DatabankWorkspace, DesktopError> {
+    verify_artifact(&artifact)?;
+    let bytes = serde_json::to_vec(&artifact)?;
+    install_databank_artifact(
+        artifact,
+        false,
+        source_path,
+        ContentHash::sha256(&bytes),
+        state,
+    )
+}
+
+fn install_databank_artifact(
+    artifact: EvolveArtifact,
+    legacy_read_only: bool,
+    source_path: PathBuf,
+    artifact_hash: ContentHash,
+    state: &DesktopState,
+) -> Result<DatabankWorkspace, DesktopError> {
     let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
     let metadata_path = companion_metadata_path(&artifact.source);
     let m1_source = manifest_path(&artifact, "m1_source");
@@ -860,7 +899,15 @@ fn run_elite_robustness_sync(
     // Reconstruct the exact Selected-TF candles from M1, then recover the same
     // IS partition that Discover hashed into the databank. This prevents a
     // Results retest from silently drifting onto full history or OOS1/OOS2.
-    let full_decision = build_decision_from_m1(&m1_source.dataset, Some(&decision_source.dataset))?;
+    let full_decision = match quote_dataset.as_ref() {
+        Some(quotes) => build_decision_from_m1_quotes(
+            &m1_source.dataset,
+            Some(&decision_source.dataset),
+            quotes,
+            broker.point,
+        )?,
+        None => build_decision_from_m1(&m1_source.dataset, Some(&decision_source.dataset))?,
+    };
     let is_decision = databank_decision_partition(
         &full_decision,
         &snapshot.data_hash,
@@ -1137,7 +1184,12 @@ fn partition_equity_for_elite(
     }
     // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
     // align with the exported EA and external MT5 backtests.
-    let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?;
+    let decision_dataset = match quote_dataset.as_ref() {
+        Some(quotes) => {
+            build_decision_from_m1_quotes(&m1.dataset, Some(&loaded.dataset), quotes, broker.point)?
+        }
+        None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
+    };
     // Use the databank's sealed split, not a hardcoded 20/20. Discover gated this
     // elite on IS/OOS1 cut with these fractions; a mismatched chart invents a
     // different OOS1 window and a false retention ratio.
@@ -1739,8 +1791,16 @@ fn prepare_trade_csv_replay(
             DesktopError::InvalidExport(format!("quote sidecar does not match M1 data: {error}"))
         })?;
     }
-    let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&decision.dataset))
-        .map_err(DesktopError::InvalidExport)?;
+    let decision_dataset = match quote_dataset.as_ref() {
+        Some(quotes) => build_decision_from_m1_quotes(
+            &m1.dataset,
+            Some(&decision.dataset),
+            quotes,
+            broker.point,
+        ),
+        None => build_decision_from_m1(&m1.dataset, Some(&decision.dataset)),
+    }
+    .map_err(DesktopError::InvalidExport)?;
     let plan = DataSplitPlan::chronological(
         &decision_dataset,
         snapshot.validation_fraction,
@@ -2369,6 +2429,7 @@ fn workspace_view(
         + telemetry.rejected_precision
         + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
+        + telemetry.rejected_development_expectancy
         + telemetry.rejected_m1_fidelity
         + telemetry.rejected_walk_forward
         + telemetry.rejected_monte_carlo
@@ -2412,6 +2473,7 @@ fn workspace_view(
             precision: telemetry.rejected_precision,
             ambiguous: telemetry.rejected_ambiguous,
             oos1: telemetry.rejected_oos1,
+            development_expectancy: telemetry.rejected_development_expectancy,
             evaluation: telemetry.rejected_evaluation,
             total: total_rejections,
         },
@@ -3046,9 +3108,25 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     )?;
     let broker = load_bound_broker(&artifact.broker, h1.metadata.as_ref())?;
     load_bound_broker(&artifact.broker, m1.metadata.as_ref())?;
+    let quote_dataset = infer_quote_sidecar_path(&request.m1_data_path)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1.dataset)
+            .map_err(|error| format!("quote sidecar does not match M1 data: {error}"))?;
+    }
 
-    // SQX-style: decision OHLC is synthesized from M1 so aggregates always match.
-    let decision = build_decision_from_m1(&m1.dataset, Some(&h1.dataset))?;
+    // Decision OHLC and spread are synthesized from the same M1 quote pack
+    // used by the chronological judge.
+    let decision = match quote_dataset.as_ref() {
+        Some(quotes) => {
+            build_decision_from_m1_quotes(&m1.dataset, Some(&h1.dataset), quotes, broker.point)?
+        }
+        None => build_decision_from_m1(&m1.dataset, Some(&h1.dataset))?,
+    };
 
     let scout = &artifact.databank.config.scout;
     let judge = JudgeConfig {
@@ -3064,9 +3142,18 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     for elite in &artifact.databank.elites {
         let h1_result = evaluate_strategy(&elite.strategy, &decision, &broker, scout)
             .map_err(|error| error.to_string());
-        let m1_result =
-            evaluate_strategy_m1(&elite.strategy, &decision, &m1.dataset, &broker, &judge)
-                .map_err(|error| error.to_string());
+        let m1_result = match quote_dataset.as_ref() {
+            Some(quotes) => quantforge_tick::evaluate_strategy_m1_with_quotes(
+                &elite.strategy,
+                &decision,
+                &m1.dataset,
+                quotes,
+                &broker,
+                &judge,
+            ),
+            None => evaluate_strategy_m1(&elite.strategy, &decision, &m1.dataset, &broker, &judge),
+        }
+        .map_err(|error| error.to_string());
 
         let (passed, reason, row) = match (h1_result, m1_result) {
             (Ok(h1_eval), Ok(m1_eval)) => {

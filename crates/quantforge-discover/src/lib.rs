@@ -38,7 +38,8 @@ pub use permutation::{
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
     MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
-    RobustnessConfig, RobustnessOutcome, RobustnessReject, run_m1_predeposit_robustness,
+    RobustnessConfig, RobustnessOutcome, RobustnessReject, development_cpcv_diagnostic,
+    run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

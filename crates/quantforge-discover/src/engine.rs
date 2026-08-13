@@ -265,6 +265,7 @@ fn evaluate_and_deposit(
 
 enum PromotionOutcome {
     Oos1Rejected,
+    DevelopmentExpectancyRejected,
     DatabankGateRejected,
     RobustnessRejected {
         reject: crate::robustness::RobustnessReject,
@@ -290,6 +291,7 @@ struct PromotionContext {
     broker: Arc<SymbolSpecification>,
     deposit_gates: GateConfig,
     oos1_expectancy_retention: f64,
+    minimum_development_expectancy_r: f64,
     require_m1_robustness: bool,
     robustness: crate::robustness::RobustnessConfig,
 }
@@ -355,6 +357,7 @@ impl PromotionPipeline {
             broker: Arc::new(broker.clone()),
             deposit_gates: config.deposit_gates.clone(),
             oos1_expectancy_retention: config.oos1_expectancy_retention,
+            minimum_development_expectancy_r: config.minimum_development_expectancy_r,
             require_m1_robustness: config.require_m1_robustness,
             robustness: robustness_config_from_discover(config),
         })
@@ -512,6 +515,13 @@ fn promote_one(
     if !crate::archive::passes_gate_config(&m1_outcome.0, &context.deposit_gates) {
         return PromotionOutcome::DatabankGateRejected;
     }
+    let development_expectancy = m1_outcome.0.metrics.expectancy;
+    if !passes_development_expectancy(
+        development_expectancy,
+        context.minimum_development_expectancy_r,
+    ) {
+        return PromotionOutcome::DevelopmentExpectancyRejected;
+    }
 
     // OOS1 is a validation gate, never a breeding or ranking input. It opens
     // only after the candidate has survived the complete Development battery.
@@ -558,7 +568,6 @@ fn promote_one(
     // The Development reference is the already-admitted M1 baseline. The
     // joined replay exists for warmup/execution continuity only and must not
     // rewrite Development fitness with information from across the boundary.
-    let development_expectancy = m1_outcome.0.metrics.expectancy;
     let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
     if !passes_oos1_pick(
         development_expectancy,
@@ -584,6 +593,10 @@ fn apply_promotion_outcome(
     match outcome {
         PromotionOutcome::Oos1Rejected => {
             bank.telemetry.record(DepositDecision::RejectedOos1);
+        }
+        PromotionOutcome::DevelopmentExpectancyRejected => {
+            bank.telemetry
+                .record(DepositDecision::RejectedDevelopmentExpectancy);
         }
         PromotionOutcome::DatabankGateRejected => {
             bank.telemetry.record(DepositDecision::RejectedDepositGate);
@@ -687,6 +700,13 @@ pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retenti
         && is_expectancy > 0.0
         && oos1_expectancy > 0.0
         && oos1_expectancy >= retention * is_expectancy
+}
+
+fn passes_development_expectancy(expectancy: f64, minimum_r: f64) -> bool {
+    expectancy.is_finite()
+        && minimum_r.is_finite()
+        && minimum_r >= 0.0
+        && expectancy >= minimum_r * crate::FIXED_RISK_PER_TRADE
 }
 
 /// Concatenate consecutive decision partitions for a validation replay. OOS2
@@ -1649,6 +1669,7 @@ mod tests {
             },
             search_ranges: crate::model::SearchRangeProfile::default(),
             oos1_expectancy_retention: 0.0,
+            minimum_development_expectancy_r: 0.0,
             require_m1_precision: true,
             simple_exits: true,
             allow_break_even: false,
@@ -1842,6 +1863,13 @@ mod tests {
         assert!(!passes_oos1_pick(10.0, -1.0, 0.7));
         assert!(!passes_oos1_pick(-2.0, 5.0, 0.7));
         assert!(!passes_oos1_pick(f64::NAN, 5.0, 0.7));
+    }
+
+    #[test]
+    fn minimum_development_expectancy_is_expressed_in_fixed_r() {
+        assert!(passes_development_expectancy(200.0, 0.2));
+        assert!(!passes_development_expectancy(199.99, 0.2));
+        assert!(!passes_development_expectancy(f64::NAN, 0.2));
     }
 
     #[test]

@@ -328,6 +328,38 @@ pub fn run_m1_predeposit_robustness(
     })
 }
 
+/// Evaluate the reusable Development CPCV rows without running the later
+/// Monte Carlo and parameter-neighborhood gates. This is intentionally a
+/// diagnostic surface: it makes cross-asset gate failures inspectable instead
+/// of reducing them to a single rejection counter.
+pub fn development_cpcv_diagnostic(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+) -> Result<Vec<WalkForwardFold>, RobustnessReject> {
+    let judge = JudgeConfig {
+        initial_balance: config.initial_balance,
+        costs: config.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+    };
+    let contract = DevelopmentCpcvPlan::for_development_bars(development.bars.len());
+    evaluate_development_cpcv(
+        strategy,
+        development,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+        config,
+        &contract,
+    )
+}
+
 fn evaluate_strategy_m1_with_optional_quotes(
     strategy: &StrategyIr,
     decision_dataset: &BarDataset,
@@ -719,8 +751,15 @@ fn evaluate_development_ranges(
                 start,
                 end,
             )
+            .map(|group| group.fold)
         })
         .collect()
+}
+
+struct DevelopmentGroupEvaluation {
+    fold: WalkForwardFold,
+    trade_profits: Vec<f64>,
+    relative_equity: Vec<f64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,21 +812,25 @@ fn evaluate_development_cpcv(
                 .iter()
                 .map(|group| &groups[*group])
                 .collect::<Vec<_>>();
-            let metrics = combine_fold_metrics(&selected, config.initial_balance);
+            let metrics = combine_group_metrics(&selected, config.initial_balance);
             WalkForwardFold {
                 fold: combination,
                 test_groups,
                 start_timestamp_ms: selected
                     .first()
-                    .map(|fold| fold.start_timestamp_ms)
+                    .map(|group| group.fold.start_timestamp_ms)
                     .unwrap_or_default(),
                 end_timestamp_ms: selected
                     .last()
-                    .map(|fold| fold.end_timestamp_ms)
+                    .map(|group| group.fold.end_timestamp_ms)
                     .unwrap_or_default(),
-                decision_bars: selected.iter().map(|fold| fold.decision_bars).sum(),
-                trades_in_fold: selected.iter().map(|fold| fold.trades_in_fold).sum(),
-                passed: selected.iter().all(|fold| fold.passed),
+                decision_bars: selected.iter().map(|group| group.fold.decision_bars).sum(),
+                trades_in_fold: selected.iter().map(|group| group.fold.trades_in_fold).sum(),
+                // A CPCV row is one concatenated held-out path. Requiring both
+                // component groups to pass independently silently turned a
+                // 60% combination threshold into an approximately 5-of-6
+                // regime threshold and unfairly rejected lumpier instruments.
+                passed: metrics_pass(&metrics, config.minimum_fold_trades, config),
                 metrics,
             }
         })
@@ -807,18 +850,27 @@ fn evaluate_development_window(
     test_groups: Vec<usize>,
     start: usize,
     end: usize,
-) -> Result<WalkForwardFold, RobustnessReject> {
+) -> Result<DevelopmentGroupEvaluation, RobustnessReject> {
     if end <= start + 1 || end > development.bars.len() {
         return Err(RobustnessReject::WalkForward);
     }
-    let lookback = 120usize;
+    // Match the judge/EA parity warm-up exactly. With a shorter prefix the
+    // judge's fixed 320-bar warm-up delayed every CPCV group by the missing
+    // bars (formerly 200), so the fold silently omitted part of its test
+    // window. A full prefix also guarantees no pre-fold entry can be scored.
+    let lookback = 320usize;
     let decision_slice = slice_dataset(development, start.saturating_sub(lookback), end);
     let start_ms = development.bars[start].timestamp_ms;
     let last_open_ms = development.bars[end - 1].timestamp_ms;
     let interval_ms = infer_median_interval_ms(&development.bars).unwrap_or(3_600_000);
+    let decision_start_ms = decision_slice
+        .bars
+        .first()
+        .map(|bar| bar.timestamp_ms)
+        .ok_or(RobustnessReject::WalkForward)?;
     let m1_slice = slice_m1_covering(
         m1_dataset,
-        start_ms,
+        decision_start_ms,
         last_open_ms.saturating_add(interval_ms),
     );
     let quote_slice = quote_dataset.map(|quotes| slice_quotes_covering(quotes, &m1_slice));
@@ -842,35 +894,81 @@ fn evaluate_development_window(
         && result.metrics.return_percent > config.minimum_return_percent
         && effective_pf(&result.metrics) >= config.minimum_profit_factor
         && result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent;
-    Ok(WalkForwardFold {
-        fold,
-        test_groups,
-        start_timestamp_ms: start_ms,
-        end_timestamp_ms: last_open_ms,
-        decision_bars: end - start,
-        trades_in_fold: trades,
-        metrics: result.metrics,
-        passed,
+    let trade_profits = result.trades.iter().map(|trade| trade.net_profit).collect();
+    let relative_equity = result
+        .equity
+        .iter()
+        .map(|point| point.equity - config.initial_balance)
+        .collect();
+    Ok(DevelopmentGroupEvaluation {
+        fold: WalkForwardFold {
+            fold,
+            test_groups,
+            start_timestamp_ms: start_ms,
+            end_timestamp_ms: last_open_ms,
+            decision_bars: end - start,
+            trades_in_fold: trades,
+            metrics: result.metrics,
+            passed,
+        },
+        trade_profits,
+        relative_equity,
     })
 }
 
-fn combine_fold_metrics(
-    folds: &[&WalkForwardFold],
+fn combine_group_metrics(
+    groups: &[&DevelopmentGroupEvaluation],
     initial_balance: f64,
 ) -> quantforge_eval::BacktestMetrics {
-    let net_profit = folds
+    let net_profit = groups
         .iter()
-        .map(|fold| fold.metrics.net_profit)
+        .map(|group| group.fold.metrics.net_profit)
         .sum::<f64>();
-    let trade_count = folds.iter().map(|fold| fold.trades_in_fold).sum::<usize>();
-    let winning_trades = folds
+    let trade_count = groups
         .iter()
-        .map(|fold| fold.metrics.winning_trades)
+        .map(|group| group.fold.trades_in_fold)
         .sum::<usize>();
-    let losing_trades = folds
+    let winning_trades = groups
         .iter()
-        .map(|fold| fold.metrics.losing_trades)
-        .sum::<usize>();
+        .flat_map(|group| group.trade_profits.iter())
+        .filter(|profit| **profit > 0.0)
+        .count();
+    let losing_trades = groups
+        .iter()
+        .flat_map(|group| group.trade_profits.iter())
+        .filter(|profit| **profit < 0.0)
+        .count();
+    let gross_wins = groups
+        .iter()
+        .flat_map(|group| group.trade_profits.iter())
+        .filter(|profit| **profit > 0.0)
+        .sum::<f64>();
+    let gross_losses = -groups
+        .iter()
+        .flat_map(|group| group.trade_profits.iter())
+        .filter(|profit| **profit < 0.0)
+        .sum::<f64>();
+    let profit_factor = (gross_losses > 0.0).then_some(gross_wins / gross_losses);
+
+    // Rebase each independently replayed Development group onto the balance
+    // left by the previous group. This creates the actual concatenated CPCV
+    // path instead of taking the worst component metric as a proxy.
+    let mut offset = 0.0;
+    let mut peak = initial_balance;
+    let mut max_drawdown = 0.0_f64;
+    let mut max_drawdown_percent = 0.0_f64;
+    for group in groups {
+        for relative in &group.relative_equity {
+            let equity = initial_balance + offset + relative;
+            peak = peak.max(equity);
+            let drawdown = peak - equity;
+            max_drawdown = max_drawdown.max(drawdown);
+            if peak > 0.0 {
+                max_drawdown_percent = max_drawdown_percent.max(drawdown / peak * 100.0);
+            }
+        }
+        offset += group.fold.metrics.net_profit;
+    }
     quantforge_eval::BacktestMetrics {
         initial_balance,
         ending_balance: initial_balance + net_profit,
@@ -884,23 +982,12 @@ fn combine_fold_metrics(
         } else {
             winning_trades as f64 / trade_count as f64 * 100.0
         },
-        // Conservatively retain the weakest group rather than manufacturing a
-        // pooled PF without persisted gross-profit/gross-loss components.
-        profit_factor: folds
+        profit_factor,
+        max_drawdown,
+        max_drawdown_percent,
+        sharpe_ratio: groups
             .iter()
-            .filter_map(|fold| fold.metrics.profit_factor)
-            .min_by(f64::total_cmp),
-        max_drawdown: folds
-            .iter()
-            .map(|fold| fold.metrics.max_drawdown)
-            .fold(0.0, f64::max),
-        max_drawdown_percent: folds
-            .iter()
-            .map(|fold| fold.metrics.max_drawdown_percent)
-            .fold(0.0, f64::max),
-        sharpe_ratio: folds
-            .iter()
-            .filter_map(|fold| fold.metrics.sharpe_ratio)
+            .filter_map(|group| group.fold.metrics.sharpe_ratio)
             .min_by(f64::total_cmp),
         expectancy: if trade_count == 0 {
             0.0
@@ -923,18 +1010,18 @@ fn slice_dataset(source: &BarDataset, start: usize, end: usize) -> BarDataset {
     }
 }
 
-/// Keep M1 bars in `[start_ms - pad, end_exclusive_ms)`.
+/// Keep M1 bars in `[start_ms, end_exclusive_ms)`.
 ///
+/// The caller derives `start_ms` from the exact decision slice (including its
+/// warm-up prefix). Using a calendar-duration guess here was both incorrect
+/// across weekend/session calendars and a source of cross-asset CPCV bias.
 /// `end_exclusive_ms` must be the open of the last decision bar **plus** that
-/// bar's interval — not the open alone — or the final hour is truncated and
-/// Judge rejects with an M1 aggregate mismatch.
+/// bar's interval, or the final decision bar is truncated.
 fn slice_m1_covering(m1: &BarDataset, start_ms: i64, end_exclusive_ms: i64) -> BarDataset {
-    let pad_ms = 7 * 24 * 60 * 60 * 1000;
-    let from = start_ms.saturating_sub(pad_ms);
     let bars: Vec<_> = m1
         .bars
         .iter()
-        .filter(|bar| bar.timestamp_ms >= from && bar.timestamp_ms < end_exclusive_ms)
+        .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms < end_exclusive_ms)
         .cloned()
         .collect();
     BarDataset {
@@ -981,6 +1068,47 @@ fn slice_quotes_covering(quotes: &QuoteBarDataset, m1: &BarDataset) -> QuoteBarD
 mod tests {
     use super::*;
     use quantforge_data::Bar;
+
+    fn group(net_profits: &[f64], passed: bool) -> DevelopmentGroupEvaluation {
+        let net_profit = net_profits.iter().sum::<f64>();
+        let winning_trades = net_profits.iter().filter(|profit| **profit > 0.0).count();
+        let losing_trades = net_profits.iter().filter(|profit| **profit < 0.0).count();
+        let metrics = quantforge_eval::BacktestMetrics {
+            initial_balance: 100_000.0,
+            ending_balance: 100_000.0 + net_profit,
+            net_profit,
+            return_percent: net_profit / 1_000.0,
+            trade_count: net_profits.len(),
+            winning_trades,
+            losing_trades,
+            win_rate: winning_trades as f64 / net_profits.len() as f64 * 100.0,
+            profit_factor: None,
+            max_drawdown: 0.0,
+            max_drawdown_percent: 0.0,
+            sharpe_ratio: None,
+            expectancy: net_profit / net_profits.len() as f64,
+        };
+        DevelopmentGroupEvaluation {
+            fold: WalkForwardFold {
+                fold: 0,
+                test_groups: vec![0],
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 1,
+                decision_bars: 10,
+                trades_in_fold: net_profits.len(),
+                metrics,
+                passed,
+            },
+            trade_profits: net_profits.to_vec(),
+            relative_equity: net_profits
+                .iter()
+                .scan(0.0, |equity, profit| {
+                    *equity += profit;
+                    Some(*equity)
+                })
+                .collect(),
+        }
+    }
 
     fn bar(ts: i64) -> Bar {
         Bar {
@@ -1053,6 +1181,43 @@ mod tests {
         assert_eq!(combinations.len(), 15);
         assert_eq!(combinations.first(), Some(&vec![0, 1]));
         assert_eq!(combinations.last(), Some(&vec![4, 5]));
+    }
+
+    #[test]
+    fn cpcv_combination_metrics_pool_component_trade_outcomes() {
+        // The first regime loses on its own, but the two-group CPCV path is
+        // profitable with PF > 1. A combination must be judged as that pooled
+        // path, not rejected merely because one component's flag is false.
+        let losing = group(&[-100.0, 25.0], false);
+        let winning = group(&[200.0, 50.0], true);
+        let metrics = combine_group_metrics(&[&losing, &winning], 100_000.0);
+
+        assert_eq!(metrics.trade_count, 4);
+        assert_eq!(metrics.net_profit, 175.0);
+        assert!((metrics.profit_factor.unwrap() - 2.75).abs() < 1.0e-12);
+        assert_eq!(metrics.winning_trades, 3);
+        assert_eq!(metrics.losing_trades, 1);
+    }
+
+    #[test]
+    fn m1_fold_slice_starts_at_the_exact_decision_prefix() {
+        let bars = (0..10)
+            .map(|minute| bar(minute * 60_000))
+            .collect::<Vec<_>>();
+        let dataset = BarDataset {
+            data_hash: bar_content_hash(&bars),
+            source_rows: bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars,
+        };
+
+        let sliced = slice_m1_covering(&dataset, 3 * 60_000, 8 * 60_000);
+        assert_eq!(sliced.bars.len(), 5);
+        assert_eq!(sliced.bars.first().unwrap().timestamp_ms, 3 * 60_000);
+        assert_eq!(sliced.bars.last().unwrap().timestamp_ms, 7 * 60_000);
     }
 
     #[test]

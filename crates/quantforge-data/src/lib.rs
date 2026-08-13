@@ -1008,6 +1008,38 @@ pub fn build_timeframe_from_m1(
     })
 }
 
+/// Attach the opening bid/ask spread from a canonical quote pack to each M1
+/// indicator bar before aggregating it to a decision timeframe.
+///
+/// Entries are decided on a completed bar and submitted at the next bar open,
+/// so the opening spread is the quote information the compact OHLC scout needs.
+/// The chronological M1 judge still consumes the full bid/ask path.
+pub fn build_timeframe_from_m1_with_quotes(
+    m1: &BarDataset,
+    quotes: &QuoteBarDataset,
+    point: f64,
+    interval_ms: i64,
+    bar_open_timestamps: Option<&[i64]>,
+) -> Result<BarDataset, DataError> {
+    if !point.is_finite() || point <= 0.0 {
+        return Err(DataError::InvalidQuotePoint(point));
+    }
+    quotes.validate_against(m1)?;
+    let mut spread_aware_m1 = m1.clone();
+    for (bar, quote) in spread_aware_m1.bars.iter_mut().zip(&quotes.bars) {
+        let spread_points = quote.spread_open() / point;
+        if !spread_points.is_finite() || spread_points < 0.0 || spread_points > f64::from(u32::MAX)
+        {
+            return Err(DataError::InvalidQuoteSpread {
+                timestamp_ms: quote.timestamp_ms,
+                spread_points,
+            });
+        }
+        bar.spread_points = Some(spread_points.round() as u32);
+    }
+    build_timeframe_from_m1(&spread_aware_m1, interval_ms, bar_open_timestamps)
+}
+
 fn median_u64(values: &[u64]) -> Option<u64> {
     if values.is_empty() {
         return None;
@@ -1101,6 +1133,13 @@ pub enum DataError {
     InvalidQuoteBar(i64),
     #[error("quote dataset mismatch: {0}")]
     QuoteDatasetMismatch(String),
+    #[error("quote spread conversion requires a finite positive broker point; got {0}")]
+    InvalidQuotePoint(f64),
+    #[error("invalid quote spread {spread_points} points at timestamp {timestamp_ms}")]
+    InvalidQuoteSpread {
+        timestamp_ms: i64,
+        spread_points: f64,
+    },
     #[error("metadata does not match dataset: {0}")]
     MetadataDatasetMismatch(String),
     #[error("decision interval must be a positive multiple of 60s; got {interval_ms}ms")]
@@ -1434,6 +1473,88 @@ mod tests {
         assert_eq!(built.bars.len(), 1);
         assert!((built.bars[0].high - 0.65513).abs() < 1e-12);
         assert_eq!(built.bars[0].tick_volume, 59);
+    }
+
+    #[test]
+    fn quote_aware_aggregation_preserves_opening_spread_in_broker_points() {
+        let bars = vec![
+            Bar {
+                timestamp_ms: 1_701_806_400_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                tick_volume: 2,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+            Bar {
+                timestamp_ms: 1_701_806_460_000,
+                open: 100.5,
+                high: 102.0,
+                low: 100.0,
+                close: 101.0,
+                tick_volume: 3,
+                real_volume: 0,
+                spread_points: Some(0),
+            },
+        ];
+        let m1 = BarDataset {
+            data_hash: bar_content_hash(&bars),
+            bars,
+            source_rows: 2,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: ',',
+            source_timezone: "Etc/UTC".into(),
+        };
+        let quote_bars = vec![
+            QuoteBar {
+                timestamp_ms: m1.bars[0].timestamp_ms,
+                bid_open: 100.0,
+                bid_high: 101.0,
+                bid_low: 99.0,
+                bid_close: 100.5,
+                ask_open: 101.2,
+                ask_high: 102.2,
+                ask_low: 100.2,
+                ask_close: 101.7,
+                tick_count: 2,
+            },
+            QuoteBar {
+                timestamp_ms: m1.bars[1].timestamp_ms,
+                bid_open: 100.5,
+                bid_high: 102.0,
+                bid_low: 100.0,
+                bid_close: 101.0,
+                ask_open: 101.0,
+                ask_high: 102.5,
+                ask_low: 100.5,
+                ask_close: 101.5,
+                tick_count: 3,
+            },
+        ];
+        let quotes = QuoteBarDataset {
+            data_hash: quote_bar_content_hash(&quote_bars),
+            bars: quote_bars,
+            source_rows: 2,
+            source_timezone: "Etc/UTC".into(),
+            schema_version: QuoteBarDataset::SCHEMA_VERSION,
+            source_model: Some(1),
+        };
+
+        let built = build_timeframe_from_m1_with_quotes(
+            &m1,
+            &quotes,
+            0.1,
+            3_600_000,
+            Some(&[m1.bars[0].timestamp_ms]),
+        )
+        .unwrap();
+
+        assert_eq!(built.bars.len(), 1);
+        assert_eq!(built.bars[0].spread_points, Some(12));
+        assert_eq!(built.bars[0].tick_volume, 5);
     }
 
     #[test]

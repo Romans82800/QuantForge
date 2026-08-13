@@ -2,8 +2,8 @@ use csv::{ReaderBuilder, StringRecord, Trim};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
     Bar, BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, QuoteBar, QuoteBarDataset,
-    SourceTimezone, build_timeframe_from_m1, infer_median_interval_ms, parse_source_timestamp,
-    quote_bar_content_hash,
+    SourceTimezone, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes,
+    infer_median_interval_ms, parse_source_timestamp, quote_bar_content_hash,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1231,6 +1231,26 @@ pub(crate) fn build_decision_from_m1(
             .collect::<Vec<_>>()
     });
     build_timeframe_from_m1(m1, interval_ms, grid.as_deref()).map_err(|error| error.to_string())
+}
+
+pub(crate) fn build_decision_from_m1_quotes(
+    m1: &BarDataset,
+    exported_decision: Option<&BarDataset>,
+    quotes: &QuoteBarDataset,
+    broker_point: f64,
+) -> Result<BarDataset, String> {
+    let interval_ms = exported_decision
+        .and_then(|dataset| infer_median_interval_ms(&dataset.bars))
+        .unwrap_or(3_600_000);
+    let grid = exported_decision.map(|dataset| {
+        dataset
+            .bars
+            .iter()
+            .map(|bar| bar.timestamp_ms)
+            .collect::<Vec<_>>()
+    });
+    build_timeframe_from_m1_with_quotes(m1, quotes, broker_point, interval_ms, grid.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn load_bound_broker(

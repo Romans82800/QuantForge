@@ -1,4 +1,7 @@
-use crate::data_lab::{build_decision_from_m1, display_path, load_bound_broker, load_data_source};
+use crate::data_lab::{
+    build_decision_from_m1, build_decision_from_m1_quotes, display_path, load_bound_broker,
+    load_data_source,
+};
 use crate::workflow::{
     ChallengeArtifact, IndicatorParityArtifact, JudgeArtifact, ParityArtifact, ScoutArtifactInput,
     ensure_new, manifest, read_json, recipe_path, write_json_new, write_text_new,
@@ -208,21 +211,6 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
         request.m1_metadata_path.as_deref(),
         request.m1_source_timezone.as_deref(),
     )?;
-    let built_decision = build_decision_from_m1(&m1.dataset, Some(&decision.dataset))?;
-    let decision_dataset = request
-        .split_plan_path
-        .as_deref()
-        .map(|path| validation_partition(&built_decision, path))
-        .transpose()?
-        .unwrap_or(built_decision);
-    let decision_quality = DataQualityReport::analyze(&decision_dataset);
-    let m1_quality = DataQualityReport::analyze(&m1.dataset);
-    if decision_quality.grade == QualityGrade::Fail || m1_quality.grade == QualityGrade::Fail {
-        return Err(format!(
-            "Judge input quality failed (decision={:?}, M1={:?})",
-            decision_quality.grade, m1_quality.grade
-        ));
-    }
     let strategy: StrategyIr = read_json(&request.strategy_path)?;
     let broker = load_bound_broker(&request.broker_path, decision.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1.metadata.as_ref())?;
@@ -255,6 +243,34 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
         .as_ref()
         .map(|path| load_quote_sidecar(&path.display().to_string(), m1.metadata.as_ref()))
         .transpose()?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1.dataset)
+            .map_err(|error| format!("quote sidecar does not match M1 data: {error}"))?;
+    }
+    let built_decision = match quote_dataset.as_ref() {
+        Some(quotes) => build_decision_from_m1_quotes(
+            &m1.dataset,
+            Some(&decision.dataset),
+            quotes,
+            broker.point,
+        )?,
+        None => build_decision_from_m1(&m1.dataset, Some(&decision.dataset))?,
+    };
+    let decision_dataset = request
+        .split_plan_path
+        .as_deref()
+        .map(|path| validation_partition(&built_decision, path))
+        .transpose()?
+        .unwrap_or(built_decision);
+    let decision_quality = DataQualityReport::analyze(&decision_dataset);
+    let m1_quality = DataQualityReport::analyze(&m1.dataset);
+    if decision_quality.grade == QualityGrade::Fail || m1_quality.grade == QualityGrade::Fail {
+        return Err(format!(
+            "Judge input quality failed (decision={:?}, M1={:?})",
+            decision_quality.grade, m1_quality.grade
+        ));
+    }
     let pending_entry = matches!(
         strategy.entry.order,
         quantforge_ir::EntryOrderPolicy::Stop { .. }

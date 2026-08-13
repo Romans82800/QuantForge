@@ -24,6 +24,7 @@ import {
   exportEliteEas,
   exportEliteTradeCsvs,
   getDiscoverJob,
+  getDiscoverLiveDatabank,
   getElitePartitionEquity,
   getEliteMql5Source,
   inspectData,
@@ -2408,7 +2409,7 @@ function HomeWorkspace({
     const timer = window.setInterval(() => {
       void getDiscoverJob().then(setJob).catch(() => {});
     }, 1500);
-    return () => window.clearInterval(timer);
+    return () => window.clearTimeout(timer);
   }, [active]);
 
   const top = useMemo(
@@ -3035,6 +3036,7 @@ function DiscoverWorkspace({
     depositMinimumProfitFactor: 1,
     depositMinimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.80,
+    minimumDevelopmentExpectancyR: 0,
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: true,
     simpleExits: true,
@@ -3099,6 +3101,7 @@ function DiscoverWorkspace({
   const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
   const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir" | "mq5">("overview");
   const lastDatabankCountRef = useRef(0);
+  const lastLiveRevisionRef = useRef(0);
   const liveReloadBusyRef = useRef(false);
   const active = job?.status === "running" || job?.status === "paused";
 
@@ -3132,26 +3135,31 @@ function DiscoverWorkspace({
   useEffect(() => {
     if (!job?.outputPath) return;
     const eliteCount = job.databankElites ?? 0;
+    const liveRevision = job.liveDatabankRevision ?? eliteCount;
     const shouldReload =
       job.status === "completed"
-      || (active && eliteCount > 0 && eliteCount !== lastDatabankCountRef.current);
+      || (active
+        && eliteCount > 0
+        && (liveRevision !== lastLiveRevisionRef.current
+          || eliteCount !== lastDatabankCountRef.current));
     if (!shouldReload || liveReloadBusyRef.current) return;
 
     const timer = window.setTimeout(() => {
       liveReloadBusyRef.current = true;
-      void loadDatabankPath(job.outputPath!)
+      void (active ? getDiscoverLiveDatabank() : loadDatabankPath(job.outputPath!))
         .then((workspace) => {
           lastDatabankCountRef.current = eliteCount;
+          lastLiveRevisionRef.current = liveRevision;
           setLiveWorkspace(workspace);
           onLiveWorkspace?.(workspace);
         })
-        .catch(() => {})
+        .catch((reason) => onError(`Live databank refresh failed: ${String(reason)}`))
         .finally(() => {
           liveReloadBusyRef.current = false;
         });
     }, active ? 1800 : 0);
     return () => window.clearInterval(timer);
-  }, [active, job?.outputPath, job?.databankElites, job?.status]);
+  }, [active, job?.outputPath, job?.databankElites, job?.liveDatabankRevision, job?.status]);
 
   const liveEliteRows = useMemo(() => {
     if (!liveWorkspace) return [];
@@ -3166,7 +3174,8 @@ function DiscoverWorkspace({
     setLiveSelected(fingerprint);
     onError(null);
     try {
-      await loadDatabankPath(job.outputPath);
+      if (active) await getDiscoverLiveDatabank();
+      else await loadDatabankPath(job.outputPath);
       setLiveDetail(await loadElite(fingerprint));
     } catch (reason) {
       onError(String(reason));
@@ -3286,6 +3295,7 @@ function DiscoverWorkspace({
             depositMinimumProfitFactor: null,
             depositMinimumReturnDrawdown: null,
             minimumM1ReturnRetention: null,
+            minimumDevelopmentExpectancyR: null,
             oos1ExpectancyRetention: null,
             requireM1Precision: null,
             simpleExits: null,
@@ -3714,6 +3724,7 @@ function DiscoverWorkspace({
                 <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (SQX RetestWithHigherPrecision bands)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
+                  <NumberField label="Minimum Development expectancy (R)" value={form.minimumDevelopmentExpectancyR} onChange={(value) => update("minimumDevelopmentExpectancyR", value)} min={0} step={0.05} />
                   <NumberField label="Legacy fold setting" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="MC block length" value={form.robustnessMonteCarloBlockLength} onChange={(value) => update("robustnessMonteCarloBlockLength", value)} min={1} />
@@ -3904,6 +3915,7 @@ function DiscoverWorkspace({
             <p className="funnel-group-label">Post-breed databank pipeline — after breeding unlocks</p>
             <ul>
               <li><span>OOS1 leakage guard (must remain 0)</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>Development expectancy floor</span><strong>{formatNumber(job?.rejectedDevelopmentExpectancy ?? 0)}</strong></li>
               <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
               <li><span>Development CPCV</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
               <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
@@ -4255,6 +4267,7 @@ function DiscoverContractSummary({
         <p className="eyebrow">Validation firewall</p>
         <SummaryLine label="Development / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
+        <SummaryLine label="Minimum Development expectancy" value={`≥ ${formatNumber(form.minimumDevelopmentExpectancyR ?? 0, 2)}R`} />
         <SummaryLine label="OOS1 validation" value={`Post-Development · ≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× Development`} />
         <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
         <SummaryLine label="OOS2" value="Sealed · display only" accent />

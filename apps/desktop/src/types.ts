@@ -25,6 +25,7 @@ export interface RejectionTelemetry {
   precision: number;
   ambiguous?: number;
   oos1: number;
+  developmentExpectancy: number;
   evaluation: number;
   total: number;
 }
@@ -534,6 +535,7 @@ export interface DiscoverRequest {
   depositMinimumProfitFactor: number | null;
   depositMinimumReturnDrawdown: number | null;
   minimumM1ReturnRetention: number | null;
+  minimumDevelopmentExpectancyR: number | null;
   oos1ExpectancyRetention: number | null;
   requireM1Precision: boolean | null;
   simpleExits: boolean | null;
@@ -678,6 +680,7 @@ export interface DiscoverJobView {
   potElites: number;
   potNewNiches: number;
   databankElites: number;
+  liveDatabankRevision: number;
   targetDatabankElites?: number | null;
   mutateAfterElites: number;
   breedingActive: boolean;
@@ -697,6 +700,7 @@ export interface DiscoverJobView {
   rejectedPrecision: number;
   rejectedAmbiguous: number;
   rejectedOos1: number;
+  rejectedDevelopmentExpectancy: number;
   rejectedM1Fidelity: number;
   rejectedWalkForward: number;
   rejectedMonteCarlo: number;

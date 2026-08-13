@@ -219,6 +219,10 @@ export function getDiscoverJob(): Promise<DiscoverJobView> {
   return invoke<DiscoverJobView>("get_discover_job");
 }
 
+export function getDiscoverLiveDatabank(): Promise<DatabankWorkspace> {
+  return invoke<DatabankWorkspace>("get_discover_live_databank");
+}
+
 export function pauseDiscover(): Promise<DiscoverJobView> {
   return invoke<DiscoverJobView>("pause_discover");
 }

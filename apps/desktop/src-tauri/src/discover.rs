@@ -1,7 +1,10 @@
 use crate::data_lab::{
-    build_decision_from_m1, display_path, load_bound_broker, load_data_source, load_quote_sidecar,
+    build_decision_from_m1, build_decision_from_m1_quotes, display_path, load_bound_broker,
+    load_data_source, load_quote_sidecar,
 };
-use crate::databank::{EvolveArtifact, verify_artifact};
+use crate::databank::{
+    DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
+};
 use quantforge_data::{
     BarDataset, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
@@ -86,6 +89,7 @@ pub struct DiscoverRequest {
     deposit_minimum_profit_factor: Option<f64>,
     deposit_minimum_return_drawdown: Option<f64>,
     minimum_m1_return_retention: Option<f64>,
+    minimum_development_expectancy_r: Option<f64>,
     oos1_expectancy_retention: Option<f64>,
     /// Downstream preference only — Discover never runs M1. When true, portfolio
     /// / export may insist on an explicit M1 fidelity pass after the run.
@@ -179,6 +183,9 @@ pub struct DiscoverJobView {
     pot_elites: usize,
     pot_new_niches: u64,
     databank_elites: usize,
+    /// Changes on both databank admission and elite replacement. The UI uses
+    /// this instead of the count alone so a same-size improved bank refreshes.
+    live_databank_revision: u64,
     target_databank_elites: Option<usize>,
     mutate_after_elites: usize,
     breeding_active: bool,
@@ -198,6 +205,7 @@ pub struct DiscoverJobView {
     rejected_precision: u64,
     rejected_ambiguous: u64,
     rejected_oos1: u64,
+    rejected_development_expectancy: u64,
     rejected_m1_fidelity: u64,
     rejected_walk_forward: u64,
     rejected_monte_carlo: u64,
@@ -244,6 +252,7 @@ impl From<DiscoverMode> for DiscoverModeView {
 
 pub struct DiscoverState {
     job: Arc<RwLock<DiscoverJobView>>,
+    live_artifact: Arc<RwLock<Option<EvolveArtifact>>>,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
@@ -252,6 +261,7 @@ impl Default for DiscoverState {
     fn default() -> Self {
         Self {
             job: Arc::new(RwLock::new(DiscoverJobView::idle())),
+            live_artifact: Arc::new(RwLock::new(None)),
             paused: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
         }
@@ -274,6 +284,7 @@ impl DiscoverJobView {
             pot_elites: 0,
             pot_new_niches: 0,
             databank_elites: 0,
+            live_databank_revision: 0,
             target_databank_elites: None,
             mutate_after_elites: 300,
             breeding_active: false,
@@ -293,6 +304,7 @@ impl DiscoverJobView {
             rejected_precision: 0,
             rejected_ambiguous: 0,
             rejected_oos1: 0,
+            rejected_development_expectancy: 0,
             rejected_m1_fidelity: 0,
             rejected_walk_forward: 0,
             rejected_monte_carlo: 0,
@@ -422,6 +434,10 @@ pub fn start_discover(
 
     state.paused.store(false, Ordering::SeqCst);
     state.stop.store(false, Ordering::SeqCst);
+    *state
+        .live_artifact
+        .write()
+        .map_err(|_| "discover live databank state is unavailable")? = None;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -442,6 +458,7 @@ pub fn start_discover(
         pot_elites: 0,
         pot_new_niches: 0,
         databank_elites: 0,
+        live_databank_revision: 0,
         target_databank_elites: request.target_databank_elites,
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
         breeding_active: false,
@@ -461,6 +478,7 @@ pub fn start_discover(
         rejected_precision: 0,
         rejected_ambiguous: 0,
         rejected_oos1: 0,
+        rejected_development_expectancy: 0,
         rejected_m1_fidelity: 0,
         rejected_walk_forward: 0,
         rejected_monte_carlo: 0,
@@ -493,8 +511,9 @@ pub fn start_discover(
     let job = Arc::clone(&state.job);
     let paused = Arc::clone(&state.paused);
     let stop = Arc::clone(&state.stop);
+    let live_artifact = Arc::clone(&state.live_artifact);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_discovery(request, &job, &paused, &stop) {
+        if let Err(error) = run_discovery(request, &job, &live_artifact, &paused, &stop) {
             if let Ok(mut view) = job.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -503,6 +522,29 @@ pub fn start_discover(
         }
     });
     Ok(started)
+}
+
+#[tauri::command]
+pub fn get_discover_live_databank(
+    state: State<'_, DiscoverState>,
+    databank_state: State<'_, DesktopState>,
+) -> Result<crate::databank::DatabankWorkspace, String> {
+    let artifact = state
+        .live_artifact
+        .read()
+        .map_err(|_| "discover live databank state is unavailable")?
+        .clone()
+        .ok_or_else(|| "the live databank has no promoted strategies yet".to_owned())?;
+    let source_path = state
+        .job
+        .read()
+        .map_err(|_| "discover job state is unavailable")?
+        .output_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| "the live databank output path is unavailable".to_owned())?;
+    install_live_databank_artifact(artifact, source_path, &databank_state)
+        .map_err(|error| error.to_string())
 }
 
 /// New discovery archives must never overwrite a previous run. The UI may
@@ -666,6 +708,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.deposit_minimum_profit_factor.is_some(),
             request.deposit_minimum_return_drawdown.is_some(),
             request.minimum_m1_return_retention.is_some(),
+            request.minimum_development_expectancy_r.is_some(),
             request.require_m1_precision.is_some(),
             request.simple_exits.is_some(),
             request.allow_break_even.is_some(),
@@ -752,6 +795,7 @@ fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMet
 fn run_discovery(
     request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
+    live_artifact: &Arc<RwLock<Option<EvolveArtifact>>>,
     paused: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -816,11 +860,29 @@ fn run_discovery(
     let decision_timeframe = request.decision_timeframe.unwrap_or(DecisionTimeframe::H1);
     let (search_decision, decision_bars_built) = {
         let built = match decision_timeframe {
-            DecisionTimeframe::H1 => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
-            DecisionTimeframe::M15 => {
-                build_timeframe_from_m1(&m1.dataset, DecisionTimeframe::M15.interval_ms(), None)
-                    .map_err(|error| error.to_string())?
-            }
+            DecisionTimeframe::H1 => match quote_dataset.as_ref() {
+                Some(quotes) => build_decision_from_m1_quotes(
+                    &m1.dataset,
+                    Some(&loaded.dataset),
+                    quotes,
+                    broker.point,
+                )?,
+                None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
+            },
+            DecisionTimeframe::M15 => match quote_dataset.as_ref() {
+                Some(quotes) => quantforge_data::build_timeframe_from_m1_with_quotes(
+                    &m1.dataset,
+                    quotes,
+                    broker.point,
+                    DecisionTimeframe::M15.interval_ms(),
+                    None,
+                )
+                .map_err(|error| error.to_string())?,
+                None => {
+                    build_timeframe_from_m1(&m1.dataset, DecisionTimeframe::M15.interval_ms(), None)
+                        .map_err(|error| error.to_string())?
+                }
+            },
         };
         let count = built.bars.len() as u64;
         (built, count)
@@ -934,6 +996,22 @@ fn run_discovery(
     if request.mode == DiscoverMode::Continue {
         clock.begin_evaluation_session(bank.evaluation_count);
     }
+    publish_live_databank(
+        live_artifact,
+        &request,
+        &bank,
+        &loaded,
+        &quality,
+        &m1_quality,
+        &m1.dataset.data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash.clone(),
+        0,
+        soft_budget,
+        run_until_stopped,
+    )?;
     update_bank(job, &bank, 0, soft_budget, run_until_stopped, &clock)?;
 
     let mut completed_now = 0u64;
@@ -972,6 +1050,22 @@ fn run_discovery(
             session
                 .flush_promotions(&mut bank)
                 .map_err(|error| error.to_string())?;
+            publish_live_databank(
+                live_artifact,
+                &request,
+                &bank,
+                &loaded,
+                &quality,
+                &m1_quality,
+                &m1.dataset.data_hash,
+                validation_fraction,
+                sealed_fraction,
+                starting_generation,
+                continuation_recipe_hash.clone(),
+                completed_now,
+                soft_budget,
+                run_until_stopped,
+            )?;
             update_bank(
                 job,
                 &bank,
@@ -1087,6 +1181,22 @@ fn run_discovery(
             )
             .map_err(|error| error.to_string())?;
         completed_now += 1;
+        publish_live_databank(
+            live_artifact,
+            &request,
+            &bank,
+            &loaded,
+            &quality,
+            &m1_quality,
+            &m1.dataset.data_hash,
+            validation_fraction,
+            sealed_fraction,
+            starting_generation,
+            continuation_recipe_hash.clone(),
+            completed_now,
+            soft_budget,
+            run_until_stopped,
+        )?;
         update_bank(
             job,
             &bank,
@@ -1141,6 +1251,22 @@ fn run_discovery(
             session
                 .flush_promotions(&mut bank)
                 .map_err(|error| error.to_string())?;
+            publish_live_databank(
+                live_artifact,
+                &request,
+                &bank,
+                &loaded,
+                &quality,
+                &m1_quality,
+                &m1.dataset.data_hash,
+                validation_fraction,
+                sealed_fraction,
+                starting_generation,
+                continuation_recipe_hash.clone(),
+                completed_now,
+                soft_budget,
+                run_until_stopped,
+            )?;
             update_bank(
                 job,
                 &bank,
@@ -1158,6 +1284,22 @@ fn run_discovery(
     session
         .flush_promotions(&mut bank)
         .map_err(|error| error.to_string())?;
+    publish_live_databank(
+        live_artifact,
+        &request,
+        &bank,
+        &loaded,
+        &quality,
+        &m1_quality,
+        &m1.dataset.data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash.clone(),
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+    )?;
 
     finish_discovery(
         request,
@@ -1334,11 +1476,12 @@ fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool)
 fn funnel_summary(bank: &Databank) -> String {
     let telemetry = &bank.telemetry;
     format!(
-        "Rejects — scout {}, deposit {}, ambiguous {}, M1 retention {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
+        "Rejects — scout {}, deposit {}, ambiguous {}, M1 retention {}, Development R {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
         telemetry.rejected_gate,
         telemetry.rejected_deposit_gate,
         telemetry.rejected_ambiguous,
         telemetry.rejected_m1_fidelity,
+        telemetry.rejected_development_expectancy,
         telemetry.rejected_walk_forward,
         telemetry.rejected_monte_carlo,
         telemetry.rejected_param_neighborhood,
@@ -1371,6 +1514,53 @@ fn write_discover_checkpoint(
     output_path: &Path,
     replace_existing: bool,
 ) -> Result<(), String> {
+    let artifact = build_discover_artifact(
+        request,
+        bank,
+        source,
+        broker,
+        metadata_hash,
+        quality,
+        m1_quality,
+        m1_data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash,
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        partial,
+        output_path,
+    )?;
+    if replace_existing {
+        write_json_replacing(output_path, &artifact).map_err(|error| error.to_string())?;
+    } else {
+        write_json_new(output_path, &artifact).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_discover_artifact(
+    request: &DiscoverRequest,
+    bank: &Databank,
+    source: String,
+    broker: String,
+    metadata_hash: Option<quantforge_core::ContentHash>,
+    quality: &quantforge_data::DataQualityReport,
+    m1_quality: &quantforge_data::DataQualityReport,
+    m1_data_hash: &quantforge_core::ContentHash,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    starting_generation: u64,
+    continuation_recipe_hash: Option<quantforge_core::ContentHash>,
+    completed_now: u64,
+    soft_budget: u64,
+    run_until_stopped: bool,
+    partial: bool,
+    output_path: &Path,
+) -> Result<EvolveArtifact, String> {
     let mut manifest_config = BTreeMap::<String, Value>::from([
         (
             "source".into(),
@@ -1451,7 +1641,7 @@ fn write_discover_checkpoint(
         },
     )
     .map_err(|error| error.to_string())?;
-    let artifact = EvolveArtifact {
+    Ok(EvolveArtifact {
         manifest,
         source,
         broker,
@@ -1460,12 +1650,74 @@ fn write_discover_checkpoint(
         coverage: bank.coverage(),
         qd_score: bank.qd_score(),
         databank: bank.clone(),
-    };
-    if replace_existing {
-        write_json_replacing(output_path, &artifact).map_err(|error| error.to_string())?;
-    } else {
-        write_json_new(output_path, &artifact).map_err(|error| error.to_string())?;
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_live_databank(
+    live_artifact: &Arc<RwLock<Option<EvolveArtifact>>>,
+    request: &DiscoverRequest,
+    bank: &Databank,
+    loaded: &crate::data_lab::LoadedDataSource,
+    quality: &quantforge_data::DataQualityReport,
+    m1_quality: &quantforge_data::DataQualityReport,
+    m1_data_hash: &quantforge_core::ContentHash,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    starting_generation: u64,
+    continuation_recipe_hash: Option<quantforge_core::ContentHash>,
+    completed_now: u64,
+    soft_budget: u64,
+    run_until_stopped: bool,
+) -> Result<(), String> {
+    if bank.elites.is_empty() {
+        return Ok(());
     }
+    let revision = bank.telemetry.databank_accepted + bank.telemetry.databank_replaced;
+    let unchanged = live_artifact
+        .read()
+        .map_err(|_| "discover live databank state is unavailable")?
+        .as_ref()
+        .is_some_and(|artifact| {
+            let old = &artifact.databank.telemetry;
+            old.databank_accepted + old.databank_replaced == revision
+                && artifact.databank.elites.len() == bank.elites.len()
+        });
+    if unchanged {
+        return Ok(());
+    }
+
+    // The live inspector needs promoted elites, not the potentially enormous
+    // breeding reservoir. Keeping the latter out of the RAM mirror makes live
+    // refresh cheap while the 30-minute recovery artifact remains complete.
+    let mut live_bank = bank.clone();
+    live_bank.accepted_pool.clear();
+    live_bank.accepted_coverage_map.clear();
+    let artifact = build_discover_artifact(
+        request,
+        &live_bank,
+        display_path(Path::new(&request.data_path)),
+        display_path(Path::new(&request.broker_path)),
+        loaded
+            .metadata
+            .as_ref()
+            .map(|value| value.metadata_hash.clone()),
+        quality,
+        m1_quality,
+        m1_data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash,
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        true,
+        Path::new(&request.databank_path),
+    )?;
+    *live_artifact
+        .write()
+        .map_err(|_| "discover live databank state is unavailable")? = Some(artifact);
     Ok(())
 }
 
@@ -1849,6 +2101,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
+        minimum_development_expectancy_r: request.minimum_development_expectancy_r.unwrap_or(0.0),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
         allow_break_even: request.allow_break_even.unwrap_or(false),
@@ -2060,6 +2313,7 @@ fn update_bank(
         + telemetry.rejected_precision
         + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
+        + telemetry.rejected_development_expectancy
         + telemetry.rejected_m1_fidelity
         + telemetry.rejected_walk_forward
         + telemetry.rejected_monte_carlo
@@ -2150,6 +2404,7 @@ fn update_bank(
     view.pot_elites = pot_elites;
     view.pot_new_niches = telemetry.pot_accepted;
     view.databank_elites = databank_elites;
+    view.live_databank_revision = telemetry.databank_accepted + telemetry.databank_replaced;
     view.target_databank_elites = target_databank;
     view.mutate_after_elites = mutate_after;
     view.breeding_active = breeding_active;
@@ -2170,6 +2425,7 @@ fn update_bank(
     view.rejected_precision = telemetry.rejected_precision;
     view.rejected_ambiguous = telemetry.rejected_ambiguous;
     view.rejected_oos1 = telemetry.rejected_oos1;
+    view.rejected_development_expectancy = telemetry.rejected_development_expectancy;
     view.rejected_m1_fidelity = telemetry.rejected_m1_fidelity;
     view.rejected_walk_forward = telemetry.rejected_walk_forward;
     view.rejected_monte_carlo = telemetry.rejected_monte_carlo;
@@ -2236,6 +2492,7 @@ mod tests {
             deposit_minimum_profit_factor: Some(0.0),
             deposit_minimum_return_drawdown: Some(0.0),
             minimum_m1_return_retention: Some(0.90),
+            minimum_development_expectancy_r: Some(0.0),
             oos1_expectancy_retention: Some(0.7),
             require_m1_precision: Some(false),
             simple_exits: Some(true),
@@ -2399,6 +2656,7 @@ mod tests {
         run_discovery(
             request,
             &job,
+            &Arc::new(RwLock::new(None)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
         )
@@ -2422,6 +2680,7 @@ mod tests {
         run_discovery(
             request,
             &job,
+            &Arc::new(RwLock::new(None)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
         )
