@@ -575,8 +575,8 @@ pub struct DiscoverConfig {
     /// Immutable numeric search space for indicators, stops and management genes.
     #[serde(default)]
     pub search_ranges: SearchRangeProfile,
-    /// Legacy v1 setting retained for decoding old databanks. New discovery
-    /// never reads OOS1; certification owns the first holdout after shortlist.
+    /// Required OOS1 expectancy retention after the complete Development
+    /// promotion battery. OOS1 never contributes to breeding or ranking.
     #[serde(default = "default_oos1_expectancy_retention")]
     pub oos1_expectancy_retention: f64,
     /// Preference / seal flag: databank elites are M1-promoted after breeding.
@@ -631,7 +631,7 @@ pub struct DiscoverConfig {
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
     /// Dedicated Rayon workers for post-breed databank promotion
-    /// (Development CPCV/robustness → M1). `0` = auto (2–4 threads). Scout keeps
+    /// (Development CPCV/robustness → M1 → OOS1 validation). `0` = auto (2–4 threads). Scout keeps
     /// generating on `worker_threads` while this pool drains the queue.
     #[serde(default = "default_promotion_worker_threads")]
     pub promotion_worker_threads: usize,
@@ -932,7 +932,7 @@ impl DiscoverConfig {
         }
         // Stop/limit/BE/trail/partials are free to search on Selected-TF for the pot.
         // After breeding unlocks, databank admission always runs Development
-        // CPCV/robustness → M1. OOS1 belongs to certification.
+        // CPCV/robustness → M1, then the separate OOS1 validation gate.
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
@@ -1482,7 +1482,8 @@ pub struct Databank {
     pub accepted_pool: Vec<Elite>,
     #[serde(default)]
     pub accepted_coverage_map: BTreeMap<String, ContentHash>,
-    /// Promotion databank: elites that also passed M1 WFO/MC/param robustness.
+    /// Promotion databank: elites that passed Development M1/CPCV/MC/parameter
+    /// robustness and the subsequent OOS1 validation gate. OOS2 is absent.
     pub elites: Vec<Elite>,
     /// Stable niche string to elite fingerprint, convenient for UI coverage maps.
     pub coverage_map: BTreeMap<String, ContentHash>,

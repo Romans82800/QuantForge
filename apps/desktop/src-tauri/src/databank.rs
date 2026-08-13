@@ -1,4 +1,5 @@
 use crate::data_lab::{build_decision_from_m1, load_bound_broker, load_quote_sidecar};
+use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::{ContentHash, FloatPolicy};
 use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
 use quantforge_discover::{
@@ -11,6 +12,7 @@ use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
 use quantforge_ir::{BoolExpr, RiskPolicy, StrategyIr};
 use quantforge_quality::DataSplitPlan;
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_text_new};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -152,6 +154,38 @@ pub struct BatchEaExportView {
     evidence_paths: Vec<String>,
 }
 
+/// Batch of SQX-compatible trade ledgers. Each selected strategy is replayed
+/// through the same M1 judge used by Results before its CSV is written.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTradeCsvExportView {
+    directory: String,
+    index_path: String,
+    csv_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TradeCsvExportSnapshot {
+    elites: Vec<Elite>,
+    source: String,
+    broker: String,
+    metadata_path: Option<String>,
+    m1_source: String,
+    m1_metadata_path: Option<String>,
+    scout: quantforge_eval::ScoutConfig,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+}
+
+struct TradeCsvReplayContext {
+    decision: BarDataset,
+    m1: BarDataset,
+    quotes: Option<quantforge_data::QuoteBarDataset>,
+    broker: SymbolSpecification,
+    judge: quantforge_tick::JudgeConfig,
+    plan: DataSplitPlan,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SelectionBiasView {
@@ -256,6 +290,8 @@ pub struct EliteDetail {
     evidence: Value,
     descriptor: Value,
     metrics: Value,
+    oos1_expectancy: Option<f64>,
+    oos1_expectancy_ratio: Option<f64>,
     strategy_ir: Value,
     equity_signature: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1366,6 +1402,22 @@ pub fn export_elite_eas(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub async fn export_elite_trade_csvs(
+    fingerprints: Vec<String>,
+    directory: String,
+    state: State<'_, DesktopState>,
+) -> Result<BatchTradeCsvExportView, String> {
+    let snapshot =
+        trade_csv_export_snapshot(&fingerprints, &state).map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        export_elite_trade_csvs_to(snapshot, Path::new(&directory))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("trade CSV export task failed: {error}"))?
+}
+
 /// Stage an elite strategy IR into a Vault `candidates/` folder.
 /// This is not Certified admission — full certify_to_vault still requires the evidence chain.
 #[tauri::command]
@@ -1532,6 +1584,438 @@ fn export_elite_eas_to(
         tester_paths: Vec::new(),
         evidence_paths: Vec::new(),
     })
+}
+
+fn trade_csv_export_snapshot(
+    fingerprints: &[String],
+    state: &DesktopState,
+) -> Result<TradeCsvExportSnapshot, DesktopError> {
+    if fingerprints.is_empty() {
+        return Err(DesktopError::InvalidExport(
+            "select at least one elite".into(),
+        ));
+    }
+    let unique: BTreeSet<_> = fingerprints.iter().collect();
+    if unique.len() != fingerprints.len() {
+        return Err(DesktopError::InvalidExport(
+            "the selection contains duplicate fingerprints".into(),
+        ));
+    }
+    let loaded = state
+        .loaded
+        .read()
+        .map_err(|_| DesktopError::StateUnavailable)?;
+    let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
+    let m1_source = loaded.m1_source.clone().ok_or_else(|| {
+        DesktopError::InvalidExport(
+            "this databank does not bind an M1 source; a full trade CSV requires the M1 judge replay"
+                .into(),
+        )
+    })?;
+    let mut elites = Vec::with_capacity(fingerprints.len());
+    for fingerprint in fingerprints {
+        elites.push(
+            loaded
+                .bank
+                .elites
+                .iter()
+                .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+                .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()))?
+                .clone(),
+        );
+    }
+    Ok(TradeCsvExportSnapshot {
+        elites,
+        source: loaded.source.clone(),
+        broker: loaded.broker.clone(),
+        metadata_path: loaded.metadata_path.clone(),
+        m1_source,
+        m1_metadata_path: loaded.m1_metadata_path.clone(),
+        scout: loaded.bank.config.scout.clone(),
+        validation_fraction: loaded.validation_fraction,
+        sealed_fraction: loaded.sealed_fraction,
+    })
+}
+
+fn export_elite_trade_csvs_to(
+    snapshot: TradeCsvExportSnapshot,
+    directory: &Path,
+) -> Result<BatchTradeCsvExportView, DesktopError> {
+    if !directory.is_dir() {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} is not an existing directory",
+            directory.display()
+        )));
+    }
+    let replay = prepare_trade_csv_replay(&snapshot)?;
+    let broker = &replay.broker;
+    let mut planned = Vec::with_capacity(snapshot.elites.len());
+    let mut used_names = BTreeSet::new();
+    for elite in &snapshot.elites {
+        let fingerprint = elite.structural_fingerprint.as_str();
+        let suffix = fingerprint.chars().take(8).collect::<String>();
+        let preferred = format!(
+            "{}_{}_{}",
+            safe_file_stem(&broker.symbol),
+            safe_file_stem(&elite.strategy.id),
+            suffix
+        );
+        let stem = if used_names.insert(preferred.clone()) {
+            preferred
+        } else {
+            format!("{preferred}_{}", planned.len() + 1)
+        };
+        planned.push((elite, directory.join(format!("{stem}.csv"))));
+    }
+    let index_path = directory.join("quantforge-strategy-csv-index.csv");
+    if let Some(existing) = planned
+        .iter()
+        .map(|(_, path)| path)
+        .chain(std::iter::once(&index_path))
+        .find(|path| path.exists())
+    {
+        return Err(DesktopError::InvalidExport(format!(
+            "{} already exists; rename or remove it, then export again",
+            existing.display()
+        )));
+    }
+
+    let completed = planned
+        .into_par_iter()
+        .map(|(elite, path)| {
+            replay_elite_for_trade_csv(&replay, elite).map(|result| (elite, path, result))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = Vec::with_capacity(completed.len());
+    let mut csv_paths = Vec::with_capacity(completed.len());
+    for (elite, path, result) in completed {
+        write_sqx_style_trade_csv(
+            &path,
+            &elite.strategy.id,
+            broker,
+            snapshot.scout.initial_balance,
+            &result.trades,
+            replay.plan.development.end_timestamp_ms_exclusive,
+            replay.plan.validation.end_timestamp_ms_exclusive,
+        )?;
+        rows.push((elite, path.clone(), result.metrics));
+        csv_paths.push(canonical_display(&path));
+    }
+    write_trade_csv_index(&index_path, &broker.symbol, &rows)?;
+
+    Ok(BatchTradeCsvExportView {
+        directory: canonical_display(directory),
+        index_path: canonical_display(&index_path),
+        csv_paths,
+    })
+}
+
+fn prepare_trade_csv_replay(
+    snapshot: &TradeCsvExportSnapshot,
+) -> Result<TradeCsvReplayContext, DesktopError> {
+    let decision = crate::data_lab::load_data_source(
+        &snapshot.source,
+        snapshot.metadata_path.as_deref(),
+        None,
+    )
+    .map_err(DesktopError::InvalidExport)?;
+    let m1 = crate::data_lab::load_data_source(
+        &snapshot.m1_source,
+        snapshot.m1_metadata_path.as_deref(),
+        None,
+    )
+    .map_err(DesktopError::InvalidExport)?;
+    let broker = load_bound_broker(&snapshot.broker, m1.metadata.as_ref())
+        .map_err(DesktopError::InvalidExport)?;
+    let quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| {
+            DesktopError::InvalidExport(format!("cannot load bid/ask quote sidecar: {error}"))
+        })?;
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes.validate_against(&m1.dataset).map_err(|error| {
+            DesktopError::InvalidExport(format!("quote sidecar does not match M1 data: {error}"))
+        })?;
+    }
+    let decision_dataset = build_decision_from_m1(&m1.dataset, Some(&decision.dataset))
+        .map_err(DesktopError::InvalidExport)?;
+    let plan = DataSplitPlan::chronological(
+        &decision_dataset,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )
+    .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    let judge = quantforge_tick::JudgeConfig {
+        initial_balance: snapshot.scout.initial_balance,
+        costs: snapshot.scout.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: snapshot.scout.indicator_engine,
+        entry_window: snapshot.scout.entry_window,
+    };
+    Ok(TradeCsvReplayContext {
+        decision: decision_dataset,
+        m1: m1.dataset,
+        quotes: quote_dataset,
+        broker,
+        judge,
+        plan,
+    })
+}
+
+fn replay_elite_for_trade_csv(
+    replay: &TradeCsvReplayContext,
+    elite: &Elite,
+) -> Result<quantforge_tick::JudgeResult, DesktopError> {
+    match replay.quotes.as_ref() {
+        Some(quotes) => quantforge_tick::evaluate_strategy_m1_with_quotes(
+            &elite.strategy,
+            &replay.decision,
+            &replay.m1,
+            quotes,
+            &replay.broker,
+            &replay.judge,
+        ),
+        None => quantforge_tick::evaluate_strategy_m1(
+            &elite.strategy,
+            &replay.decision,
+            &replay.m1,
+            &replay.broker,
+            &replay.judge,
+        ),
+    }
+    .map_err(|error| {
+        DesktopError::InvalidExport(format!(
+            "M1 trade replay failed for {}: {error}",
+            elite.strategy.id
+        ))
+    })
+}
+
+const SQX_TRADE_HEADERS: [&str; 20] = [
+    "Ticket",
+    "Symbol",
+    "Type",
+    "Open time",
+    "Open price",
+    "Size",
+    "Close time",
+    "Close price",
+    "Time in trade",
+    "Profit/Loss",
+    "Cummulative P/L",
+    "Comm/Swap",
+    "P/L in money",
+    "Cummulative money P/L",
+    "P/L in pips",
+    "Cummulative pips P/L",
+    "P/L in %",
+    "Cummulative % P/L",
+    "Comment",
+    "Sample type",
+];
+
+fn write_sqx_style_trade_csv(
+    path: &Path,
+    strategy_id: &str,
+    broker: &SymbolSpecification,
+    initial_balance: f64,
+    trades: &[quantforge_eval::Trade],
+    is_end_timestamp_ms: i64,
+    oos1_end_timestamp_ms: i64,
+) -> Result<(), DesktopError> {
+    let clock = BrokerClock::parse(&broker.timezone)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    let pip_size = if matches!(broker.digits, 3 | 5) {
+        broker.point * 10.0
+    } else {
+        broker.point
+    };
+    let mut writer = csv::WriterBuilder::new()
+        .terminator(csv::Terminator::CRLF)
+        .from_path(path)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    writer
+        .write_record(SQX_TRADE_HEADERS)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    let mut cumulative_profit = 0.0;
+    let mut cumulative_pips = 0.0;
+    for (index, trade) in trades.iter().enumerate() {
+        let direction = match trade.side {
+            quantforge_eval::PositionSide::Long => 1.0,
+            quantforge_eval::PositionSide::Short => -1.0,
+        };
+        let pips = if pip_size > 0.0 {
+            (trade.exit_price - trade.entry_price) * direction / pip_size
+        } else {
+            0.0
+        };
+        let balance_before = initial_balance + cumulative_profit;
+        cumulative_profit += trade.net_profit;
+        cumulative_pips += pips;
+        let trade_percent = if balance_before.abs() > 1.0e-12 {
+            trade.net_profit / balance_before * 100.0
+        } else {
+            0.0
+        };
+        let cumulative_percent = if initial_balance.abs() > 1.0e-12 {
+            cumulative_profit / initial_balance * 100.0
+        } else {
+            0.0
+        };
+        let comment = trade_exit_comment(trade, broker.digits, strategy_id);
+        let sample = if trade.entry_timestamp_ms < is_end_timestamp_ms {
+            "IS"
+        } else if trade.entry_timestamp_ms < oos1_end_timestamp_ms {
+            "OOS1"
+        } else {
+            "OOS2"
+        };
+        writer
+            .write_record([
+                ((index + 1) * 2).to_string(),
+                broker.symbol.clone(),
+                match trade.side {
+                    quantforge_eval::PositionSide::Long => "Buy".into(),
+                    quantforge_eval::PositionSide::Short => "Sell".into(),
+                },
+                format_sqx_timestamp(clock, trade.entry_timestamp_ms)?,
+                format_price(trade.entry_price, broker.digits),
+                format_decimal(trade.volume, 8),
+                format_sqx_timestamp(clock, trade.exit_timestamp_ms)?,
+                format_price(trade.exit_price, broker.digits),
+                format_duration(trade.exit_timestamp_ms - trade.entry_timestamp_ms),
+                format_decimal(trade.net_profit, 2),
+                format_decimal(cumulative_profit, 2),
+                format_decimal(-trade.commission + trade.swap, 2),
+                format_decimal(trade.net_profit, 2),
+                format_decimal(cumulative_profit, 2),
+                format_decimal(pips, 2),
+                format_decimal(cumulative_pips, 2),
+                format_decimal(trade_percent, 2),
+                format_decimal(cumulative_percent, 2),
+                comment,
+                sample.into(),
+            ])
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    Ok(())
+}
+
+fn write_trade_csv_index(
+    path: &Path,
+    symbol: &str,
+    rows: &[(&Elite, PathBuf, quantforge_eval::BacktestMetrics)],
+) -> Result<(), DesktopError> {
+    let mut writer = csv::WriterBuilder::new()
+        .terminator(csv::Terminator::CRLF)
+        .from_path(path)
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    writer
+        .write_record([
+            "Strategy",
+            "Fingerprint",
+            "Symbol",
+            "Trades",
+            "Net profit",
+            "Return %",
+            "Max drawdown %",
+            "Recovery factor",
+            "Profit factor",
+            "Sharpe ratio",
+            "CSV path",
+        ])
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    for (elite, csv_path, metrics) in rows {
+        writer
+            .write_record([
+                elite.strategy.id.clone(),
+                elite.structural_fingerprint.to_string(),
+                symbol.to_owned(),
+                metrics.trade_count.to_string(),
+                format_decimal(metrics.net_profit, 2),
+                format_decimal(metrics.return_percent, 4),
+                format_decimal(metrics.max_drawdown_percent, 4),
+                finite_recovery_factor(metrics)
+                    .map(|value| format_decimal(value, 4))
+                    .unwrap_or_default(),
+                metrics
+                    .profit_factor
+                    .map(|value| format_decimal(value, 4))
+                    .unwrap_or_default(),
+                metrics
+                    .sharpe_ratio
+                    .map(|value| format_decimal(value, 4))
+                    .unwrap_or_default(),
+                canonical_display(csv_path),
+            ])
+            .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?;
+    Ok(())
+}
+
+fn format_sqx_timestamp(clock: BrokerClock, timestamp_ms: i64) -> Result<String, DesktopError> {
+    clock
+        .local_datetime(timestamp_ms)
+        .map(|value| value.format("%d.%m.%Y %H:%M:%S").to_string())
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))
+}
+
+fn format_duration(milliseconds: i64) -> String {
+    let total_seconds = milliseconds.max(0) / 1_000;
+    let days = total_seconds / 86_400;
+    let hours = total_seconds % 86_400 / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}s"));
+    }
+    parts.join(" ")
+}
+
+fn format_price(value: f64, digits: u8) -> String {
+    format!("{value:.precision$}", precision = usize::from(digits))
+}
+
+fn format_decimal(value: f64, precision: usize) -> String {
+    let formatted = format!("{value:.precision$}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+fn trade_exit_comment(trade: &quantforge_eval::Trade, digits: u8, strategy_id: &str) -> String {
+    match trade.exit_reason {
+        quantforge_eval::ExitReason::StopLoss => {
+            format!("sl {}", format_price(trade.exit_price, digits))
+        }
+        quantforge_eval::ExitReason::TakeProfit => {
+            format!("tp {}", format_price(trade.exit_price, digits))
+        }
+        quantforge_eval::ExitReason::Indicator => strategy_id.into(),
+        quantforge_eval::ExitReason::TimeStop => "time exit".into(),
+        quantforge_eval::ExitReason::EndOfDay => "end of day".into(),
+        quantforge_eval::ExitReason::PartialExit => "partial exit".into(),
+        quantforge_eval::ExitReason::EndOfData => "end of data".into(),
+    }
 }
 
 fn export_elite_strategies_to(
@@ -2105,6 +2589,8 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         evidence: serde_json::to_value(&elite.evidence)?,
         descriptor: serde_json::to_value(&elite.descriptor)?,
         metrics: serde_json::to_value(&elite.metrics)?,
+        oos1_expectancy: elite.oos1_expectancy,
+        oos1_expectancy_ratio: elite.oos1_expectancy_ratio,
         strategy_ir: serde_json::to_value(&elite.strategy)?,
         equity_signature: elite.equity_signature.clone(),
         robustness: elite_robustness(elite)?,
@@ -2358,6 +2844,90 @@ mod tests {
     fn batch_export_file_stems_are_portable_and_non_empty() {
         assert_eq!(safe_file_stem("trend/AUDUSD:one"), "trend_AUDUSD_one");
         assert_eq!(safe_file_stem(""), "strategy");
+    }
+
+    #[test]
+    fn sqx_trade_csv_matches_reference_columns_and_partition_labels() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("strategy.csv");
+        let broker: SymbolSpecification = serde_json::from_str(include_str!(
+            "../../../../fixtures/EURUSD_fixture_broker.json"
+        ))
+        .expect("broker fixture");
+        let trades = vec![
+            quantforge_eval::Trade {
+                side: quantforge_eval::PositionSide::Long,
+                entry_timestamp_ms: 1_704_067_200_000,
+                exit_timestamp_ms: 1_704_070_900_000,
+                entry_price: 1.10001,
+                exit_price: 1.10101,
+                volume: 1.25,
+                initial_stop_loss: 1.09901,
+                initial_take_profit: 1.10101,
+                gross_profit: 125.0,
+                commission: 8.75,
+                swap: 0.0,
+                net_profit: 116.25,
+                bars_held: 1,
+                exit_reason: quantforge_eval::ExitReason::TakeProfit,
+            },
+            quantforge_eval::Trade {
+                side: quantforge_eval::PositionSide::Short,
+                entry_timestamp_ms: 1_704_074_400_000,
+                exit_timestamp_ms: 1_704_078_000_000,
+                entry_price: 1.10100,
+                exit_price: 1.10200,
+                volume: 1.0,
+                initial_stop_loss: 1.10200,
+                initial_take_profit: 1.09900,
+                gross_profit: -100.0,
+                commission: 7.0,
+                swap: -1.0,
+                net_profit: -108.0,
+                bars_held: 1,
+                exit_reason: quantforge_eval::ExitReason::StopLoss,
+            },
+        ];
+        write_sqx_style_trade_csv(
+            &path,
+            "test-strategy",
+            &broker,
+            100_000.0,
+            &trades,
+            1_704_074_400_000,
+            1_704_100_000_000,
+        )
+        .expect("CSV export");
+        let mut reader = csv::Reader::from_path(&path).expect("CSV reader");
+        assert_eq!(reader.headers().expect("headers").len(), 20);
+        assert_eq!(
+            reader
+                .headers()
+                .expect("headers")
+                .iter()
+                .collect::<Vec<_>>(),
+            SQX_TRADE_HEADERS
+        );
+        let rows = reader
+            .records()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("CSV rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&rows[0][1], "EURUSD");
+        assert_eq!(&rows[0][2], "Buy");
+        assert_eq!(&rows[0][19], "IS");
+        assert_eq!(&rows[1][2], "Sell");
+        assert_eq!(&rows[1][19], "OOS1");
+        assert!(rows[0][18].starts_with("tp "));
+        assert!(rows[1][18].starts_with("sl "));
+    }
+
+    #[test]
+    fn sqx_duration_and_decimal_formatting_are_compact() {
+        assert_eq!(format_duration(18 * 3_600_000 + 45 * 60_000), "18h 45m");
+        assert_eq!(format_duration(40_000), "40s");
+        assert_eq!(format_decimal(7.20, 8), "7.2");
+        assert_eq!(format_price(108.2, 3), "108.200");
     }
 
     #[test]

@@ -209,6 +209,12 @@ export interface BatchEaExportView {
   evidencePaths: string[];
 }
 
+export interface BatchTradeCsvExportView {
+  directory: string;
+  indexPath: string;
+  csvPaths: string[];
+}
+
 export interface WalkForwardFold {
   fold: number;
   test_groups?: number[];
@@ -331,6 +337,8 @@ export interface EliteDetail {
   evidence: Record<string, number>;
   descriptor: Record<string, string | number>;
   metrics: Record<string, number | null>;
+  oos1Expectancy: number | null;
+  oos1ExpectancyRatio: number | null;
   strategyIr: unknown;
   equitySignature: number[];
   /** Present when Discover persisted robustness gate detail; otherwise UI shows "not recorded". */

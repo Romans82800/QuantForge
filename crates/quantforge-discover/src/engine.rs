@@ -11,7 +11,7 @@ use crate::model::{
 use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
-use quantforge_data::{BarDataset, QuoteBarDataset};
+use quantforge_data::{BarDataset, QuoteBarDataset, bar_content_hash};
 use quantforge_eval::ScoutResult;
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_ir::StrategyIr;
@@ -69,12 +69,6 @@ fn evaluate_and_deposit(
     promotion: &PromotionPipeline,
     indicator_cache: &Arc<IndicatorBufferCache>,
 ) -> Result<(), DiscoverError> {
-    if certification_oos1.is_some() {
-        return Err(DiscoverError::InvalidConfig(
-            "Discover cannot consume OOS1; freeze a diverse shortlist, then run Challenge certification"
-                .into(),
-        ));
-    }
     // Apply finished promotions before scouting so databank / telemetry stay current
     // without blocking the H1 worker pool on in-flight M1 work.
     promotion.drain_completed(bank)?;
@@ -249,12 +243,18 @@ fn evaluate_and_deposit(
     }
 
     // Discovery is development-only. Once breeding unlocks, the side pool runs
-    // M1 fidelity + Development CPCV/robustness and archives M1 evidence. OOS1
-    // is opened only after a diverse shortlist has been frozen.
+    // M1 fidelity + Development CPCV/robustness, then the separate OOS1
+    // validation gate. OOS1 never feeds breeding/ranking; OOS2 is absent.
     let breeding_unlocked = bank.accepted_pool.len() >= bank.config.mutate_after_elites;
     if breeding_unlocked && !pot_promotions.is_empty() {
-        let context =
-            promotion.context_for(&bank.config, dataset, m1_dataset, quote_dataset, broker);
+        let context = promotion.context_for(
+            &bank.config,
+            dataset,
+            certification_oos1,
+            m1_dataset,
+            quote_dataset,
+            broker,
+        );
         for pot_evaluation in pot_promotions {
             promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
         }
@@ -264,6 +264,7 @@ fn evaluate_and_deposit(
 }
 
 enum PromotionOutcome {
+    Oos1Rejected,
     DatabankGateRejected,
     RobustnessRejected {
         reject: crate::robustness::RobustnessReject,
@@ -275,16 +276,20 @@ enum PromotionOutcome {
         pot_evaluation: CandidateEvaluation,
         m1_result: ScoutResult,
         robustness: Option<crate::model::RobustnessEvidence>,
+        oos1_expectancy: Option<f64>,
+        oos1_expectancy_ratio: Option<f64>,
     },
 }
 
 /// Immutable inputs shared by every in-flight promotion job.
 struct PromotionContext {
     dataset: Arc<BarDataset>,
+    oos1: Option<Arc<BarDataset>>,
     m1: Arc<BarDataset>,
     quotes: Option<Arc<QuoteBarDataset>>,
     broker: Arc<SymbolSpecification>,
     deposit_gates: GateConfig,
+    oos1_expectancy_retention: f64,
     require_m1_robustness: bool,
     robustness: crate::robustness::RobustnessConfig,
 }
@@ -299,7 +304,7 @@ struct PromotionShared {
     wake: Condvar,
 }
 
-/// Side pool for Development CPCV/robustness → M1 while scouting continues.
+/// Side pool for Development CPCV/robustness → M1 → OOS1 validation while scouting continues.
 struct PromotionPipeline {
     pool: Option<rayon::ThreadPool>,
     shared: Arc<PromotionShared>,
@@ -337,16 +342,19 @@ impl PromotionPipeline {
         &self,
         config: &DiscoverConfig,
         dataset: &BarDataset,
+        oos1_dataset: Option<&BarDataset>,
         m1_dataset: &BarDataset,
         quote_dataset: Option<&QuoteBarDataset>,
         broker: &SymbolSpecification,
     ) -> Arc<PromotionContext> {
         Arc::new(PromotionContext {
             dataset: Arc::new(dataset.clone()),
+            oos1: oos1_dataset.map(|data| Arc::new(data.clone())),
             m1: Arc::new(m1_dataset.clone()),
             quotes: quote_dataset.map(|data| Arc::new(data.clone())),
             broker: Arc::new(broker.clone()),
             deposit_gates: config.deposit_gates.clone(),
+            oos1_expectancy_retention: config.oos1_expectancy_retention,
             require_m1_robustness: config.require_m1_robustness,
             robustness: robustness_config_from_discover(config),
         })
@@ -504,10 +512,68 @@ fn promote_one(
     if !crate::archive::passes_gate_config(&m1_outcome.0, &context.deposit_gates) {
         return PromotionOutcome::DatabankGateRejected;
     }
+
+    // OOS1 is a validation gate, never a breeding or ranking input. It opens
+    // only after the candidate has survived the complete Development battery.
+    // The replay joins Development + OOS1 solely to preserve indicator warmup,
+    // open-position chronology and quote-aware execution across the boundary.
+    let Some(oos1) = context.oos1.as_deref() else {
+        // Explicit unsplit/methodology runs remain research-only. Desktop
+        // production runs always provide the frozen OOS1 partition.
+        return PromotionOutcome::Ready {
+            pot_evaluation,
+            m1_result: m1_outcome.0,
+            robustness: m1_outcome.1,
+            oos1_expectancy: None,
+            oos1_expectancy_ratio: None,
+        };
+    };
+    let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
+        return PromotionOutcome::EvaluationError {
+            message: "OOS1 validation partition is empty".into(),
+        };
+    };
+    let validation_decision = join_datasets(context.dataset.as_ref(), oos1);
+    let validation = match evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        &validation_decision,
+        context.m1.as_ref(),
+        context.quotes.as_deref(),
+        broker,
+        &JudgeConfig {
+            initial_balance: robustness.initial_balance,
+            costs: robustness.costs.clone(),
+            allow_execution_gaps: false,
+            indicator_engine: robustness.indicator_engine,
+            entry_window: robustness.entry_window,
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return PromotionOutcome::EvaluationError {
+                message: format!("M1 OOS1 validation replay failed: {error}"),
+            };
+        }
+    };
+    // The Development reference is the already-admitted M1 baseline. The
+    // joined replay exists for warmup/execution continuity only and must not
+    // rewrite Development fitness with information from across the boundary.
+    let development_expectancy = m1_outcome.0.metrics.expectancy;
+    let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
+    if !passes_oos1_pick(
+        development_expectancy,
+        oos1_expectancy,
+        context.oos1_expectancy_retention,
+    ) {
+        return PromotionOutcome::Oos1Rejected;
+    }
+    let oos1_expectancy_ratio = oos1_expectancy / development_expectancy;
     PromotionOutcome::Ready {
         pot_evaluation,
         m1_result: m1_outcome.0,
         robustness: m1_outcome.1,
+        oos1_expectancy: Some(oos1_expectancy),
+        oos1_expectancy_ratio: Some(oos1_expectancy_ratio),
     }
 }
 
@@ -516,6 +582,9 @@ fn apply_promotion_outcome(
     outcome: PromotionOutcome,
 ) -> Result<(), DiscoverError> {
     match outcome {
+        PromotionOutcome::Oos1Rejected => {
+            bank.telemetry.record(DepositDecision::RejectedOos1);
+        }
         PromotionOutcome::DatabankGateRejected => {
             bank.telemetry.record(DepositDecision::RejectedDepositGate);
         }
@@ -542,6 +611,8 @@ fn apply_promotion_outcome(
             pot_evaluation,
             m1_result,
             robustness,
+            oos1_expectancy,
+            oos1_expectancy_ratio,
         } => {
             let multi_symbol_results = pot_evaluation.multi_symbol_results.clone();
             let deflated_trade_sharpe = pot_evaluation.deflated_trade_sharpe;
@@ -549,15 +620,13 @@ fn apply_promotion_outcome(
             let bank_evaluation = CandidateEvaluation {
                 result: m1_result,
                 is_expectancy: m1_expectancy,
-                // OOS1 is deliberately absent from discovery artifacts. These
-                // compatibility fields are populated only by certification.
-                oos1_expectancy: None,
-                oos1_expectancy_ratio: None,
+                oos1_expectancy,
+                oos1_expectancy_ratio,
                 gate_results: build_gate_results(
                     m1_expectancy,
-                    None,
-                    None,
-                    false,
+                    oos1_expectancy,
+                    oos1_expectancy_ratio,
+                    oos1_expectancy.is_some(),
                     None,
                     &multi_symbol_results,
                     bank.config.multi_symbol_minimum_pass,
@@ -610,15 +679,51 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     }
 }
 
-/// Certification formula retained only as a regression-testable definition.
-/// Discover must never call it; Challenge owns the post-shortlist OOS1 replay.
-#[cfg(test)]
+/// OOS1 validation requires positive expectancy and retention relative to the
+/// M1 Development replay. It must never be used to breed or rank candidates.
 pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
     is_expectancy.is_finite()
         && oos1_expectancy.is_finite()
         && is_expectancy > 0.0
         && oos1_expectancy > 0.0
         && oos1_expectancy >= retention * is_expectancy
+}
+
+/// Concatenate consecutive decision partitions for a validation replay. OOS2
+/// is never accepted by this helper or stored in the promotion context.
+fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
+    let mut bars = Vec::with_capacity(first.bars.len() + second.bars.len());
+    bars.extend_from_slice(&first.bars);
+    bars.extend_from_slice(&second.bars);
+    BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: first.delimiter,
+        source_timezone: first.source_timezone.clone(),
+        bars,
+    }
+}
+
+fn expectancy_from(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
+    expectancy_for(trades, |entry| entry >= timestamp_ms)
+}
+
+fn expectancy_for(trades: &[quantforge_eval::Trade], include: impl Fn(i64) -> bool) -> f64 {
+    let mut profit = 0.0;
+    let mut count = 0usize;
+    for trade in trades {
+        if include(trade.entry_timestamp_ms) {
+            profit += trade.net_profit;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        profit / count as f64
+    }
 }
 
 /// Fraction of trades that open and close on the same decision bar (SQX ambiguous).
@@ -1911,15 +2016,22 @@ mod tests {
     }
 
     #[test]
-    fn discover_rejects_any_attempt_to_supply_oos1() {
+    fn oos1_is_used_only_after_development_promotion() {
         let dataset = dataset();
         let mut cfg = config();
         cfg.mutate_after_elites = 1;
         cfg.require_m1_robustness = false;
         let oos1 = dataset.clone();
-        let error = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
-            .expect_err("OOS1 must never enter discovery");
-        assert!(error.to_string().contains("cannot consume OOS1"));
+        let bank = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
+            .expect("OOS1 is valid only on the post-Development promotion path");
+        assert!(
+            bank.accepted_pool
+                .iter()
+                .all(|elite| elite.oos1_expectancy.is_none())
+        );
+        assert!(bank.elites.iter().all(|elite| {
+            elite.oos1_expectancy.is_some() && elite.oos1_expectancy_ratio.is_some()
+        }));
     }
 
     #[test]
@@ -1931,10 +2043,20 @@ mod tests {
         cfg.promotion_worker_threads = 1;
         cfg.promotion_queue_capacity = 8;
         let session = EvolutionSession::new(&cfg, dataset.bars.len()).unwrap();
-        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), cfg, 0).unwrap();
+        let oos1 = dataset.clone();
+        let mut bank = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 0).unwrap();
         // Seed pot without generations, then step once via session.
         bank = session
-            .advance(bank, &dataset, None, &dataset, &broker(), &[], "TEST", 1)
+            .advance(
+                bank,
+                &dataset,
+                Some(&oos1),
+                &dataset,
+                &broker(),
+                &[],
+                "TEST",
+                1,
+            )
             .unwrap();
         assert_eq!(bank.completed_generations, 1);
         // Scout finished the generation without waiting for a flush of every

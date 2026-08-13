@@ -4,6 +4,7 @@ import type {
   DatabankWorkspace,
   BatchEaExportRequest,
   BatchEaExportView,
+  BatchTradeCsvExportView,
   BatchExportView,
   CertifyRequest,
   AssembleEvidenceRequest,
@@ -125,6 +126,15 @@ export async function exportEliteEas(
     baseMagic,
   };
   return invoke<BatchEaExportView>("export_elite_eas", { request });
+}
+
+export async function exportEliteTradeCsvs(
+  fingerprints: string[],
+): Promise<BatchTradeCsvExportView | null> {
+  const directory = await chooseDirectory("Choose a folder for strategy trade CSV files");
+  return directory
+    ? invoke<BatchTradeCsvExportView>("export_elite_trade_csvs", { fingerprints, directory })
+    : null;
 }
 
 export function chooseDataFile(): Promise<string | null> {

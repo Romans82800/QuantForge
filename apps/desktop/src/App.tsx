@@ -22,6 +22,7 @@ import {
   exportEliteStrategy,
   exportEliteStrategies,
   exportEliteEas,
+  exportEliteTradeCsvs,
   getDiscoverJob,
   getElitePartitionEquity,
   getEliteMql5Source,
@@ -96,6 +97,23 @@ import type {
   VaultView,
   WorkspaceName,
 } from "./types";
+
+async function writeClipboardText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("clipboard access is unavailable");
+}
 import {
   bindDiscoverTimezone,
   cagrPercent,
@@ -427,6 +445,24 @@ function App() {
       if (result) {
         setBatchMessage(
           `Exported ${result.expertPaths.length} MQ5 experts to ${result.directory}. Live trading is disabled in every EA.`,
+        );
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function exportSelectedTradeCsvs() {
+    setBatchBusy(true);
+    setBatchMessage(null);
+    setError(null);
+    try {
+      const result = await exportEliteTradeCsvs([...batchSelection]);
+      if (result) {
+        setBatchMessage(
+          `Exported ${result.csvPaths.length} SQX-style M1 trade CSV files and a strategy index to ${result.directory}`,
         );
       }
     } catch (reason) {
@@ -948,6 +984,14 @@ function App() {
                       >
                         {batchBusy ? "Exporting…" : `Export ${batchSelection.size} EAs`}
                       </button>
+                      <button
+                        className="secondary"
+                        disabled={batchBusy || batchSelection.size === 0}
+                        onClick={() => void exportSelectedTradeCsvs()}
+                        title="Replay each strategy on M1 and export one SQX-compatible trade ledger per strategy"
+                      >
+                        {batchBusy ? "Exporting…" : `Export ${batchSelection.size} CSVs`}
+                      </button>
                     </div>
                   </div>
                   <p className="batch-message">
@@ -956,6 +1000,8 @@ function App() {
                     <code>.mq5</code> names fail instead of overwriting. Experts are named
                     <code>SYMBOL_ENTRYCONDITIONS_UNIQUE_NUMBER</code>; that final number is also the
                     magic. Live trading is off. Choose the strategy’s decision timeframe.
+                    Trade CSV export replays each selected strategy through the M1 judge and writes
+                    SQX-compatible ledgers plus a summary index with IS, OOS1 and OOS2 labels.
                   </p>
                   {batchMessage && <p className="batch-message">{batchMessage}</p>}
                   <EliteTable
@@ -1159,6 +1205,8 @@ function ResultsDetailPage({
   const [robustnessRun, setRobustnessRun] = useState<ResultsRobustnessView | null>(null);
   const [robustnessBusy, setRobustnessBusy] = useState(false);
   const [tableQuery, setTableQuery] = useState("");
+  const [copyMq5Busy, setCopyMq5Busy] = useState(false);
+  const [copyMq5Done, setCopyMq5Done] = useState(false);
   const [analysisTab, setAnalysisTab] = useState<"overview" | "equity" | "walkForward" | "monteCarlo" | "parameters" | "trades" | "ir">("overview");
   const row = workspace?.elites.find((elite) => elite.fingerprint === fingerprint) ?? null;
 
@@ -1203,6 +1251,22 @@ function ResultsDetailPage({
       onError(String(reason));
     } finally {
       setRobustnessBusy(false);
+    }
+  };
+
+  const copyMq5ToClipboard = async () => {
+    setCopyMq5Busy(true);
+    setCopyMq5Done(false);
+    onError(null);
+    try {
+      const source = await getEliteMql5Source(fingerprint, timeframeFromDataPath(workspace?.dataPath) ?? "H1");
+      await writeClipboardText(source.source);
+      setCopyMq5Done(true);
+      window.setTimeout(() => setCopyMq5Done(false), 1_800);
+    } catch (reason) {
+      onError(`Could not copy MQL5 source: ${String(reason)}`);
+    } finally {
+      setCopyMq5Busy(false);
     }
   };
 
@@ -1307,6 +1371,9 @@ function ResultsDetailPage({
             <span className="result-more" title="Export and certification actions" aria-hidden="true">•••</span>
             <button type="button" className="secondary" onClick={() => onExportIr(fingerprint)}>Export IR</button>
             <button type="button" className="secondary" onClick={() => onExportMq5(fingerprint)}>Export MQ5</button>
+            <button type="button" className="secondary" disabled={copyMq5Busy} onClick={() => void copyMq5ToClipboard()}>
+              {copyMq5Busy ? "Generating…" : copyMq5Done ? "Copied" : "Copy MQ5"}
+            </button>
             <button
               type="button"
               className="primary"
@@ -1383,7 +1450,7 @@ function ResultsDetailPage({
           <h2>Re-run the exact M1 promotion checks</h2>
           <p>
             Uses this databank’s bound IS, M1 chronology, broker costs, thresholds and frozen seed.
-            OOS1 and sealed OOS2 remain untouched.
+            OOS1 validation runs after the Development battery; sealed OOS2 remains untouched.
           </p>
         </div>
         <div className="results-robustness-controls">
@@ -2389,7 +2456,7 @@ function HomeWorkspace({
           <div className="overview-status-kpis">
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
-            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + CPCV + MC + params" />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + CPCV + MC + params + OOS1" />
             <KpiCell label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0)} note={`${job?.workerThreads ?? "—"} scout${job?.breedingActive ? ` · queue ${job?.promotionQueueDepth ?? 0}` : ""}`} />
           </div>
           <div className="overview-status-actions">
@@ -3638,7 +3705,7 @@ function DiscoverWorkspace({
               </details>
               <details className="advanced-settings" open>
                 <summary>Post-breed databank pipeline — starts only after breeding</summary>
-                <p className="immutable-note">{`Development-only pipeline: reservoir → breed → M1 fidelity → CPCV + MC + ±${perturbationPercent(form)}% plateau → databank. OOS1 opens only after a diverse shortlist is frozen; OOS2 remains sealed.`}</p>
+                <p className="immutable-note">{`Development search: reservoir → breed → M1 fidelity → CPCV + MC + ±${perturbationPercent(form)}% plateau → OOS1 validation → databank. OOS1 never affects breeding or ranking; OOS2 remains sealed.`}</p>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>M1 robustness battery on databank path (Development CPCV / Monte Carlo / param plateau)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (SQX RetestWithHigherPrecision bands)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
@@ -3700,7 +3767,7 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">Discover uses Development only. After breeding starts: M1 fidelity → Development CPCV/robustness → databank. OOS1 and OOS2 are unavailable to search.</p>
+            <p className="immutable-note">Development alone drives search and breeding. After breeding starts: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank. OOS2 is never opened.</p>
             <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
@@ -3744,7 +3811,7 @@ function DiscoverWorkspace({
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: Development gates → reservoir → breed → M1 fidelity + CPCV robustness → research databank. OOS1 certification happens after shortlist. Expectancy in R ($1,000 risk).</p>
+          <p>Pipeline: Development gates → reservoir → breed → M1 fidelity + CPCV robustness → OOS1 validation → databank. OOS2 remains sealed. Expectancy in R ($1,000 risk).</p>
           <button
             className="primary"
             disabled={
@@ -3792,7 +3859,7 @@ function DiscoverWorkspace({
                 job?.targetDatabankElites
                   ? "Quota · post-breed M1 only"
                   : job?.breedingActive
-                    ? "Post-breed Development CPCV→M1"
+                    ? "Post-breed Development CPCV→M1→OOS1"
                     : "Empty until breeding unlocks"
               }
             />
@@ -3844,7 +3911,7 @@ function DiscoverWorkspace({
               </p>
             )}
             <p className="funnel-best">
-              OOS1 certification — untouched. Freeze a diverse shortlist, then open it in Challenge.
+              OOS1 validation — runs only after a candidate passes the complete Development battery; it never feeds breeding or ranking.
             </p>
             <p className="funnel-best">
               OOS2 sealed final — held out from Discover selection. It is assessed only in the one-shot Sealed Final stage; the Databank equity chart may display it but never uses it as a Discover gate.
@@ -4183,7 +4250,7 @@ function DiscoverContractSummary({
         <p className="eyebrow">Validation firewall</p>
         <SummaryLine label="Development / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
-        <SummaryLine label="OOS1 certification" value={`Frozen shortlist · ≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× Development`} />
+        <SummaryLine label="OOS1 validation" value={`Post-Development · ≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× Development`} />
         <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
         <SummaryLine label="OOS2" value="Sealed · display only" accent />
       </div>
@@ -4207,7 +4274,7 @@ function DiscoverContractSummary({
       </div>
 
       <p className="contract-note">
-        Neither OOS1 nor OOS2 is available to Discover for breeding, ranking, or selection. OOS1 opens only after a shortlist is frozen; OOS2 opens once for final portfolio certification. The full contract is sealed into the databank manifest.
+        Development alone drives breeding and ranking. OOS1 is opened only as a post-Development validation gate and its metrics are stored with passing elites. OOS2 is never loaded by Discover and opens once for final portfolio certification. The full contract is sealed into the databank manifest.
       </p>
     </aside>
   );
@@ -4926,6 +4993,18 @@ function EliteInspector({
   const [mq5View, setMq5View] = useState<EliteMql5SourceView | null>(null);
   const [mq5Busy, setMq5Busy] = useState(false);
   const [mq5Timeframe, setMq5Timeframe] = useState<"M1" | "M15" | "H1">("H1");
+  const [mq5Copied, setMq5Copied] = useState(false);
+
+  async function copyMq5Source() {
+    if (!mq5View) return;
+    try {
+      await writeClipboardText(mq5View.source);
+      setMq5Copied(true);
+      window.setTimeout(() => setMq5Copied(false), 1_800);
+    } catch (reason) {
+      onError(`Could not copy MQL5 source: ${String(reason)}`);
+    }
+  }
 
   useEffect(() => {
     if (!detail || tab !== "overview") {
@@ -5087,8 +5166,10 @@ function EliteInspector({
               </section>
               <div className="gate-stack">
                 <span className="gate-pass">Development CPCV research</span>
-                <span className="gate-pending">OOS1 certification not opened</span>
-                <span className="gate-pass">OOS2 display only</span>
+                {detail.oos1ExpectancyRatio === null
+                  ? <span className="gate-pending">OOS1 validation unavailable on this legacy elite</span>
+                  : <span className="gate-pass">OOS1 validated · {detail.oos1ExpectancyRatio.toFixed(2)}× Development</span>}
+                <span className="gate-pending">OOS2 sealed · not evaluated by Discover</span>
                 <span className="gate-pending">External parity unknown</span>
               </div>
             </div>
@@ -5116,6 +5197,14 @@ function EliteInspector({
                     <option value="H1">H1</option>
                   </select>
                 </label>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!mq5View || mq5Busy}
+                  onClick={() => void copyMq5Source()}
+                >
+                  {mq5Copied ? "Copied" : "Copy MQ5"}
+                </button>
               </div>
               {mq5Busy || !mq5View
                 ? <div className="inspector-loading">Generating deterministic MQL5 preview…</div>

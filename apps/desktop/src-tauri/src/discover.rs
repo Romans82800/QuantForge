@@ -850,9 +850,12 @@ fn run_discovery(
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| development_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
+    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
+        .then(|| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
+        .transpose()?;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
-    // Discover constructs Development only. OOS1 is intentionally not loaded
-    // into the search process; Challenge opens it after shortlist freeze.
+    // Development alone drives random search and breeding. OOS1 is passed only
+    // to the post-Development promotion gate; OOS2 is never materialized here.
     let m1_eval = &m1.dataset;
     let pack = load_fx_pack(
         request.pack_data_dir.as_deref(),
@@ -869,7 +872,7 @@ fn run_discovery(
                 job,
                 "Evaluating initial grammar population",
                 &format!(
-                    "Development gates fill the breeding reservoir. After breeding unlocks: M1 fidelity → Development CPCV/robustness → databank. OOS1 remains untouched."
+                    "Development gates fill the breeding reservoir. After breeding unlocks: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank. OOS2 remains untouched."
                 ),
             )?;
             let mut config = new_config(&request)?;
@@ -885,7 +888,7 @@ fn run_discovery(
             }
             let bank = evolve_new_with_pack_and_quotes(
                 new_dataset,
-                None,
+                oos1_dataset.as_ref(),
                 m1_eval,
                 quote_dataset.as_ref(),
                 &broker,
@@ -964,7 +967,7 @@ fn run_discovery(
             "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
         })?
     };
-    let evaluation_oos1 = None;
+    let evaluation_oos1 = oos1_dataset.as_ref();
     let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
         &m1.dataset
     } else {
@@ -1000,9 +1003,9 @@ fn run_discovery(
         };
         let breeding = bank.pot_size() >= bank.config.mutate_after_elites;
         let status_message = if breeding {
-            "Build continues on scout workers; Development CPCV/robustness→M1 runs on side workers. OOS1 is untouched."
+            "Build continues on scout workers; Development CPCV/robustness→M1→OOS1 validation runs on side workers. OOS2 is untouched."
         } else {
-            "Candidates enter the Development reservoir only. After breeding unlocks: M1 fidelity → Development CPCV/robustness → databank."
+            "Candidates enter the Development reservoir only. After breeding unlocks: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank."
         };
         update_phase(job, &phase_label, status_message)?;
 
@@ -1142,7 +1145,7 @@ fn finish_discovery(
         view.status = "completed";
         view.phase = "Completed with an empty bank".into();
         view.message = format!(
-            "No elites passed the post-breed pipeline (Development CPCV/robustness → M1) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
+            "No elites passed the post-breed pipeline (Development CPCV/robustness → M1 → OOS1 validation) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
             bank.evaluation_count, completed_now
         );
         view.output_path = None;
@@ -1540,6 +1543,22 @@ fn development_partition(
     )
     .map_err(|error| error.to_string())?;
     slice_partition(dataset, 0, plan.development.bar_count)
+}
+
+fn oos1_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, String> {
+    let plan = quantforge_quality::DataSplitPlan::chronological(
+        dataset,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let start = plan.development.bar_count;
+    let end = start + plan.validation.bar_count;
+    slice_partition(dataset, start, end)
 }
 
 fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<BarDataset, String> {
@@ -1947,7 +1966,7 @@ fn update_bank(
         )
     } else {
         format!(
-            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (CPCV/robustness→M1). {} more reservoir members until breeding. {}",
+            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (CPCV/robustness→M1→OOS1 validation). {} more reservoir members until breeding. {}",
             mutate_after.saturating_sub(pot_elites),
             funnel_summary(bank)
         )

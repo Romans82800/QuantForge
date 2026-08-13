@@ -39,6 +39,7 @@ pub fn run() {
             databank::export_elite_strategy,
             databank::export_elite_strategies,
             databank::export_elite_eas,
+            databank::export_elite_trade_csvs,
             databank::promote_elite_to_vault,
             databank::run_fidelity_demo,
             data_lab::inspect_data,

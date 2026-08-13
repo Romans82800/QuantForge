@@ -1,4 +1,4 @@
-//! M1 robustness battery on IS (before OOS1 pick) for Discover databank promotion.
+//! M1 robustness battery on Development, before the separate OOS1 validation gate.
 
 use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};

@@ -4040,6 +4040,10 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         .promotion_split
         .then(|| development_partition(&dataset, args.validation_fraction, args.sealed_fraction))
         .transpose()?;
+    let oos1 = args
+        .promotion_split
+        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .transpose()?;
     let search_dataset = development.as_ref().unwrap_or(&dataset);
     let m1_is = args
         .promotion_split
@@ -4059,7 +4063,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
                 "this databank was built from an IS partition; enable --promotion-split to continue it",
             )?
         };
-        let evaluation_oos1 = None;
+        let evaluation_oos1 = oos1.as_ref();
         let evaluation_m1 = if previous.databank.execution_data_hash == m1_dataset.data_hash {
             &m1_dataset
         } else {
@@ -4089,7 +4093,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         (
             evolve_new(
                 search_dataset,
-                None,
+                oos1.as_ref(),
                 m1_eval,
                 &broker_spec,
                 config,
