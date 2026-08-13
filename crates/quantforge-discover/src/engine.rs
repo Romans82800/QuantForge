@@ -50,6 +50,7 @@ enum CandidateOutcome {
     },
     Accepted {
         result: Box<ScoutResult>,
+        island_id: u16,
         is_expectancy: f64,
         observed_trade_sharpe: Option<f64>,
         expected_max_lucky_sharpe: f64,
@@ -99,7 +100,9 @@ fn evaluate_and_deposit(
     let evaluate_batch = || {
         candidates
             .into_par_iter()
-            .map(|strategy| {
+            .enumerate()
+            .map(|(index, strategy)| {
+                let island_id = (index % discover_config.effective_island_count()) as u16;
                 let result = (|| {
                     let coarse = evaluate_strategy_cached(
                         &strategy,
@@ -162,6 +165,7 @@ fn evaluate_and_deposit(
                     let is_expectancy = coarse.metrics.expectancy;
                     Ok(CandidateOutcome::Accepted {
                         result: Box::new(coarse),
+                        island_id,
                         is_expectancy,
                         observed_trade_sharpe: observed,
                         expected_max_lucky_sharpe: expected,
@@ -185,6 +189,7 @@ fn evaluate_and_deposit(
         match result {
             Ok(CandidateOutcome::Accepted {
                 result,
+                island_id,
                 is_expectancy,
                 observed_trade_sharpe,
                 expected_max_lucky_sharpe,
@@ -195,6 +200,7 @@ fn evaluate_and_deposit(
                     strategy: strategy.clone(),
                     result: *result,
                     generation,
+                    island_id,
                     is_expectancy,
                     oos1_expectancy: None,
                     oos1_expectancy_ratio: None,
@@ -530,6 +536,7 @@ fn promote_one(
         strategy: pot_evaluation.strategy.clone(),
         result: m1_outcome.0.clone(),
         generation: pot_evaluation.generation,
+        island_id: pot_evaluation.island_id,
         is_expectancy: development_expectancy,
         oos1_expectancy: None,
         oos1_expectancy_ratio: None,
@@ -888,11 +895,12 @@ pub fn evolve_new_with_pack_and_quotes(
 
     let initial = (0..bank.config.initial_candidates)
         .map(|index| {
+            let island_id = index % bank.config.effective_island_count();
             let mut rng = rng_for(bank.config.seed, 99, index as u64);
             let mut seeded = build_seed(
                 SearchFamily::Universal,
                 &mut rng,
-                format!("seed-{index}"),
+                format!("i{island_id}-seed-{index}"),
                 bank.config
                     .universal_grammar
                     .maximum_entry_conditions
@@ -1176,6 +1184,12 @@ fn run_generations(
             indicator_cache,
         )?;
         bank.completed_generations = generation;
+        if bank.config.migration_interval > 0
+            && generation % bank.config.migration_interval == 0
+            && bank.config.effective_island_count() > 1
+        {
+            crate::islands::migrate_islands(bank);
+        }
     }
     Ok(())
 }
@@ -1189,8 +1203,11 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
         .maximum_entry_conditions
         .max(1);
     let market_only = bank.config.market_entries_only();
+    let island_count = bank.config.effective_island_count();
     (0..bank.config.batch_size)
         .map(|index| {
+            let island_id = (index % island_count) as u16;
+            let island_role = bank.config.island_role(island_id);
             let sequence = generation
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
@@ -1199,7 +1216,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 let mut seeded = build_seed(
                     SearchFamily::Universal,
                     rng,
-                    format!("g{generation}-{index}"),
+                    format!("i{island_id}-g{generation}-{index}"),
                     max_atoms,
                     true,
                     market_only,
@@ -1208,9 +1225,13 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 apply_search_ranges(&mut seeded, rng, &bank.config.search_ranges);
                 apply_production_policy(seeded, &bank.config)
             };
-            let keep_filling = !breeding_unlocked
-                || bank.accepted_pool.is_empty()
-                || rng.gen_bool(bank.config.random_fill_fraction);
+            let random_fill = match island_role {
+                crate::model::IslandRole::Exploration => bank.config.random_fill_fraction.max(0.60),
+                crate::model::IslandRole::Refinement => bank.config.random_fill_fraction.min(0.15),
+                crate::model::IslandRole::General => bank.config.random_fill_fraction,
+            };
+            let keep_filling =
+                !breeding_unlocked || bank.accepted_pool.is_empty() || rng.gen_bool(random_fill);
             if keep_filling {
                 return fresh_seed(&mut rng);
             }
@@ -1218,22 +1239,35 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             // A separate exploitation lane starts only from candidates that
             // passed the complete Development battery. It freezes the logical
             // tree and execution modules and perturbs existing numeric genes.
-            if !bank.specialist_pool.is_empty() && rng.gen_bool(0.25) {
-                let parent = tournament_in(&bank.specialist_pool, &bank.config, &mut rng);
+            let specialist_probability = match island_role {
+                crate::model::IslandRole::Refinement => 0.90,
+                crate::model::IslandRole::General => 0.25,
+                crate::model::IslandRole::Exploration => 0.05,
+            };
+            if !bank.specialist_pool.is_empty() && rng.gen_bool(specialist_probability) {
+                let parent = crate::islands::tournament_in_elites(
+                    &bank.specialist_pool,
+                    &bank.config,
+                    &mut rng,
+                    island_id,
+                )
+                .unwrap_or_else(|| tournament_in(&bank.specialist_pool, &bank.config, &mut rng));
                 if let Ok(mut child) = perturb_strategy_parameters(
                     &bank.specialist_pool[parent].strategy,
                     bank.config.robustness_perturbation_fraction,
                     sequence as usize,
                     bank.config.seed ^ generation,
                 ) {
-                    child.id = format!("g{generation}-{index}-specialist");
+                    child.id = format!("i{island_id}-g{generation}-{index}-specialist");
                     return child;
                 }
             }
 
-            let first_index = tournament(bank, &mut rng, None);
+            let first_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
+                .unwrap_or_else(|| tournament(bank, &mut rng, None));
             let first = &bank.accepted_pool[first_index];
-            let second_index = tournament(bank, &mut rng, None);
+            let second_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
+                .unwrap_or_else(|| tournament(bank, &mut rng, None));
             let crossed = crossover(
                 &first.strategy,
                 &bank.accepted_pool[second_index].strategy,
@@ -1242,13 +1276,23 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             let mut child = mutate_with_rng(
                 &crossed,
                 &mut rng,
-                bank.config.structural_mutation_probability,
+                match island_role {
+                    crate::model::IslandRole::Exploration => {
+                        bank.config.structural_mutation_probability.max(0.45)
+                    }
+                    crate::model::IslandRole::Refinement => {
+                        bank.config.structural_mutation_probability.min(0.05)
+                    }
+                    crate::model::IslandRole::General => {
+                        bank.config.structural_mutation_probability
+                    }
+                },
                 sequence,
                 false,
                 SearchFamily::Universal,
                 &bank.config.universal_grammar,
             );
-            child.id = format!("g{generation}-{index}");
+            child.id = format!("i{island_id}-g{generation}-{index}");
             apply_search_ranges(&mut child, &mut rng, &bank.config.search_ranges);
             let child = apply_production_policy(child, &bank.config);
             crate::grammar::fit_within_ir_limits(
@@ -1781,6 +1825,12 @@ mod tests {
             calendar_year_folds: false,
             minimum_deflated_trade_sharpe: None,
             multi_symbol_minimum_pass: 0,
+            island_count: 1,
+            migration_interval: 0,
+            migration_elites: 2,
+            general_island_count: 0,
+            refinement_island_count: 0,
+            exploration_island_count: 0,
             scout: ScoutConfig {
                 initial_balance: 10_000.0,
                 same_bar_policy: SameBarPolicy::Conservative,
@@ -2139,6 +2189,38 @@ mod tests {
         config.require_m1_precision = true;
         config.allow_market_entries = false;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn high_performance_mode_restores_historical_island_topology() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::HighPerformanceIslands;
+        config.apply_run_mode();
+        assert_eq!(config.island_count, 4);
+        assert_eq!(config.migration_interval, 10);
+        assert_eq!(config.migration_elites, 2);
+        assert!(config.initial_candidates >= 2_000);
+        assert!(config.batch_size >= 500);
+        assert!(config.require_m1_robustness);
+        assert!(config.require_m1_precision);
+    }
+
+    #[test]
+    fn adaptive_island_counts_and_migration_controls_are_honored() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::HighPerformanceIslands;
+        config.general_island_count = 3;
+        config.refinement_island_count = 2;
+        config.exploration_island_count = 1;
+        config.migration_interval = 17;
+        config.migration_elites = 3;
+        config.apply_run_mode();
+        assert_eq!(config.effective_island_count(), 6);
+        assert_eq!(config.migration_interval, 17);
+        assert_eq!(config.migration_elites, 3);
+        assert_eq!(config.island_role(0), crate::model::IslandRole::General);
+        assert_eq!(config.island_role(3), crate::model::IslandRole::Refinement);
+        assert_eq!(config.island_role(5), crate::model::IslandRole::Exploration);
     }
 
     #[test]

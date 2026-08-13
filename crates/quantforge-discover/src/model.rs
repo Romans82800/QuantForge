@@ -527,6 +527,15 @@ pub enum DiscoverRunMode {
     FullHarvest,
     /// Seed-heavy, softer param neighborhood, stop when databank hits quota.
     QuotaHarvest,
+    /// Historical high-performance genetic islands with ring migration.
+    HighPerformanceIslands,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IslandRole {
+    General,
+    Refinement,
+    Exploration,
 }
 
 /// Named gate outcome persisted on elites for evidence-first promotion.
@@ -686,6 +695,23 @@ pub struct DiscoverConfig {
     /// symbols before M1 work. `0` disables the multi-symbol screen.
     #[serde(default = "default_multi_symbol_minimum_pass")]
     pub multi_symbol_minimum_pass: usize,
+    /// Isolated breeding populations. One preserves classic single-pool behaviour.
+    #[serde(default = "default_island_count")]
+    pub island_count: usize,
+    /// Move leading parents around the island ring every N generations; zero disables it.
+    #[serde(default = "default_migration_interval")]
+    pub migration_interval: u64,
+    /// Number of leading parents moved from each island at migration.
+    #[serde(default = "default_migration_elites")]
+    pub migration_elites: usize,
+    /// Role-specific populations. A zero sum falls back to `island_count`
+    /// general islands for backwards-compatible databanks.
+    #[serde(default)]
+    pub general_island_count: usize,
+    #[serde(default)]
+    pub refinement_island_count: usize,
+    #[serde(default)]
+    pub exploration_island_count: usize,
     pub scout: ScoutConfig,
 }
 
@@ -793,6 +819,15 @@ fn default_minimum_deflated_trade_sharpe() -> Option<f64> {
 fn default_multi_symbol_minimum_pass() -> usize {
     0
 }
+fn default_island_count() -> usize {
+    1
+}
+fn default_migration_interval() -> u64 {
+    0
+}
+fn default_migration_elites() -> usize {
+    2
+}
 
 impl Default for DiscoverConfig {
     fn default() -> Self {
@@ -848,6 +883,12 @@ impl Default for DiscoverConfig {
             calendar_year_folds: default_calendar_year_folds(),
             minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
             multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
+            island_count: default_island_count(),
+            migration_interval: default_migration_interval(),
+            migration_elites: default_migration_elites(),
+            general_island_count: 0,
+            refinement_island_count: 0,
+            exploration_island_count: 0,
             scout: ScoutConfig::default(),
         }
     }
@@ -902,6 +943,53 @@ impl DiscoverConfig {
                 self.minimum_neighborhood_survival_fraction =
                     self.minimum_neighborhood_survival_fraction.min(0.5);
             }
+            DiscoverRunMode::HighPerformanceIslands => {
+                // Exact lineage topology from the earlier high-output builder:
+                // four isolated populations and deterministic ring migration.
+                self.simple_exits = !self.has_complex_execution();
+                if self.configured_role_island_count() == 0 {
+                    self.general_island_count = 4;
+                }
+                self.island_count = self.configured_role_island_count();
+                if self.migration_interval == 0 {
+                    self.migration_interval = 10;
+                }
+                self.initial_candidates = self.initial_candidates.max(2_000);
+                self.batch_size = self.batch_size.max(500);
+                self.early_stop_pot_elites = None;
+                self.target_databank_elites = None;
+                self.require_m1_precision = true;
+                self.require_m1_robustness = true;
+            }
+        }
+    }
+
+    pub fn configured_role_island_count(&self) -> usize {
+        self.general_island_count
+            .saturating_add(self.refinement_island_count)
+            .saturating_add(self.exploration_island_count)
+    }
+
+    pub fn effective_island_count(&self) -> usize {
+        let roles = self.configured_role_island_count();
+        if roles > 0 {
+            roles
+        } else {
+            self.island_count.max(1)
+        }
+    }
+
+    pub fn island_role(&self, island_id: u16) -> IslandRole {
+        if self.configured_role_island_count() == 0 {
+            return IslandRole::General;
+        }
+        let id = island_id as usize;
+        if id < self.general_island_count {
+            IslandRole::General
+        } else if id < self.general_island_count + self.refinement_island_count {
+            IslandRole::Refinement
+        } else {
+            IslandRole::Exploration
         }
     }
 
@@ -934,6 +1022,16 @@ impl DiscoverConfig {
         if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
             return Err(DiscoverError::InvalidConfig(
                 "enable at least one entry order kind: market, stop or limit".into(),
+            ));
+        }
+        if self.island_count == 0 {
+            return Err(DiscoverError::InvalidConfig(
+                "island_count must be at least 1".into(),
+            ));
+        }
+        if self.effective_island_count() > u16::MAX as usize {
+            return Err(DiscoverError::InvalidConfig(
+                "total island count exceeds 65535".into(),
             ));
         }
         // Stop/limit/BE/trail/partials are free to search on Selected-TF for the pot.
@@ -1352,6 +1450,9 @@ pub struct Elite {
     /// Downsampled equity deltas, normalized only when correlation is computed.
     pub equity_signature: Vec<f64>,
     pub discovered_generation: u64,
+    /// Breeding lineage. Zero for legacy/single-population databanks.
+    #[serde(default)]
+    pub island_id: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1433,6 +1534,8 @@ pub struct DiscoverTelemetry {
     #[serde(default)]
     pub rejected_deflated_sharpe: u64,
     pub rejected_evaluation: u64,
+    #[serde(default)]
+    pub island_migrations: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
     /// Pot admissions enqueued for the post-breed databank pipeline.
     #[serde(default)]

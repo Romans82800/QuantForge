@@ -145,8 +145,13 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
-    /// `fast_scout`, `full_harvest`, or `quota_harvest`.
+    /// `fast_scout`, `full_harvest`, `quota_harvest`, or `high_performance_islands`.
     run_mode: Option<String>,
+    general_island_count: Option<usize>,
+    refinement_island_count: Option<usize>,
+    exploration_island_count: Option<usize>,
+    migration_interval: Option<u64>,
+    migration_elites: Option<usize>,
     /// Early-stop when accepted pot reaches this size (Fast Scout / Quota).
     early_stop_pot_elites: Option<usize>,
     /// Early-stop when databank reaches this many elites (Quota Harvest default 20).
@@ -686,7 +691,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         if let Some(mode) = request.run_mode.as_deref() {
             if parse_run_mode(mode).is_none() {
                 return Err(format!(
-                    "unknown run mode '{mode}' (use fast_scout, full_harvest, or quota_harvest)"
+                    "unknown run mode '{mode}' (use fast_scout, full_harvest, quota_harvest, or high_performance_islands)"
                 ));
             }
         }
@@ -2076,6 +2081,9 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
         "quota_harvest" | "quotaharvest" | "quota" => {
             Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
         }
+        "high_performance_islands" | "highperformanceislands" | "islands" => {
+            Some(quantforge_discover::DiscoverRunMode::HighPerformanceIslands)
+        }
         _ => None,
     }
 }
@@ -2177,6 +2185,14 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
+        island_count: request.general_island_count.unwrap_or(1)
+            + request.refinement_island_count.unwrap_or(0)
+            + request.exploration_island_count.unwrap_or(0),
+        migration_interval: request.migration_interval.unwrap_or(10),
+        migration_elites: request.migration_elites.unwrap_or(2),
+        general_island_count: request.general_island_count.unwrap_or(0),
+        refinement_island_count: request.refinement_island_count.unwrap_or(0),
+        exploration_island_count: request.exploration_island_count.unwrap_or(0),
         scout: ScoutConfig {
             initial_balance: request.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: SameBarPolicy::Conservative,

@@ -3030,6 +3030,11 @@ function DiscoverWorkspace({
     seed: 42,
     universalGrammar: { ...DEFAULT_UNIVERSAL_GRAMMAR },
     runMode: "full_harvest" as DiscoverRunModeId,
+    generalIslandCount: 0,
+    refinementIslandCount: 0,
+    explorationIslandCount: 0,
+    migrationInterval: 10,
+    migrationElites: 2,
     earlyStopPotElites: null,
     targetDatabankElites: null,
     searchRanges: DEFAULT_SEARCH_RANGES,
@@ -3297,6 +3302,11 @@ function DiscoverWorkspace({
             noveltyWeight: null,
             seed: null,
             runMode: null,
+            generalIslandCount: null,
+            refinementIslandCount: null,
+            explorationIslandCount: null,
+            migrationInterval: null,
+            migrationElites: null,
             earlyStopPotElites: null,
             targetDatabankElites: null,
             searchRanges: null,
@@ -3585,11 +3595,49 @@ function DiscoverWorkspace({
                   >
                     Quota (20)
                   </button>
+                  <button
+                    type="button"
+                    className={form.runMode === "high_performance_islands" ? "active" : ""}
+                    onClick={() =>
+                      setForm((current) => ({
+                        ...current,
+                        runMode: "high_performance_islands",
+                        mutateAfterElites: 300,
+                        earlyStopPotElites: null,
+                        targetDatabankElites: null,
+                        initialCandidates: Math.max(current.initialCandidates ?? 500, 2000),
+                        batchSize: Math.max(current.batchSize ?? 200, 500),
+                        requireM1Robustness: true,
+                        requireM1Precision: true,
+                        generalIslandCount: (current.generalIslandCount ?? 0) > 0 ? current.generalIslandCount : 4,
+                        refinementIslandCount: (current.refinementIslandCount ?? 0) > 0 ? current.refinementIslandCount : 2,
+                        explorationIslandCount: (current.explorationIslandCount ?? 0) > 0 ? current.explorationIslandCount : 2,
+                        migrationInterval: current.migrationInterval ?? 10,
+                        migrationElites: current.migrationElites ?? 2,
+                      }))
+                    }
+                  >
+                    High-Performance Islands
+                  </button>
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <p className="recipe-summary">
                     Stops at 20 databank elites. Softer ±param gate (50% of 5). Pot is only a breeding bag — not the goal.
                   </p>
+                )}
+                {form.runMode === "high_performance_islands" && (
+                  <div className="form-stack compact">
+                    <p className="recipe-summary">
+                      General islands evolve structures; refinement islands preserve trees and search parameter plateaus; exploration islands use fresh seeds and stronger structural mutation. Only Development-approved parents migrate. OOS1 and OOS2 never influence evolution.
+                    </p>
+                    <div className="form-grid universal-grammar-grid">
+                      <NumberField label="General islands" value={form.generalIslandCount ?? 4} onChange={(value) => setForm((current) => ({ ...current, generalIslandCount: value ?? 4 }))} min={1} max={32} />
+                      <NumberField label="Refinement islands" value={form.refinementIslandCount ?? 2} onChange={(value) => setForm((current) => ({ ...current, refinementIslandCount: value ?? 0 }))} min={0} max={32} />
+                      <NumberField label="Exploration islands" value={form.explorationIslandCount ?? 2} onChange={(value) => setForm((current) => ({ ...current, explorationIslandCount: value ?? 0 }))} min={0} max={32} />
+                      <NumberField label="Migration interval" value={form.migrationInterval ?? 10} onChange={(value) => setForm((current) => ({ ...current, migrationInterval: value ?? 10 }))} min={1} />
+                      <NumberField label="Migration elites" value={form.migrationElites ?? 2} onChange={(value) => setForm((current) => ({ ...current, migrationElites: value ?? 2 }))} min={0} max={16} />
+                    </div>
+                  </div>
                 )}
               </div>
             </>
@@ -4254,7 +4302,7 @@ function DiscoverContractSummary({
         <p className="eyebrow">Hypothesis</p>
         <div className="contract-hero">
           <strong>{form.decisionTimeframe ?? "—"}</strong>
-          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : "Full harvest"}</span>
+          <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : form.runMode === "high_performance_islands" ? "High-performance islands" : "Full harvest"}</span>
         </div>
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />

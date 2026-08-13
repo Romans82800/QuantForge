@@ -1398,6 +1398,7 @@ fn parse_cli_run_mode(value: &str) -> Result<DiscoverRunMode, Box<dyn Error>> {
         "fast_scout" | "scout" => Ok(DiscoverRunMode::FastScout),
         "full_harvest" | "harvest" => Ok(DiscoverRunMode::FullHarvest),
         "quota_harvest" | "quota" => Ok(DiscoverRunMode::QuotaHarvest),
+        "high_performance_islands" | "islands" => Ok(DiscoverRunMode::HighPerformanceIslands),
         other => Err(format!("unknown run mode: {other}").into()),
     }
 }
@@ -4767,6 +4768,12 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        island_count: 1,
+        migration_interval: 0,
+        migration_elites: 2,
+        general_island_count: 0,
+        refinement_island_count: 0,
+        exploration_island_count: 0,
         scout: ScoutConfig {
             initial_balance: args.initial_balance.unwrap_or(100_000.0),
             same_bar_policy: quantforge_eval::SameBarPolicy::Conservative,

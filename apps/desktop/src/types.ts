@@ -472,7 +472,7 @@ export interface UniversalGrammarConfig {
   maximumShift: number;
 }
 
-export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest";
+export type DiscoverRunModeId = "fast_scout" | "full_harvest" | "quota_harvest" | "high_performance_islands";
 
 export interface ConditionBakeoffRow {
   entryConditions: number;
@@ -533,6 +533,11 @@ export interface DiscoverRequest {
   seed: number | null;
   universalGrammar: UniversalGrammarConfig | null;
   runMode: DiscoverRunModeId | null;
+  generalIslandCount: number | null;
+  refinementIslandCount: number | null;
+  explorationIslandCount: number | null;
+  migrationInterval: number | null;
+  migrationElites: number | null;
   earlyStopPotElites: number | null;
   targetDatabankElites: number | null;
   searchRanges: SearchRangeProfile | null;

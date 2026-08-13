@@ -4,6 +4,7 @@ mod archive;
 mod bakeoff;
 mod engine;
 mod grammar;
+mod islands;
 mod methodology;
 mod model;
 mod multi_symbol;
@@ -25,7 +26,7 @@ pub use methodology::{
 };
 pub use model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError, DiscoverRunMode,
-    DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult,
+    DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult, IslandRole,
     LongShortSkewBucket, M1RetentionEvidence, NicheKey, ParameterNeighborhoodEvidence,
     ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, SearchFamily,
     SearchFamilySpec, SearchRange, SearchRangeProfile, SymbolScreenResult, TRIAL_BUDGET_WARNING,

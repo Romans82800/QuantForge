@@ -226,6 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(RobustnessReject::WalkForward) => "development_cpcv",
             Err(RobustnessReject::MonteCarlo) => "monte_carlo",
             Err(RobustnessReject::ParamNeighborhood) => "parameter_plateau",
+            Err(RobustnessReject::Cpcv) => "development_cpcv",
         };
         if label == "development_cpcv" && cpcv_samples.len() < 3 {
             let rows = development_cpcv_diagnostic(

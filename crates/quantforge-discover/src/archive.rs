@@ -13,6 +13,7 @@ pub(crate) struct CandidateEvaluation {
     pub strategy: StrategyIr,
     pub result: ScoutResult,
     pub generation: u64,
+    pub island_id: u16,
     pub is_expectancy: f64,
     pub oos1_expectancy: Option<f64>,
     pub oos1_expectancy_ratio: Option<f64>,
@@ -135,6 +136,7 @@ fn deposit_into_stack(
             robustness: candidate.robustness,
             equity_signature: signature,
             discovered_generation: candidate.generation,
+            island_id: candidate.island_id,
         };
         refresh_fingerprint_coverage_map(entries, coverage_map);
         return Ok(replaced);
@@ -164,6 +166,7 @@ fn deposit_into_stack(
         robustness: candidate.robustness,
         equity_signature: signature,
         discovered_generation: candidate.generation,
+        island_id: candidate.island_id,
     });
     refresh_fingerprint_coverage_map(entries, coverage_map);
     Ok(accepted)
@@ -504,6 +507,7 @@ mod tests {
                 strategy: trend.clone(),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -524,6 +528,7 @@ mod tests {
                 strategy: trend,
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -544,6 +549,7 @@ mod tests {
                 strategy: generate_seed(42, 1),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -568,6 +574,7 @@ mod tests {
                 strategy: generate_seed(7, 0),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -594,6 +601,7 @@ mod tests {
                 strategy: generate_seed(7, 3),
                 result: second_result,
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -620,6 +628,7 @@ mod tests {
                 strategy: generate_seed(11, 0),
                 result: profitable_result(),
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
@@ -645,6 +654,7 @@ mod tests {
                 strategy: generate_seed(11, 4),
                 result: second_result,
                 generation: 0,
+                island_id: 0,
                 is_expectancy: 1.0,
                 oos1_expectancy: None,
                 oos1_expectancy_ratio: None,
