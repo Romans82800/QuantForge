@@ -384,6 +384,7 @@ function App() {
 
   function useDataInDiscover(report: DataLabView) {
     setDiscoverPreset({
+      selectedSymbol: report.symbol ?? symbolFromDataPath(report.sourcePath),
       dataPath: report.sourcePath,
       metadataPath: report.metadataPath,
       sourceTimezone: report.metadataPath ? null : report.sourceTimezone,
@@ -3004,6 +3005,7 @@ function DiscoverWorkspace({
 }) {
   const [form, setForm] = useState<DiscoverRequest>(() => ({
     mode: "new",
+    selectedSymbol: null,
     dataPath: "",
     decisionTimeframe: "H1",
     metadataPath: null,
@@ -3205,6 +3207,10 @@ function DiscoverWorkspace({
     setForm((current) => ({
       ...current,
       ...saved,
+      selectedSymbol:
+        saved.selectedSymbol
+        ?? symbolFromDataPath(saved.brokerPath)
+        ?? symbolFromDataPath(saved.dataPath),
       mode: "new",
       databankPath: "",
       promotionSplit: true,
@@ -3269,6 +3275,10 @@ function DiscoverWorkspace({
     try {
       const sourceBoundForm = bindDiscoverTimezone({
         ...form,
+        selectedSymbol:
+          form.selectedSymbol
+          ?? symbolFromDataPath(form.brokerPath)
+          ?? symbolFromDataPath(form.dataPath),
         promotionSplit: true,
       });
       const request = form.mode === "continue"
@@ -3591,6 +3601,7 @@ function DiscoverWorkspace({
                 const defaults = discoverDefaultsForSymbol(symbol.symbol);
                 setForm((current) => ({
                   ...current,
+                  selectedSymbol: symbol.symbol,
                   dataPath: symbol.dataPath,
                   metadataPath: symbol.metadataPath,
                   sourceTimezone: null,
@@ -3607,7 +3618,7 @@ function DiscoverWorkspace({
                   databankPath: current.mode === "new" ? "" : current.databankPath || symbol.defaultDatabankPath,
                 }));
               }}
-              selectedDataPath={form.dataPath}
+              selectedSymbol={form.selectedSymbol}
             />
             <PathField
               label={form.mode === "new" ? "New databank (auto if blank)" : "Existing databank"}
@@ -3832,6 +3843,7 @@ function DiscoverWorkspace({
             disabled={
               active
               || busy
+              || !form.selectedSymbol
               || !form.dataPath
               || !form.m1DataPath
               || !form.brokerPath
@@ -4314,25 +4326,23 @@ function SymbolSelect({
   disabled = false,
   onError,
   onSelect,
+  selectedSymbol,
   selectedDataPath,
 }: {
   disabled?: boolean;
   onError: (message: string | null) => void;
   onSelect: (symbol: SymbolPack) => void;
-  selectedDataPath: string;
+  selectedSymbol?: string | null;
+  selectedDataPath?: string;
 }) {
   const [symbols, setSymbols] = useState<SymbolPack[]>([]);
-  const [selected, setSelected] = useState("");
+  const boundSymbol = selectedSymbol ?? symbolFromDataPath(selectedDataPath);
   useEffect(() => {
     void listSymbols()
       .then((items) => {
         setSymbols(items);
-        if (!selectedDataPath && items[0]) {
-          setSelected(items[0].symbol);
+        if (!boundSymbol && items[0]) {
           onSelect(items[0]);
-        } else {
-          const match = items.find((item) => item.dataPath === selectedDataPath);
-          if (match) setSelected(match.symbol);
         }
       })
       .catch((reason) => onError(String(reason)));
@@ -4343,10 +4353,9 @@ function SymbolSelect({
       <span>Symbol <small>required</small></span>
       <select
         disabled={disabled || symbols.length === 0}
-        value={selected}
+        value={boundSymbol ?? ""}
         onChange={(event) => {
           const next = symbols.find((item) => item.symbol === event.target.value);
-          setSelected(event.target.value);
           if (next) onSelect(next);
         }}
       >

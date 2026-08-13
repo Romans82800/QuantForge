@@ -241,6 +241,7 @@ describe("results detail derivations", () => {
 
   it("reads the universe and timeframe from a bound export path", () => {
     expect(symbolFromDataPath("/data/ICMarkets/EURUSD_H1_2020.csv")).toBe("EURUSD");
+    expect(symbolFromDataPath("/data/ICMarketsSC-Demo_AUDUSD_H1_2020_present.tsv")).toBe("AUDUSD");
     expect(symbolFromDataPath(null)).toBeNull();
     expect(timeframeFromDataPath("/data/ICMarkets/EURUSD_H1_2020.csv")).toBe("H1");
     expect(timeframeFromDataPath("/data/ICMarkets/EURUSD-m15.csv")).toBe("M15");

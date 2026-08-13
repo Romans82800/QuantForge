@@ -503,6 +503,8 @@ export interface ConditionBakeoffRequest {
 
 export interface DiscoverRequest {
   mode: DiscoverMode;
+  /** Explicit UI selection. The backend refuses data/broker bindings for another symbol. */
+  selectedSymbol: string | null;
   dataPath: string;
   decisionTimeframe: "H1" | "M15" | null;
   metadataPath: string | null;

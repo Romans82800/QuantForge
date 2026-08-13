@@ -438,7 +438,11 @@ export function cagrPercent(
 export function symbolFromDataPath(path: string | null | undefined): string | null {
   if (!path) return null;
   const file = path.split(/[\\/]/).at(-1) ?? "";
-  const token = file.split(".")[0]?.split(/[_-]/)[0] ?? "";
+  const tokens = file.split(".")[0]?.split(/[_-]/).filter(Boolean) ?? [];
+  const timeframeIndex = tokens.findIndex((token) =>
+    /^(M1|M5|M15|M30|H1|H4|D1|W1|MN1)$/i.test(token),
+  );
+  const token = timeframeIndex > 0 ? tokens[timeframeIndex - 1] : tokens[0] ?? "";
   return token.length > 0 ? token.toUpperCase() : null;
 }
 

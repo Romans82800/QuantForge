@@ -31,6 +31,11 @@ const LEGACY_TOTAL_NICHES: usize = 10 * 3usize.pow(5);
 const SELECTION_BIAS_WARNING_THRESHOLD: u64 = 1_500;
 const LEGACY_DATABANK_SCHEMA_VERSION: u16 = 5;
 const LEGACY_GRAMMAR_VERSION: &str = "search-families-v5-selected-tf-parity";
+/// A full M1 replay retains an equity path as well as its trades.  Running an
+/// arbitrarily large selection through Rayon and collecting every result at
+/// once can therefore consume several gigabytes before the first CSV is
+/// written.  Keep a small amount of CPU parallelism while bounding peak memory.
+const TRADE_CSV_REPLAY_BATCH_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EvolveArtifact {
@@ -177,6 +182,9 @@ struct TradeCsvExportSnapshot {
     scout: quantforge_eval::ScoutConfig,
     validation_fraction: f64,
     sealed_fraction: f64,
+    data_hash: ContentHash,
+    execution_data_hash: ContentHash,
+    broker_spec_hash: ContentHash,
 }
 
 struct TradeCsvReplayContext {
@@ -490,10 +498,23 @@ fn install_databank_artifact(
     artifact_hash: ContentHash,
     state: &DesktopState,
 ) -> Result<DatabankWorkspace, DesktopError> {
-    let workspace = workspace_view(&artifact, &source_path, &artifact_hash);
-    let metadata_path = companion_metadata_path(&artifact.source);
-    let m1_source = manifest_path(&artifact, "m1_source");
+    let mut workspace = workspace_view(&artifact, &source_path, &artifact_hash);
+    // Archives are often copied from a Windows VPS. Preserve the signed/hash-
+    // bound artifact exactly as written, but recover unavailable absolute paths
+    // by filename from a sibling market-data pack on this machine. Replay code
+    // verifies the recovered files against the hashes sealed in the bank before
+    // it exports anything.
+    let source = resolve_portable_binding(&artifact.source, &source_path);
+    let broker = resolve_portable_binding(&artifact.broker, &source_path);
+    let m1_source = manifest_path(&artifact, "m1_source")
+        .map(|path| resolve_portable_binding(&path, &source_path));
+    let metadata_path = companion_metadata_path(&source);
     let m1_metadata_path = m1_source.as_deref().and_then(companion_metadata_path);
+    workspace.data_path = source.clone();
+    workspace.metadata_path = metadata_path.clone();
+    workspace.m1_data_path = m1_source.clone();
+    workspace.m1_metadata_path = m1_metadata_path.clone();
+    workspace.broker_path = broker.clone();
     let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
     let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
     *state
@@ -503,8 +524,8 @@ fn install_databank_artifact(
         bank: artifact.databank,
         legacy_read_only,
         databank_path: source_path.display().to_string(),
-        source: artifact.source,
-        broker: artifact.broker,
+        source,
+        broker,
         metadata_path,
         m1_source,
         m1_metadata_path,
@@ -512,6 +533,34 @@ fn install_databank_artifact(
         sealed_fraction,
     });
     Ok(workspace)
+}
+
+fn resolve_portable_binding(stored: &str, archive_path: &Path) -> String {
+    if Path::new(stored).is_file() {
+        return stored.to_owned();
+    }
+    let normalized = stored.replace('\\', "/");
+    let mut parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "?")
+        .collect::<Vec<_>>();
+    let Some(file_name) = parts.pop() else {
+        return stored.to_owned();
+    };
+    let parent_name = parts.last().copied();
+    for ancestor in archive_path.ancestors().skip(1).take(5) {
+        let direct = ancestor.join(file_name);
+        if direct.is_file() {
+            return canonical_display(&direct);
+        }
+        if let Some(parent_name) = parent_name {
+            let nested = ancestor.join(parent_name).join(file_name);
+            if nested.is_file() {
+                return canonical_display(&nested);
+            }
+        }
+    }
+    stored.to_owned()
 }
 
 /// Open current archives with the full v6 verifier. Schema-v5 archives use a
@@ -1686,6 +1735,9 @@ fn trade_csv_export_snapshot(
         scout: loaded.bank.config.scout.clone(),
         validation_fraction: loaded.validation_fraction,
         sealed_fraction: loaded.sealed_fraction,
+        data_hash: loaded.bank.data_hash.clone(),
+        execution_data_hash: loaded.bank.execution_data_hash.clone(),
+        broker_spec_hash: loaded.bank.broker_spec_hash.clone(),
     })
 }
 
@@ -1732,26 +1784,32 @@ fn export_elite_trade_csvs_to(
         )));
     }
 
-    let completed = planned
-        .into_par_iter()
-        .map(|(elite, path)| {
-            replay_elite_for_trade_csv(&replay, elite).map(|result| (elite, path, result))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut rows = Vec::with_capacity(completed.len());
-    let mut csv_paths = Vec::with_capacity(completed.len());
-    for (elite, path, result) in completed {
-        write_sqx_style_trade_csv(
-            &path,
-            &elite.strategy.id,
-            broker,
-            snapshot.scout.initial_balance,
-            &result.trades,
-            replay.plan.development.end_timestamp_ms_exclusive,
-            replay.plan.validation.end_timestamp_ms_exclusive,
-        )?;
-        rows.push((elite, path.clone(), result.metrics));
-        csv_paths.push(canonical_display(&path));
+    let mut rows = Vec::with_capacity(planned.len());
+    let mut csv_paths = Vec::with_capacity(planned.len());
+    for batch in planned.chunks(TRADE_CSV_REPLAY_BATCH_SIZE) {
+        let completed = batch
+            .par_iter()
+            .map(|(elite, path)| {
+                replay_elite_for_trade_csv(&replay, elite)
+                    .map(|result| (*elite, path.clone(), result))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (elite, path, result) in completed {
+            write_sqx_style_trade_csv(
+                &path,
+                &elite.strategy.id,
+                broker,
+                snapshot.scout.initial_balance,
+                &result.trades,
+                replay.plan.development.end_timestamp_ms_exclusive,
+                replay.plan.validation.end_timestamp_ms_exclusive,
+            )?;
+            rows.push((elite, path.clone(), result.metrics));
+            csv_paths.push(canonical_display(&path));
+            // `result.equity` is dropped here instead of being retained for the
+            // entire selection.  Exporting 1,000 strategies is now bounded to
+            // at most one small replay batch in memory.
+        }
     }
     write_trade_csv_index(&index_path, &broker.symbol, &rows)?;
 
@@ -1779,6 +1837,20 @@ fn prepare_trade_csv_replay(
     .map_err(DesktopError::InvalidExport)?;
     let broker = load_bound_broker(&snapshot.broker, m1.metadata.as_ref())
         .map_err(DesktopError::InvalidExport)?;
+    if broker
+        .content_hash()
+        .map_err(|error| DesktopError::InvalidExport(error.to_string()))?
+        != snapshot.broker_spec_hash
+    {
+        return Err(DesktopError::InvalidExport(
+            "the recovered broker profile does not match this databank".into(),
+        ));
+    }
+    if m1.dataset.data_hash != snapshot.execution_data_hash {
+        return Err(DesktopError::InvalidExport(
+            "the recovered M1 source does not match this databank".into(),
+        ));
+    }
     let quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
@@ -1800,6 +1872,16 @@ fn prepare_trade_csv_replay(
         ),
         None => build_decision_from_m1(&m1.dataset, Some(&decision.dataset)),
     }
+    .map_err(DesktopError::InvalidExport)?;
+    // The bank binds the Development partition rather than the full 60/20/20
+    // history. Reconstruct that partition to prove the recovered decision grid
+    // is identical before replaying the full history for CSV labels.
+    databank_decision_partition(
+        &decision_dataset,
+        &snapshot.data_hash,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )
     .map_err(DesktopError::InvalidExport)?;
     let plan = DataSplitPlan::chronological(
         &decision_dataset,
@@ -2455,7 +2537,10 @@ fn workspace_view(
         legacy_read_only: bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION,
         quality_grade: format!("{:?}", artifact.data_quality.grade).to_ascii_lowercase(),
         quality_score: artifact.data_quality.score,
-        coverage: bank.coverage(),
+        // The databank is a diversified strategy stack, so its entry count is
+        // not the same thing as behavioral coverage. Count distinct niche
+        // labels for the coverage KPI and map.
+        coverage: unique_niche_count(bank),
         total_niches: if bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION {
             LEGACY_TOTAL_NICHES
         } else {
@@ -2710,11 +2795,21 @@ fn elite_robustness(elite: &Elite) -> Result<Option<EliteRobustnessView>, serde_
 }
 
 fn coverage_condition_groups(bank: &Databank) -> Vec<ConditionCoverage> {
-    let elites: BTreeMap<_, _> = bank
-        .elites
-        .iter()
-        .map(|elite| (elite.structural_fingerprint.as_str(), elite))
-        .collect();
+    // Since v6 the persisted coverage_map is fingerprint-keyed because the
+    // databank may retain multiple diverse structures in one behavioral niche.
+    // Build the display index from Elite.niche and choose the strongest member
+    // of each cell. Looking up niche labels in coverage_map leaves every cell
+    // dark even though the archive contains promoted strategies.
+    let mut elites_by_niche: BTreeMap<String, &Elite> = BTreeMap::new();
+    for elite in &bank.elites {
+        let label = niche_label(&elite.niche);
+        match elites_by_niche.get(&label) {
+            Some(current) if current.evidence.total >= elite.evidence.total => {}
+            _ => {
+                elites_by_niche.insert(label, elite);
+            }
+        }
+    }
     let minimum = bank
         .elites
         .iter()
@@ -2743,9 +2838,7 @@ fn coverage_condition_groups(bank: &Databank) -> Vec<ConditionCoverage> {
                                     long_short_skew: skew,
                                 };
                                 let label = niche_label(&niche);
-                                let elite = bank.coverage_map.get(&label).and_then(|fingerprint| {
-                                    elites.get(fingerprint.as_str()).copied()
-                                });
+                                let elite = elites_by_niche.get(&label).copied();
                                 cells.push(CoverageCell {
                                     index: cells.len(),
                                     niche: label,
@@ -2779,6 +2872,14 @@ fn coverage_condition_groups(bank: &Databank) -> Vec<ConditionCoverage> {
         .collect()
 }
 
+fn unique_niche_count(bank: &Databank) -> usize {
+    bank.elites
+        .iter()
+        .map(|elite| niche_label(&elite.niche))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 fn evidence_intensity(value: f64, minimum: f64, maximum: f64) -> f64 {
     if (maximum - minimum).abs() <= f64::EPSILON {
         1.0
@@ -2807,6 +2908,63 @@ fn skew_levels() -> [LongShortSkewBucket; 3] {
 mod tests {
     use super::*;
 
+    fn sample_elite(sequence: u64, niche: NicheKey, evidence_total: f64) -> Elite {
+        let strategy = quantforge_discover::generate_seed(42, sequence);
+        let fingerprint = strategy
+            .structural_fingerprint(quantforge_core::FloatPolicy::default())
+            .expect("fingerprint");
+        Elite {
+            strategy,
+            structural_fingerprint: fingerprint,
+            descriptor: quantforge_discover::BehaviorDescriptor {
+                entry_conditions: niche.entry_conditions,
+                exit_conditions: 1,
+                trades_per_1000_bars: 10.0,
+                average_bars_held: 8.0,
+                drawdown_percent: 8.0,
+                win_rate_percent: 45.0,
+                long_short_skew: 0.0,
+            },
+            niche,
+            evidence: quantforge_discover::EvidenceComponents {
+                return_component: evidence_total,
+                profit_factor_component: 0.0,
+                trade_count_bonus: 0.0,
+                drawdown_penalty: 0.0,
+                complexity_penalty: 0.0,
+                total: evidence_total,
+            },
+            novelty: 0.0,
+            complexity: 1,
+            metrics: quantforge_eval::BacktestMetrics {
+                initial_balance: 100_000.0,
+                ending_balance: 101_000.0,
+                net_profit: 1_000.0,
+                return_percent: 1.0,
+                trade_count: 10,
+                winning_trades: 5,
+                losing_trades: 5,
+                win_rate: 50.0,
+                profit_factor: Some(1.2),
+                max_drawdown: 500.0,
+                max_drawdown_percent: 0.5,
+                sharpe_ratio: Some(1.0),
+                expectancy: 100.0,
+            },
+            is_expectancy: 0.0,
+            oos1_expectancy: None,
+            oos1_expectancy_ratio: None,
+            observed_trade_sharpe: None,
+            expected_max_lucky_sharpe: None,
+            deflated_trade_sharpe: None,
+            multi_symbol_results: Vec::new(),
+            gate_results: Vec::new(),
+            robustness: None,
+            equity_signature: vec![0.0, 1.0],
+            discovered_generation: 1,
+        }
+    }
+
     #[test]
     fn coverage_surface_contains_every_niche_once() {
         let bank = Databank {
@@ -2831,6 +2989,50 @@ mod tests {
             TOTAL_NICHES
         );
         assert!(groups.iter().all(|group| group.occupied == 0));
+    }
+
+    #[test]
+    fn coverage_surface_groups_stacked_strategies_by_actual_niche() {
+        let niche = NicheKey {
+            entry_conditions: 2,
+            trade_frequency: ThreeLevelBucket::Medium,
+            hold_time: ThreeLevelBucket::Medium,
+            drawdown: ThreeLevelBucket::Medium,
+            win_rate: ThreeLevelBucket::Medium,
+            long_short_skew: LongShortSkewBucket::Balanced,
+        };
+        let weak = sample_elite(1, niche.clone(), 2.0);
+        let strong = sample_elite(2, niche, 9.0);
+        let strong_fingerprint = strong.structural_fingerprint.as_str().to_owned();
+        let bank = Databank {
+            schema_version: quantforge_discover::DATABANK_SCHEMA_VERSION,
+            grammar_version: quantforge_discover::GRAMMAR_VERSION.into(),
+            data_hash: ContentHash::sha256("data"),
+            execution_data_hash: ContentHash::sha256("m1-data"),
+            broker_spec_hash: ContentHash::sha256("broker"),
+            config: Default::default(),
+            completed_generations: 1,
+            evaluation_count: 2,
+            elites: vec![weak, strong],
+            // v6 production archives are fingerprint-keyed, not niche-keyed.
+            coverage_map: BTreeMap::new(),
+            accepted_pool: Vec::new(),
+            accepted_coverage_map: BTreeMap::new(),
+            telemetry: Default::default(),
+        };
+
+        assert_eq!(unique_niche_count(&bank), 1);
+        let groups = coverage_condition_groups(&bank);
+        let occupied: Vec<_> = groups
+            .iter()
+            .flat_map(|group| &group.cells)
+            .filter(|cell| cell.occupied)
+            .collect();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(
+            occupied[0].fingerprint.as_deref(),
+            Some(strong_fingerprint.as_str())
+        );
     }
 
     #[test]
@@ -2906,6 +3108,23 @@ mod tests {
     fn batch_export_file_stems_are_portable_and_non_empty() {
         assert_eq!(safe_file_stem("trend/AUDUSD:one"), "trend_AUDUSD_one");
         assert_eq!(safe_file_stem(""), "strategy");
+    }
+
+    #[test]
+    fn portable_binding_recovers_a_windows_vps_path_without_editing_the_archive() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let pack = root.path().join("ICMarkets_EST7_2020_present");
+        fs::create_dir(&pack).expect("market pack");
+        let local = pack.join("BTCUSD_M1.tsv");
+        fs::write(&local, "fixture").expect("local binding");
+        let archive = root.path().join("runs").join("btc-databank.json");
+        assert_eq!(
+            resolve_portable_binding(
+                r"\\?\C:\Users\Administrator\Documents\QuantForge\ICMarkets_EST7_2020_present\BTCUSD_M1.tsv",
+                &archive,
+            ),
+            canonical_display(&local),
+        );
     }
 
     #[test]

@@ -56,6 +56,9 @@ impl DecisionTimeframe {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverRequest {
     mode: DiscoverMode,
+    /// Explicit symbol chosen in the UI. It must match both metadata files and
+    /// the broker profile; stale profile paths are never allowed to run.
+    selected_symbol: Option<String>,
     data_path: String,
     /// M15 is deterministically built from the bound M1 execution stream.
     decision_timeframe: Option<DecisionTimeframe>,
@@ -558,12 +561,18 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
         .and_then(|value| value.to_str())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "cannot derive an archive name from decision OHLC path".to_owned())?;
-    let symbol = stem
-        .split(['_', '-'])
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("strategy")
-        .to_ascii_uppercase();
+    let symbol = request
+        .selected_symbol
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| {
+            stem.split(['_', '-'])
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("strategy")
+                .to_ascii_uppercase()
+        });
     let timeframe = match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
         DecisionTimeframe::H1 => "H1",
         DecisionTimeframe::M15 => "M15",
@@ -657,6 +666,18 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         || request.databank_path.trim().is_empty()
     {
         return Err("data, broker and databank paths are required".into());
+    }
+    if request.mode == DiscoverMode::New
+        && request
+            .selected_symbol
+            .as_deref()
+            .is_none_or(|symbol| symbol.trim().is_empty())
+    {
+        return Err("select a symbol before starting Discover".into());
+    }
+    if request.mode == DiscoverMode::New {
+        let broker = load_bound_broker(&request.broker_path, None)?;
+        validate_selected_symbol(request.selected_symbol.as_deref(), &broker.symbol)?;
     }
     if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
@@ -849,6 +870,7 @@ fn run_discovery(
     }
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1.metadata.as_ref())?;
+    validate_selected_symbol(request.selected_symbol.as_deref(), &broker.symbol)?;
     let m1_quality = quantforge_data::DataQualityReport::analyze(&m1.dataset);
     if m1_quality.grade == quantforge_data::QualityGrade::Fail {
         return Err(format!(
@@ -1319,6 +1341,18 @@ fn run_discovery(
         stop.load(Ordering::SeqCst),
         &clock,
     )
+}
+
+fn validate_selected_symbol(selected: Option<&str>, broker_symbol: &str) -> Result<(), String> {
+    let Some(selected) = selected.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if !selected.eq_ignore_ascii_case(broker_symbol) {
+        return Err(format!(
+            "selected symbol {selected} does not match the bound data/broker symbol {broker_symbol}; reselect {selected} to refresh all pack paths"
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2465,6 +2499,7 @@ mod tests {
     fn request(databank_path: String) -> DiscoverRequest {
         DiscoverRequest {
             mode: DiscoverMode::New,
+            selected_symbol: Some("EURUSD".into()),
             data_path: fixture("EURUSD_M15_sample.tsv"),
             decision_timeframe: Some(DecisionTimeframe::M15),
             metadata_path: Some(fixture("EURUSD_M15_sample.metadata.csv")),
@@ -2551,6 +2586,17 @@ mod tests {
         request.mode = DiscoverMode::Continue;
         let error = validate_request(&request).expect_err("override must fail");
         assert!(error.contains("immutable configuration"));
+    }
+
+    #[test]
+    fn new_discovery_rejects_a_stale_cross_symbol_binding() {
+        let directory = tempdir().expect("temp directory");
+        let mut request = request(directory.path().join("bank.json").display().to_string());
+        request.selected_symbol = Some("AUDUSD".into());
+
+        let error = validate_request(&request).expect_err("EURUSD inputs cannot run as AUDUSD");
+        assert!(error.contains("selected symbol AUDUSD"));
+        assert!(error.contains("EURUSD"));
     }
 
     #[test]
