@@ -1514,7 +1514,8 @@ function ResultsDetailPage({
           retention={evidence?.m1_retention ?? null}
           fallback={detail?.robustness?.paramPermutation ?? null}
         />
-        <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} />
+        <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Development CPCV analysis" />
+        <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential walk-forward analysis" />
       </div>
 
       {detail?.thesis && (
@@ -1550,7 +1551,10 @@ function ResultsDetailPage({
       )}
 
       {analysisTab === "walkForward" && (
-        <section className="results-analysis-single"><WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} expanded /></section>
+        <section className="results-analysis-single">
+          <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Development CPCV analysis" expanded />
+          <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential walk-forward analysis" expanded />
+        </section>
       )}
 
       {analysisTab === "monteCarlo" && (
@@ -2240,15 +2244,17 @@ function MetricHistogram({
 function WalkForwardPanel({
   evidence,
   fallback,
+  title = "Development CPCV analysis",
   expanded = false,
 }: {
   evidence: RobustnessEvidence["walk_forward"] | null;
   fallback: string | null;
+  title?: string;
   expanded?: boolean;
 }) {
   if (!evidence) {
     return (
-      <RobustnessShell title="Development CPCV analysis" status={{ label: "not recorded", tone: "unknown" }}>
+      <RobustnessShell title={title} status={{ label: "not recorded", tone: "unknown" }}>
         <RobustnessMissing fallback={fallback} />
       </RobustnessShell>
     );
@@ -2260,7 +2266,7 @@ function WalkForwardPanel({
   const scorePercent = (evidence.passing_fraction * 100).toFixed(0);
   return (
     <RobustnessShell
-      title="Development CPCV analysis"
+      title={title}
       status={{ label: passed ? "passed" : "failed", tone: passed ? "pass" : "fail" }}
     >
       <div className="wf-score-card">

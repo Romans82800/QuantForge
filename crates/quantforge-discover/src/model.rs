@@ -1300,7 +1300,12 @@ pub struct ParameterNeighborhoodEvidence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RobustnessEvidence {
     pub m1_retention: M1RetentionEvidence,
+    /// Purged combinatorial cross-validation on Development.
     pub walk_forward: WalkForwardEvidence,
+    /// Chronological expanding-window style test run after CPCV. Older
+    /// databanks predate this separate stage and deserialize it as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequential_walk_forward: Option<WalkForwardEvidence>,
     pub monte_carlo: MonteCarloReport,
     pub parameter_neighborhood: ParameterNeighborhoodEvidence,
 }
@@ -1376,6 +1381,7 @@ pub enum DepositDecision {
     RejectedOos1,
     RejectedDevelopmentExpectancy,
     RejectedM1Fidelity,
+    RejectedCpcv,
     RejectedWalkForward,
     RejectedMonteCarlo,
     RejectedParamNeighborhood,
@@ -1415,6 +1421,8 @@ pub struct DiscoverTelemetry {
     #[serde(default)]
     pub rejected_m1_fidelity: u64,
     #[serde(default)]
+    pub rejected_cpcv: u64,
+    #[serde(default)]
     pub rejected_walk_forward: u64,
     #[serde(default)]
     pub rejected_monte_carlo: u64,
@@ -1441,6 +1449,11 @@ pub struct DiscoverTelemetry {
     /// Last observed in-flight (actively running) promotion jobs.
     #[serde(default)]
     pub promotion_inflight: u64,
+    /// Development-approved parents available to the frozen-structure lane.
+    #[serde(default)]
+    pub specialist_accepted: u64,
+    #[serde(default)]
+    pub specialist_replaced: u64,
 }
 
 impl DiscoverTelemetry {
@@ -1474,6 +1487,7 @@ impl DiscoverTelemetry {
                 self.rejected_development_expectancy += 1;
             }
             DepositDecision::RejectedM1Fidelity => self.rejected_m1_fidelity += 1,
+            DepositDecision::RejectedCpcv => self.rejected_cpcv += 1,
             DepositDecision::RejectedWalkForward => self.rejected_walk_forward += 1,
             DepositDecision::RejectedMonteCarlo => self.rejected_monte_carlo += 1,
             DepositDecision::RejectedParamNeighborhood => self.rejected_param_neighborhood += 1,
@@ -1501,6 +1515,13 @@ pub struct Databank {
     pub accepted_pool: Vec<Elite>,
     #[serde(default)]
     pub accepted_coverage_map: BTreeMap<String, ContentHash>,
+    /// Development-only parents that passed M1 fidelity, CPCV, sequential
+    /// walk-forward, Monte Carlo and parameter-plateau gates. OOS1 never
+    /// determines membership or ranking in this specialist breeding pool.
+    #[serde(default)]
+    pub specialist_pool: Vec<Elite>,
+    #[serde(default)]
+    pub specialist_coverage_map: BTreeMap<String, ContentHash>,
     /// Promotion databank: elites that passed Development M1/CPCV/MC/parameter
     /// robustness and the subsequent OOS1 validation gate. OOS2 is absent.
     pub elites: Vec<Elite>,
@@ -1568,6 +1589,16 @@ impl Databank {
                 )
             })
             .collect();
+        let specialist_coverage: BTreeMap<_, _> = self
+            .specialist_pool
+            .iter()
+            .map(|elite| {
+                (
+                    elite.structural_fingerprint.to_string(),
+                    elite.structural_fingerprint.clone(),
+                )
+            })
+            .collect();
         validate_archive_entries(
             &self.elites,
             &elite_coverage,
@@ -1578,6 +1609,13 @@ impl Databank {
         validate_archive_entries(
             &self.accepted_pool,
             &pot_coverage,
+            &self.config,
+            self.completed_generations,
+            ArchiveKind::BreedingBag,
+        )?;
+        validate_archive_entries(
+            &self.specialist_pool,
+            &specialist_coverage,
             &self.config,
             self.completed_generations,
             ArchiveKind::BreedingBag,

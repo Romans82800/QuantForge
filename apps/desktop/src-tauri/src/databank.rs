@@ -1171,9 +1171,13 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
             "m1_fidelity",
             "Failed Selected-TF to M1 return, trade-count or drawdown retention.",
         ),
+        RobustnessReject::Cpcv => (
+            "cpcv",
+            "Failed the purged combinatorial Development cross-validation requirement.",
+        ),
         RobustnessReject::WalkForward => (
             "walk_forward",
-            "Failed the M1 walk-forward stability requirement.",
+            "Failed the sequential Development walk-forward stability requirement.",
         ),
         RobustnessReject::MonteCarlo => (
             "monte_carlo",

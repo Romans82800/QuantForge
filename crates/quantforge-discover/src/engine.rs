@@ -1,4 +1,6 @@
-use crate::archive::{CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank};
+use crate::archive::{
+    CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank, deposit_to_specialist_pool,
+};
 use crate::grammar::{
     apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
 };
@@ -15,7 +17,10 @@ use quantforge_data::{BarDataset, QuoteBarDataset, bar_content_hash};
 use quantforge_eval::ScoutResult;
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_ir::StrategyIr;
-use quantforge_quality::{deflated_trade_sharpe, expected_max_lucky_sharpe, trade_sharpe_proxy};
+use quantforge_quality::{
+    deflated_trade_sharpe, expected_max_lucky_sharpe, perturb_strategy_parameters,
+    trade_sharpe_proxy,
+};
 use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -264,21 +269,19 @@ fn evaluate_and_deposit(
 }
 
 enum PromotionOutcome {
-    Oos1Rejected,
     DevelopmentExpectancyRejected,
     DatabankGateRejected,
     RobustnessRejected {
         reject: crate::robustness::RobustnessReject,
     },
-    EvaluationError {
-        message: String,
-    },
-    Ready {
-        pot_evaluation: CandidateEvaluation,
-        m1_result: ScoutResult,
-        robustness: Option<crate::model::RobustnessEvidence>,
+    DevelopmentApproved {
+        candidate: CandidateEvaluation,
+        oos1_passed: bool,
         oos1_expectancy: Option<f64>,
         oos1_expectancy_ratio: Option<f64>,
+    },
+    EvaluationError {
+        message: String,
     },
 }
 
@@ -523,6 +526,21 @@ fn promote_one(
         return PromotionOutcome::DevelopmentExpectancyRejected;
     }
 
+    let development_candidate = CandidateEvaluation {
+        strategy: pot_evaluation.strategy.clone(),
+        result: m1_outcome.0.clone(),
+        generation: pot_evaluation.generation,
+        is_expectancy: development_expectancy,
+        oos1_expectancy: None,
+        oos1_expectancy_ratio: None,
+        observed_trade_sharpe: pot_evaluation.observed_trade_sharpe,
+        expected_max_lucky_sharpe: pot_evaluation.expected_max_lucky_sharpe,
+        deflated_trade_sharpe: pot_evaluation.deflated_trade_sharpe,
+        multi_symbol_results: pot_evaluation.multi_symbol_results.clone(),
+        gate_results: pot_evaluation.gate_results.clone(),
+        robustness: m1_outcome.1.clone(),
+    };
+
     // OOS1 is a validation gate, never a breeding or ranking input. It opens
     // only after the candidate has survived the complete Development battery.
     // The replay joins Development + OOS1 solely to preserve indicator warmup,
@@ -530,10 +548,9 @@ fn promote_one(
     let Some(oos1) = context.oos1.as_deref() else {
         // Explicit unsplit/methodology runs remain research-only. Desktop
         // production runs always provide the frozen OOS1 partition.
-        return PromotionOutcome::Ready {
-            pot_evaluation,
-            m1_result: m1_outcome.0,
-            robustness: m1_outcome.1,
+        return PromotionOutcome::DevelopmentApproved {
+            candidate: development_candidate,
+            oos1_passed: true,
             oos1_expectancy: None,
             oos1_expectancy_ratio: None,
         };
@@ -574,13 +591,17 @@ fn promote_one(
         oos1_expectancy,
         context.oos1_expectancy_retention,
     ) {
-        return PromotionOutcome::Oos1Rejected;
+        return PromotionOutcome::DevelopmentApproved {
+            candidate: development_candidate,
+            oos1_passed: false,
+            oos1_expectancy: Some(oos1_expectancy),
+            oos1_expectancy_ratio: None,
+        };
     }
     let oos1_expectancy_ratio = oos1_expectancy / development_expectancy;
-    PromotionOutcome::Ready {
-        pot_evaluation,
-        m1_result: m1_outcome.0,
-        robustness: m1_outcome.1,
+    PromotionOutcome::DevelopmentApproved {
+        candidate: development_candidate,
+        oos1_passed: true,
         oos1_expectancy: Some(oos1_expectancy),
         oos1_expectancy_ratio: Some(oos1_expectancy_ratio),
     }
@@ -591,9 +612,6 @@ fn apply_promotion_outcome(
     outcome: PromotionOutcome,
 ) -> Result<(), DiscoverError> {
     match outcome {
-        PromotionOutcome::Oos1Rejected => {
-            bank.telemetry.record(DepositDecision::RejectedOos1);
-        }
         PromotionOutcome::DevelopmentExpectancyRejected => {
             bank.telemetry
                 .record(DepositDecision::RejectedDevelopmentExpectancy);
@@ -608,6 +626,9 @@ fn apply_promotion_outcome(
             crate::robustness::RobustnessReject::WalkForward => {
                 bank.telemetry.record(DepositDecision::RejectedWalkForward);
             }
+            crate::robustness::RobustnessReject::Cpcv => {
+                bank.telemetry.record(DepositDecision::RejectedCpcv);
+            }
             crate::robustness::RobustnessReject::MonteCarlo => {
                 bank.telemetry.record(DepositDecision::RejectedMonteCarlo);
             }
@@ -620,35 +641,39 @@ fn apply_promotion_outcome(
             *bank.telemetry.evaluation_errors.entry(message).or_default() += 1;
             bank.telemetry.record(DepositDecision::RejectedEvaluation);
         }
-        PromotionOutcome::Ready {
-            pot_evaluation,
-            m1_result,
-            robustness,
+        PromotionOutcome::DevelopmentApproved {
+            candidate,
+            oos1_passed,
             oos1_expectancy,
             oos1_expectancy_ratio,
         } => {
-            let multi_symbol_results = pot_evaluation.multi_symbol_results.clone();
-            let deflated_trade_sharpe = pot_evaluation.deflated_trade_sharpe;
-            let m1_expectancy = m1_result.metrics.expectancy;
-            let bank_evaluation = CandidateEvaluation {
-                result: m1_result,
-                is_expectancy: m1_expectancy,
+            // OOS1 fields are absent from the Development specialist parent.
+            // This makes leakage structurally impossible in its breeding lane.
+            let specialist_decision = deposit_to_specialist_pool(bank, candidate.clone())?;
+            match specialist_decision {
+                DepositDecision::AcceptedToPot => bank.telemetry.specialist_accepted += 1,
+                DepositDecision::ReplacedInPot => bank.telemetry.specialist_replaced += 1,
+                _ => {}
+            }
+            if !oos1_passed {
+                bank.telemetry.record(DepositDecision::RejectedOos1);
+                return Ok(());
+            }
+            let m1_expectancy = candidate.result.metrics.expectancy;
+            let mut bank_evaluation = candidate;
+            bank_evaluation.oos1_expectancy = oos1_expectancy;
+            bank_evaluation.oos1_expectancy_ratio = oos1_expectancy_ratio;
+            bank_evaluation.gate_results = build_gate_results(
+                m1_expectancy,
                 oos1_expectancy,
                 oos1_expectancy_ratio,
-                gate_results: build_gate_results(
-                    m1_expectancy,
-                    oos1_expectancy,
-                    oos1_expectancy_ratio,
-                    oos1_expectancy.is_some(),
-                    None,
-                    &multi_symbol_results,
-                    bank.config.multi_symbol_minimum_pass,
-                    deflated_trade_sharpe,
-                    bank.config.minimum_deflated_trade_sharpe,
-                ),
-                robustness,
-                ..pot_evaluation
-            };
+                oos1_expectancy.is_some(),
+                None,
+                &bank_evaluation.multi_symbol_results,
+                bank.config.multi_symbol_minimum_pass,
+                bank_evaluation.deflated_trade_sharpe,
+                bank.config.minimum_deflated_trade_sharpe,
+            );
             let bank_decision = deposit_to_databank(bank, bank_evaluation)?;
             bank.telemetry.record(bank_decision);
         }
@@ -856,6 +881,8 @@ pub fn evolve_new_with_pack_and_quotes(
         coverage_map: BTreeMap::new(),
         accepted_pool: Vec::new(),
         accepted_coverage_map: BTreeMap::new(),
+        specialist_pool: Vec::new(),
+        specialist_coverage_map: BTreeMap::new(),
         telemetry: Default::default(),
     };
 
@@ -1188,6 +1215,22 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 return fresh_seed(&mut rng);
             }
 
+            // A separate exploitation lane starts only from candidates that
+            // passed the complete Development battery. It freezes the logical
+            // tree and execution modules and perturbs existing numeric genes.
+            if !bank.specialist_pool.is_empty() && rng.gen_bool(0.25) {
+                let parent = tournament_in(&bank.specialist_pool, &bank.config, &mut rng);
+                if let Ok(mut child) = perturb_strategy_parameters(
+                    &bank.specialist_pool[parent].strategy,
+                    bank.config.robustness_perturbation_fraction,
+                    sequence as usize,
+                    bank.config.seed ^ generation,
+                ) {
+                    child.id = format!("g{generation}-{index}-specialist");
+                    return child;
+                }
+            }
+
             let first_index = tournament(bank, &mut rng, None);
             let first = &bank.accepted_pool[first_index];
             let second_index = tournament(bank, &mut rng, None);
@@ -1510,6 +1553,17 @@ fn tournament(
             &bank.accepted_pool[winner],
             bank.config.novelty_weight,
         ) {
+            winner = contender;
+        }
+    }
+    winner
+}
+
+fn tournament_in(pool: &[Elite], config: &DiscoverConfig, rng: &mut ChaCha8Rng) -> usize {
+    let mut winner = rng.gen_range(0..pool.len());
+    for _ in 1..config.tournament_size {
+        let contender = rng.gen_range(0..pool.len());
+        if selection_is_better(&pool[contender], &pool[winner], config.novelty_weight) {
             winner = contender;
         }
     }

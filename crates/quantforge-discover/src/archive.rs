@@ -63,6 +63,20 @@ pub(crate) fn deposit_to_databank(
     )
 }
 
+pub(crate) fn deposit_to_specialist_pool(
+    bank: &mut Databank,
+    candidate: CandidateEvaluation,
+) -> Result<DepositDecision, quantforge_ir::IrError> {
+    deposit_into_stack(
+        &mut bank.specialist_pool,
+        &mut bank.specialist_coverage_map,
+        bank.config.correlation_threshold,
+        candidate,
+        DepositDecision::AcceptedToPot,
+        DepositDecision::ReplacedInPot,
+    )
+}
+
 /// Fingerprint-keyed stacking bag (no niche uniqueness / replacement).
 fn deposit_into_stack(
     entries: &mut Vec<Elite>,
@@ -409,6 +423,8 @@ mod tests {
             evaluation_count: 0,
             accepted_pool: Vec::new(),
             accepted_coverage_map: BTreeMap::new(),
+            specialist_pool: Vec::new(),
+            specialist_coverage_map: BTreeMap::new(),
             elites: Vec::new(),
             coverage_map: BTreeMap::new(),
             telemetry: DiscoverTelemetry::default(),

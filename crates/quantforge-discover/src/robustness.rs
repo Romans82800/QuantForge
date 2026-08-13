@@ -35,6 +35,7 @@ pub struct RobustnessOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RobustnessReject {
     M1Fidelity,
+    Cpcv,
     WalkForward,
     MonteCarlo,
     ParamNeighborhood,
@@ -138,7 +139,7 @@ pub fn run_m1_predeposit_robustness(
     let (fold_rows, fold_scheme, purge_bars, embargo_bars, required_fraction) =
         if config.calendar_year_folds {
             let ranges = calendar_year_fold_ranges(is_decision, &broker.timezone)
-                .map_err(|_| RobustnessReject::WalkForward)?;
+                .map_err(|_| RobustnessReject::Cpcv)?;
             let rows = evaluate_development_ranges(
                 strategy,
                 is_decision,
@@ -171,12 +172,12 @@ pub fn run_m1_predeposit_robustness(
             )
         };
     if fold_rows.is_empty() {
-        return Err(RobustnessReject::WalkForward);
+        return Err(RobustnessReject::Cpcv);
     }
     let passing_folds = fold_rows.iter().filter(|fold| fold.passed).count();
     let fold_fraction = passing_folds as f64 / fold_rows.len().max(1) as f64;
     if fold_fraction + 1e-12 < required_fraction {
-        return Err(RobustnessReject::WalkForward);
+        return Err(RobustnessReject::Cpcv);
     }
     let walk_forward_evidence = WalkForwardEvidence {
         fold_scheme,
@@ -187,6 +188,38 @@ pub fn run_m1_predeposit_robustness(
         purge_bars,
         embargo_bars,
         folds: fold_rows,
+    };
+
+    // CPCV deliberately permutes held-out Development groups and therefore
+    // does not test chronological degradation. Follow it with distinct,
+    // ordered windows so regime decay must also survive before promotion.
+    let sequential_ranges =
+        sequential_walk_forward_ranges(is_decision.bars.len(), config.folds.max(3))
+            .ok_or(RobustnessReject::WalkForward)?;
+    let sequential_rows = evaluate_development_ranges(
+        strategy,
+        is_decision,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+        config,
+        &sequential_ranges,
+    )?;
+    let sequential_passing = sequential_rows.iter().filter(|fold| fold.passed).count();
+    let sequential_fraction = sequential_passing as f64 / sequential_rows.len().max(1) as f64;
+    if sequential_fraction + 1e-12 < config.minimum_passing_fold_fraction {
+        return Err(RobustnessReject::WalkForward);
+    }
+    let sequential_walk_forward = WalkForwardEvidence {
+        fold_scheme: "development_sequential_walk_forward".into(),
+        total_folds: sequential_rows.len(),
+        passing_folds: sequential_passing,
+        passing_fraction: sequential_fraction,
+        required_passing_fraction: config.minimum_passing_fold_fraction,
+        purge_bars: 0,
+        embargo_bars: 0,
+        folds: sequential_rows,
     };
 
     let profits: Vec<_> = baseline
@@ -309,6 +342,7 @@ pub fn run_m1_predeposit_robustness(
         evidence: Some(RobustnessEvidence {
             m1_retention: retention_evidence,
             walk_forward: walk_forward_evidence,
+            sequential_walk_forward: Some(sequential_walk_forward),
             monte_carlo: mc,
             parameter_neighborhood: ParameterNeighborhoodEvidence {
                 method: "systematic_axis_plus_seeded_joint".into(),
@@ -675,6 +709,34 @@ pub(crate) fn calendar_year_fold_ranges(
     } else {
         Ok(ranges)
     }
+}
+
+/// Ordered, non-overlapping Development test windows used after CPCV.
+/// Indicator warm-up is supplied by `evaluate_development_window`; only trades
+/// entering inside each chronological window are scored.
+fn sequential_walk_forward_ranges(
+    bars: usize,
+    requested_folds: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let folds = requested_folds.clamp(3, 10);
+    if bars < folds.saturating_mul(50) {
+        return None;
+    }
+    let base = bars / folds;
+    let mut ranges = Vec::with_capacity(folds);
+    for fold in 0..folds {
+        let start = fold.saturating_mul(base);
+        let end = if fold + 1 == folds {
+            bars
+        } else {
+            (fold + 1).saturating_mul(base)
+        };
+        if end.saturating_sub(start) < 50 {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    Some(ranges)
 }
 
 /// SQX RetestWithHigherPrecision acceptance (80% net/return, 80% trades, DD < 130%).
@@ -1181,6 +1243,17 @@ mod tests {
         assert_eq!(combinations.len(), 15);
         assert_eq!(combinations.first(), Some(&vec![0, 1]));
         assert_eq!(combinations.last(), Some(&vec![4, 5]));
+    }
+
+    #[test]
+    fn sequential_walk_forward_is_chronological_and_non_overlapping() {
+        let ranges = sequential_walk_forward_ranges(1_000, 5).unwrap();
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges.first(), Some(&(0, 200)));
+        assert_eq!(ranges.last(), Some(&(800, 1_000)));
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
     }
 
     #[test]

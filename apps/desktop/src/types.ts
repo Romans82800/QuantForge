@@ -249,6 +249,16 @@ export interface RobustnessEvidence {
     required_passing_fraction: number;
     folds?: WalkForwardFold[];
   };
+  sequential_walk_forward?: {
+    fold_scheme: string;
+    purge_bars?: number;
+    embargo_bars?: number;
+    total_folds: number;
+    passing_folds: number;
+    passing_fraction: number;
+    required_passing_fraction: number;
+    folds?: WalkForwardFold[];
+  } | null;
   monte_carlo: {
     method: string;
     seed: number;
