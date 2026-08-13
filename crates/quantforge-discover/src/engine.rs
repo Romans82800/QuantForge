@@ -319,6 +319,14 @@ struct PromotionShared {
 struct PromotionPipeline {
     pool: Option<rayon::ThreadPool>,
     shared: Arc<PromotionShared>,
+    /// One immutable market-data context for the lifetime of the session.
+    ///
+    /// Previously `evaluate_and_deposit` cloned every Development/OOS1/M1/
+    /// quote dataset once per generation.  A backed-up promotion queue then
+    /// retained dozens of complete copies and could exhaust workstation RAM
+    /// during an overnight run.  Resume validation guarantees that a session
+    /// cannot change feeds, so sharing this context is both safe and exact.
+    context: Mutex<Option<Arc<PromotionContext>>>,
 }
 
 impl PromotionPipeline {
@@ -332,6 +340,7 @@ impl PromotionPipeline {
                 capacity: capacity.max(1),
                 wake: Condvar::new(),
             }),
+            context: Mutex::new(None),
         })
     }
 
@@ -358,7 +367,14 @@ impl PromotionPipeline {
         quote_dataset: Option<&QuoteBarDataset>,
         broker: &SymbolSpecification,
     ) -> Arc<PromotionContext> {
-        Arc::new(PromotionContext {
+        let mut cached = self
+            .context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(context) = cached.as_ref() {
+            return Arc::clone(context);
+        }
+        let context = Arc::new(PromotionContext {
             dataset: Arc::new(dataset.clone()),
             oos1: oos1_dataset.map(|data| Arc::new(data.clone())),
             m1: Arc::new(m1_dataset.clone()),
@@ -369,7 +385,9 @@ impl PromotionPipeline {
             minimum_development_expectancy_r: config.minimum_development_expectancy_r,
             require_m1_robustness: config.require_m1_robustness,
             robustness: robustness_config_from_discover(config),
-        })
+        });
+        *cached = Some(Arc::clone(&context));
+        context
     }
 
     fn enqueue(
@@ -1054,12 +1072,15 @@ impl EvolutionSession {
     /// `decision_bars` must be the bar count of the one decision dataset this
     /// session will be advanced against; buffers are keyed to those bars.
     pub fn new(config: &DiscoverConfig, decision_bars: usize) -> Result<Self, DiscoverError> {
+        // Robustness replays are memory-heavy and a large queued backlog adds
+        // no search quality.  Keep at most two active jobs and eight retained
+        // candidates even when an older profile requested the legacy 64-job
+        // queue.  Scout throughput remains independently configurable.
+        let promotion_workers = config.resolved_promotion_worker_threads().clamp(1, 2);
+        let promotion_capacity = config.promotion_queue_capacity.clamp(1, 8);
         Ok(Self {
             scout_pool: build_worker_pool(config.resolved_scout_worker_threads())?,
-            promotion: PromotionPipeline::new(
-                config.resolved_promotion_worker_threads(),
-                config.promotion_queue_capacity,
-            )?,
+            promotion: PromotionPipeline::new(promotion_workers, promotion_capacity)?,
             indicator_cache: Arc::new(IndicatorBufferCache::new(decision_bars)),
         })
     }
@@ -2223,6 +2244,20 @@ mod tests {
         let mut config = DiscoverConfig::default();
         config.promotion_queue_capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn promotion_context_is_shared_across_generations() {
+        let dataset = dataset();
+        let broker = broker();
+        let config = config();
+        let pipeline = PromotionPipeline::new(1, 2).unwrap();
+        let first = pipeline.context_for(&config, &dataset, None, &dataset, None, &broker);
+        let second = pipeline.context_for(&config, &dataset, None, &dataset, None, &broker);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.dataset, &second.dataset));
+        assert!(Arc::ptr_eq(&first.m1, &second.m1));
     }
 
     #[test]
