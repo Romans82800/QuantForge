@@ -1304,6 +1304,20 @@ enum EntryOrderKind {
     Limit,
 }
 
+/// Derive an independent deterministic lane from a candidate selector.
+///
+/// Rotating the same FNV hash is not enough separation when candidate ids are
+/// sequential: modulo-small decisions (order kind and on/off feature flags)
+/// can become perfectly correlated. SplitMix64's avalanche step gives each
+/// execution gene its own reproducible stream without coupling it to another.
+fn execution_gene_lane(selector: u64, salt: u64) -> u64 {
+    let mut value = selector ^ salt;
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 /// Restrict the grammar to the individually enabled execution genes.  The
 /// selector is derived from the immutable candidate id, so it is deterministic
 /// across replays while still giving the search both an off-state and several
@@ -1353,8 +1367,9 @@ fn enforce_execution_feature_flags(
         enabled.push(EntryOrderKind::Limit);
     }
     // `validate` rejects a run with nothing enabled; market keeps replay safe.
+    let order_lane = execution_gene_lane(selector, 0x6f72_6465_725f_7479);
     let chosen = enabled
-        .get(selector as usize % enabled.len().max(1))
+        .get(order_lane as usize % enabled.len().max(1))
         .copied()
         .unwrap_or(EntryOrderKind::Market);
     strategy.entry.order = match chosen {
@@ -1369,25 +1384,32 @@ fn enforce_execution_feature_flags(
         },
     };
 
-    if !config.allow_break_even || selector.rotate_left(7) % 3 == 0 {
+    let break_even_lane = execution_gene_lane(selector, 0x6272_6561_6b5f_6576);
+    let trailing_lane = execution_gene_lane(selector, 0x7472_6169_6c69_6e67);
+    let partial_lane = execution_gene_lane(selector, 0x7061_7274_6961_6c73);
+
+    if !config.allow_break_even || break_even_lane % 3 == 0 {
         strategy.manage.break_even_at_r = None;
     } else if strategy.manage.break_even_at_r.is_none() {
-        strategy.manage.break_even_at_r = Some([0.75, 1.0, 1.25, 1.5][selector as usize % 4]);
+        strategy.manage.break_even_at_r =
+            Some([0.75, 1.0, 1.25, 1.5][break_even_lane as usize % 4]);
     }
-    if !config.allow_trailing_stops || selector.rotate_left(13) % 3 == 0 {
+    if !config.allow_trailing_stops || trailing_lane % 3 == 0 {
         strategy.manage.trailing = None;
     } else if strategy.manage.trailing.is_none() {
         strategy.manage.trailing = Some(TrailingPolicy::RiskMultiple {
-            activate_at_r: [1.0, 1.5, 2.0][selector as usize % 3],
-            distance_r: [0.5, 0.75, 1.0][selector.rotate_left(19) as usize % 3],
+            activate_at_r: [1.0, 1.5, 2.0][trailing_lane as usize % 3],
+            distance_r: [0.5, 0.75, 1.0]
+                [execution_gene_lane(selector, 0x7472_6169_6c5f_7061) as usize % 3],
         });
     }
-    if !config.allow_partial_exits || selector.rotate_left(23) % 3 == 0 {
+    if !config.allow_partial_exits || partial_lane % 3 == 0 {
         strategy.manage.partial_exits.clear();
     } else if strategy.manage.partial_exits.is_empty() {
         strategy.manage.partial_exits.push(PartialExit {
-            at_r: [0.75, 1.0, 1.25, 1.5][selector.rotate_left(29) as usize % 4],
-            fraction: [0.25, 0.5, 0.75][selector.rotate_left(31) as usize % 3],
+            at_r: [0.75, 1.0, 1.25, 1.5][partial_lane as usize % 4],
+            fraction: [0.25, 0.5, 0.75]
+                [execution_gene_lane(selector, 0x7061_7274_5f66_7261) as usize % 3],
         });
     }
 }
@@ -1947,6 +1969,47 @@ mod tests {
             strategy.entry.order,
             quantforge_ir::EntryOrderPolicy::Limit { .. }
         )));
+
+        let management_enabled = |strategy: &&StrategyIr| {
+            strategy.manage.break_even_at_r.is_some()
+                || strategy.manage.trailing.is_some()
+                || !strategy.manage.partial_exits.is_empty()
+        };
+        assert!(
+            candidates
+                .iter()
+                .filter(management_enabled)
+                .any(|strategy| {
+                    matches!(
+                        strategy.entry.order,
+                        quantforge_ir::EntryOrderPolicy::Market
+                    )
+                })
+        );
+        assert!(candidates.iter().any(|strategy| {
+            matches!(
+                strategy.entry.order,
+                quantforge_ir::EntryOrderPolicy::Stop { .. }
+                    | quantforge_ir::EntryOrderPolicy::Limit { .. }
+            ) && strategy.manage.break_even_at_r.is_none()
+                && strategy.manage.trailing.is_none()
+                && strategy.manage.partial_exits.is_empty()
+        }));
+        assert!(candidates.iter().any(|strategy| {
+            strategy.manage.break_even_at_r.is_some()
+                && strategy.manage.trailing.is_none()
+                && strategy.manage.partial_exits.is_empty()
+        }));
+        assert!(candidates.iter().any(|strategy| {
+            strategy.manage.break_even_at_r.is_none()
+                && strategy.manage.trailing.is_some()
+                && strategy.manage.partial_exits.is_empty()
+        }));
+        assert!(candidates.iter().any(|strategy| {
+            strategy.manage.break_even_at_r.is_none()
+                && strategy.manage.trailing.is_none()
+                && !strategy.manage.partial_exits.is_empty()
+        }));
     }
 
     #[test]
