@@ -574,6 +574,8 @@ export interface DiscoverRequest {
   promotionWorkerThreads: number | null;
   /** Max waiting + in-flight promotions before backpressure. */
   promotionQueueCapacity: number | null;
+  /** Hard resident-memory ceiling in MiB; reaching it stops and checkpoints safely. */
+  maxMemoryMb: number | null;
   requireM1Robustness: boolean | null;
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
@@ -704,6 +706,8 @@ export interface DiscoverJobView {
   workerThreads: number;
   promotionWorkerThreads: number;
   promotionQueueCapacity: number;
+  maxMemoryMb: number;
+  residentMemoryMb: number;
   promotionQueueDepth: number;
   promotionInflight: number;
   promotionsEnqueued: number;

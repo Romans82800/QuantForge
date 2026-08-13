@@ -122,6 +122,9 @@ pub struct DiscoverRequest {
     promotion_worker_threads: Option<usize>,
     /// Max waiting + in-flight promotions before backpressure.
     promotion_queue_capacity: Option<usize>,
+    /// Process resident-memory ceiling. The worker stops and writes its final
+    /// artifact before the operating system is forced to kill it.
+    max_memory_mb: Option<u64>,
     require_m1_robustness: Option<bool>,
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
@@ -200,6 +203,8 @@ pub struct DiscoverJobView {
     worker_threads: usize,
     promotion_worker_threads: usize,
     promotion_queue_capacity: usize,
+    max_memory_mb: u64,
+    resident_memory_mb: u64,
     promotion_queue_depth: u64,
     promotion_inflight: u64,
     promotions_enqueued: u64,
@@ -299,6 +304,8 @@ impl DiscoverJobView {
             worker_threads: 0,
             promotion_worker_threads: 0,
             promotion_queue_capacity: 64,
+            max_memory_mb: 8_192,
+            resident_memory_mb: 0,
             promotion_queue_depth: 0,
             promotion_inflight: 0,
             promotions_enqueued: 0,
@@ -473,6 +480,8 @@ pub fn start_discover(
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
         promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
+        max_memory_mb: request.max_memory_mb.unwrap_or(8_192),
+        resident_memory_mb: resident_memory_mb().unwrap_or(0),
         promotion_queue_depth: 0,
         promotion_inflight: 0,
         promotions_enqueued: 0,
@@ -1233,6 +1242,21 @@ fn run_discovery(
             &clock,
         )?;
 
+        let resident_mb = resident_memory_mb().unwrap_or(0);
+        if let Ok(mut view) = job.write() {
+            view.resident_memory_mb = resident_mb;
+        }
+        let memory_limit_mb = request.max_memory_mb.unwrap_or(8_192).max(1_024);
+        if resident_mb >= memory_limit_mb {
+            if let Ok(mut view) = job.write() {
+                view.phase = "Memory limit reached — saving safely".into();
+                view.message = format!(
+                    "Resident memory reached {resident_mb} MB of the {memory_limit_mb} MB limit. QuantForge stopped cleanly and is writing the final artifact."
+                );
+            }
+            break;
+        }
+
         let checkpoint_due = clock.active_seconds() - last_checkpoint_active_seconds
             >= RECOVERY_CHECKPOINT_INTERVAL.as_secs_f64();
         if checkpoint_due
@@ -1732,6 +1756,8 @@ fn publish_live_databank(
     let mut live_bank = bank.clone();
     live_bank.accepted_pool.clear();
     live_bank.accepted_coverage_map.clear();
+    live_bank.specialist_pool.clear();
+    live_bank.specialist_coverage_map.clear();
     let artifact = build_discover_artifact(
         request,
         &live_bank,
@@ -1775,6 +1801,22 @@ fn immutable_snapshot_path(databank_path: &str, reason: &str) -> Result<PathBuf,
         suffix += 1;
     }
     Ok(candidate)
+}
+
+fn resident_memory_mb() -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let kib = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib.div_ceil(1_024))
 }
 
 /// Load matching decision-timeframe pack symbols for the identical-parameter
@@ -2160,6 +2202,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
         promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
+        max_accepted_pool_elites: 10_000,
+        max_specialist_pool_elites: 2_000,
+        max_databank_elites: 5_000,
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),

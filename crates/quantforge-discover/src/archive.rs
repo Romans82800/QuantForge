@@ -35,14 +35,20 @@ pub(crate) fn deposit_to_accepted_pool(
     }
     // Breeding pot is a bag: fingerprint dedup + correlation only. Strategies
     // with the same behaviour niche are allowed to stack.
-    deposit_into_stack(
+    let decision = deposit_into_stack(
         &mut bank.accepted_pool,
         &mut bank.accepted_coverage_map,
         bank.config.correlation_threshold,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
-    )
+    )?;
+    trim_pool(
+        &mut bank.accepted_pool,
+        bank.config.max_accepted_pool_elites,
+    );
+    refresh_fingerprint_coverage_map(&bank.accepted_pool, &mut bank.accepted_coverage_map);
+    Ok(decision)
 }
 
 pub(crate) fn deposit_to_databank(
@@ -54,28 +60,55 @@ pub(crate) fn deposit_to_databank(
     }
     // Databank stacks like the pot — no MAP-Elites niche replacement. Niche
     // labels stay as descriptive metadata only.
-    deposit_into_stack(
+    let decision = deposit_into_stack(
         &mut bank.elites,
         &mut bank.coverage_map,
         bank.config.correlation_threshold,
         candidate,
         DepositDecision::AcceptedToDatabank,
         DepositDecision::ReplacedInDatabank,
-    )
+    )?;
+    trim_pool(&mut bank.elites, bank.config.max_databank_elites);
+    refresh_fingerprint_coverage_map(&bank.elites, &mut bank.coverage_map);
+    Ok(decision)
 }
 
 pub(crate) fn deposit_to_specialist_pool(
     bank: &mut Databank,
     candidate: CandidateEvaluation,
 ) -> Result<DepositDecision, quantforge_ir::IrError> {
-    deposit_into_stack(
+    let decision = deposit_into_stack(
         &mut bank.specialist_pool,
         &mut bank.specialist_coverage_map,
         bank.config.correlation_threshold,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
-    )
+    )?;
+    trim_pool(
+        &mut bank.specialist_pool,
+        bank.config.max_specialist_pool_elites,
+    );
+    refresh_fingerprint_coverage_map(&bank.specialist_pool, &mut bank.specialist_coverage_map);
+    Ok(decision)
+}
+
+fn trim_pool(entries: &mut Vec<Elite>, limit: usize) {
+    while entries.len() > limit {
+        let worst = entries
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                left.evidence
+                    .total
+                    .total_cmp(&right.evidence.total)
+                    .then_with(|| left.novelty.total_cmp(&right.novelty))
+                    .then_with(|| right.complexity.cmp(&left.complexity))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        entries.swap_remove(worst);
+    }
 }
 
 /// Fingerprint-keyed stacking bag (no niche uniqueness / replacement).
@@ -255,13 +288,16 @@ fn three_level(value: f64, first: f64, second: f64) -> ThreeLevelBucket {
 }
 
 fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
-    // Raw compounded returns can become enormous and overwhelm every other
-    // quality term. Rank on bounded log growth while retaining the raw M1
-    // metrics for reporting and gates.
-    let return_component = (1.0 + result.metrics.return_percent.max(-99.0) / 100.0)
-        .ln()
-        .mul_add(100.0, 0.0)
-        .clamp(-100.0, 100.0);
+    // Evidence measures quality, not how long a strategy happened to trade.
+    // Compounded return and raw trade count both grow with sample length, so
+    // they previously let mediocre high-frequency strategies outrank compact
+    // high-quality strategies. Use bounded risk-adjusted terms instead.
+    let trades = result.metrics.trade_count.max(1) as f64;
+    let expectancy_r = result.metrics.net_profit / trades / 1_000.0;
+    let expectancy_component = (expectancy_r / 0.40).tanh() * 20.0;
+    let recovery_component = (recovery_factor(&result.metrics) / 5.0).tanh() * 15.0;
+    let sharpe_component = (result.metrics.sharpe_ratio.unwrap_or(0.0) / 3.0).tanh() * 10.0;
+    let return_component = expectancy_component + recovery_component + sharpe_component;
     let effective_profit_factor = result.metrics.profit_factor.unwrap_or({
         if result.metrics.net_profit > 0.0 {
             10.0
@@ -270,12 +306,14 @@ fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
         }
     });
     let profit_factor_component = if effective_profit_factor > 0.0 {
-        effective_profit_factor.min(10.0).ln() * 5.0
+        ((effective_profit_factor - 1.0) / 0.75).tanh() * 20.0
     } else {
-        -10.0
+        -20.0
     };
-    let trade_count_bonus = (result.metrics.trade_count.min(100) as f64) * 0.02;
-    let drawdown_penalty = result.metrics.max_drawdown_percent * 0.5;
+    // Confidence saturates around 300 trades and can contribute at most five
+    // points. 1,500 trades therefore cannot overwhelm expectancy/recovery/PF.
+    let trade_count_bonus = (1.0 - (-(result.metrics.trade_count as f64) / 100.0).exp()) * 5.0;
+    let drawdown_penalty = (result.metrics.max_drawdown_percent / 20.0).tanh() * 20.0;
     let complexity_penalty = strategy.complexity().score as f64 * 0.05;
     let total = return_component + profit_factor_component + trade_count_bonus
         - drawdown_penalty

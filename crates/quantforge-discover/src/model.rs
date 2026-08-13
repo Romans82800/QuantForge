@@ -654,6 +654,17 @@ pub struct DiscoverConfig {
     /// than dropping elites or growing RAM without bound.
     #[serde(default = "default_promotion_queue_capacity")]
     pub promotion_queue_capacity: usize,
+    /// Maximum retained breeding candidates. Lowest-quality candidates are
+    /// evicted when the cap is reached, preventing continuous runs from
+    /// retaining an unbounded reservoir.
+    #[serde(default = "default_max_accepted_pool_elites")]
+    pub max_accepted_pool_elites: usize,
+    /// Maximum Development-tested specialist parents retained in RAM.
+    #[serde(default = "default_max_specialist_pool_elites")]
+    pub max_specialist_pool_elites: usize,
+    /// Maximum promoted databank strategies retained in RAM.
+    #[serde(default = "default_max_databank_elites")]
+    pub max_databank_elites: usize,
     /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
     /// neighborhood battery before databank admission. Pot fill never waits on this.
     #[serde(default = "default_require_m1_robustness")]
@@ -761,6 +772,15 @@ fn default_promotion_worker_threads() -> usize {
 fn default_promotion_queue_capacity() -> usize {
     64
 }
+fn default_max_accepted_pool_elites() -> usize {
+    10_000
+}
+fn default_max_specialist_pool_elites() -> usize {
+    2_000
+}
+fn default_max_databank_elites() -> usize {
+    5_000
+}
 
 fn default_require_m1_robustness() -> bool {
     // Post-breed databank path always runs the M1 robustness battery.
@@ -866,6 +886,9 @@ impl Default for DiscoverConfig {
             worker_threads: default_worker_threads(),
             promotion_worker_threads: default_promotion_worker_threads(),
             promotion_queue_capacity: default_promotion_queue_capacity(),
+            max_accepted_pool_elites: default_max_accepted_pool_elites(),
+            max_specialist_pool_elites: default_max_specialist_pool_elites(),
+            max_databank_elites: default_max_databank_elites(),
             require_m1_robustness: default_require_m1_robustness(),
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
@@ -1121,6 +1144,14 @@ impl DiscoverConfig {
         if self.promotion_queue_capacity == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "promotion_queue_capacity must be greater than zero".into(),
+            ));
+        }
+        if self.max_accepted_pool_elites == 0
+            || self.max_specialist_pool_elites == 0
+            || self.max_databank_elites == 0
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "retained pool limits must be greater than zero".into(),
             ));
         }
         if self.require_m1_robustness {

@@ -3069,6 +3069,7 @@ function DiscoverWorkspace({
     workerThreads: 0,
     promotionWorkerThreads: 0,
     promotionQueueCapacity: 64,
+    maxMemoryMb: 8192,
     requireM1Robustness: true,
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
@@ -3726,6 +3727,7 @@ function DiscoverWorkspace({
               <NumberField label="Scout worker threads (0 = auto)" value={form.workerThreads} onChange={(value) => update("workerThreads", value)} min={0} />
               <NumberField label="Promotion workers (0 = auto 2–4)" value={form.promotionWorkerThreads} onChange={(value) => update("promotionWorkerThreads", value)} min={0} />
               <NumberField label="Promotion queue capacity" value={form.promotionQueueCapacity} onChange={(value) => update("promotionQueueCapacity", value)} min={1} />
+              <NumberField label="Maximum RAM (MB)" value={form.maxMemoryMb} onChange={(value) => update("maxMemoryMb", value)} min={1024} step={1024} />
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
               <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
