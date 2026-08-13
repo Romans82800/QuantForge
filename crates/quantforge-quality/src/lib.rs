@@ -30,7 +30,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const EVIDENCE_PROTOCOL_VERSION: &str = "certification-evidence-v1";
-pub const SPLIT_PLAN_SCHEMA_VERSION: u16 = 1;
+pub const SPLIT_PLAN_SCHEMA_VERSION: u16 = 2;
+const LEGACY_SPLIT_PLAN_SCHEMA_VERSION: u16 = 1;
 pub const CERTIFICATION_SCHEMA_VERSION: u16 = 1;
 pub const VALIDATION_ATTESTATION_SCHEMA_VERSION: u16 = 1;
 
@@ -51,12 +52,104 @@ pub struct DataSegment {
     pub data_hash: ContentHash,
 }
 
+/// Immutable research protocol applied *inside* the chronological development
+/// partition. These folds are reusable development evidence, never OOS1 or the
+/// sealed final. Holding the contract beside the outer split prevents a later
+/// run from silently changing the number of groups or boundary exclusions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentCpcvPlan {
+    pub protocol_version: String,
+    pub groups: usize,
+    pub test_groups: usize,
+    pub purge_bars: usize,
+    pub embargo_bars: usize,
+    pub combinations: usize,
+}
+
+impl Default for DevelopmentCpcvPlan {
+    fn default() -> Self {
+        let groups = 6;
+        let test_groups = 2;
+        Self {
+            protocol_version: "development-cpcv-v1".into(),
+            groups,
+            test_groups,
+            // The production grammar currently caps time exits at 16 decision
+            // bars. Purging by that horizon prevents a trade opened in one
+            // group from leaking its outcome across the next boundary.
+            purge_bars: 16,
+            embargo_bars: 3,
+            combinations: binomial(groups, test_groups),
+        }
+    }
+}
+
+impl DevelopmentCpcvPlan {
+    /// Standard production contract, scaled down only when a short diagnostic
+    /// history cannot accommodate the normal 16/3 boundary policy.
+    pub fn for_development_bars(development_bars: usize) -> Self {
+        let mut plan = Self::default();
+        let smallest_group = development_bars / plan.groups;
+        plan.purge_bars = plan.purge_bars.min(smallest_group.saturating_div(5));
+        plan.embargo_bars = plan.embargo_bars.min(smallest_group.saturating_div(10));
+        plan
+    }
+
+    /// Deterministic lexicographic test-group combinations. Breeding may use
+    /// every returned combination because all groups are inside Development.
+    pub fn test_group_combinations(&self) -> Vec<Vec<usize>> {
+        fn visit(
+            next: usize,
+            remaining: usize,
+            groups: usize,
+            current: &mut Vec<usize>,
+            output: &mut Vec<Vec<usize>>,
+        ) {
+            if remaining == 0 {
+                output.push(current.clone());
+                return;
+            }
+            for group in next..=groups.saturating_sub(remaining) {
+                current.push(group);
+                visit(group + 1, remaining - 1, groups, current, output);
+                current.pop();
+            }
+        }
+
+        let mut output = Vec::with_capacity(self.combinations);
+        visit(
+            0,
+            self.test_groups,
+            self.groups,
+            &mut Vec::with_capacity(self.test_groups),
+            &mut output,
+        );
+        output
+    }
+
+    /// Equal-count chronological group boundaries over Development.
+    pub fn group_ranges(&self, development_bars: usize) -> Vec<(usize, usize)> {
+        (0..self.groups)
+            .map(|group| {
+                (
+                    development_bars * group / self.groups,
+                    development_bars * (group + 1) / self.groups,
+                )
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataSplitPlan {
     pub schema_version: u16,
     pub full_data_hash: ContentHash,
     pub bar_count: usize,
     pub development: DataSegment,
+    /// Present on v2 plans. Legacy v1 artifacts remain readable, but cannot
+    /// claim that their development folds were frozen by the split contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub development_cpcv: Option<DevelopmentCpcvPlan>,
     pub validation: DataSegment,
     pub sealed_final: DataSegment,
 }
@@ -98,14 +191,31 @@ impl DataSplitPlan {
             .checked_add(1)
             .ok_or(EvidenceError::TimestampOverflow)?;
 
+        // Production histories retain the full 16-bar purge and 3-bar
+        // embargo. Tiny fixtures and deliberately short diagnostic imports
+        // receive a proportional boundary instead of an impossible contract
+        // that would consume an entire Development group.
+        // A six-group CPCV claim requires at least one Development bar per
+        // group. Extremely small smoke fixtures retain the legacy outer split
+        // schema instead of advertising evidence they cannot contain.
+        let (schema_version, development_cpcv) = if validation_start >= 6 {
+            (
+                SPLIT_PLAN_SCHEMA_VERSION,
+                Some(DevelopmentCpcvPlan::for_development_bars(validation_start)),
+            )
+        } else {
+            (LEGACY_SPLIT_PLAN_SCHEMA_VERSION, None)
+        };
+
         let plan = Self {
-            schema_version: SPLIT_PLAN_SCHEMA_VERSION,
+            schema_version,
             full_data_hash: dataset.data_hash.clone(),
             bar_count: bars.len(),
             development: segment(
                 &bars[..validation_start],
                 bars[validation_start].timestamp_ms,
             ),
+            development_cpcv,
             validation: segment(
                 &bars[validation_start..sealed_start],
                 bars[sealed_start].timestamp_ms,
@@ -117,8 +227,36 @@ impl DataSplitPlan {
     }
 
     pub fn validate(&self) -> Result<(), EvidenceError> {
-        if self.schema_version != SPLIT_PLAN_SCHEMA_VERSION {
+        if self.schema_version != SPLIT_PLAN_SCHEMA_VERSION
+            && self.schema_version != LEGACY_SPLIT_PLAN_SCHEMA_VERSION
+        {
             return Err(EvidenceError::UnsupportedSplitSchema(self.schema_version));
+        }
+        if self.schema_version == SPLIT_PLAN_SCHEMA_VERSION {
+            let cpcv = self.development_cpcv.as_ref().ok_or_else(|| {
+                EvidenceError::InvalidPartition("development CPCV contract missing".into())
+            })?;
+            if cpcv.protocol_version != "development-cpcv-v1"
+                || cpcv.groups < 3
+                || cpcv.test_groups == 0
+                || cpcv.test_groups >= cpcv.groups
+                || cpcv.combinations != binomial(cpcv.groups, cpcv.test_groups)
+            {
+                return Err(EvidenceError::InvalidPartition(
+                    "development CPCV contract is invalid".into(),
+                ));
+            }
+            let smallest_group = self.development.bar_count / cpcv.groups;
+            if smallest_group == 0 {
+                return Err(EvidenceError::InvalidPartition(
+                    "development does not contain enough bars for its CPCV groups".into(),
+                ));
+            }
+            if cpcv.purge_bars + cpcv.embargo_bars >= smallest_group {
+                return Err(EvidenceError::InvalidPartition(
+                    "development CPCV purge and embargo consume a complete group".into(),
+                ));
+            }
         }
         for (name, partition) in [
             ("development", &self.development),
@@ -158,6 +296,19 @@ impl DataSplitPlan {
     pub fn content_hash(&self) -> Result<ContentHash, HashError> {
         stable_json_hash(self)
     }
+
+    /// OOS1 is intentionally exposed as a semantic accessor while the stored
+    /// field remains `validation` for backward-compatible artifact decoding.
+    pub fn oos1(&self) -> &DataSegment {
+        &self.validation
+    }
+}
+
+fn binomial(n: usize, k: usize) -> usize {
+    let k = k.min(n.saturating_sub(k));
+    (0..k).fold(1usize, |value, index| {
+        value.saturating_mul(n - index) / (index + 1)
+    })
 }
 
 fn validate_fractions(validation: f64, sealed: f64) -> Result<(), EvidenceError> {
@@ -865,6 +1016,32 @@ mod tests {
             plan.sealed_final.start_timestamp_ms
         );
         assert_ne!(plan.validation.data_hash, plan.sealed_final.data_hash);
+        let cpcv = plan.development_cpcv.as_ref().unwrap();
+        assert_eq!(cpcv.groups, 6);
+        assert_eq!(cpcv.test_groups, 2);
+        assert_eq!(cpcv.combinations, 15);
+        assert_eq!(cpcv.test_group_combinations().len(), 15);
+        assert_eq!(cpcv.group_ranges(plan.development.bar_count).len(), 6);
+    }
+
+    #[test]
+    fn legacy_split_plan_remains_readable_but_does_not_claim_cpcv() {
+        let mut value =
+            serde_json::to_value(DataSplitPlan::chronological(&dataset(100), 0.2, 0.2).unwrap())
+                .unwrap();
+        value["schema_version"] = serde_json::json!(1);
+        value.as_object_mut().unwrap().remove("development_cpcv");
+        let legacy: DataSplitPlan = serde_json::from_value(value).unwrap();
+        assert!(legacy.development_cpcv.is_none());
+        legacy.validate().unwrap();
+    }
+
+    #[test]
+    fn microscopic_split_does_not_claim_unavailable_cpcv_evidence() {
+        let plan = DataSplitPlan::chronological(&dataset(6), 0.2, 0.2).unwrap();
+        assert_eq!(plan.schema_version, LEGACY_SPLIT_PLAN_SCHEMA_VERSION);
+        assert!(plan.development_cpcv.is_none());
+        plan.validate().unwrap();
     }
 
     #[test]

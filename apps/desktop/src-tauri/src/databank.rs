@@ -852,9 +852,7 @@ fn run_elite_robustness_sync(
         monte_carlo_minimum_p80_profit_retention: snapshot
             .config
             .robustness_monte_carlo_p80_profit_retention,
-        monte_carlo_max_drawdown_ratio: snapshot
-            .config
-            .robustness_monte_carlo_max_drawdown_ratio,
+        monte_carlo_max_drawdown_ratio: snapshot.config.robustness_monte_carlo_max_drawdown_ratio,
         neighborhood_samples,
         seed: snapshot.config.seed,
         initial_balance: snapshot.config.scout.initial_balance,

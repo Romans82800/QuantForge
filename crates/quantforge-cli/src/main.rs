@@ -140,7 +140,7 @@ enum Command {
     SealedFinal(SealedFinalArgs),
     /// Stationary-bootstrap noise floor for Discover gate calibration.
     PermutationNull(PermutationNullArgs),
-    /// Short Fast Scout per entry-condition count, ranked by OOS1 retention.
+    /// Equal-budget Development scout per entry-condition count (no OOS access).
     ConditionBakeoff(ConditionBakeoffArgs),
     /// Factor grid across entry/exit condition counts × recipes → OOS1 retention.
     MethodologyResearch(MethodologyResearchArgs),
@@ -389,7 +389,7 @@ struct EvolveArgs {
     /// Allow a data-quality Fail and record the override in the manifest.
     #[arg(long)]
     allow_failed_data: bool,
-    /// Train on IS only and pick elites when OOS1 expectancy retains enough of IS.
+    /// Search Development only. Frozen OOS1 is reserved for post-shortlist certification.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     promotion_split: bool,
     #[arg(long, default_value_t = 0.2)]
@@ -1433,7 +1433,6 @@ fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn E
     broker.validate()?;
     let search_dataset =
         development_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
-    let oos1 = oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction)?;
     let mut discover = DiscoverConfig {
         run_mode: DiscoverRunMode::FastScout,
         initial_candidates: args.initial_candidates,
@@ -1454,7 +1453,7 @@ fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn E
     };
     let report = run_condition_bakeoff(
         &search_dataset,
-        Some(&oos1),
+        None,
         &m1,
         &broker,
         &[],
@@ -1472,13 +1471,8 @@ fn condition_bakeoff_command(args: ConditionBakeoffArgs) -> Result<(), Box<dyn E
     );
     for row in &report.rows {
         println!(
-            "  entry_conditions={} retention={:.3} oos1_E={:.4} pass={:.0}% pot={} evals={}",
-            row.entry_conditions,
-            row.median_retention,
-            row.median_oos1_expectancy_r,
-            row.pass_rate * 100.0,
-            row.pot_elites,
-            row.evaluations
+            "  entry_conditions={} development_E={:.4} pot={} evals={}",
+            row.entry_conditions, row.median_is_expectancy_r, row.pot_elites, row.evaluations
         );
     }
     Ok(())
@@ -4046,12 +4040,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         .promotion_split
         .then(|| development_partition(&dataset, args.validation_fraction, args.sealed_fraction))
         .transpose()?;
-    let oos1 = args
-        .promotion_split
-        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
-        .transpose()?;
     let search_dataset = development.as_ref().unwrap_or(&dataset);
-    let oos1_ref = oos1.as_ref();
     let m1_is = args
         .promotion_split
         .then(|| clip_dataset_to_window(&m1_dataset, search_dataset))
@@ -4070,11 +4059,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
                 "this databank was built from an IS partition; enable --promotion-split to continue it",
             )?
         };
-        let evaluation_oos1 = if previous.databank.data_hash == dataset.data_hash {
-            None
-        } else {
-            oos1_ref
-        };
+        let evaluation_oos1 = None;
         let evaluation_m1 = if previous.databank.execution_data_hash == m1_dataset.data_hash {
             &m1_dataset
         } else {
@@ -4104,7 +4089,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         (
             evolve_new(
                 search_dataset,
-                oos1_ref,
+                None,
                 m1_eval,
                 &broker_spec,
                 config,
@@ -4757,6 +4742,8 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         mutate_after_elites: 300,
         random_fill_fraction: 0.4,
         worker_threads: 0,
+        promotion_worker_threads: 0,
+        promotion_queue_capacity: 64,
         require_m1_robustness: true,
         robustness_folds: 3,
         robustness_monte_carlo_trials: 250,

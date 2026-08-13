@@ -211,6 +211,7 @@ export interface BatchEaExportView {
 
 export interface WalkForwardFold {
   fold: number;
+  test_groups?: number[];
   start_timestamp_ms: number;
   end_timestamp_ms: number;
   decision_bars: number;
@@ -233,6 +234,8 @@ export interface RobustnessEvidence {
   };
   walk_forward: {
     fold_scheme: string;
+    purge_bars?: number;
+    embargo_bars?: number;
     total_folds: number;
     passing_folds: number;
     passing_fraction: number;
@@ -540,6 +543,10 @@ export interface DiscoverRequest {
   mutateAfterElites: number | null;
   randomFillFraction: number | null;
   workerThreads: number | null;
+  /** Dedicated OOS1→M1 promotion workers; 0 / null = auto (2–4). */
+  promotionWorkerThreads: number | null;
+  /** Max waiting + in-flight promotions before backpressure. */
+  promotionQueueCapacity: number | null;
   requireM1Robustness: boolean | null;
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
@@ -667,6 +674,14 @@ export interface DiscoverJobView {
   mutateAfterElites: number;
   breedingActive: boolean;
   workerThreads: number;
+  promotionWorkerThreads: number;
+  promotionQueueCapacity: number;
+  promotionQueueDepth: number;
+  promotionInflight: number;
+  promotionsEnqueued: number;
+  promotionsCompleted: number;
+  promotionBackpressureEvents: number;
+  promotionsPerHour: number;
   coverage: number;
   qdScore: number;
   rejectedGate: number;

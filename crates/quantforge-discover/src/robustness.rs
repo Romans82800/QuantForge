@@ -9,7 +9,7 @@ use quantforge_data::{
 use quantforge_eval::{ScoutResult, ScoutTelemetry};
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
 use quantforge_quality::{
-    monte_carlo_trade_resampling_with_skip, parameter_permutation_neighbors,
+    DevelopmentCpcvPlan, monte_carlo_trade_resampling_with_skip, parameter_permutation_neighbors,
     perturb_strategy_parameters,
 };
 
@@ -90,7 +90,7 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
 /// SQX-style trade manipulation: each resampled path removes 10% of fills.
 
-/// M1 baseline → SQX retention vs H1 → WFO/MC/params.
+/// M1 baseline → retention vs selected timeframe → Development CPCV/MC/params.
 pub fn run_m1_predeposit_robustness(
     strategy: &StrategyIr,
     is_decision: &BarDataset,
@@ -135,83 +135,57 @@ pub fn run_m1_predeposit_robustness(
     }
     let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
 
-    let folds = if config.calendar_year_folds {
-        calendar_year_fold_ranges(is_decision, &broker.timezone)
-            .map_err(|_| RobustnessReject::WalkForward)?
-    } else {
-        contiguous_fold_ranges(is_decision.bars.len(), config.folds)
-    };
-    if folds.is_empty() {
+    let (fold_rows, fold_scheme, purge_bars, embargo_bars, required_fraction) =
+        if config.calendar_year_folds {
+            let ranges = calendar_year_fold_ranges(is_decision, &broker.timezone)
+                .map_err(|_| RobustnessReject::WalkForward)?;
+            let rows = evaluate_development_ranges(
+                strategy,
+                is_decision,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &judge,
+                config,
+                &ranges,
+            )?;
+            (rows, "development_calendar_year".into(), 0, 0, 1.0)
+        } else {
+            let contract = DevelopmentCpcvPlan::for_development_bars(is_decision.bars.len());
+            let rows = evaluate_development_cpcv(
+                strategy,
+                is_decision,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &judge,
+                config,
+                &contract,
+            )?;
+            (
+                rows,
+                "development_cpcv_6_choose_2".into(),
+                contract.purge_bars,
+                contract.embargo_bars,
+                config.minimum_passing_fold_fraction,
+            )
+        };
+    if fold_rows.is_empty() {
         return Err(RobustnessReject::WalkForward);
     }
-
-    let mut passing_folds = 0usize;
-    let mut fold_rows = Vec::with_capacity(folds.len());
-    for (index, (start, end)) in folds.iter().enumerate() {
-        if *end <= *start + 1 {
-            continue;
-        }
-        let lookback = 120usize;
-        let slice_start = start.saturating_sub(lookback);
-        let decision_slice = slice_dataset(is_decision, slice_start, *end);
-        let start_ms = is_decision.bars[*start].timestamp_ms;
-        let last_open_ms = is_decision.bars[*end - 1].timestamp_ms;
-        let interval_ms = infer_median_interval_ms(&is_decision.bars).unwrap_or(3_600_000);
-        let end_exclusive_ms = last_open_ms.saturating_add(interval_ms);
-        let m1_slice = slice_m1_covering(m1_dataset, start_ms, end_exclusive_ms);
-        let quote_slice = quote_dataset.map(|quotes| slice_quotes_covering(quotes, &m1_slice));
-        let fold_result = evaluate_strategy_m1_with_optional_quotes(
-            strategy,
-            &decision_slice,
-            &m1_slice,
-            quote_slice.as_ref(),
-            broker,
-            &judge,
-        )
-        .map_err(|_| RobustnessReject::WalkForward)?;
-        let fold_trades = fold_result
-            .trades
-            .iter()
-            .filter(|trade| {
-                trade.entry_timestamp_ms >= start_ms && trade.entry_timestamp_ms <= last_open_ms
-            })
-            .count();
-        let fold_passed = fold_trades >= config.minimum_fold_trades
-            && fold_result.metrics.return_percent > config.minimum_return_percent
-            && effective_pf(&fold_result.metrics) >= config.minimum_profit_factor
-            && fold_result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent;
-        if fold_passed {
-            passing_folds += 1;
-        }
-        fold_rows.push(WalkForwardFold {
-            fold: index,
-            start_timestamp_ms: start_ms,
-            end_timestamp_ms: last_open_ms,
-            decision_bars: end.saturating_sub(*start),
-            trades_in_fold: fold_trades,
-            metrics: fold_result.metrics.clone(),
-            passed: fold_passed,
-        });
-    }
-    let required_fraction = if config.calendar_year_folds {
-        1.0
-    } else {
-        config.minimum_passing_fold_fraction
-    };
-    let fold_fraction = passing_folds as f64 / folds.len().max(1) as f64;
+    let passing_folds = fold_rows.iter().filter(|fold| fold.passed).count();
+    let fold_fraction = passing_folds as f64 / fold_rows.len().max(1) as f64;
     if fold_fraction + 1e-12 < required_fraction {
         return Err(RobustnessReject::WalkForward);
     }
     let walk_forward_evidence = WalkForwardEvidence {
-        fold_scheme: if config.calendar_year_folds {
-            "calendar_year".into()
-        } else {
-            "contiguous".into()
-        },
-        total_folds: folds.len(),
+        fold_scheme,
+        total_folds: fold_rows.len(),
         passing_folds,
         passing_fraction: fold_fraction,
         required_passing_fraction: required_fraction,
+        purge_bars,
+        embargo_bars,
         folds: fold_rows,
     };
 
@@ -627,16 +601,6 @@ fn adjust_constant(
     }
 }
 
-fn contiguous_fold_ranges(bar_count: usize, folds: usize) -> Vec<(usize, usize)> {
-    (0..folds)
-        .map(|fold| {
-            let start = bar_count * fold / folds;
-            let end = bar_count * (fold + 1) / folds;
-            (start, end)
-        })
-        .collect()
-}
-
 /// Broker-local calendar-year index ranges covering the IS window.
 ///
 /// Years with fewer than `minimum_year_bars` are skipped. Boundaries use the
@@ -725,6 +689,225 @@ fn effective_pf(metrics: &quantforge_eval::BacktestMetrics) -> f64 {
         } else {
             0.0
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_development_ranges(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    judge: &JudgeConfig,
+    config: &RobustnessConfig,
+    ranges: &[(usize, usize)],
+) -> Result<Vec<WalkForwardFold>, RobustnessReject> {
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, end))| {
+            evaluate_development_window(
+                strategy,
+                development,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                judge,
+                config,
+                index,
+                vec![index],
+                start,
+                end,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_development_cpcv(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    judge: &JudgeConfig,
+    config: &RobustnessConfig,
+    contract: &DevelopmentCpcvPlan,
+) -> Result<Vec<WalkForwardFold>, RobustnessReject> {
+    let ranges = contract.group_ranges(development.bars.len());
+    let mut groups = Vec::with_capacity(ranges.len());
+    for (group, &(raw_start, raw_end)) in ranges.iter().enumerate() {
+        // Boundary observations are not scored. The lookback prefix is still
+        // supplied for indicator warmup but entries there are excluded below.
+        let start = if group == 0 {
+            raw_start
+        } else {
+            raw_start.saturating_add(contract.purge_bars)
+        };
+        let end = if group + 1 == ranges.len() {
+            raw_end
+        } else {
+            raw_end.saturating_sub(contract.embargo_bars)
+        };
+        groups.push(evaluate_development_window(
+            strategy,
+            development,
+            m1_dataset,
+            quote_dataset,
+            broker,
+            judge,
+            config,
+            group,
+            vec![group],
+            start,
+            end,
+        )?);
+    }
+
+    Ok(contract
+        .test_group_combinations()
+        .into_iter()
+        .enumerate()
+        .map(|(combination, test_groups)| {
+            let selected = test_groups
+                .iter()
+                .map(|group| &groups[*group])
+                .collect::<Vec<_>>();
+            let metrics = combine_fold_metrics(&selected, config.initial_balance);
+            WalkForwardFold {
+                fold: combination,
+                test_groups,
+                start_timestamp_ms: selected
+                    .first()
+                    .map(|fold| fold.start_timestamp_ms)
+                    .unwrap_or_default(),
+                end_timestamp_ms: selected
+                    .last()
+                    .map(|fold| fold.end_timestamp_ms)
+                    .unwrap_or_default(),
+                decision_bars: selected.iter().map(|fold| fold.decision_bars).sum(),
+                trades_in_fold: selected.iter().map(|fold| fold.trades_in_fold).sum(),
+                passed: selected.iter().all(|fold| fold.passed),
+                metrics,
+            }
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_development_window(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    judge: &JudgeConfig,
+    config: &RobustnessConfig,
+    fold: usize,
+    test_groups: Vec<usize>,
+    start: usize,
+    end: usize,
+) -> Result<WalkForwardFold, RobustnessReject> {
+    if end <= start + 1 || end > development.bars.len() {
+        return Err(RobustnessReject::WalkForward);
+    }
+    let lookback = 120usize;
+    let decision_slice = slice_dataset(development, start.saturating_sub(lookback), end);
+    let start_ms = development.bars[start].timestamp_ms;
+    let last_open_ms = development.bars[end - 1].timestamp_ms;
+    let interval_ms = infer_median_interval_ms(&development.bars).unwrap_or(3_600_000);
+    let m1_slice = slice_m1_covering(
+        m1_dataset,
+        start_ms,
+        last_open_ms.saturating_add(interval_ms),
+    );
+    let quote_slice = quote_dataset.map(|quotes| slice_quotes_covering(quotes, &m1_slice));
+    let result = evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        &decision_slice,
+        &m1_slice,
+        quote_slice.as_ref(),
+        broker,
+        judge,
+    )
+    .map_err(|_| RobustnessReject::WalkForward)?;
+    let trades = result
+        .trades
+        .iter()
+        .filter(|trade| {
+            trade.entry_timestamp_ms >= start_ms && trade.entry_timestamp_ms <= last_open_ms
+        })
+        .count();
+    let passed = trades >= config.minimum_fold_trades
+        && result.metrics.return_percent > config.minimum_return_percent
+        && effective_pf(&result.metrics) >= config.minimum_profit_factor
+        && result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent;
+    Ok(WalkForwardFold {
+        fold,
+        test_groups,
+        start_timestamp_ms: start_ms,
+        end_timestamp_ms: last_open_ms,
+        decision_bars: end - start,
+        trades_in_fold: trades,
+        metrics: result.metrics,
+        passed,
+    })
+}
+
+fn combine_fold_metrics(
+    folds: &[&WalkForwardFold],
+    initial_balance: f64,
+) -> quantforge_eval::BacktestMetrics {
+    let net_profit = folds
+        .iter()
+        .map(|fold| fold.metrics.net_profit)
+        .sum::<f64>();
+    let trade_count = folds.iter().map(|fold| fold.trades_in_fold).sum::<usize>();
+    let winning_trades = folds
+        .iter()
+        .map(|fold| fold.metrics.winning_trades)
+        .sum::<usize>();
+    let losing_trades = folds
+        .iter()
+        .map(|fold| fold.metrics.losing_trades)
+        .sum::<usize>();
+    quantforge_eval::BacktestMetrics {
+        initial_balance,
+        ending_balance: initial_balance + net_profit,
+        net_profit,
+        return_percent: net_profit / initial_balance * 100.0,
+        trade_count,
+        winning_trades,
+        losing_trades,
+        win_rate: if trade_count == 0 {
+            0.0
+        } else {
+            winning_trades as f64 / trade_count as f64 * 100.0
+        },
+        // Conservatively retain the weakest group rather than manufacturing a
+        // pooled PF without persisted gross-profit/gross-loss components.
+        profit_factor: folds
+            .iter()
+            .filter_map(|fold| fold.metrics.profit_factor)
+            .min_by(f64::total_cmp),
+        max_drawdown: folds
+            .iter()
+            .map(|fold| fold.metrics.max_drawdown)
+            .fold(0.0, f64::max),
+        max_drawdown_percent: folds
+            .iter()
+            .map(|fold| fold.metrics.max_drawdown_percent)
+            .fold(0.0, f64::max),
+        sharpe_ratio: folds
+            .iter()
+            .filter_map(|fold| fold.metrics.sharpe_ratio)
+            .min_by(f64::total_cmp),
+        expectancy: if trade_count == 0 {
+            0.0
+        } else {
+            net_profit / trade_count as f64
+        },
+    }
 }
 
 fn slice_dataset(source: &BarDataset, start: usize, end: usize) -> BarDataset {
@@ -857,6 +1040,19 @@ mod tests {
         years.sort();
         years.dedup();
         assert_eq!(years.len(), 4);
+    }
+
+    #[test]
+    fn development_cpcv_contract_has_fifteen_purged_combinations() {
+        let contract = DevelopmentCpcvPlan::for_development_bars(6_000);
+        let combinations = contract.test_group_combinations();
+        assert_eq!(contract.groups, 6);
+        assert_eq!(contract.test_groups, 2);
+        assert_eq!(contract.purge_bars, 16);
+        assert_eq!(contract.embargo_bars, 3);
+        assert_eq!(combinations.len(), 15);
+        assert_eq!(combinations.first(), Some(&vec![0, 1]));
+        assert_eq!(combinations.last(), Some(&vec![4, 5]));
     }
 
     #[test]

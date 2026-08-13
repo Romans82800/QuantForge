@@ -111,6 +111,20 @@ def ensure_broker(pack: Path, symbol: str) -> None:
             if changed:
                 dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
                 print(f"repaired broker geometry {dest.name}")
+        elif symbol == "XTIUSD":
+            data = json.loads(dest.read_text(encoding="utf-8"))
+            changed = False
+            # Older stubs cloned XAUUSD swap points (~±54/lot/day). That is gold
+            # carry, not WTI, and it rejects every oil candidate in Discover.
+            if data.get("swap_long") in (-53.876, -53.876000000000):
+                data["swap_mode"] = "points"
+                data["swap_long"] = -5.5
+                data["swap_short"] = -2.8
+                data["triple_swap_day"] = "wednesday"
+                changed = True
+            if changed:
+                dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                print(f"repaired broker swap {dest.name}")
         return
     template_symbol = TEMPLATE_MAP.get(symbol, "GBPUSD")
     if not (pack / f"{template_symbol}.broker.json").exists():

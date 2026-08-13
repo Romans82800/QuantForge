@@ -99,7 +99,9 @@ import type {
 import {
   bindDiscoverTimezone,
   cagrPercent,
+  defaultCommissionPerLotRoundTurn,
   describeStrategyConditions,
+  discoverDefaultsForSymbol,
   discoverProgress,
   discoverProgressLabel,
   filterAndSortElites,
@@ -739,7 +741,7 @@ function App() {
                   <dd>
                     {formatNumber((1 - workspace.validationFraction - workspace.sealedFraction) * 100, 0)}/
                     {formatNumber(workspace.validationFraction * 100, 0)}/
-                    {formatNumber(workspace.sealedFraction * 100, 0)}% IS/OOS1/OOS2
+                    {formatNumber(workspace.sealedFraction * 100, 0)}% Development/OOS1/OOS2
                   </dd>
                 </div>
                 <div>
@@ -1579,7 +1581,7 @@ function ResultsAnalysisTabs({
   const tabs: Array<[typeof active, string]> = [
     ["overview", "Overview"],
     ["equity", "Equity"],
-    ["walkForward", "Walk-forward"],
+    ["walkForward", "Development CPCV"],
     ["monteCarlo", "Monte Carlo"],
     ["parameters", "Parameters"],
     ["trades", "Trades"],
@@ -2177,7 +2179,7 @@ function WalkForwardPanel({
 }) {
   if (!evidence) {
     return (
-      <RobustnessShell title="Walk-forward analysis" status={{ label: "not recorded", tone: "unknown" }}>
+      <RobustnessShell title="Development CPCV analysis" status={{ label: "not recorded", tone: "unknown" }}>
         <RobustnessMissing fallback={fallback} />
       </RobustnessShell>
     );
@@ -2189,7 +2191,7 @@ function WalkForwardPanel({
   const scorePercent = (evidence.passing_fraction * 100).toFixed(0);
   return (
     <RobustnessShell
-      title="Walk-forward analysis"
+      title="Development CPCV analysis"
       status={{ label: passed ? "passed" : "failed", tone: passed ? "pass" : "fail" }}
     >
       <div className="wf-score-card">
@@ -2387,8 +2389,8 @@ function HomeWorkspace({
           <div className="overview-status-kpis">
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
-            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + WFO + MC + params" />
-            <KpiCell label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0)} note={`${job?.workerThreads ?? "—"} worker threads`} />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + CPCV + MC + params" />
+            <KpiCell label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0)} note={`${job?.workerThreads ?? "—"} scout${job?.breedingActive ? ` · queue ${job?.promotionQueueDepth ?? 0}` : ""}`} />
           </div>
           <div className="overview-status-actions">
             <button className="primary" type="button" onClick={() => onNavigate("Discover")}>
@@ -2978,7 +2980,9 @@ function DiscoverWorkspace({
     maxOneEntryPerDay: true,
     mutateAfterElites: 300,
     randomFillFraction: 0.4,
-    workerThreads: 11,
+    workerThreads: 0,
+    promotionWorkerThreads: 0,
+    promotionQueueCapacity: 64,
     requireM1Robustness: true,
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
@@ -3227,6 +3231,8 @@ function DiscoverWorkspace({
             mutateAfterElites: null,
             randomFillFraction: null,
             workerThreads: null,
+            promotionWorkerThreads: null,
+            promotionQueueCapacity: null,
             requireM1Robustness: null,
             robustnessFolds: null,
             robustnessMonteCarloTrials: null,
@@ -3501,6 +3507,7 @@ function DiscoverWorkspace({
               disabled={active || busy}
               onError={onError}
               onSelect={(symbol) => {
+                const defaults = discoverDefaultsForSymbol(symbol.symbol);
                 setForm((current) => ({
                   ...current,
                   dataPath: symbol.dataPath,
@@ -3510,6 +3517,10 @@ function DiscoverWorkspace({
                   m1MetadataPath: symbol.m1MetadataPath,
                   m1SourceTimezone: null,
                   brokerPath: symbol.brokerPath,
+                  commissionPerLotRoundTurn: defaults.commissionPerLotRoundTurn,
+                  multiSymbolMinimumPass: defaults.multiSymbolMinimumPass,
+                  packDataDir:
+                    defaults.packDataDir === undefined ? current.packDataDir : defaults.packDataDir,
                   // New runs automatically receive a unique immutable path at
                   // Start. Never carry the previous archive into a fresh run.
                   databankPath: current.mode === "new" ? "" : current.databankPath || symbol.defaultDatabankPath,
@@ -3566,7 +3577,9 @@ function DiscoverWorkspace({
               <NumberField label="Initial candidates" value={form.initialCandidates} onChange={(value) => update("initialCandidates", value)} min={1} />
               <NumberField label="Batch / generation" value={form.batchSize} onChange={(value) => update("batchSize", value)} min={1} />
               <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value)} min={0} />
-              <NumberField label="Worker threads (0 = all)" value={form.workerThreads} onChange={(value) => update("workerThreads", value)} min={0} />
+              <NumberField label="Scout worker threads (0 = auto)" value={form.workerThreads} onChange={(value) => update("workerThreads", value)} min={0} />
+              <NumberField label="Promotion workers (0 = auto 2–4)" value={form.promotionWorkerThreads} onChange={(value) => update("promotionWorkerThreads", value)} min={0} />
+              <NumberField label="Promotion queue capacity" value={form.promotionQueueCapacity} onChange={(value) => update("promotionQueueCapacity", value)} min={1} />
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
               <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
@@ -3625,12 +3638,12 @@ function DiscoverWorkspace({
               </details>
               <details className="advanced-settings" open>
                 <summary>Post-breed databank pipeline — starts only after breeding</summary>
-                <p className="immutable-note">{`SQX structure: H1 pot → breed → OOS1 databank gate → robustness (WFO/MC/±${perturbationPercent(form)}%) → M1 fidelity → databank (M1 metrics only). Never runs before the pot unlocks breeding. Never archives Selected-TF equity into the databank.`}</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>M1 robustness battery on databank path (WFO / Monte Carlo / param plateau)</span></label>
+                <p className="immutable-note">{`Development-only pipeline: reservoir → breed → M1 fidelity → CPCV + MC + ±${perturbationPercent(form)}% plateau → databank. OOS1 opens only after a diverse shortlist is frozen; OOS2 remains sealed.`}</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>M1 robustness battery on databank path (Development CPCV / Monte Carlo / param plateau)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (SQX RetestWithHigherPrecision bands)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
-                  <NumberField label="WFO folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
+                  <NumberField label="Legacy fold setting" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="MC block length" value={form.robustnessMonteCarloBlockLength} onChange={(value) => update("robustnessMonteCarloBlockLength", value)} min={1} />
                   <NumberField
@@ -3676,7 +3689,7 @@ function DiscoverWorkspace({
                   <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
                   <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
                   <NumberField label="M1 fidelity min return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
-                  <NumberField label="OOS1 expectancy retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
+                  <NumberField label="OOS1 certification retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
                   <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                   <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
                   <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
@@ -3687,7 +3700,7 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">SQX structure: H1 gates fill the breeding pot only. After breeding starts: OOS1 databank gate → robustness → M1 → databank. Selected-TF strategies never enter the databank. OOS2 is never used in Discover.</p>
+            <p className="immutable-note">Discover uses Development only. After breeding starts: M1 fidelity → Development CPCV/robustness → databank. OOS1 and OOS2 are unavailable to search.</p>
             <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
@@ -3731,7 +3744,7 @@ function DiscoverWorkspace({
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: H1 gates → pot (breed) → [after breeding] OOS1 databank gate → robustness → M1 → databank. Nothing enters the databank before breeding. Expectancy in R ($1,000 risk).</p>
+          <p>Pipeline: Development gates → reservoir → breed → M1 fidelity + CPCV robustness → research databank. OOS1 certification happens after shortlist. Expectancy in R ($1,000 risk).</p>
           <button
             className="primary"
             disabled={
@@ -3779,13 +3792,30 @@ function DiscoverWorkspace({
                 job?.targetDatabankElites
                   ? "Quota · post-breed M1 only"
                   : job?.breedingActive
-                    ? "Post-breed OOS1→robustness→M1"
+                    ? "Post-breed Development CPCV→M1"
                     : "Empty until breeding unlocks"
               }
             />
             <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for databank pipeline" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
-            <Kpi label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0, 0)} note={`${formatNumber(job?.acceptsPerHour ?? 0, 1)} accepts/hr · ${job?.workerThreads ?? "—"} threads`} />
+            <Kpi
+              label="Evals / hour"
+              value={formatNumber(job?.evaluationsPerHour ?? 0, 0)}
+              note={[
+                `${formatNumber(job?.acceptsPerHour ?? 0, 1)} accepts/hr`,
+                `${job?.workerThreads ?? "—"} scout`,
+                job?.breedingActive ? `${job?.promotionWorkerThreads ?? "—"} promo` : null,
+              ].filter(Boolean).join(" · ")}
+            />
+            <Kpi
+              label="Promo queue"
+              value={`${formatNumber(job?.promotionQueueDepth ?? 0)}/${formatNumber(job?.promotionQueueCapacity ?? 64)}`}
+              note={
+                job?.breedingActive
+                  ? `${formatNumber(job?.promotionInflight ?? 0)} in flight · ${formatNumber(job?.promotionsPerHour ?? 0, 0)} promo/hr`
+                  : "Idle until breeding unlocks"
+              }
+            />
             <Kpi label="QD score" value={formatNumber(job?.qdScore ?? 0, 2)} note="Databank evidence mass" />
           </div>
           <div className="reject-funnel">
@@ -3801,22 +3831,20 @@ function DiscoverWorkspace({
             </ul>
             <p className="funnel-group-label">Post-breed databank pipeline — after breeding unlocks</p>
             <ul>
-              <li><span>OOS1 databank gate</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>OOS1 leakage guard (must remain 0)</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
               <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
-              <li><span>Walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
+              <li><span>Development CPCV</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
               <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
               <li><span>Param plateau</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
               <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
             </ul>
             {job?.bestIsExpectancy != null && (
               <p className="funnel-best">
-                Best pre-OOS1 IS expectancy — {formatNumber(job.bestIsExpectancy, 2)}R. This may be a pot candidate and is not yet validation evidence.
+                Best Development expectancy — {formatNumber(job.bestIsExpectancy, 2)}R. This is research evidence, not OOS certification.
               </p>
             )}
             <p className="funnel-best">
-              OOS1 validation — {job?.bestOos1Expectancy != null
-                ? `best databank survivor ${formatNumber(job.bestOos1Expectancy, 2)}R.`
-                : "no candidate has passed into the databank yet."}
+              OOS1 certification — untouched. Freeze a diverse shortlist, then open it in Challenge.
             </p>
             <p className="funnel-best">
               OOS2 sealed final — held out from Discover selection. It is assessed only in the one-shot Sealed Final stage; the Databank equity chart may display it but never uses it as a Discover gate.
@@ -3902,13 +3930,12 @@ function DiscoverWorkspace({
                   <p className="eyebrow">Methodology lite</p>
                   <h2>Condition bakeoff</h2>
                 </div>
-                <span className="read-only-badge">equal-budget OOS1 · no sealed</span>
+                <span className="read-only-badge">Development only · no OOS access</span>
               </div>
               <div className="family-tester-body">
                 <p className="immutable-note">
-                  Equal-budget Fast Scout per entry-condition count. Every retained pot member is rechecked on OOS1;
-                  expectancy is shown in R ($1,000 fixed risk). This advises which entry cardinality to harvest — it does
-                  not replace M1 robustness or the sealed OOS2 final.
+                  Equal-budget research per entry-condition count using Development only. Expectancy is shown in R
+                  ($1,000 fixed risk). It may guide grammar choice, so OOS1 and sealed OOS2 remain unavailable here.
                 </p>
                 <div className="family-tester-toggles" role="group" aria-label="Entry counts to test">
                   {[2, 3, 4].map((count) => (
@@ -3974,13 +4001,9 @@ function DiscoverWorkspace({
                       <thead>
                         <tr>
                           <th>Entry</th>
-                          <th>IS E (R)</th>
-                          <th>OOS1 E (R)</th>
-                          <th>Retention</th>
-                          <th>OOS1 pass</th>
+                          <th>Development E (R)</th>
                           <th>Elites</th>
                           <th>Pot</th>
-                          <th>OOS1 tested</th>
                           <th>Evals</th>
                           <th />
                         </tr>
@@ -3995,12 +4018,8 @@ function DiscoverWorkspace({
                                 {recommended ? " · recommended" : ""}
                               </td>
                               <td>{formatNumber(row.medianIsExpectancyR, 3)}</td>
-                              <td>{formatNumber(row.medianOos1ExpectancyR, 3)}</td>
-                              <td>{formatNumber(row.medianRetention, 3)}</td>
-                              <td>{formatNumber(row.passRate * 100, 0)}%</td>
                               <td>{formatNumber(row.elites)}</td>
                               <td>{formatNumber(row.potElites)}</td>
-                              <td>{formatNumber(row.oos1Tested)}</td>
                               <td>{formatNumber(row.evaluations)}</td>
                               <td>
                                 <button
@@ -4154,17 +4173,18 @@ function DiscoverContractSummary({
         <p className="eyebrow">Search budget</p>
         <SummaryLine label="Initial candidates" value={formatNumber(form.initialCandidates ?? 0)} />
         <SummaryLine label="Batch / generation" value={formatNumber(form.batchSize ?? 0)} />
-        <SummaryLine label="Worker threads" value={(form.workerThreads ?? 0) === 0 ? "All available" : formatNumber(form.workerThreads ?? 0)} />
+        <SummaryLine label="Scout workers" value={(form.workerThreads ?? 0) === 0 ? "Auto" : formatNumber(form.workerThreads ?? 0)} />
+        <SummaryLine label="Promotion workers" value={(form.promotionWorkerThreads ?? 0) === 0 ? "Auto 2–4" : formatNumber(form.promotionWorkerThreads ?? 0)} />
         <SummaryLine label="Breeding begins" value={`${formatNumber(form.mutateAfterElites ?? 0)} pot elites`} />
         <SummaryLine label="Generation limit" value={form.runUntilStopped ? "Continuous" : formatNumber(form.generations)} />
       </div>
 
       <div className="contract-section">
         <p className="eyebrow">Validation firewall</p>
-        <SummaryLine label="IS / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
+        <SummaryLine label="Development / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
-        <SummaryLine label="OOS1 expectancy" value={`≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× IS`} />
-        <SummaryLine label="Robustness" value={`${form.robustnessFolds ?? 0} WFO · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
+        <SummaryLine label="OOS1 certification" value={`Frozen shortlist · ≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× Development`} />
+        <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
         <SummaryLine label="OOS2" value="Sealed · display only" accent />
       </div>
 
@@ -4187,7 +4207,7 @@ function DiscoverContractSummary({
       </div>
 
       <p className="contract-note">
-        OOS2 is never used to breed, rank, or select a Discover candidate. The full contract is sealed into the databank manifest.
+        Neither OOS1 nor OOS2 is available to Discover for breeding, ranking, or selection. OOS1 opens only after a shortlist is frozen; OOS2 opens once for final portfolio certification. The full contract is sealed into the databank manifest.
       </p>
     </aside>
   );
@@ -4300,11 +4320,12 @@ function JudgePanel({
               m1SourceTimezone: null,
               quotePath: symbol.quotePath,
               brokerPath: symbol.brokerPath,
+              commissionPerLotRoundTurn: defaultCommissionPerLotRoundTurn(symbol.symbol),
             }));
           }}
           selectedDataPath={form.decisionDataPath}
         />
-        <PathField label="Split plan (uses validation only)" path={form.splitPlanPath ?? ""} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value || null)} />
+        <PathField label="Split plan (uses frozen OOS1 only)" path={form.splitPlanPath ?? ""} choose={() => chooseJsonFile("Choose split plan")} onChange={(value) => update("splitPlanPath", value || null)} />
         <PathField label="M1 bid/ask quote sidecar (required for certification)" path={form.quotePath ?? ""} choose={() => chooseTesterCsv("Choose M1 quote sidecar")} onChange={(value) => update("quotePath", value || null)} />
         <PathField label="Strategy IR" path={form.strategyPath} choose={() => chooseJsonFile("Choose strategy IR")} onChange={(value) => update("strategyPath", value)} required />
         <PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required />
@@ -5065,7 +5086,8 @@ function EliteInspector({
                 <code className="niche-code">{detail.niche}</code>
               </section>
               <div className="gate-stack">
-                <span className="gate-pass">IS train · OOS1 pick gate</span>
+                <span className="gate-pass">Development CPCV research</span>
+                <span className="gate-pending">OOS1 certification not opened</span>
                 <span className="gate-pass">OOS2 display only</span>
                 <span className="gate-pending">External parity unknown</span>
               </div>
@@ -5122,7 +5144,7 @@ function PartitionEquityChart({
 }) {
   const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("full");
   if (busy && !view) {
-    return <div className="partition-equity loading">Replaying full IS / OOS1 / OOS2 equity…</div>;
+    return <div className="partition-equity loading">Replaying full Development / OOS1 / OOS2 equity…</div>;
   }
   if (!view || view.points.length < 2) {
     return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
@@ -5169,7 +5191,7 @@ function PartitionEquityChart({
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
           <small>
-            {view.executionEngine} · IS 60% · OOS1 20% · OOS2 20% (display only)
+            {view.executionEngine} · Development 60% · OOS1 20% · OOS2 20% (display only)
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>
@@ -5233,9 +5255,9 @@ function PartitionEquityChart({
       </svg>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
-        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS · chart split`} />
+        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× Development · chart split`} />
         <Kpi label="OOS2 expectancy (R)" value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
-        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="IS / OOS1 / OOS2 · databank split" />
+        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="Development / OOS1 / OOS2 · databank split" />
       </div>
     </section>
   );

@@ -211,6 +211,8 @@ fn write_databank(
         mutate_after_elites: 0,
         random_fill_fraction: 0.0,
         worker_threads: 1,
+        promotion_worker_threads: 1,
+        promotion_queue_capacity: 8,
         require_m1_robustness: false,
         robustness_folds: 3,
         robustness_monte_carlo_trials: 50,

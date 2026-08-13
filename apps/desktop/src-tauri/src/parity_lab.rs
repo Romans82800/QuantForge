@@ -257,7 +257,8 @@ fn run_m1_judge_sync(request: &JudgeRequest) -> Result<JudgeView, String> {
         .transpose()?;
     let pending_entry = matches!(
         strategy.entry.order,
-        quantforge_ir::EntryOrderPolicy::Stop { .. } | quantforge_ir::EntryOrderPolicy::Limit { .. }
+        quantforge_ir::EntryOrderPolicy::Stop { .. }
+            | quantforge_ir::EntryOrderPolicy::Limit { .. }
     );
     if pending_entry && quote_dataset.is_none() {
         return Err(format!(

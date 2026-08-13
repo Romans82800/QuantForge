@@ -108,6 +108,10 @@ pub struct DiscoverRequest {
     mutate_after_elites: Option<usize>,
     random_fill_fraction: Option<f64>,
     worker_threads: Option<usize>,
+    /// Dedicated Development robustness→M1 workers. `0` / omit = auto (2–4).
+    promotion_worker_threads: Option<usize>,
+    /// Max waiting + in-flight promotions before backpressure.
+    promotion_queue_capacity: Option<usize>,
     require_m1_robustness: Option<bool>,
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
@@ -176,6 +180,14 @@ pub struct DiscoverJobView {
     mutate_after_elites: usize,
     breeding_active: bool,
     worker_threads: usize,
+    promotion_worker_threads: usize,
+    promotion_queue_capacity: usize,
+    promotion_queue_depth: u64,
+    promotion_inflight: u64,
+    promotions_enqueued: u64,
+    promotions_completed: u64,
+    promotion_backpressure_events: u64,
+    promotions_per_hour: f64,
     coverage: usize,
     qd_score: f64,
     rejected_gate: u64,
@@ -257,6 +269,14 @@ impl DiscoverJobView {
             mutate_after_elites: 300,
             breeding_active: false,
             worker_threads: 0,
+            promotion_worker_threads: 0,
+            promotion_queue_capacity: 64,
+            promotion_queue_depth: 0,
+            promotion_inflight: 0,
+            promotions_enqueued: 0,
+            promotions_completed: 0,
+            promotion_backpressure_events: 0,
+            promotions_per_hour: 0.0,
             coverage: 0,
             qd_score: 0.0,
             rejected_gate: 0,
@@ -338,7 +358,6 @@ pub fn run_condition_bakeoff(
         ));
     }
     let search_h1 = development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
-    let oos1 = oos1_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
     let m1_is = development_partition(&m1_loaded.dataset, validation_fraction, sealed_fraction)?;
     let mut discover = DiscoverConfig {
         run_mode: DiscoverRunMode::FastScout,
@@ -360,7 +379,7 @@ pub fn run_condition_bakeoff(
     };
     evolve_condition_bakeoff(
         &search_h1,
-        Some(&oos1),
+        None,
         &m1_is,
         &broker,
         &[],
@@ -415,6 +434,14 @@ pub fn start_discover(
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
         breeding_active: false,
         worker_threads: request.worker_threads.unwrap_or(0),
+        promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
+        promotion_queue_depth: 0,
+        promotion_inflight: 0,
+        promotions_enqueued: 0,
+        promotions_completed: 0,
+        promotion_backpressure_events: 0,
+        promotions_per_hour: 0.0,
         coverage: 0,
         qd_score: 0.0,
         rejected_gate: 0,
@@ -639,6 +666,8 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.mutate_after_elites.is_some(),
             request.random_fill_fraction.is_some(),
             request.worker_threads.is_some(),
+            request.promotion_worker_threads.is_some(),
+            request.promotion_queue_capacity.is_some(),
             request.require_m1_robustness.is_some(),
             request.robustness_folds.is_some(),
             request.robustness_monte_carlo_trials.is_some(),
@@ -649,9 +678,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request
                 .robustness_monte_carlo_p80_profit_retention
                 .is_some(),
-            request
-                .robustness_monte_carlo_max_drawdown_ratio
-                .is_some(),
+            request.robustness_monte_carlo_max_drawdown_ratio.is_some(),
             request.robustness_neighborhood_samples.is_some(),
             request.robustness_perturbation_fraction.is_some(),
             request.commission_per_lot_round_turn.is_some(),
@@ -743,8 +770,8 @@ fn run_discovery(
                 .into(),
         );
     }
-    let wants_pending = request.allow_stop_entries.unwrap_or(false)
-        || request.allow_limit_entries.unwrap_or(false);
+    let wants_pending =
+        request.allow_stop_entries.unwrap_or(false) || request.allow_limit_entries.unwrap_or(false);
     if wants_pending && quote_dataset.is_none() {
         return Err(
             "stop/limit Discover requires a bid/ask M1 quote sidecar beside the M1 pack \
@@ -796,7 +823,7 @@ fn run_discovery(
     let promotion_split = request.promotion_split.unwrap_or(true);
     // New runs take the UI split. Continuations must reuse the fractions sealed
     // into the databank manifest — defaulting to 0.2/0.2 here used to rewrite
-    // checkpoints onto a different IS/OOS1/OOS2 cut than the elites were gated on.
+    // checkpoints onto a different Development/OOS1/OOS2 cut.
     let continued_artifact = match request.mode {
         DiscoverMode::Continue => {
             let bytes = fs::read(&request.databank_path)
@@ -823,15 +850,9 @@ fn run_discovery(
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
         .then(|| development_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
-    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
-        .transpose()?;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
-    let oos1_ref = oos1_dataset.as_ref();
-    // Always retain the full M1 stream.  The evaluator only consumes the M1
-    // minutes covered by the supplied decision partition, so this lets OOS1 be
-    // replayed at the same precision as IS instead of comparing M1 IS against
-    // an H1/M15 OOS result.
+    // Discover constructs Development only. OOS1 is intentionally not loaded
+    // into the search process; Challenge opens it after shortlist freeze.
     let m1_eval = &m1.dataset;
     let pack = load_fx_pack(
         request.pack_data_dir.as_deref(),
@@ -848,11 +869,14 @@ fn run_discovery(
                 job,
                 "Evaluating initial grammar population",
                 &format!(
-                    "H1 gates fill the breeding pot only. After breeding unlocks: OOS1 → M1 robustness → M1 fidelity → databank."
+                    "Development gates fill the breeding reservoir. After breeding unlocks: M1 fidelity → Development CPCV/robustness → databank. OOS1 remains untouched."
                 ),
             )?;
             let mut config = new_config(&request)?;
-            if !pack.is_empty()
+            if !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
+                // Indices, oil, crypto and metals cannot pass the FX identical-parameter screen.
+                config.multi_symbol_minimum_pass = 0;
+            } else if !pack.is_empty()
                 && config.multi_symbol_minimum_pass == 0
                 && request.multi_symbol_minimum_pass.is_none()
             {
@@ -861,7 +885,7 @@ fn run_discovery(
             }
             let bank = evolve_new_with_pack_and_quotes(
                 new_dataset,
-                oos1_ref,
+                None,
                 m1_eval,
                 quote_dataset.as_ref(),
                 &broker,
@@ -940,21 +964,15 @@ fn run_discovery(
             "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
         })?
     };
-    let evaluation_oos1 = if bank.data_hash == search_decision.data_hash {
-        None
-    } else {
-        oos1_ref
-    };
+    let evaluation_oos1 = None;
     let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
         &m1.dataset
     } else {
         m1_eval
     };
-    let session = quantforge_discover::EvolutionSession::new(
-        bank.config.worker_threads,
-        evaluation_dataset.bars.len(),
-    )
-    .map_err(|error| error.to_string())?;
+    let session =
+        quantforge_discover::EvolutionSession::new(&bank.config, evaluation_dataset.bars.len())
+            .map_err(|error| error.to_string())?;
 
     loop {
         wait_if_paused(job, paused, stop, &clock)?;
@@ -980,11 +998,13 @@ fn run_discovery(
                 soft_budget.max(1)
             )
         };
-        update_phase(
-            job,
-            &phase_label,
-            "Candidates enter the pot on Selected-TF H1 gates only. After breeding unlocks: OOS1 databank gate → M1 robustness → M1 fidelity → databank (M1 metrics only).",
-        )?;
+        let breeding = bank.pot_size() >= bank.config.mutate_after_elites;
+        let status_message = if breeding {
+            "Build continues on scout workers; Development CPCV/robustness→M1 runs on side workers. OOS1 is untouched."
+        } else {
+            "Candidates enter the Development reservoir only. After breeding unlocks: M1 fidelity → Development CPCV/robustness → databank."
+        };
+        update_phase(job, &phase_label, status_message)?;
 
         bank = session
             .advance_with_quotes(
@@ -1043,11 +1063,28 @@ fn run_discovery(
             }
         }
 
-        // Quota Harvest (and any run with a databank target): stop when filled.
+        // Quota Harvest: flush in-flight promotions so the count is current.
+        if bank.config.target_databank_elites.is_some() {
+            session
+                .flush_promotions(&mut bank)
+                .map_err(|error| error.to_string())?;
+            update_bank(
+                job,
+                &bank,
+                completed_now,
+                soft_budget,
+                run_until_stopped,
+                &clock,
+            )?;
+        }
         if quota_met(&bank) {
             break;
         }
     }
+
+    session
+        .flush_promotions(&mut bank)
+        .map_err(|error| error.to_string())?;
 
     finish_discovery(
         request,
@@ -1105,7 +1142,7 @@ fn finish_discovery(
         view.status = "completed";
         view.phase = "Completed with an empty bank".into();
         view.message = format!(
-            "No elites passed the post-breed pipeline (OOS1 → M1 robustness → M1) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
+            "No elites passed the post-breed pipeline (Development CPCV/robustness → M1) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
             bank.evaluation_count, completed_now
         );
         view.output_path = None;
@@ -1435,7 +1472,9 @@ fn decision_timeframe_label(dataset: &BarDataset) -> Result<String, String> {
     })
 }
 
-/// Threads Rayon will actually use. `0` is the "global pool" sentinel.
+/// Threads Rayon will actually use when a caller still passes the legacy
+/// `0 = all CPUs` sentinel outside resolved scout/promotion helpers.
+#[allow(dead_code)]
 fn effective_worker_threads(configured: usize) -> usize {
     if configured > 0 {
         return configured;
@@ -1501,22 +1540,6 @@ fn development_partition(
     )
     .map_err(|error| error.to_string())?;
     slice_partition(dataset, 0, plan.development.bar_count)
-}
-
-fn oos1_partition(
-    dataset: &BarDataset,
-    validation_fraction: f64,
-    sealed_fraction: f64,
-) -> Result<BarDataset, String> {
-    let plan = quantforge_quality::DataSplitPlan::chronological(
-        dataset,
-        validation_fraction,
-        sealed_fraction,
-    )
-    .map_err(|error| error.to_string())?;
-    let start = plan.development.bar_count;
-    let end = start + plan.validation.bar_count;
-    slice_partition(dataset, start, end)
 }
 
 fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<BarDataset, String> {
@@ -1633,10 +1656,25 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
     }
 }
 
+fn broker_symbol_from_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".broker.json"))
+        .map(str::to_ascii_uppercase)
+}
+
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
-    let commission = request
+    let mut commission = request
         .commission_per_lot_round_turn
         .ok_or_else(|| "commission is required for a new databank".to_owned())?;
+    if let Some(symbol) = broker_symbol_from_path(&request.broker_path) {
+        let expected = quantforge_broker::default_commission_per_lot_round_turn(&symbol);
+        // Saved profiles and the FX default still carry $7 on zero-commission symbols.
+        if (commission - 7.0).abs() < f64::EPSILON && expected == 0.0 {
+            commission = 0.0;
+        }
+    }
     Ok(DiscoverConfig {
         initial_candidates: request.initial_candidates.unwrap_or(500),
         batch_size: request.batch_size.unwrap_or(200),
@@ -1686,11 +1724,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
         random_fill_fraction: request.random_fill_fraction.unwrap_or(0.4),
-        worker_threads: request.worker_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|cores| cores.get().saturating_sub(1).max(1))
-                .unwrap_or(1)
-        }),
+        worker_threads: request.worker_threads.unwrap_or(0),
+        promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
@@ -1884,13 +1920,15 @@ fn update_bank(
     let databank_elites = bank.coverage();
     let target_databank = bank.config.target_databank_elites;
     let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
+    let queue_depth = telemetry.promotion_queue_depth;
+    let inflight = telemetry.promotion_inflight;
     let phase = if let Some(target) = target_databank {
         format!(
             "Quota · databank {databank_elites}/{target} · pot {pot_elites} · gen {completed_now}"
         )
     } else if breeding_active {
         format!(
-            "Breeding from pot · pot {pot_elites} · databank {databank_elites} · gen {completed_now}"
+            "Breeding · pot {pot_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
         )
     } else {
         format!(
@@ -1902,17 +1940,15 @@ fn update_bank(
             "Quota Harvest: databank {databank_elites}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
             funnel_summary(bank)
         )
+    } else if breeding_active {
+        format!(
+            "Build continues; databank pipeline on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · databank {databank_elites}. {}",
+            funnel_summary(bank)
+        )
     } else {
         format!(
-            "Initial pot {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (OOS1→robustness→M1). {} · {}",
-            if breeding_active {
-                "Breeding unlocked — databank pipeline active".to_owned()
-            } else {
-                format!(
-                    "{} more pot elites until breeding (no databank yet)",
-                    mutate_after.saturating_sub(pot_elites)
-                )
-            },
+            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (CPCV/robustness→M1). {} more reservoir members until breeding. {}",
+            mutate_after.saturating_sub(pot_elites),
             funnel_summary(bank)
         )
     };
@@ -1936,9 +1972,16 @@ fn update_bank(
     view.target_databank_elites = target_databank;
     view.mutate_after_elites = mutate_after;
     view.breeding_active = breeding_active;
-    // `0` means "Rayon global pool", which is every logical CPU. Report the
-    // threads that actually run, not the sentinel.
-    view.worker_threads = effective_worker_threads(bank.config.worker_threads);
+    // Report resolved scout / promotion split, not the 0=auto sentinel.
+    view.worker_threads = bank.config.resolved_scout_worker_threads();
+    view.promotion_worker_threads = bank.config.resolved_promotion_worker_threads();
+    view.promotion_queue_capacity = bank.config.promotion_queue_capacity;
+    view.promotion_queue_depth = telemetry.promotion_queue_depth;
+    view.promotion_inflight = telemetry.promotion_inflight;
+    view.promotions_enqueued = telemetry.promotions_enqueued;
+    view.promotions_completed = telemetry.promotions_completed;
+    view.promotion_backpressure_events = telemetry.promotion_backpressure_events;
+    view.promotions_per_hour = telemetry.promotions_completed as f64 / hours;
     view.coverage = databank_elites;
     view.qd_score = bank.qd_score();
     view.rejected_gate = telemetry.rejected_gate;
@@ -2026,6 +2069,8 @@ mod tests {
             mutate_after_elites: Some(0),
             random_fill_fraction: Some(0.0),
             worker_threads: Some(1),
+            promotion_worker_threads: Some(1),
+            promotion_queue_capacity: Some(8),
             require_m1_robustness: Some(false),
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),

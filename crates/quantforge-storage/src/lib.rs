@@ -507,6 +507,7 @@ mod tests {
                 bar_count: 20,
                 data_hash: ContentHash::sha256("development"),
             },
+            development_cpcv: None,
             validation: DataSegment {
                 start_timestamp_ms: 20,
                 end_timestamp_ms_exclusive: 40,

@@ -575,8 +575,8 @@ pub struct DiscoverConfig {
     /// Immutable numeric search space for indicators, stops and management genes.
     #[serde(default)]
     pub search_ranges: SearchRangeProfile,
-    /// OOS1 expectancy must be at least this fraction of IS expectancy before a
-    /// candidate may enter the databank (promotion-grade IS/OOS1/OOS2 workflow).
+    /// Legacy v1 setting retained for decoding old databanks. New discovery
+    /// never reads OOS1; certification owns the first holdout after shortlist.
     #[serde(default = "default_oos1_expectancy_retention")]
     pub oos1_expectancy_retention: f64,
     /// Preference / seal flag: databank elites are M1-promoted after breeding.
@@ -617,7 +617,7 @@ pub struct DiscoverConfig {
     pub max_one_entry_per_day: bool,
     /// Keep random-filling the initial accepted pot until it holds this many
     /// strategies, then unlock crossover/mutation from that pot. Databank
-    /// promotion (OOS1 → robustness → M1) starts only after this unlock.
+    /// Development robustness → M1 promotion starts only after this unlock.
     #[serde(
         default = "default_mutate_after_elites",
         alias = "mutate_after_generation"
@@ -626,9 +626,20 @@ pub struct DiscoverConfig {
     /// After breeding starts, this fraction of each batch remains fresh random seeds.
     #[serde(default = "default_random_fill_fraction")]
     pub random_fill_fraction: f64,
-    /// Rayon worker threads for candidate evaluation. `0` = all logical CPUs.
+    /// Rayon worker threads for H1 scout / pot admission. `0` = auto
+    /// (`available_parallelism − 1 − promotion workers`).
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
+    /// Dedicated Rayon workers for post-breed databank promotion
+    /// (Development CPCV/robustness → M1). `0` = auto (2–4 threads). Scout keeps
+    /// generating on `worker_threads` while this pool drains the queue.
+    #[serde(default = "default_promotion_worker_threads")]
+    pub promotion_worker_threads: usize,
+    /// Max pot admissions waiting or running on the promotion pool. When full,
+    /// Discover applies backpressure (pauses further enqueue / pot growth) rather
+    /// than dropping elites or growing RAM without bound.
+    #[serde(default = "default_promotion_queue_capacity")]
+    pub promotion_queue_capacity: usize,
     /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
     /// neighborhood battery before databank admission. Pot fill never waits on this.
     #[serde(default = "default_require_m1_robustness")]
@@ -707,9 +718,17 @@ fn default_random_fill_fraction() -> f64 {
 }
 
 fn default_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|cores| cores.get().saturating_sub(1).max(1))
-        .unwrap_or(1)
+    // 0 = auto at pool build time (reserves room for promotion workers).
+    0
+}
+
+fn default_promotion_worker_threads() -> usize {
+    // 0 = auto: clamp 2..=4 from available CPUs.
+    0
+}
+
+fn default_promotion_queue_capacity() -> usize {
+    64
 }
 
 fn default_require_m1_robustness() -> bool {
@@ -804,6 +823,8 @@ impl Default for DiscoverConfig {
             mutate_after_elites: default_mutate_after_elites(),
             random_fill_fraction: default_random_fill_fraction(),
             worker_threads: default_worker_threads(),
+            promotion_worker_threads: default_promotion_worker_threads(),
+            promotion_queue_capacity: default_promotion_queue_capacity(),
             require_m1_robustness: default_require_m1_robustness(),
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
@@ -852,7 +873,7 @@ impl DiscoverConfig {
             DiscoverRunMode::QuotaHarvest => {
                 // ~20 databank elites: seed-heavy, softer param neighborhood,
                 // stop on databank quota — not pot 300. Databank still requires
-                // post-breed OOS1 → robustness → M1 (never H1-only elites).
+                // post-breed Development robustness → M1 (never H1-only elites).
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
@@ -910,7 +931,8 @@ impl DiscoverConfig {
             ));
         }
         // Stop/limit/BE/trail/partials are free to search on Selected-TF for the pot.
-        // After breeding unlocks, databank admission always runs OOS1 → robustness → M1.
+        // After breeding unlocks, databank admission always runs Development
+        // CPCV/robustness → M1. OOS1 belongs to certification.
         if self.initial_candidates == 0 {
             return Err(DiscoverError::InvalidConfig(
                 "initial_candidates must be greater than zero".into(),
@@ -985,6 +1007,11 @@ impl DiscoverConfig {
                 "random_fill_fraction must be finite and between 0 and 1".into(),
             ));
         }
+        if self.promotion_queue_capacity == 0 {
+            return Err(DiscoverError::InvalidConfig(
+                "promotion_queue_capacity must be greater than zero".into(),
+            ));
+        }
         if self.require_m1_robustness {
             if self.robustness_folds < 2 {
                 return Err(DiscoverError::InvalidConfig(
@@ -1010,9 +1037,7 @@ impl DiscoverConfig {
                         .into(),
                 ));
             }
-            if !self
-                .robustness_monte_carlo_p80_profit_retention
-                .is_finite()
+            if !self.robustness_monte_carlo_p80_profit_retention.is_finite()
                 || !(0.0..=1.0).contains(&self.robustness_monte_carlo_p80_profit_retention)
             {
                 return Err(DiscoverError::InvalidConfig(
@@ -1047,6 +1072,30 @@ impl DiscoverConfig {
         self.universal_grammar.validate()?;
         self.scout.validate()?;
         Ok(())
+    }
+
+    /// Dedicated promotion-pool size. `0` → auto clamp into 2..=4.
+    pub fn resolved_promotion_worker_threads(&self) -> usize {
+        if self.promotion_worker_threads > 0 {
+            return self.promotion_worker_threads;
+        }
+        let cpus = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        (cpus / 4).clamp(2, 4)
+    }
+
+    /// H1 scout-pool size. `0` → auto (`cpus − 1 − promotion`), leaving room
+    /// for the side promotion workers.
+    pub fn resolved_scout_worker_threads(&self) -> usize {
+        if self.worker_threads > 0 {
+            return self.worker_threads;
+        }
+        let cpus = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        let promotion = self.resolved_promotion_worker_threads();
+        cpus.saturating_sub(1).saturating_sub(promotion).max(1)
     }
 }
 
@@ -1155,6 +1204,10 @@ pub struct M1RetentionEvidence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardFold {
     pub fold: usize,
+    /// Development group indexes held out by this combination. Empty on
+    /// legacy contiguous/calendar-year evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_groups: Vec<usize>,
     /// Open of the first decision bar inside the fold.
     pub start_timestamp_ms: i64,
     /// Open of the last decision bar inside the fold.
@@ -1170,13 +1223,19 @@ pub struct WalkForwardFold {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardEvidence {
-    /// `calendar_year` folds require every fold to pass; `contiguous` folds use
-    /// `required_passing_fraction`.
+    /// Development diagnostics only. CPCV combinations are adaptive search
+    /// evidence and must never be represented as frozen OOS certification.
     pub fold_scheme: String,
     pub total_folds: usize,
     pub passing_folds: usize,
     pub passing_fraction: f64,
     pub required_passing_fraction: f64,
+    /// Purge applied before each held-out Development group.
+    #[serde(default)]
+    pub purge_bars: usize,
+    /// Embargo applied after each held-out Development group.
+    #[serde(default)]
+    pub embargo_bars: usize,
     /// Evaluated folds only. Degenerate ranges still count in `total_folds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folds: Vec<WalkForwardFold>,
@@ -1351,6 +1410,21 @@ pub struct DiscoverTelemetry {
     pub rejected_deflated_sharpe: u64,
     pub rejected_evaluation: u64,
     pub evaluation_errors: BTreeMap<String, u64>,
+    /// Pot admissions enqueued for the post-breed databank pipeline.
+    #[serde(default)]
+    pub promotions_enqueued: u64,
+    /// Promotion jobs that finished (pass or reject) on the side pool.
+    #[serde(default)]
+    pub promotions_completed: u64,
+    /// Times enqueue waited because the promotion queue was at capacity.
+    #[serde(default)]
+    pub promotion_backpressure_events: u64,
+    /// Last observed depth: waiting + in-flight promotion jobs.
+    #[serde(default)]
+    pub promotion_queue_depth: u64,
+    /// Last observed in-flight (actively running) promotion jobs.
+    #[serde(default)]
+    pub promotion_inflight: u64,
 }
 
 impl DiscoverTelemetry {

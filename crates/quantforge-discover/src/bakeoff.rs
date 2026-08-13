@@ -1,16 +1,15 @@
-//! Equal-budget Fast Scout per entry-condition count, ranked by OOS1 retention.
+//! Equal-budget Development scout per entry-condition count.
 //!
 //! This replaces the old per-family bakeoff. Families said what indicators a
 //! strategy was allowed to use; the question that actually matters is how many
 //! mirrored entry conditions survive out of sample, because every extra
 //! condition is another degree of freedom to overfit.
 
-use crate::engine::{evolve_new_with_pack, passes_oos1_pick};
+use crate::engine::evolve_new_with_pack;
 use crate::model::{DiscoverConfig, DiscoverError, DiscoverRunMode, UniversalGrammarConfig};
 use crate::multi_symbol::PackSymbol;
 use quantforge_broker::SymbolSpecification;
 use quantforge_data::BarDataset;
-use quantforge_eval::evaluate_strategy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,17 +69,23 @@ pub struct ConditionBakeoffReport {
     pub recommended: Option<usize>,
 }
 
-/// Run an equal-budget Fast Scout for each entry-condition count, then
-/// independently recheck every retained pot member on OOS1 before ranking it.
+/// Run an equal-budget Development scout for each entry-condition count. OOS1
+/// is deliberately unavailable here; this diagnostic may guide grammar choice
+/// and therefore is part of research, not certification.
 pub fn run_condition_bakeoff(
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
+    certification_oos1: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
     config: ConditionBakeoffConfig,
 ) -> Result<ConditionBakeoffReport, DiscoverError> {
+    if certification_oos1.is_some() {
+        return Err(DiscoverError::InvalidConfig(
+            "condition bakeoff cannot consume OOS1; compare grammars on Development only".into(),
+        ));
+    }
     let mut rows = Vec::with_capacity(config.entry_condition_counts.len());
     for entry_conditions in &config.entry_condition_counts {
         let entry_conditions =
@@ -96,7 +101,7 @@ pub fn run_condition_bakeoff(
         discover.apply_run_mode();
         let bank = evolve_new_with_pack(
             dataset,
-            oos1_dataset,
+            None,
             m1_dataset,
             broker,
             pack,
@@ -104,74 +109,42 @@ pub fn run_condition_bakeoff(
             discover,
             config.generations,
         )?;
-        // Production Discover preserves OOS1 metrics only for candidates that
-        // pass OOS1 into the databank. Aggregating those persisted fields here
-        // made the tester display a mechanical 100% pass rate. Re-evaluate
-        // every current pot member on the held-out OOS1 partition instead.
-        let mut is_values_r = Vec::with_capacity(bank.accepted_pool.len());
-        let mut oos1_values_r = Vec::with_capacity(bank.accepted_pool.len());
-        let mut retentions = Vec::with_capacity(bank.accepted_pool.len());
-        let mut passes = 0usize;
-        if let Some(oos1) = oos1_dataset {
-            for elite in &bank.accepted_pool {
-                let oos1_result =
-                    evaluate_strategy(&elite.strategy, oos1, broker, &bank.config.scout)?;
-                let is_expectancy = elite.is_expectancy;
-                let oos1_expectancy = oos1_result.metrics.expectancy;
-                is_values_r.push(is_expectancy / crate::FIXED_RISK_PER_TRADE);
-                oos1_values_r.push(oos1_expectancy / crate::FIXED_RISK_PER_TRADE);
-                if is_expectancy > 0.0 && is_expectancy.is_finite() && oos1_expectancy.is_finite() {
-                    retentions.push(oos1_expectancy / is_expectancy);
-                }
-                if passes_oos1_pick(
-                    is_expectancy,
-                    oos1_expectancy,
-                    bank.config.oos1_expectancy_retention,
-                ) {
-                    passes += 1;
-                }
-            }
-        }
-        let oos1_tested = oos1_values_r.len();
-        let pass_rate = if oos1_tested == 0 {
-            0.0
-        } else {
-            passes as f64 / oos1_tested as f64
-        };
+        let is_values_r = bank
+            .accepted_pool
+            .iter()
+            .map(|elite| elite.is_expectancy / crate::FIXED_RISK_PER_TRADE)
+            .collect::<Vec<_>>();
         rows.push(ConditionBakeoffRow {
             entry_conditions,
             median_is_expectancy_r: median(&is_values_r),
-            median_oos1_expectancy_r: median(&oos1_values_r),
-            median_retention: median(&retentions),
-            pass_rate,
+            median_oos1_expectancy_r: 0.0,
+            median_retention: 0.0,
+            pass_rate: 0.0,
             elites: bank.elites.len(),
             pot_elites: bank.accepted_pool.len(),
-            oos1_tested,
+            oos1_tested: 0,
             evaluations: bank.evaluation_count,
         });
     }
     rows.sort_by(|left, right| {
         right
-            .median_retention
-            .partial_cmp(&left.median_retention)
+            .median_is_expectancy_r
+            .partial_cmp(&left.median_is_expectancy_r)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                right
-                    .median_oos1_expectancy_r
-                    .partial_cmp(&left.median_oos1_expectancy_r)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
             // Break remaining ties toward the simpler arm.
             .then_with(|| left.entry_conditions.cmp(&right.entry_conditions))
     });
+    // This is a development diagnostic. Prefer the simplest viable arm within
+    // 90% of the best Development expectancy; never call it OOS validated.
+    let best = rows
+        .iter()
+        .map(|row| row.median_is_expectancy_r)
+        .fold(0.0_f64, f64::max);
     let recommended = rows
         .iter()
-        .find(|row| {
-            row.oos1_tested >= 10
-                && row.pass_rate >= 0.50
-                && row.median_retention >= 0.70
-                && row.median_oos1_expectancy_r > 0.0
-        })
+        .filter(|row| row.median_is_expectancy_r > 0.0)
+        .filter(|row| row.median_is_expectancy_r + 1e-12 >= best * 0.9)
+        .min_by_key(|row| row.entry_conditions)
         .map(|row| row.entry_conditions);
     Ok(ConditionBakeoffReport { rows, recommended })
 }
@@ -209,12 +182,14 @@ mod tests {
     }
 
     #[test]
-    fn bakeoff_ranks_by_retention() {
+    fn bakeoff_ranks_by_development_expectancy() {
         let mut rows = [row(4, 0.5), row(2, 0.9)];
+        rows[0].median_is_expectancy_r = 0.1;
+        rows[1].median_is_expectancy_r = 0.3;
         rows.sort_by(|left, right| {
             right
-                .median_retention
-                .partial_cmp(&left.median_retention)
+                .median_is_expectancy_r
+                .partial_cmp(&left.median_is_expectancy_r)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         assert_eq!(rows[0].entry_conditions, 2);

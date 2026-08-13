@@ -8,6 +8,22 @@ use thiserror::Error;
 
 const IC_MARKETS_EST_PLUS_7: &str = "ICMarkets/EST+7";
 
+/// IC Markets raw-spread symbols with no round-turn commission in Discover / MT5 parity.
+pub fn default_commission_per_lot_round_turn(symbol: &str) -> f64 {
+    match symbol.to_ascii_uppercase().as_str() {
+        "US500" | "US100" | "US30" | "NAS100" | "BTCUSD" | "XTIUSD" | "DE40" => 0.0,
+        _ => 7.0,
+    }
+}
+
+/// Whether the identical-parameter FX pack screen applies to this discovery symbol.
+pub fn fx_multi_symbol_primary(symbol: &str) -> bool {
+    !matches!(
+        symbol.to_ascii_uppercase().as_str(),
+        "US500" | "US100" | "US30" | "NAS100" | "BTCUSD" | "XTIUSD" | "XAUUSD" | "DE40"
+    )
+}
+
 /// Converts absolute timestamps into the wall clock used for broker sessions,
 /// time-based features and swap rollovers. Most brokers use a normal IANA
 /// timezone; IC Markets' New-York-plus-seven server clock is an explicit

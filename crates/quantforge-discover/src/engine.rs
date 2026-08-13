@@ -2,14 +2,16 @@ use crate::archive::{CandidateEvaluation, deposit_to_accepted_pool, deposit_to_d
 use crate::grammar::{
     apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
 };
+#[cfg(test)]
+use crate::model::recovery_factor;
 use crate::model::{
-    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateResult, SearchFamily,
-    SymbolScreenResult, recovery_factor,
+    Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateConfig, GateResult,
+    SearchFamily, SymbolScreenResult,
 };
 use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
 use quantforge_broker::SymbolSpecification;
-use quantforge_data::{BarDataset, QuoteBarDataset, bar_content_hash};
+use quantforge_data::{BarDataset, QuoteBarDataset};
 use quantforge_eval::ScoutResult;
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_ir::StrategyIr;
@@ -19,6 +21,9 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 enum CandidateOutcome {
     CoarseRejected,
@@ -53,16 +58,27 @@ fn evaluate_and_deposit(
     bank: &mut Databank,
     candidates: Vec<StrategyIr>,
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
+    certification_oos1: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     pack: &[PackSymbol],
     primary_symbol: &str,
     generation: u64,
-    pool: Option<&rayon::ThreadPool>,
-    indicator_cache: &IndicatorBufferCache,
+    scout_pool: Option<&rayon::ThreadPool>,
+    promotion: &PromotionPipeline,
+    indicator_cache: &Arc<IndicatorBufferCache>,
 ) -> Result<(), DiscoverError> {
+    if certification_oos1.is_some() {
+        return Err(DiscoverError::InvalidConfig(
+            "Discover cannot consume OOS1; freeze a diverse shortlist, then run Challenge certification"
+                .into(),
+        ));
+    }
+    // Apply finished promotions before scouting so databank / telemetry stay current
+    // without blocking the H1 worker pool on in-flight M1 work.
+    promotion.drain_completed(bank)?;
+
     let mut scout = bank.config.scout.clone();
     // Both the coarse gate and the multi-symbol screen cap drawdown at
     // `gates.maximum_drawdown_percent`, so a candidate past that ceiling is already
@@ -78,12 +94,9 @@ fn evaluate_and_deposit(
     let owned_gates = bank.config.gates.clone();
     let gates = &owned_gates;
     let discover_config = &bank.config;
-    let oos1_retention = bank.config.oos1_expectancy_retention;
     let multi_symbol_minimum = bank.config.multi_symbol_minimum_pass;
     let minimum_deflated = bank.config.minimum_deflated_trade_sharpe;
-    let require_m1_robustness = bank.config.require_m1_robustness;
     let evaluations_touched = bank.evaluation_count.max(1);
-    let robustness = robustness_config_from_discover(&bank.config);
     let evaluate_batch = || {
         candidates
             .into_par_iter()
@@ -94,7 +107,7 @@ fn evaluate_and_deposit(
                         dataset,
                         broker,
                         &scout,
-                        indicator_cache,
+                        indicator_cache.as_ref(),
                     )
                     .map_err(|error| error.to_string())?;
                     if !crate::archive::passes_gates(&coarse, discover_config) {
@@ -140,8 +153,8 @@ fn evaluate_and_deposit(
                         }
                     }
 
-                    // Pot admission is Selected-TF / H1 only. Databank promotion
-                    // (OOS1 → robustness → M1) waits until breeding unlocks.
+                    // Pot admission is Selected-TF / H1 Development only.
+                    // Development robustness → M1 waits until breeding unlocks.
                     if !crate::archive::passes_gate_config(&coarse, &discover_config.deposit_gates)
                     {
                         return Ok(CandidateOutcome::DepositGateRejected);
@@ -161,7 +174,7 @@ fn evaluate_and_deposit(
             })
             .collect::<Vec<_>>()
     };
-    let evaluated = match pool {
+    let evaluated = match scout_pool {
         Some(pool) => pool.install(evaluate_batch),
         None => evaluate_batch(),
     };
@@ -235,274 +248,22 @@ fn evaluate_and_deposit(
         }
     }
 
-    // SQX structure: fill the pot on H1 before breeding. Only after breeding
-    // unlocks does the databank pipeline run:
-    //   databank gates (OOS1) → robustness → M1 → databank (M1 metrics only).
+    // Discovery is development-only. Once breeding unlocks, the side pool runs
+    // M1 fidelity + Development CPCV/robustness and archives M1 evidence. OOS1
+    // is opened only after a diverse shortlist has been frozen.
     let breeding_unlocked = bank.accepted_pool.len() >= bank.config.mutate_after_elites;
-    if !breeding_unlocked || pot_promotions.is_empty() {
-        return Ok(());
-    }
-
-    let deposit_gates = bank.config.deposit_gates.clone();
-    let multi_symbol_minimum_pass = bank.config.multi_symbol_minimum_pass;
-    let minimum_deflated_trade_sharpe = bank.config.minimum_deflated_trade_sharpe;
-    // OOS1 must be checked with the same M1 chronology that is ultimately
-    // archived.  The selected-timeframe check below remains a cheap first
-    // filter, while this joined IS+OOS1 replay prevents an H1-only survivor
-    // from entering the M1 databank with a negative first holdout.
-    let m1_oos1_decision = oos1_dataset.map(|oos1| join_datasets(dataset, oos1));
-    let promote_one = |pot_evaluation: CandidateEvaluation| -> PromotionOutcome {
-        let strategy = &pot_evaluation.strategy;
-        let h1_is_expectancy = pot_evaluation.is_expectancy;
-
-        // Databank gate: Selected-TF OOS1 retention before paying for M1.
-        let (oos1_expectancy, oos1_expectancy_ratio) = if let Some(oos1) = oos1_dataset {
-            match evaluate_strategy_cached(strategy, oos1, broker, &scout, indicator_cache) {
-                Ok(oos1_result) => {
-                    let oos1_expectancy = oos1_result.metrics.expectancy;
-                    if !passes_oos1_pick(h1_is_expectancy, oos1_expectancy, oos1_retention) {
-                        return PromotionOutcome::Oos1Rejected;
-                    }
-                    let ratio = (h1_is_expectancy > 0.0)
-                        .then_some(oos1_expectancy / h1_is_expectancy)
-                        .filter(|value| value.is_finite());
-                    (Some(oos1_expectancy), ratio)
-                }
-                Err(error) => {
-                    return PromotionOutcome::EvaluationError {
-                        message: error.to_string(),
-                    };
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        // Robustness battery + M1 fidelity. Databank archives the M1 result —
-        // never Selected-TF equity/metrics.  A caller may explicitly disable
-        // the expensive battery for smoke tests or a deliberately cheap scout;
-        // that still evaluates the candidate on M1, it simply records no
-        // robustness evidence.  The production default keeps the full battery.
-        let m1_outcome = if require_m1_robustness {
-            match crate::robustness::run_m1_predeposit_robustness(
-                strategy,
-                dataset,
-                m1_dataset,
-                quote_dataset,
-                broker,
-                &robustness,
-                &pot_evaluation.result.metrics,
-            ) {
-                Err(reject) => return PromotionOutcome::RobustnessRejected { reject },
-                Ok(outcome) => (outcome.result, outcome.evidence),
-            }
-        } else {
-            match evaluate_strategy_m1_with_optional_quotes(
-                strategy,
-                dataset,
-                m1_dataset,
-                quote_dataset,
-                broker,
-                &JudgeConfig {
-                    initial_balance: robustness.initial_balance,
-                    costs: robustness.costs.clone(),
-                    allow_execution_gaps: false,
-                    indicator_engine: robustness.indicator_engine,
-                    entry_window: robustness.entry_window,
-                },
-            ) {
-                Err(error) => {
-                    return PromotionOutcome::EvaluationError {
-                        message: error.to_string(),
-                    };
-                }
-                Ok(result) => (
-                    ScoutResult {
-                        trades: result.trades,
-                        equity: result.equity,
-                        metrics: result.metrics,
-                        telemetry: Default::default(),
-                    },
-                    None,
-                ),
-            }
-        };
-        let (archived_oos1_expectancy, archived_oos1_ratio) =
-            if let Some(m1_oos1_decision) = m1_oos1_decision.as_ref() {
-                let oos1_start_ms = oos1_dataset
-                    .and_then(|data| data.bars.first())
-                    .map(|bar| bar.timestamp_ms)
-                    .expect("OOS1 dataset must contain at least one bar");
-                let judge = JudgeConfig {
-                    initial_balance: robustness.initial_balance,
-                    costs: robustness.costs.clone(),
-                    allow_execution_gaps: false,
-                    indicator_engine: robustness.indicator_engine,
-                    entry_window: robustness.entry_window,
-                };
-                let m1_oos1_replay = match evaluate_strategy_m1_with_optional_quotes(
-                    strategy,
-                    m1_oos1_decision,
-                    m1_dataset,
-                    quote_dataset,
-                    broker,
-                    &judge,
-                ) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        return PromotionOutcome::EvaluationError {
-                            message: format!("M1 OOS1 replay failed: {error}"),
-                        };
-                    }
-                };
-                let m1_is_expectancy = expectancy_before(&m1_oos1_replay.trades, oos1_start_ms);
-                let m1_oos1_expectancy = expectancy_from(&m1_oos1_replay.trades, oos1_start_ms);
-                if !passes_oos1_pick(m1_is_expectancy, m1_oos1_expectancy, oos1_retention) {
-                    return PromotionOutcome::Oos1Rejected;
-                }
-                let m1_oos1_ratio = (m1_is_expectancy > 0.0)
-                    .then_some(m1_oos1_expectancy / m1_is_expectancy)
-                    .filter(|value| value.is_finite());
-                // Archive the M1 OOS1 evidence, rather than the preliminary
-                // Selected-TF figure, so the Databank table and full-run chart
-                // describe the very gate that admitted the strategy.
-                (Some(m1_oos1_expectancy), m1_oos1_ratio)
-            } else {
-                (oos1_expectancy, oos1_expectancy_ratio)
-            };
-        if !crate::archive::passes_gate_config(&m1_outcome.0, &deposit_gates) {
-            return PromotionOutcome::DatabankGateRejected;
-        }
-        PromotionOutcome::Ready {
-            pot_evaluation,
-            m1_result: m1_outcome.0,
-            robustness: m1_outcome.1,
-            oos1_expectancy: archived_oos1_expectancy,
-            oos1_expectancy_ratio: archived_oos1_ratio,
-        }
-    };
-
-    let promotion_outcomes = match pool {
-        Some(pool) => pool.install(|| {
-            pot_promotions
-                .into_par_iter()
-                .map(promote_one)
-                .collect::<Vec<_>>()
-        }),
-        None => pot_promotions
-            .into_par_iter()
-            .map(promote_one)
-            .collect::<Vec<_>>(),
-    };
-
-    // Sequential databank deposits + telemetry (archive is not Sync).
-    for outcome in promotion_outcomes {
-        match outcome {
-            PromotionOutcome::Oos1Rejected => {
-                bank.telemetry.record(DepositDecision::RejectedOos1);
-            }
-            PromotionOutcome::DatabankGateRejected => {
-                bank.telemetry.record(DepositDecision::RejectedDepositGate);
-            }
-            PromotionOutcome::RobustnessRejected { reject } => match reject {
-                crate::robustness::RobustnessReject::M1Fidelity => {
-                    bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
-                }
-                crate::robustness::RobustnessReject::WalkForward => {
-                    bank.telemetry.record(DepositDecision::RejectedWalkForward);
-                }
-                crate::robustness::RobustnessReject::MonteCarlo => {
-                    bank.telemetry.record(DepositDecision::RejectedMonteCarlo);
-                }
-                crate::robustness::RobustnessReject::ParamNeighborhood => {
-                    bank.telemetry
-                        .record(DepositDecision::RejectedParamNeighborhood);
-                }
-            },
-            PromotionOutcome::EvaluationError { message } => {
-                *bank.telemetry.evaluation_errors.entry(message).or_default() += 1;
-                bank.telemetry.record(DepositDecision::RejectedEvaluation);
-            }
-            PromotionOutcome::Ready {
-                pot_evaluation,
-                m1_result,
-                robustness,
-                oos1_expectancy,
-                oos1_expectancy_ratio,
-            } => {
-                let multi_symbol_results = pot_evaluation.multi_symbol_results.clone();
-                let deflated_trade_sharpe = pot_evaluation.deflated_trade_sharpe;
-                let m1_expectancy = m1_result.metrics.expectancy;
-                let bank_evaluation = CandidateEvaluation {
-                    result: m1_result,
-                    is_expectancy: m1_expectancy,
-                    oos1_expectancy,
-                    oos1_expectancy_ratio,
-                    gate_results: build_gate_results(
-                        m1_expectancy,
-                        oos1_expectancy,
-                        oos1_expectancy_ratio,
-                        true,
-                        None,
-                        &multi_symbol_results,
-                        multi_symbol_minimum_pass,
-                        deflated_trade_sharpe,
-                        minimum_deflated_trade_sharpe,
-                    ),
-                    robustness,
-                    ..pot_evaluation
-                };
-                let bank_decision = deposit_to_databank(bank, bank_evaluation)?;
-                bank.telemetry.record(bank_decision);
-            }
+    if breeding_unlocked && !pot_promotions.is_empty() {
+        let context =
+            promotion.context_for(&bank.config, dataset, m1_dataset, quote_dataset, broker);
+        for pot_evaluation in pot_promotions {
+            promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
         }
     }
+    promotion.snapshot_telemetry(bank);
     Ok(())
 }
 
-/// Concatenates consecutive chronological partitions for an M1 replay without
-/// exposing the sealed OOS2 partition to the promotion gate.
-fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
-    let mut bars = Vec::with_capacity(first.bars.len() + second.bars.len());
-    bars.extend_from_slice(&first.bars);
-    bars.extend_from_slice(&second.bars);
-    BarDataset {
-        data_hash: bar_content_hash(&bars),
-        source_rows: bars.len(),
-        duplicate_rows_removed: 0,
-        input_was_sorted: true,
-        delimiter: first.delimiter,
-        source_timezone: first.source_timezone.clone(),
-        bars,
-    }
-}
-
-fn expectancy_before(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
-    expectancy_for(trades, |entry| entry < timestamp_ms)
-}
-
-fn expectancy_from(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
-    expectancy_for(trades, |entry| entry >= timestamp_ms)
-}
-
-fn expectancy_for(trades: &[quantforge_eval::Trade], include: impl Fn(i64) -> bool) -> f64 {
-    let mut profit = 0.0;
-    let mut count = 0usize;
-    for trade in trades {
-        if include(trade.entry_timestamp_ms) {
-            profit += trade.net_profit;
-            count += 1;
-        }
-    }
-    if count == 0 {
-        0.0
-    } else {
-        profit / count as f64
-    }
-}
-
 enum PromotionOutcome {
-    Oos1Rejected,
     DatabankGateRejected,
     RobustnessRejected {
         reject: crate::robustness::RobustnessReject,
@@ -514,9 +275,303 @@ enum PromotionOutcome {
         pot_evaluation: CandidateEvaluation,
         m1_result: ScoutResult,
         robustness: Option<crate::model::RobustnessEvidence>,
-        oos1_expectancy: Option<f64>,
-        oos1_expectancy_ratio: Option<f64>,
     },
+}
+
+/// Immutable inputs shared by every in-flight promotion job.
+struct PromotionContext {
+    dataset: Arc<BarDataset>,
+    m1: Arc<BarDataset>,
+    quotes: Option<Arc<QuoteBarDataset>>,
+    broker: Arc<SymbolSpecification>,
+    deposit_gates: GateConfig,
+    require_m1_robustness: bool,
+    robustness: crate::robustness::RobustnessConfig,
+}
+
+struct PromotionShared {
+    completed: Mutex<Vec<PromotionOutcome>>,
+    /// Waiting + running promotion jobs. Cap this for backpressure.
+    inflight: AtomicUsize,
+    /// Actively executing on the promotion pool (subset of inflight).
+    running: AtomicUsize,
+    capacity: usize,
+    wake: Condvar,
+}
+
+/// Side pool for Development CPCV/robustness → M1 while scouting continues.
+struct PromotionPipeline {
+    pool: Option<rayon::ThreadPool>,
+    shared: Arc<PromotionShared>,
+}
+
+impl PromotionPipeline {
+    fn new(worker_threads: usize, capacity: usize) -> Result<Self, DiscoverError> {
+        Ok(Self {
+            pool: build_worker_pool(worker_threads.max(1))?,
+            shared: Arc::new(PromotionShared {
+                completed: Mutex::new(Vec::new()),
+                inflight: AtomicUsize::new(0),
+                running: AtomicUsize::new(0),
+                capacity: capacity.max(1),
+                wake: Condvar::new(),
+            }),
+        })
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.shared.inflight.load(Ordering::SeqCst)
+    }
+
+    fn inflight_running(&self) -> usize {
+        self.shared.running.load(Ordering::SeqCst)
+    }
+
+    fn snapshot_telemetry(&self, bank: &mut Databank) {
+        bank.telemetry.promotion_queue_depth = self.queue_depth() as u64;
+        bank.telemetry.promotion_inflight = self.inflight_running() as u64;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn context_for(
+        &self,
+        config: &DiscoverConfig,
+        dataset: &BarDataset,
+        m1_dataset: &BarDataset,
+        quote_dataset: Option<&QuoteBarDataset>,
+        broker: &SymbolSpecification,
+    ) -> Arc<PromotionContext> {
+        Arc::new(PromotionContext {
+            dataset: Arc::new(dataset.clone()),
+            m1: Arc::new(m1_dataset.clone()),
+            quotes: quote_dataset.map(|data| Arc::new(data.clone())),
+            broker: Arc::new(broker.clone()),
+            deposit_gates: config.deposit_gates.clone(),
+            require_m1_robustness: config.require_m1_robustness,
+            robustness: robustness_config_from_discover(config),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        pot_evaluation: CandidateEvaluation,
+        context: Arc<PromotionContext>,
+        bank: &mut Databank,
+    ) -> Result<(), DiscoverError> {
+        // Prefer backpressure over dropping pot admissions: wait until a slot
+        // frees, draining any finished promotions while we wait.
+        loop {
+            self.drain_completed(bank)?;
+            let depth = self.shared.inflight.load(Ordering::SeqCst);
+            if depth < self.shared.capacity {
+                break;
+            }
+            bank.telemetry.promotion_backpressure_events += 1;
+            self.snapshot_telemetry(bank);
+            let guard = self
+                .shared
+                .completed
+                .lock()
+                .map_err(|_| DiscoverError::InvalidConfig("promotion lock poisoned".into()))?;
+            let (_guard, _) = self
+                .shared
+                .wake
+                .wait_timeout(guard, Duration::from_millis(25))
+                .map_err(|_| DiscoverError::InvalidConfig("promotion wait poisoned".into()))?;
+        }
+
+        self.shared.inflight.fetch_add(1, Ordering::SeqCst);
+        bank.telemetry.promotions_enqueued += 1;
+        self.snapshot_telemetry(bank);
+
+        let shared = Arc::clone(&self.shared);
+        let run = move || {
+            shared.running.fetch_add(1, Ordering::SeqCst);
+            let outcome = promote_one(pot_evaluation, &context);
+            shared.running.fetch_sub(1, Ordering::SeqCst);
+            if let Ok(mut completed) = shared.completed.lock() {
+                completed.push(outcome);
+            }
+            shared.inflight.fetch_sub(1, Ordering::SeqCst);
+            shared.wake.notify_all();
+        };
+
+        match &self.pool {
+            Some(pool) => {
+                pool.spawn(run);
+            }
+            None => {
+                // No dedicated pool: run inline so gates still apply.
+                run();
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_completed(&self, bank: &mut Databank) -> Result<(), DiscoverError> {
+        let outcomes = {
+            let mut completed = self
+                .shared
+                .completed
+                .lock()
+                .map_err(|_| DiscoverError::InvalidConfig("promotion lock poisoned".into()))?;
+            std::mem::take(&mut *completed)
+        };
+        for outcome in outcomes {
+            apply_promotion_outcome(bank, outcome)?;
+            bank.telemetry.promotions_completed += 1;
+        }
+        self.snapshot_telemetry(bank);
+        Ok(())
+    }
+
+    fn flush(&self, bank: &mut Databank) -> Result<(), DiscoverError> {
+        loop {
+            self.drain_completed(bank)?;
+            if self.shared.inflight.load(Ordering::SeqCst) == 0 {
+                self.drain_completed(bank)?;
+                self.snapshot_telemetry(bank);
+                return Ok(());
+            }
+            let guard = self
+                .shared
+                .completed
+                .lock()
+                .map_err(|_| DiscoverError::InvalidConfig("promotion lock poisoned".into()))?;
+            let (_guard, _) = self
+                .shared
+                .wake
+                .wait_timeout(guard, Duration::from_millis(50))
+                .map_err(|_| DiscoverError::InvalidConfig("promotion wait poisoned".into()))?;
+        }
+    }
+}
+
+fn promote_one(
+    pot_evaluation: CandidateEvaluation,
+    context: &PromotionContext,
+) -> PromotionOutcome {
+    let strategy = &pot_evaluation.strategy;
+    let broker = context.broker.as_ref();
+    let robustness = &context.robustness;
+
+    // Robustness battery + M1 fidelity. Databank archives the M1 result —
+    // never Selected-TF equity/metrics.
+    let m1_outcome = if context.require_m1_robustness {
+        match crate::robustness::run_m1_predeposit_robustness(
+            strategy,
+            context.dataset.as_ref(),
+            context.m1.as_ref(),
+            context.quotes.as_deref(),
+            broker,
+            robustness,
+            &pot_evaluation.result.metrics,
+        ) {
+            Err(reject) => return PromotionOutcome::RobustnessRejected { reject },
+            Ok(outcome) => (outcome.result, outcome.evidence),
+        }
+    } else {
+        match evaluate_strategy_m1_with_optional_quotes(
+            strategy,
+            context.dataset.as_ref(),
+            context.m1.as_ref(),
+            context.quotes.as_deref(),
+            broker,
+            &JudgeConfig {
+                initial_balance: robustness.initial_balance,
+                costs: robustness.costs.clone(),
+                allow_execution_gaps: false,
+                indicator_engine: robustness.indicator_engine,
+                entry_window: robustness.entry_window,
+            },
+        ) {
+            Err(error) => {
+                return PromotionOutcome::EvaluationError {
+                    message: error.to_string(),
+                };
+            }
+            Ok(result) => (
+                ScoutResult {
+                    trades: result.trades,
+                    equity: result.equity,
+                    metrics: result.metrics,
+                    telemetry: Default::default(),
+                },
+                None,
+            ),
+        }
+    };
+    if !crate::archive::passes_gate_config(&m1_outcome.0, &context.deposit_gates) {
+        return PromotionOutcome::DatabankGateRejected;
+    }
+    PromotionOutcome::Ready {
+        pot_evaluation,
+        m1_result: m1_outcome.0,
+        robustness: m1_outcome.1,
+    }
+}
+
+fn apply_promotion_outcome(
+    bank: &mut Databank,
+    outcome: PromotionOutcome,
+) -> Result<(), DiscoverError> {
+    match outcome {
+        PromotionOutcome::DatabankGateRejected => {
+            bank.telemetry.record(DepositDecision::RejectedDepositGate);
+        }
+        PromotionOutcome::RobustnessRejected { reject } => match reject {
+            crate::robustness::RobustnessReject::M1Fidelity => {
+                bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
+            }
+            crate::robustness::RobustnessReject::WalkForward => {
+                bank.telemetry.record(DepositDecision::RejectedWalkForward);
+            }
+            crate::robustness::RobustnessReject::MonteCarlo => {
+                bank.telemetry.record(DepositDecision::RejectedMonteCarlo);
+            }
+            crate::robustness::RobustnessReject::ParamNeighborhood => {
+                bank.telemetry
+                    .record(DepositDecision::RejectedParamNeighborhood);
+            }
+        },
+        PromotionOutcome::EvaluationError { message } => {
+            *bank.telemetry.evaluation_errors.entry(message).or_default() += 1;
+            bank.telemetry.record(DepositDecision::RejectedEvaluation);
+        }
+        PromotionOutcome::Ready {
+            pot_evaluation,
+            m1_result,
+            robustness,
+        } => {
+            let multi_symbol_results = pot_evaluation.multi_symbol_results.clone();
+            let deflated_trade_sharpe = pot_evaluation.deflated_trade_sharpe;
+            let m1_expectancy = m1_result.metrics.expectancy;
+            let bank_evaluation = CandidateEvaluation {
+                result: m1_result,
+                is_expectancy: m1_expectancy,
+                // OOS1 is deliberately absent from discovery artifacts. These
+                // compatibility fields are populated only by certification.
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                gate_results: build_gate_results(
+                    m1_expectancy,
+                    None,
+                    None,
+                    false,
+                    None,
+                    &multi_symbol_results,
+                    bank.config.multi_symbol_minimum_pass,
+                    deflated_trade_sharpe,
+                    bank.config.minimum_deflated_trade_sharpe,
+                ),
+                robustness,
+                ..pot_evaluation
+            };
+            let bank_decision = deposit_to_databank(bank, bank_evaluation)?;
+            bank.telemetry.record(bank_decision);
+        }
+    }
+    Ok(())
 }
 
 fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness::RobustnessConfig {
@@ -555,8 +610,9 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     }
 }
 
-/// Promotion pick gate: OOS1 expectancy must retain at least `retention` of IS
-/// expectancy. Both windows must show positive expectancy.
+/// Certification formula retained only as a regression-testable definition.
+/// Discover must never call it; Challenge owns the post-shortlist OOS1 replay.
+#[cfg(test)]
 pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
     is_expectancy.is_finite()
         && oos1_expectancy.is_finite()
@@ -697,9 +753,13 @@ pub fn evolve_new_with_pack_and_quotes(
             apply_production_policy(seeded, &bank.config)
         })
         .collect();
-    let pool = build_worker_pool(bank.config.worker_threads)?;
+    let pool = build_worker_pool(bank.config.resolved_scout_worker_threads())?;
+    let promotion = PromotionPipeline::new(
+        bank.config.resolved_promotion_worker_threads(),
+        bank.config.promotion_queue_capacity,
+    )?;
     // One cache per decision dataset, reused by every candidate in the run.
-    let indicator_cache = IndicatorBufferCache::new(dataset.bars.len());
+    let indicator_cache = Arc::new(IndicatorBufferCache::new(dataset.bars.len()));
     evaluate_and_deposit(
         &mut bank,
         initial,
@@ -712,6 +772,7 @@ pub fn evolve_new_with_pack_and_quotes(
         primary_symbol,
         0,
         pool.as_ref(),
+        &promotion,
         &indicator_cache,
     )?;
     run_generations(
@@ -725,8 +786,10 @@ pub fn evolve_new_with_pack_and_quotes(
         primary_symbol,
         generations,
         pool.as_ref(),
+        &promotion,
         &indicator_cache,
     )?;
+    promotion.flush(&mut bank)?;
     Ok(bank)
 }
 
@@ -752,7 +815,7 @@ pub fn continue_evolution(
 
 #[allow(clippy::too_many_arguments)]
 pub fn continue_evolution_with_pack(
-    mut bank: Databank,
+    bank: Databank,
     dataset: &BarDataset,
     oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
@@ -787,8 +850,12 @@ pub fn continue_evolution_with_pack_and_quotes(
     additional_generations: u64,
 ) -> Result<Databank, DiscoverError> {
     validate_resume(&bank, dataset, m1_dataset, broker)?;
-    let pool = build_worker_pool(bank.config.worker_threads)?;
-    let indicator_cache = IndicatorBufferCache::new(dataset.bars.len());
+    let pool = build_worker_pool(bank.config.resolved_scout_worker_threads())?;
+    let promotion = PromotionPipeline::new(
+        bank.config.resolved_promotion_worker_threads(),
+        bank.config.promotion_queue_capacity,
+    )?;
+    let indicator_cache = Arc::new(IndicatorBufferCache::new(dataset.bars.len()));
     run_generations(
         &mut bank,
         dataset,
@@ -800,38 +867,60 @@ pub fn continue_evolution_with_pack_and_quotes(
         primary_symbol,
         additional_generations,
         pool.as_ref(),
+        &promotion,
         &indicator_cache,
     )?;
+    promotion.flush(&mut bank)?;
     Ok(bank)
 }
 
-/// Long-lived worker pool and cross-candidate indicator cache for a caller that
+/// Long-lived worker pools and cross-candidate indicator cache for a caller that
 /// advances one generation at a time.
 ///
+/// H1 scouting runs on the scout pool. After breeding unlocks, Development
+/// robustness → M1 promotions drain on a dedicated pool.
 /// [`continue_evolution_with_pack`] builds both per call, which is right for a
 /// batch of generations but throws the indicator cache away every generation
 /// when a UI advances singly to checkpoint and refresh progress. Holding one
 /// session for the whole run keeps `ATR(14)`-style buffers warm across
 /// generations instead of recomputing them from the first bar each time.
 pub struct EvolutionSession {
-    pool: Option<rayon::ThreadPool>,
-    indicator_cache: IndicatorBufferCache,
+    scout_pool: Option<rayon::ThreadPool>,
+    promotion: PromotionPipeline,
+    indicator_cache: Arc<IndicatorBufferCache>,
 }
 
 impl EvolutionSession {
     /// `decision_bars` must be the bar count of the one decision dataset this
     /// session will be advanced against; buffers are keyed to those bars.
-    pub fn new(worker_threads: usize, decision_bars: usize) -> Result<Self, DiscoverError> {
+    pub fn new(config: &DiscoverConfig, decision_bars: usize) -> Result<Self, DiscoverError> {
         Ok(Self {
-            pool: build_worker_pool(worker_threads)?,
-            indicator_cache: IndicatorBufferCache::new(decision_bars),
+            scout_pool: build_worker_pool(config.resolved_scout_worker_threads())?,
+            promotion: PromotionPipeline::new(
+                config.resolved_promotion_worker_threads(),
+                config.promotion_queue_capacity,
+            )?,
+            indicator_cache: Arc::new(IndicatorBufferCache::new(decision_bars)),
         })
+    }
+
+    /// Wait for every queued promotion to finish and deposit results.
+    pub fn flush_promotions(&self, bank: &mut Databank) -> Result<(), DiscoverError> {
+        self.promotion.flush(bank)
+    }
+
+    pub fn promotion_queue_depth(&self) -> usize {
+        self.promotion.queue_depth()
+    }
+
+    pub fn promotion_inflight(&self) -> usize {
+        self.promotion.inflight_running()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn advance(
         &self,
-        mut bank: Databank,
+        bank: Databank,
         dataset: &BarDataset,
         oos1_dataset: Option<&BarDataset>,
         m1_dataset: &BarDataset,
@@ -877,7 +966,8 @@ impl EvolutionSession {
             pack,
             primary_symbol,
             additional_generations,
-            self.pool.as_ref(),
+            self.scout_pool.as_ref(),
+            &self.promotion,
             &self.indicator_cache,
         )?;
         Ok(bank)
@@ -906,8 +996,9 @@ fn run_generations(
     pack: &[PackSymbol],
     primary_symbol: &str,
     count: u64,
-    pool: Option<&rayon::ThreadPool>,
-    indicator_cache: &IndicatorBufferCache,
+    scout_pool: Option<&rayon::ThreadPool>,
+    promotion: &PromotionPipeline,
+    indicator_cache: &Arc<IndicatorBufferCache>,
 ) -> Result<(), DiscoverError> {
     for _ in 0..count {
         if let Some(limit) = bank.config.early_stop_pot_elites {
@@ -928,7 +1019,8 @@ fn run_generations(
             pack,
             primary_symbol,
             generation,
-            pool,
+            scout_pool,
+            promotion,
             indicator_cache,
         )?;
         bank.completed_generations = generation;
@@ -1289,6 +1381,7 @@ fn selection_is_better(left: &Elite, right: &Elite, novelty_weight: f64) -> bool
         .is_gt()
 }
 
+#[cfg(test)]
 fn precision_passes(
     metrics: &quantforge_eval::BacktestMetrics,
     return_retention: f64,
@@ -1468,6 +1561,8 @@ mod tests {
             mutate_after_elites: 10_000,
             random_fill_fraction: 0.0,
             worker_threads: 1,
+            promotion_worker_threads: 1,
+            promotion_queue_capacity: 8,
             require_m1_robustness: true,
             robustness_folds: 3,
             robustness_monte_carlo_trials: 50,
@@ -1579,8 +1674,7 @@ mod tests {
         let dataset = dataset();
         let batch = evolve_new(&dataset, None, &dataset, &broker(), config(), 3).unwrap();
         let mut stepped = evolve_new(&dataset, None, &dataset, &broker(), config(), 1).unwrap();
-        let session =
-            EvolutionSession::new(stepped.config.worker_threads, dataset.bars.len()).unwrap();
+        let session = EvolutionSession::new(&stepped.config, dataset.bars.len()).unwrap();
         for _ in 0..2 {
             stepped = session
                 .advance(
@@ -1807,5 +1901,48 @@ mod tests {
         }
         config.robustness_perturbation_fraction = 0.35;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn promotion_queue_capacity_must_be_positive() {
+        let mut config = DiscoverConfig::default();
+        config.promotion_queue_capacity = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn discover_rejects_any_attempt_to_supply_oos1() {
+        let dataset = dataset();
+        let mut cfg = config();
+        cfg.mutate_after_elites = 1;
+        cfg.require_m1_robustness = false;
+        let oos1 = dataset.clone();
+        let error = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
+            .expect_err("OOS1 must never enter discovery");
+        assert!(error.to_string().contains("cannot consume OOS1"));
+    }
+
+    #[test]
+    fn scout_generations_advance_while_promotions_are_configured() {
+        let dataset = dataset();
+        let mut cfg = config();
+        cfg.mutate_after_elites = 1;
+        cfg.require_m1_robustness = false;
+        cfg.promotion_worker_threads = 1;
+        cfg.promotion_queue_capacity = 8;
+        let session = EvolutionSession::new(&cfg, dataset.bars.len()).unwrap();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), cfg, 0).unwrap();
+        // Seed pot without generations, then step once via session.
+        bank = session
+            .advance(bank, &dataset, None, &dataset, &broker(), &[], "TEST", 1)
+            .unwrap();
+        assert_eq!(bank.completed_generations, 1);
+        // Scout finished the generation without waiting for a flush of every
+        // promotion; flush still applies the same deposit path.
+        session.flush_promotions(&mut bank).unwrap();
+        assert_eq!(
+            bank.telemetry.promotions_enqueued,
+            bank.telemetry.promotions_completed
+        );
     }
 }

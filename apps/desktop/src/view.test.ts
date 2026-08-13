@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   bindDiscoverTimezone,
   cagrPercent,
+  defaultCommissionPerLotRoundTurn,
   describeCondition,
   describeStrategyConditions,
+  discoverDefaultsForSymbol,
   discoverProgress,
   entryOrderError,
   entryOrderSummary,
@@ -80,6 +82,17 @@ describe("databank view rules", () => {
     expect(perturbationError({ robustnessPerturbationFraction: 0 })).toMatch(/between 1% and 100%/);
     expect(perturbationError({ robustnessPerturbationFraction: 1.5 })).toMatch(/between 1% and 100%/);
     expect(perturbationError({ robustnessPerturbationFraction: 0.35 })).toBeNull();
+  });
+
+  it("defaults zero commission and disables FX pack gates for indices and oil", () => {
+    expect(defaultCommissionPerLotRoundTurn("US500")).toBe(0);
+    expect(defaultCommissionPerLotRoundTurn("XTIUSD")).toBe(0);
+    expect(defaultCommissionPerLotRoundTurn("EURUSD")).toBe(7);
+    expect(discoverDefaultsForSymbol("US500")).toEqual({
+      commissionPerLotRoundTurn: 0,
+      multiSymbolMinimumPass: 0,
+      packDataDir: null,
+    });
   });
 
   it("filters by entry conditions and sorts drawdown conservatively", () => {

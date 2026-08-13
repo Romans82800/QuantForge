@@ -450,6 +450,40 @@ export function timeframeFromDataPath(path: string | null | undefined): string |
   return /^(M1|M5|M15|M30|H1|H4|D1|W1|MN1)$/i.test(token) ? token.toUpperCase() : null;
 }
 
+const ZERO_COMMISSION_SYMBOLS = new Set([
+  "US500",
+  "US100",
+  "US30",
+  "NAS100",
+  "BTCUSD",
+  "XTIUSD",
+  "DE40",
+]);
+
+/** IC Markets raw-spread symbols with no round-turn commission. */
+export function defaultCommissionPerLotRoundTurn(symbol: string | null | undefined): number {
+  if (!symbol) return 7;
+  return ZERO_COMMISSION_SYMBOLS.has(symbol.toUpperCase()) ? 0 : 7;
+}
+
+/** Whether identical-parameter FX pack screening applies to this discovery symbol. */
+export function fxMultiSymbolPrimary(symbol: string | null | undefined): boolean {
+  if (!symbol) return true;
+  const upper = symbol.toUpperCase();
+  return !(
+    ZERO_COMMISSION_SYMBOLS.has(upper) ||
+    upper === "XAUUSD"
+  );
+}
+
+export function discoverDefaultsForSymbol(symbol: string) {
+  return {
+    commissionPerLotRoundTurn: defaultCommissionPerLotRoundTurn(symbol),
+    multiSymbolMinimumPass: fxMultiSymbolPrimary(symbol) ? null : 0,
+    packDataDir: fxMultiSymbolPrimary(symbol) ? undefined : null,
+  };
+}
+
 export function formatDateRange(
   startTimestampMs: number | null,
   endTimestampMs: number | null,
