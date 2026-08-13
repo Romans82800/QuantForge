@@ -2457,7 +2457,11 @@ function HomeWorkspace({
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
             <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + CPCV + MC + params + OOS1" />
-            <KpiCell label="Evals / hour" value={formatNumber(job?.evaluationsPerHour ?? 0)} note={`${job?.workerThreads ?? "—"} scout${job?.breedingActive ? ` · queue ${job?.promotionQueueDepth ?? 0}` : ""}`} />
+            <KpiCell
+              label="Evals / hour · rolling"
+              value={formatNumber(job?.rollingEvaluationsPerHour ?? 0)}
+              note={`${formatNumber(job?.lifetimeEvaluationsPerHour ?? job?.evaluationsPerHour ?? 0)} lifetime avg · ${job?.workerThreads ?? "—"} scout${job?.breedingActive ? ` · queue ${job?.promotionQueueDepth ?? 0}` : ""}`}
+            />
           </div>
           <div className="overview-status-actions">
             <button className="primary" type="button" onClick={() => onNavigate("Discover")}>
@@ -3866,9 +3870,10 @@ function DiscoverWorkspace({
             <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for databank pipeline" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
             <Kpi
-              label="Evals / hour"
-              value={formatNumber(job?.evaluationsPerHour ?? 0, 0)}
+              label="Evals / hour · rolling"
+              value={formatNumber(job?.rollingEvaluationsPerHour ?? 0, 0)}
               note={[
+                `${formatNumber(job?.lifetimeEvaluationsPerHour ?? job?.evaluationsPerHour ?? 0, 0)} lifetime avg`,
                 `${formatNumber(job?.acceptsPerHour ?? 0, 1)} accepts/hr`,
                 `${job?.workerThreads ?? "—"} scout`,
                 job?.breedingActive ? `${job?.promotionWorkerThreads ?? "—"} promo` : null,
@@ -3932,7 +3937,7 @@ function DiscoverWorkspace({
           </div>
           {active && <div className="job-controls">
             {job?.status === "running" ? <button className="secondary" onClick={() => void control(pauseDiscover)}>Pause</button> : <button className="secondary" onClick={() => void control(resumeDiscover)}>Resume</button>}
-            <button className="danger" onClick={() => void control(stopDiscover)}>Stop & checkpoint</button>
+            <button className="danger" onClick={() => void control(stopDiscover)}>Stop & save final</button>
             <small>Pause and stop take effect at a generation boundary. Elites are written to the databank as soon as they pass.</small>
           </div>}
           {job?.status === "completed" && job.outputPath && <div className="completion-card"><div><span>Checkpoint</span><code>{job.outputPath}</code></div><button className="primary" onClick={() => onOpenDatabank(job.outputPath!)}>Open in Databank</button></div>}

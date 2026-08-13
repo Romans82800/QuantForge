@@ -445,6 +445,23 @@ pub fn write_json_versioned<T: Serialize>(
     Ok(backup)
 }
 
+/// Atomically replaces a mutable JSON checkpoint without retaining historical
+/// copies. Immutable artifacts must continue to use [`write_json_new`].
+///
+/// This is intentionally separate from [`write_json_versioned`]: long-running
+/// workers update their recovery checkpoint repeatedly, and preserving a full
+/// timestamped copy on every update causes unbounded disk growth.
+pub fn write_json_replacing<T: Serialize>(
+    path: impl AsRef<Path>,
+    value: &T,
+) -> Result<(), StorageError> {
+    let path = path.as_ref();
+    let temp = serialized_temp_file(path, value)?;
+    temp.persist(path)
+        .map_err(|error| StorageError::Io(error.error))?;
+    Ok(())
+}
+
 fn serialized_temp_file<T: Serialize>(
     destination: &Path,
     value: &T,
@@ -594,6 +611,19 @@ mod tests {
 
         assert_eq!(fs::read_to_string(path).unwrap().trim(), "2");
         assert_eq!(fs::read_to_string(backup).unwrap().trim(), "1");
+    }
+
+    #[test]
+    fn replacing_write_keeps_only_the_live_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bank.json");
+
+        write_json_replacing(&path, &1).unwrap();
+        write_json_replacing(&path, &2).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "2");
+        let files = fs::read_dir(directory.path()).unwrap().count();
+        assert_eq!(files, 1, "mutable replacement must not retain backups");
     }
 
     #[test]

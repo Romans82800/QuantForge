@@ -708,12 +708,18 @@ export interface DiscoverJobView {
   rejectedNicheNotImproved: number;
   rejectedEvaluation: number;
   rejectedTotal: number;
+  /** Five-minute moving candidate throughput. */
+  rollingEvaluationsPerHour: number;
+  /** Whole-run active-time candidate throughput. */
+  lifetimeEvaluationsPerHour: number;
+  /** Backward-compatible alias for lifetimeEvaluationsPerHour. */
   evaluationsPerHour: number;
   acceptsPerHour: number;
   bestIsExpectancy: number | null;
   bestOos1Expectancy: number | null;
   topEvaluationErrors: EvaluationErrorCount[];
   m1BarsRepaired: number;
+  latestImmutableSnapshotPath: string | null;
   startedAtMs: number | null;
   stopRequested: boolean;
   message: string;

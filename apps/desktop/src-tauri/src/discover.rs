@@ -11,17 +11,20 @@ use quantforge_discover::{
     evolve_new_with_pack_and_quotes, run_condition_bakeoff as evolve_condition_bakeoff,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
-use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
+use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_replacing};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
+
+const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const ROLLING_THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,12 +209,18 @@ pub struct DiscoverJobView {
     rejected_niche_not_improved: u64,
     rejected_evaluation: u64,
     rejected_total: u64,
+    /// Five-minute moving throughput, suitable for detecting current slowdown.
+    rolling_evaluations_per_hour: f64,
+    /// Whole-run active-time average (paused time excluded).
+    lifetime_evaluations_per_hour: f64,
+    /// Backward-compatible alias for the lifetime average.
     evaluations_per_hour: f64,
     accepts_per_hour: f64,
     best_is_expectancy: Option<f64>,
     best_oos1_expectancy: Option<f64>,
     top_evaluation_errors: Vec<EvaluationErrorCount>,
     m1_bars_repaired: u64,
+    latest_immutable_snapshot_path: Option<String>,
     started_at_ms: Option<u64>,
     stop_requested: bool,
     message: String,
@@ -295,12 +304,15 @@ impl DiscoverJobView {
             rejected_niche_not_improved: 0,
             rejected_evaluation: 0,
             rejected_total: 0,
+            rolling_evaluations_per_hour: 0.0,
+            lifetime_evaluations_per_hour: 0.0,
             evaluations_per_hour: 0.0,
             accepts_per_hour: 0.0,
             best_is_expectancy: None,
             best_oos1_expectancy: None,
             top_evaluation_errors: Vec::new(),
             m1_bars_repaired: 0,
+            latest_immutable_snapshot_path: None,
             started_at_ms: None,
             stop_requested: false,
             message: "Configure a new search or continue an existing databank.".into(),
@@ -460,12 +472,15 @@ pub fn start_discover(
         rejected_niche_not_improved: 0,
         rejected_evaluation: 0,
         rejected_total: 0,
+        rolling_evaluations_per_hour: 0.0,
+        lifetime_evaluations_per_hour: 0.0,
         evaluations_per_hour: 0.0,
         accepts_per_hour: 0.0,
         best_is_expectancy: None,
         best_oos1_expectancy: None,
         top_evaluation_errors: Vec::new(),
         m1_bars_repaired: 0,
+        latest_immutable_snapshot_path: None,
         started_at_ms: Some(now_ms),
         stop_requested: false,
         message: "The Rust discovery worker is starting.".into(),
@@ -741,6 +756,7 @@ fn run_discovery(
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let clock = ActiveClock::new();
+    clock.begin_evaluation_session(0);
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
@@ -898,21 +914,12 @@ fn run_discovery(
                 0,
             )
             .map_err(|error| error.to_string())?;
-            update_bank(job, &bank, 0, soft_budget, run_until_stopped, &clock)?;
             (bank, None, 0u64)
         }
         DiscoverMode::Continue => {
             let artifact = continued_artifact
                 .expect("continuation always loads the databank before partitioning");
             let starting_generation = artifact.databank.completed_generations;
-            update_bank(
-                job,
-                &artifact.databank,
-                0,
-                soft_budget,
-                run_until_stopped,
-                &clock,
-            )?;
             (
                 artifact.databank,
                 Some(artifact.manifest.recipe_hash),
@@ -921,34 +928,16 @@ fn run_discovery(
         }
     };
 
-    let mut completed_now = 0u64;
-    let mut wrote_checkpoint = Path::new(&request.databank_path).exists();
-
-    if bank.coverage() > 0 {
-        write_discover_checkpoint(
-            &request,
-            &bank,
-            display_path(Path::new(&request.data_path)),
-            display_path(Path::new(&request.broker_path)),
-            loaded
-                .metadata
-                .as_ref()
-                .map(|value| value.metadata_hash.clone()),
-            &quality,
-            &m1_quality,
-            &m1.dataset.data_hash,
-            validation_fraction,
-            sealed_fraction,
-            starting_generation,
-            continuation_recipe_hash.clone(),
-            completed_now,
-            soft_budget,
-            run_until_stopped,
-            true,
-            wrote_checkpoint,
-        )?;
-        wrote_checkpoint = true;
+    // Continuing a bank must measure this process's work, not divide every
+    // historical evaluation by a timer that started a few milliseconds ago.
+    // A new run keeps the zero baseline established before its initial batch.
+    if request.mode == DiscoverMode::Continue {
+        clock.begin_evaluation_session(bank.evaluation_count);
     }
+    update_bank(job, &bank, 0, soft_budget, run_until_stopped, &clock)?;
+
+    let mut completed_now = 0u64;
+    let mut last_checkpoint_active_seconds = clock.active_seconds();
 
     let quota_met = |bank: &Databank| -> bool {
         bank.config
@@ -978,7 +967,82 @@ fn run_discovery(
             .map_err(|error| error.to_string())?;
 
     loop {
+        let pausing_now = paused.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst);
+        if pausing_now {
+            session
+                .flush_promotions(&mut bank)
+                .map_err(|error| error.to_string())?;
+            update_bank(
+                job,
+                &bank,
+                completed_now,
+                soft_budget,
+                run_until_stopped,
+                &clock,
+            )?;
+            if bank.evaluation_count > 0
+                && (!bank.elites.is_empty() || !bank.accepted_pool.is_empty())
+            {
+                write_discover_checkpoint(
+                    &request,
+                    &bank,
+                    display_path(Path::new(&request.data_path)),
+                    display_path(Path::new(&request.broker_path)),
+                    loaded
+                        .metadata
+                        .as_ref()
+                        .map(|value| value.metadata_hash.clone()),
+                    &quality,
+                    &m1_quality,
+                    &m1.dataset.data_hash,
+                    validation_fraction,
+                    sealed_fraction,
+                    starting_generation,
+                    continuation_recipe_hash.clone(),
+                    completed_now,
+                    soft_budget,
+                    run_until_stopped,
+                    true,
+                    Path::new(&request.databank_path),
+                    true,
+                )?;
+                let snapshot = immutable_snapshot_path(&request.databank_path, "paused")?;
+                write_discover_checkpoint(
+                    &request,
+                    &bank,
+                    display_path(Path::new(&request.data_path)),
+                    display_path(Path::new(&request.broker_path)),
+                    loaded
+                        .metadata
+                        .as_ref()
+                        .map(|value| value.metadata_hash.clone()),
+                    &quality,
+                    &m1_quality,
+                    &m1.dataset.data_hash,
+                    validation_fraction,
+                    sealed_fraction,
+                    starting_generation,
+                    continuation_recipe_hash.clone(),
+                    completed_now,
+                    soft_budget,
+                    run_until_stopped,
+                    false,
+                    &snapshot,
+                    false,
+                )?;
+                if let Ok(mut view) = job.write() {
+                    view.latest_immutable_snapshot_path = Some(display_path(&snapshot));
+                    view.message = format!(
+                        "Paused safely. Immutable snapshot: {}",
+                        display_path(&snapshot)
+                    );
+                }
+            }
+        }
         wait_if_paused(job, paused, stop, &clock)?;
+        if pausing_now {
+            last_checkpoint_active_seconds = clock.active_seconds();
+        }
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -1032,7 +1096,12 @@ fn run_discovery(
             &clock,
         )?;
 
-        if bank.coverage() > 0 {
+        let checkpoint_due = clock.active_seconds() - last_checkpoint_active_seconds
+            >= RECOVERY_CHECKPOINT_INTERVAL.as_secs_f64();
+        if checkpoint_due
+            && bank.evaluation_count > 0
+            && (!bank.elites.is_empty() || !bank.accepted_pool.is_empty())
+        {
             write_discover_checkpoint(
                 &request,
                 &bank,
@@ -1053,9 +1122,10 @@ fn run_discovery(
                 soft_budget,
                 run_until_stopped,
                 true,
-                wrote_checkpoint,
+                Path::new(&request.databank_path),
+                true,
             )?;
-            wrote_checkpoint = true;
+            last_checkpoint_active_seconds = clock.active_seconds();
             if let Ok(mut view) = job.write() {
                 view.output_path = Some(display_path(Path::new(&request.databank_path)));
                 view.message = format!(
@@ -1100,11 +1170,11 @@ fn run_discovery(
         validation_fraction,
         sealed_fraction,
         starting_generation,
-        continuation_recipe_hash,
+        continuation_recipe_hash.clone(),
         completed_now,
         soft_budget,
         run_until_stopped,
-        wrote_checkpoint,
+        stop.load(Ordering::SeqCst),
         &clock,
     )
 }
@@ -1125,7 +1195,7 @@ fn finish_discovery(
     completed_now: u64,
     soft_budget: u64,
     run_until_stopped: bool,
-    wrote_checkpoint: bool,
+    stopped_by_user: bool,
     clock: &ActiveClock,
 ) -> Result<(), String> {
     update_bank(
@@ -1137,7 +1207,7 @@ fn finish_discovery(
         clock,
     )?;
 
-    if bank.elites.is_empty() {
+    if bank.elites.is_empty() && bank.accepted_pool.is_empty() {
         let funnel = funnel_summary(&bank);
         let mut view = job
             .write()
@@ -1160,8 +1230,39 @@ fn finish_discovery(
 
     update_phase(
         job,
-        "Writing immutable checkpoint",
-        "The manifest and archive are being written atomically.",
+        "Writing final artifacts",
+        "The recovery checkpoint and immutable final snapshot are being written atomically.",
+    )?;
+    write_discover_checkpoint(
+        &request,
+        &bank,
+        display_path(Path::new(&request.data_path)),
+        display_path(Path::new(&request.broker_path)),
+        loaded
+            .metadata
+            .as_ref()
+            .map(|value| value.metadata_hash.clone()),
+        quality,
+        m1_quality,
+        &m1.dataset.data_hash,
+        validation_fraction,
+        sealed_fraction,
+        starting_generation,
+        continuation_recipe_hash.clone(),
+        completed_now,
+        soft_budget,
+        run_until_stopped,
+        true,
+        Path::new(&request.databank_path),
+        true,
+    )?;
+    let snapshot = immutable_snapshot_path(
+        &request.databank_path,
+        if stopped_by_user {
+            "stopped"
+        } else {
+            "completed"
+        },
     )?;
     write_discover_checkpoint(
         &request,
@@ -1183,7 +1284,8 @@ fn finish_discovery(
         soft_budget,
         run_until_stopped,
         false,
-        wrote_checkpoint,
+        &snapshot,
+        false,
     )?;
 
     let mut view = job
@@ -1202,6 +1304,7 @@ fn finish_discovery(
         "Discovery checkpoint complete".into()
     };
     view.output_path = Some(display_path(Path::new(&request.databank_path)));
+    view.latest_immutable_snapshot_path = Some(display_path(&snapshot));
     view.message = if quota_complete {
         format!(
             "Reached databank quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
@@ -1211,8 +1314,10 @@ fn finish_discovery(
         )
     } else {
         format!(
-            "Saved {} niches after {} evaluations.",
-            view.coverage, view.evaluation_count
+            "Saved {} strategies after {} evaluations. Immutable snapshot: {}",
+            view.coverage,
+            view.evaluation_count,
+            display_path(&snapshot)
         )
     };
     Ok(())
@@ -1263,7 +1368,8 @@ fn write_discover_checkpoint(
     soft_budget: u64,
     run_until_stopped: bool,
     partial: bool,
-    already_exists: bool,
+    output_path: &Path,
+    replace_existing: bool,
 ) -> Result<(), String> {
     let mut manifest_config = BTreeMap::<String, Value>::from([
         (
@@ -1278,10 +1384,7 @@ fn write_discover_checkpoint(
             "m1_source".into(),
             json!(display_path(Path::new(&request.m1_data_path))),
         ),
-        (
-            "databank".into(),
-            json!(display_path(Path::new(&request.databank_path))),
-        ),
+        ("databank".into(), json!(display_path(output_path))),
         ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
         (
             "discover_config".into(),
@@ -1358,13 +1461,29 @@ fn write_discover_checkpoint(
         qd_score: bank.qd_score(),
         databank: bank.clone(),
     };
-    if already_exists || request.mode == DiscoverMode::Continue {
-        write_json_versioned(&request.databank_path, &artifact)
-            .map_err(|error| error.to_string())?;
+    if replace_existing {
+        write_json_replacing(output_path, &artifact).map_err(|error| error.to_string())?;
     } else {
-        write_json_new(&request.databank_path, &artifact).map_err(|error| error.to_string())?;
+        write_json_new(output_path, &artifact).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn immutable_snapshot_path(databank_path: &str, reason: &str) -> Result<PathBuf, String> {
+    let path = Path::new(databank_path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("quantforge-databank");
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
+    let mut candidate = parent.join(format!("{stem}.{reason}.{stamp}.json"));
+    let mut suffix = 2usize;
+    while candidate.exists() {
+        candidate = parent.join(format!("{stem}.{reason}.{stamp}.{suffix}.json"));
+        suffix += 1;
+    }
+    Ok(candidate)
 }
 
 /// Load matching decision-timeframe pack symbols for the identical-parameter
@@ -1813,6 +1932,8 @@ pub(crate) fn entry_window(
 struct ActiveClock {
     started: Instant,
     paused_millis: Arc<AtomicU64>,
+    evaluation_baseline: Arc<AtomicU64>,
+    throughput_samples: Arc<Mutex<VecDeque<(f64, u64)>>>,
 }
 
 impl ActiveClock {
@@ -1820,6 +1941,17 @@ impl ActiveClock {
         Self {
             started: Instant::now(),
             paused_millis: Arc::new(AtomicU64::new(0)),
+            evaluation_baseline: Arc::new(AtomicU64::new(0)),
+            throughput_samples: Arc::new(Mutex::new(VecDeque::from([(0.0, 0)]))),
+        }
+    }
+
+    fn begin_evaluation_session(&self, evaluation_count: u64) {
+        self.evaluation_baseline
+            .store(evaluation_count, Ordering::SeqCst);
+        if let Ok(mut samples) = self.throughput_samples.lock() {
+            samples.clear();
+            samples.push_back((self.active_seconds(), evaluation_count));
         }
     }
 
@@ -1828,10 +1960,40 @@ impl ActiveClock {
             .fetch_add(span.as_millis() as u64, Ordering::SeqCst);
     }
 
-    fn active_hours(&self) -> f64 {
+    fn active_seconds(&self) -> f64 {
         let paused = self.paused_millis.load(Ordering::SeqCst) as f64 / 1_000.0;
-        let active = (self.started.elapsed().as_secs_f64() - paused).max(1.0);
-        active / 3600.0
+        (self.started.elapsed().as_secs_f64() - paused).max(0.0)
+    }
+
+    fn active_hours(&self) -> f64 {
+        self.active_seconds().max(1.0) / 3600.0
+    }
+
+    fn lifetime_evaluations_per_hour(&self, evaluation_count: u64) -> f64 {
+        let baseline = self.evaluation_baseline.load(Ordering::SeqCst);
+        evaluation_count.saturating_sub(baseline) as f64 / self.active_hours()
+    }
+
+    fn rolling_evaluations_per_hour(&self, evaluation_count: u64) -> f64 {
+        let now = self.active_seconds();
+        let Ok(mut samples) = self.throughput_samples.lock() else {
+            return 0.0;
+        };
+        if samples
+            .back()
+            .is_none_or(|(_, count)| *count != evaluation_count)
+        {
+            samples.push_back((now, evaluation_count));
+        }
+        let cutoff = (now - ROLLING_THROUGHPUT_WINDOW.as_secs_f64()).max(0.0);
+        while samples.len() > 2 && samples.get(1).is_some_and(|(at, _)| *at < cutoff) {
+            samples.pop_front();
+        }
+        let Some((then, count)) = samples.front().copied() else {
+            return 0.0;
+        };
+        let seconds = (now - then).max(1.0);
+        evaluation_count.saturating_sub(count) as f64 / seconds * 3_600.0
     }
 }
 
@@ -2019,7 +2181,10 @@ fn update_bank(
     view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
     view.rejected_evaluation = telemetry.rejected_evaluation;
     view.rejected_total = rejected_total;
-    view.evaluations_per_hour = bank.evaluation_count as f64 / hours;
+    let lifetime_evaluations_per_hour = clock.lifetime_evaluations_per_hour(bank.evaluation_count);
+    view.rolling_evaluations_per_hour = clock.rolling_evaluations_per_hour(bank.evaluation_count);
+    view.lifetime_evaluations_per_hour = lifetime_evaluations_per_hour;
+    view.evaluations_per_hour = lifetime_evaluations_per_hour;
     view.accepts_per_hour = accepted_total as f64 / hours;
     view.best_is_expectancy = best_is;
     view.best_oos1_expectancy = best_oos1;
@@ -2160,6 +2325,37 @@ mod tests {
         // would otherwise halve the reported evaluations per hour.
         assert!(clock.active_hours() <= before);
         assert!(clock.active_hours() > 0.0);
+    }
+
+    #[test]
+    fn throughput_session_excludes_historical_continuation_evaluations() {
+        let clock = ActiveClock::new();
+        clock.begin_evaluation_session(1_000_000);
+
+        assert_eq!(clock.lifetime_evaluations_per_hour(1_000_000), 0.0);
+        assert_eq!(clock.rolling_evaluations_per_hour(1_000_000), 0.0);
+        assert!(clock.lifetime_evaluations_per_hour(1_000_100) > 0.0);
+        assert!(clock.rolling_evaluations_per_hour(1_000_100) > 0.0);
+    }
+
+    #[test]
+    fn immutable_snapshot_names_are_unique_and_keep_the_live_path_untouched() {
+        let directory = tempdir().expect("temp directory");
+        let live = directory.path().join("AUDUSD_H1_databank.json");
+        let first = immutable_snapshot_path(&live.display().to_string(), "paused").unwrap();
+        fs::write(&first, "snapshot").unwrap();
+        let second = immutable_snapshot_path(&live.display().to_string(), "paused").unwrap();
+
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".paused.")
+        );
+        assert_eq!(first.parent(), live.parent());
+        assert_ne!(first, live);
     }
 
     #[test]
