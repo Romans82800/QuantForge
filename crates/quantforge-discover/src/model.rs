@@ -658,8 +658,17 @@ pub struct DiscoverConfig {
     /// Maximum promoted databank strategies retained in RAM.
     #[serde(default = "default_max_databank_elites")]
     pub max_databank_elites: usize,
+    /// Maximum Holding (pre-battery) strategies retained in RAM.
+    #[serde(default = "default_max_holding_elites")]
+    pub max_holding_elites: usize,
+    /// When true (default), post-breed survivors go to Holding after H1 gates +
+    /// M1 fidelity — not Databank. Heavy WFO/MC/±param/OOS1 wait for an
+    /// on-demand battery. When false, legacy path deposits straight to Databank.
+    #[serde(default = "default_build_to_holding")]
+    pub build_to_holding: bool,
     /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
-    /// neighborhood battery before databank admission. Pot fill never waits on this.
+    /// neighborhood battery before databank admission. Ignored when
+    /// `build_to_holding` is true (battery is deferred). Pot fill never waits on this.
     #[serde(default = "default_require_m1_robustness")]
     pub require_m1_robustness: bool,
     #[serde(default = "default_robustness_folds")]
@@ -776,8 +785,17 @@ fn default_max_databank_elites() -> usize {
     5_000
 }
 
+fn default_max_holding_elites() -> usize {
+    5_000
+}
+
+fn default_build_to_holding() -> bool {
+    true
+}
+
 fn default_require_m1_robustness() -> bool {
-    // Post-breed databank path always runs the M1 robustness battery.
+    // Legacy direct-to-databank path runs the M1 robustness battery.
+    // Default Discover uses `build_to_holding` and defers this battery.
     true
 }
 
@@ -883,6 +901,8 @@ impl Default for DiscoverConfig {
             max_accepted_pool_elites: default_max_accepted_pool_elites(),
             max_specialist_pool_elites: default_max_specialist_pool_elites(),
             max_databank_elites: default_max_databank_elites(),
+            max_holding_elites: default_max_holding_elites(),
+            build_to_holding: default_build_to_holding(),
             require_m1_robustness: default_require_m1_robustness(),
             robustness_folds: default_robustness_folds(),
             robustness_monte_carlo_trials: default_robustness_monte_carlo_trials(),
@@ -935,22 +955,23 @@ impl DiscoverConfig {
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
-                // ~20 databank elites: seed-heavy, softer param neighborhood,
-                // stop on databank quota — not pot 300. Databank still requires
-                // post-breed Development robustness → M1 (never H1-only elites).
+                // ~20 Holding survivors: seed-heavy, soft neighborhood knobs kept
+                // for the later on-demand battery. Stop on Holding quota — not pot.
+                // Holding requires M1 fidelity; WFO/MC/±param stay deferred.
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
                     self.simple_exits = false;
                 }
                 self.require_m1_precision = true;
+                self.build_to_holding = true;
                 self.require_m1_robustness = true;
                 self.initial_candidates = self.initial_candidates.max(1000);
                 self.batch_size = self.batch_size.max(300);
                 self.random_fill_fraction = self.random_fill_fraction.max(0.75);
                 self.mutate_after_elites = self.mutate_after_elites.min(25);
-                // Do not early-stop on pot size — that freezes before databank fills.
-                // Only the databank quota stops the run.
+                // Do not early-stop on pot size — that freezes before Holding fills.
+                // Only the Holding/databank quota stops the run.
                 self.early_stop_pot_elites = None;
                 if self.target_databank_elites.is_none() {
                     self.target_databank_elites = Some(20);
@@ -1129,6 +1150,7 @@ impl DiscoverConfig {
         if self.max_accepted_pool_elites == 0
             || self.max_specialist_pool_elites == 0
             || self.max_databank_elites == 0
+            || self.max_holding_elites == 0
         {
             return Err(DiscoverError::InvalidConfig(
                 "retained pool limits must be greater than zero".into(),
@@ -1481,6 +1503,8 @@ pub struct SymbolScreenResult {
 pub enum DepositDecision {
     AcceptedToPot,
     ReplacedInPot,
+    AcceptedToHolding,
+    ReplacedInHolding,
     AcceptedToDatabank,
     ReplacedInDatabank,
     RejectedGate,
@@ -1508,6 +1532,10 @@ pub struct DiscoverTelemetry {
     pub pot_accepted: u64,
     #[serde(default)]
     pub pot_replaced: u64,
+    #[serde(default)]
+    pub holding_accepted: u64,
+    #[serde(default)]
+    pub holding_replaced: u64,
     #[serde(default)]
     pub databank_accepted: u64,
     #[serde(default)]
@@ -1581,6 +1609,12 @@ impl DiscoverTelemetry {
                 self.pot_replaced += 1;
                 self.replaced_elite += 1;
             }
+            DepositDecision::AcceptedToHolding => {
+                self.holding_accepted += 1;
+            }
+            DepositDecision::ReplacedInHolding => {
+                self.holding_replaced += 1;
+            }
             DepositDecision::AcceptedToDatabank => {
                 self.databank_accepted += 1;
             }
@@ -1636,6 +1670,12 @@ pub struct Databank {
     pub specialist_pool: Vec<Elite>,
     #[serde(default)]
     pub specialist_coverage_map: BTreeMap<String, ContentHash>,
+    /// Pre-battery Holding: M1-fidelity survivors awaiting on-demand battery.
+    /// Not certified — browseable candidates only.
+    #[serde(default)]
+    pub holding: Vec<Elite>,
+    #[serde(default)]
+    pub holding_coverage_map: BTreeMap<String, ContentHash>,
     /// Promotion databank: elites that passed Development M1/CPCV/MC/parameter
     /// robustness and the subsequent OOS1 validation gate. OOS2 is absent.
     pub elites: Vec<Elite>,
@@ -1651,6 +1691,19 @@ impl Databank {
 
     pub fn pot_size(&self) -> usize {
         self.accepted_pool.len()
+    }
+
+    pub fn holding_size(&self) -> usize {
+        self.holding.len()
+    }
+
+    /// Quota progress: Holding when building to Holding, else Databank elites.
+    pub fn quota_progress_count(&self) -> usize {
+        if self.config.build_to_holding {
+            self.holding.len()
+        } else {
+            self.elites.len()
+        }
     }
 
     pub fn qd_score(&self) -> f64 {
@@ -1675,9 +1728,13 @@ impl Databank {
                 self.grammar_version, GRAMMAR_VERSION
             )));
         }
-        if self.evaluation_count == 0 || (self.elites.is_empty() && self.accepted_pool.is_empty()) {
+        if self.evaluation_count == 0
+            || (self.elites.is_empty()
+                && self.accepted_pool.is_empty()
+                && self.holding.is_empty())
+        {
             return Err(DiscoverError::IncompatibleDatabank(
-                "a databank requires evaluations and either an accepted pot or databank elites"
+                "a databank requires evaluations and either an accepted pot, holding, or databank elites"
                     .into(),
             ));
         }
@@ -1713,6 +1770,16 @@ impl Databank {
                 )
             })
             .collect();
+        let holding_coverage: BTreeMap<_, _> = self
+            .holding
+            .iter()
+            .map(|elite| {
+                (
+                    elite.structural_fingerprint.to_string(),
+                    elite.structural_fingerprint.clone(),
+                )
+            })
+            .collect();
         validate_archive_entries(
             &self.elites,
             &elite_coverage,
@@ -1730,6 +1797,13 @@ impl Databank {
         validate_archive_entries(
             &self.specialist_pool,
             &specialist_coverage,
+            &self.config,
+            self.completed_generations,
+            ArchiveKind::BreedingBag,
+        )?;
+        validate_archive_entries(
+            &self.holding,
+            &holding_coverage,
             &self.config,
             self.completed_generations,
             ArchiveKind::BreedingBag,

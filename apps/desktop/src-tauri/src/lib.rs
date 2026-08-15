@@ -5,6 +5,7 @@ mod databank;
 mod deploy;
 mod discover;
 mod evidence;
+mod holding_battery;
 mod parity_lab;
 mod portfolio;
 mod promotion_ledger;
@@ -13,6 +14,7 @@ mod workflow;
 
 use databank::DesktopState;
 use discover::DiscoverState;
+use holding_battery::BatteryJobState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,6 +22,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopState::default())
         .manage(DiscoverState::default())
+        .manage(BatteryJobState::default())
         .invoke_handler(tauri::generate_handler![
             assets::list_assets,
             assets::list_symbols,
@@ -41,6 +44,10 @@ pub fn run() {
             databank::export_elite_eas,
             databank::export_elite_trade_csvs,
             databank::promote_elite_to_vault,
+            databank::run_holding_battery,
+            holding_battery::start_holding_battery_job,
+            holding_battery::get_holding_battery_job,
+            holding_battery::stop_holding_battery,
             databank::run_fidelity_demo,
             data_lab::inspect_data,
             data_lab::import_market_folder,

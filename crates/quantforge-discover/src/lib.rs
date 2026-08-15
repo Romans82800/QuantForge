@@ -16,8 +16,9 @@ pub use bakeoff::{
     ConditionBakeoffConfig, ConditionBakeoffReport, ConditionBakeoffRow, run_condition_bakeoff,
 };
 pub use engine::{
-    EvolutionSession, continue_evolution, continue_evolution_with_pack, evolve_new,
-    evolve_new_with_pack, evolve_new_with_pack_and_quotes,
+    EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, continue_evolution,
+    continue_evolution_with_pack, evolve_new, evolve_new_with_pack, evolve_new_with_pack_and_quotes,
+    run_holding_battery_and_promote,
 };
 pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use methodology::{
@@ -40,7 +41,7 @@ pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
     MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
     RobustnessConfig, RobustnessOutcome, RobustnessReject, development_cpcv_diagnostic,
-    run_m1_predeposit_robustness,
+    run_m1_holding_admission, run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

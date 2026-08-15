@@ -186,6 +186,8 @@ export interface DatabankWorkspace {
   sealedFraction: number;
   conditionGroups: ConditionCoverage[];
   elites: EliteRow[];
+  /** Pre-battery M1 survivors. Empty on older archives. */
+  holding?: EliteRow[];
 }
 
 export interface BatchExportView {
@@ -698,6 +700,7 @@ export interface DiscoverJobView {
   acceptedTotal: number;
   potElites: number;
   potNewNiches: number;
+  holdingElites?: number;
   databankElites: number;
   liveDatabankRevision: number;
   targetDatabankElites?: number | null;
@@ -726,18 +729,15 @@ export interface DiscoverJobView {
   rejectedWalkForward: number;
   rejectedMonteCarlo: number;
   rejectedParamNeighborhood: number;
-  rejectedMultiSymbol: number;
-  rejectedDeflatedSharpe: number;
+  rejectedMultiSymbol?: number;
+  rejectedDeflatedSharpe?: number;
   rejectedClone: number;
   rejectedCorrelated: number;
   rejectedNicheNotImproved: number;
   rejectedEvaluation: number;
   rejectedTotal: number;
-  /** Five-minute moving candidate throughput. */
   rollingEvaluationsPerHour: number;
-  /** Whole-run active-time candidate throughput. */
   lifetimeEvaluationsPerHour: number;
-  /** Backward-compatible alias for lifetimeEvaluationsPerHour. */
   evaluationsPerHour: number;
   acceptsPerHour: number;
   bestIsExpectancy: number | null;
@@ -748,6 +748,37 @@ export interface DiscoverJobView {
   startedAtMs: number | null;
   stopRequested: boolean;
   message: string;
+}
+
+export interface BatteryItemView {
+  fingerprint: string;
+  strategyId: string;
+  status: "queued" | "running" | "passed" | "rejected" | string;
+  reason?: string | null;
+  evidence: number;
+  trades: number;
+}
+
+export interface BatteryJobView {
+  jobId: string | null;
+  status: "idle" | "running" | "completed" | "stopped" | "failed" | string;
+  phase: string;
+  message: string;
+  databankPath: string | null;
+  total: number;
+  queued: number;
+  running: number;
+  completed: number;
+  passed: number;
+  rejected: number;
+  holdingRemaining: number;
+  databankElites: number;
+  batteriesPerHour: number;
+  etaSeconds: number | null;
+  elapsedSeconds: number;
+  stopRequested: boolean;
+  revision: number;
+  items: BatteryItemView[];
 }
 
 export interface ChallengeRequest {

@@ -91,7 +91,60 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
 /// SQX-style trade manipulation: each resampled path removes 10% of fills.
 
+/// M1 baseline + Selected-TF retention only. Used for Holding admission so
+/// Discover stays fast while still rejecting pure H1 fantasy.
+pub fn run_m1_holding_admission(
+    strategy: &StrategyIr,
+    is_decision: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+    h1_metrics: &quantforge_eval::BacktestMetrics,
+) -> Result<RobustnessOutcome, RobustnessReject> {
+    let judge = JudgeConfig {
+        initial_balance: config.initial_balance,
+        costs: config.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+    };
+    let baseline = evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        is_decision,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+    )
+    .map_err(|_| RobustnessReject::M1Fidelity)?;
+    let baseline_result = ScoutResult {
+        trades: baseline.trades.clone(),
+        equity: baseline.equity.clone(),
+        metrics: baseline.metrics.clone(),
+        telemetry: ScoutTelemetry::default(),
+    };
+    if !passes_sqx_m1_retention(
+        h1_metrics,
+        &baseline.metrics,
+        config.minimum_return_retention,
+    ) {
+        return Err(RobustnessReject::M1Fidelity);
+    }
+    let _retention = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
+    Ok(RobustnessOutcome {
+        result: baseline_result,
+        // Holding is pre-battery: keep the audit trail empty until the user
+        // runs WFO / Monte Carlo / ±param and promotes to Databank.
+        evidence: None,
+    })
+}
+
 /// M1 baseline → retention vs selected timeframe → Development CPCV/MC/params.
+///
+/// Set `enforce_m1_retention` to false for the Holding → Databank battery: M1
+/// fidelity was already the Holding admission gate, and re-scouting Selected-TF
+/// here can disagree with the original pot H1 and falsely reject as M1Fidelity.
 pub fn run_m1_predeposit_robustness(
     strategy: &StrategyIr,
     is_decision: &BarDataset,
@@ -100,6 +153,7 @@ pub fn run_m1_predeposit_robustness(
     broker: &SymbolSpecification,
     config: &RobustnessConfig,
     h1_metrics: &quantforge_eval::BacktestMetrics,
+    enforce_m1_retention: bool,
 ) -> Result<RobustnessOutcome, RobustnessReject> {
     let judge = JudgeConfig {
         initial_balance: config.initial_balance,
@@ -127,11 +181,13 @@ pub fn run_m1_predeposit_robustness(
         telemetry: ScoutTelemetry::default(),
     };
     // SQX-style: M1 must retain Selected-TF results, not re-clear absolute deposit gates.
-    if !passes_sqx_m1_retention(
-        h1_metrics,
-        &baseline.metrics,
-        config.minimum_return_retention,
-    ) {
+    if enforce_m1_retention
+        && !passes_sqx_m1_retention(
+            h1_metrics,
+            &baseline.metrics,
+            config.minimum_return_retention,
+        )
+    {
         return Err(RobustnessReject::M1Fidelity);
     }
     let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);

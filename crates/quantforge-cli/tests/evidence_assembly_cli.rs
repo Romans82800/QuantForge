@@ -214,6 +214,11 @@ fn write_databank(
         worker_threads: 1,
         promotion_worker_threads: 1,
         promotion_queue_capacity: 8,
+        max_accepted_pool_elites: 10_000,
+        max_specialist_pool_elites: 2_000,
+        max_databank_elites: 5_000,
+        max_holding_elites: 5_000,
+        build_to_holding: false,
         require_m1_robustness: false,
         robustness_folds: 3,
         robustness_monte_carlo_trials: 50,
@@ -227,6 +232,12 @@ fn write_databank(
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        island_count: 1,
+        migration_interval: 0,
+        migration_elites: 2,
+        general_island_count: 0,
+        refinement_island_count: 0,
+        exploration_island_count: 0,
         scout,
     };
     let bucket = |value: f64, first: f64, second: f64| {
@@ -281,6 +292,7 @@ fn write_databank(
         robustness: None,
         equity_signature: Vec::new(),
         discovered_generation: 0,
+        island_id: 0,
     };
     let databank = Databank {
         schema_version: quantforge_discover::DATABANK_SCHEMA_VERSION,
@@ -295,6 +307,10 @@ fn write_databank(
         coverage_map: BTreeMap::from([(niche_label(&niche), fingerprint)]),
         accepted_pool: Vec::new(),
         accepted_coverage_map: BTreeMap::new(),
+        specialist_pool: Vec::new(),
+        specialist_coverage_map: BTreeMap::new(),
+        holding: Vec::new(),
+        holding_coverage_map: BTreeMap::new(),
         telemetry: DiscoverTelemetry::default(),
     };
     let run_manifest = manifest(

@@ -6,6 +6,7 @@ import type {
   BatchEaExportView,
   BatchTradeCsvExportView,
   BatchExportView,
+  BatteryJobView,
   CertifyRequest,
   AssembleEvidenceRequest,
   EvidenceView,
@@ -72,6 +73,28 @@ export async function chooseAndLoadDatabank(): Promise<DatabankWorkspace | null>
 
 export function loadDatabankPath(path: string): Promise<DatabankWorkspace> {
   return invoke<DatabankWorkspace>("load_databank", { path });
+}
+
+export function runHoldingBattery(fingerprints: string[]): Promise<{
+  promoted: number;
+  rejected: { fingerprint: string; reason: string }[];
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("run_holding_battery", { request: { fingerprints } });
+}
+
+export function startHoldingBatteryJob(fingerprints: string[]): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("start_holding_battery_job", {
+    request: { fingerprints },
+  });
+}
+
+export function getHoldingBatteryJob(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("get_holding_battery_job");
+}
+
+export function stopHoldingBattery(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("stop_holding_battery");
 }
 
 export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityDemoView> {

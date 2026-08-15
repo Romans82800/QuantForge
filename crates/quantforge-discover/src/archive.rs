@@ -73,6 +73,39 @@ pub(crate) fn deposit_to_databank(
     Ok(decision)
 }
 
+pub(crate) fn deposit_to_holding(
+    bank: &mut Databank,
+    candidate: CandidateEvaluation,
+) -> Result<DepositDecision, quantforge_ir::IrError> {
+    if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
+        return Ok(DepositDecision::RejectedDepositGate);
+    }
+    let decision = deposit_into_stack(
+        &mut bank.holding,
+        &mut bank.holding_coverage_map,
+        bank.config.correlation_threshold,
+        candidate,
+        DepositDecision::AcceptedToHolding,
+        DepositDecision::ReplacedInHolding,
+    )?;
+    trim_pool(&mut bank.holding, bank.config.max_holding_elites);
+    refresh_fingerprint_coverage_map(&bank.holding, &mut bank.holding_coverage_map);
+    Ok(decision)
+}
+
+pub(crate) fn remove_holding_by_fingerprint(
+    bank: &mut Databank,
+    fingerprint: &quantforge_core::ContentHash,
+) -> Option<Elite> {
+    let index = bank
+        .holding
+        .iter()
+        .position(|elite| &elite.structural_fingerprint == fingerprint)?;
+    let removed = bank.holding.swap_remove(index);
+    refresh_fingerprint_coverage_map(&bank.holding, &mut bank.holding_coverage_map);
+    Some(removed)
+}
+
 pub(crate) fn deposit_to_specialist_pool(
     bank: &mut Databank,
     candidate: CandidateEvaluation,
@@ -466,6 +499,8 @@ mod tests {
             accepted_coverage_map: BTreeMap::new(),
             specialist_pool: Vec::new(),
             specialist_coverage_map: BTreeMap::new(),
+            holding: Vec::new(),
+            holding_coverage_map: BTreeMap::new(),
             elites: Vec::new(),
             coverage_map: BTreeMap::new(),
             telemetry: DiscoverTelemetry::default(),

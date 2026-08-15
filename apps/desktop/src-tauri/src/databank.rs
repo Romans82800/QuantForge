@@ -50,17 +50,17 @@ pub(crate) struct EvolveArtifact {
 }
 
 #[derive(Debug)]
-struct LoadedDatabank {
-    bank: Databank,
-    legacy_read_only: bool,
-    databank_path: String,
-    source: String,
-    broker: String,
-    metadata_path: Option<String>,
-    m1_source: Option<String>,
-    m1_metadata_path: Option<String>,
-    validation_fraction: f64,
-    sealed_fraction: f64,
+pub(crate) struct LoadedDatabank {
+    pub(crate) bank: Databank,
+    pub(crate) legacy_read_only: bool,
+    pub(crate) databank_path: String,
+    pub(crate) source: String,
+    pub(crate) broker: String,
+    pub(crate) metadata_path: Option<String>,
+    pub(crate) m1_source: Option<String>,
+    pub(crate) m1_metadata_path: Option<String>,
+    pub(crate) validation_fraction: f64,
+    pub(crate) sealed_fraction: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +82,7 @@ struct RobustnessSnapshot {
 
 #[derive(Default)]
 pub struct DesktopState {
-    loaded: RwLock<Option<LoadedDatabank>>,
+    pub(crate) loaded: RwLock<Option<LoadedDatabank>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -127,6 +127,8 @@ pub struct DatabankWorkspace {
     sealed_fraction: f64,
     condition_groups: Vec<ConditionCoverage>,
     elites: Vec<EliteRow>,
+    #[serde(default)]
+    holding: Vec<EliteRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -876,7 +878,7 @@ pub async fn run_elite_robustness(
         .map_err(|error| format!("Results robustness task failed: {error}"))?
 }
 
-fn infer_quote_sidecar_path(m1_path: &str) -> Option<PathBuf> {
+pub(crate) fn infer_quote_sidecar_path(m1_path: &str) -> Option<PathBuf> {
     let path = Path::new(m1_path);
     let stem = path.file_stem()?.to_str()?;
     let mut candidates = vec![path.with_file_name(format!("{stem}.quotes.csv"))];
@@ -1022,6 +1024,7 @@ fn run_elite_robustness_sync(
         &broker,
         &config,
         &selected_timeframe.metrics,
+        true,
     );
     let (passed, blocker, message, evidence) = match outcome {
         Ok(outcome) => (
@@ -1567,6 +1570,239 @@ pub fn promote_elite_to_vault(
     quantforge_storage::write_json_new(&path, &elite.strategy)
         .map_err(|error| error.to_string())?;
     Ok(path.canonicalize().unwrap_or(path).display().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingBatteryRequest {
+    pub fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingBatteryRejectRow {
+    fingerprint: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingBatteryView {
+    promoted: usize,
+    rejected: Vec<HoldingBatteryRejectRow>,
+    workspace: DatabankWorkspace,
+}
+
+/// Run the deferred M1 battery + OOS1 on Holding candidates and promote passes
+/// into Databank elites. Failures stay in Holding.
+#[tauri::command]
+pub async fn run_holding_battery(
+    request: HoldingBatteryRequest,
+    state: State<'_, DesktopState>,
+) -> Result<HoldingBatteryView, String> {
+    if request.fingerprints.is_empty() {
+        return Err("select at least one Holding strategy".into());
+    }
+    let snapshot = {
+        let loaded = state
+            .loaded
+            .read()
+            .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+        let loaded = loaded
+            .as_ref()
+            .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
+        if loaded.legacy_read_only {
+            return Err(
+                "Schema-v5 databanks are read-only. Run a fresh Discover archive before Holding battery."
+                    .into(),
+            );
+        }
+        (
+            loaded.bank.clone(),
+            loaded.databank_path.clone(),
+            loaded.source.clone(),
+            loaded.broker.clone(),
+            loaded.metadata_path.clone(),
+            loaded
+                .m1_source
+                .clone()
+                .ok_or_else(|| {
+                    "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
+                })?,
+            loaded.m1_metadata_path.clone(),
+            loaded.validation_fraction,
+            loaded.sealed_fraction,
+        )
+    };
+    let (
+        mut bank,
+        databank_path,
+        source,
+        broker_path,
+        metadata_path,
+        m1_source,
+        m1_metadata_path,
+        validation_fraction,
+        sealed_fraction,
+    ) = snapshot;
+    let fingerprints = request.fingerprints.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_holding_battery_sync(
+            &mut bank,
+            &fingerprints,
+            &source,
+            metadata_path.as_deref(),
+            &m1_source,
+            m1_metadata_path.as_deref(),
+            &broker_path,
+            validation_fraction,
+            sealed_fraction,
+        )
+        .map(|report| (bank, report))
+    })
+    .await
+    .map_err(|error| format!("Holding battery task failed: {error}"))??;
+    let (bank, report) = result;
+    persist_loaded_bank(&databank_path, &bank, &state)?;
+    let workspace = load_databank_path(Path::new(&databank_path), &state)
+        .map_err(|error| error.to_string())?;
+    Ok(HoldingBatteryView {
+        promoted: report.promoted,
+        rejected: report.rejected,
+        workspace,
+    })
+}
+
+struct HoldingBatteryReport {
+    promoted: usize,
+    rejected: Vec<HoldingBatteryRejectRow>,
+}
+
+fn run_holding_battery_sync(
+    bank: &mut Databank,
+    fingerprints: &[String],
+    source: &str,
+    metadata_path: Option<&str>,
+    m1_source: &str,
+    m1_metadata_path: Option<&str>,
+    broker_path: &str,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<HoldingBatteryReport, String> {
+    let decision = crate::data_lab::load_data_source(source, metadata_path, None)?;
+    let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
+    let broker = load_bound_broker(broker_path, decision.metadata.as_ref())?;
+    load_bound_broker(broker_path, m1.metadata.as_ref())?;
+    let quote_dataset = infer_quote_sidecar_path(m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
+        .map_err(|error| error.to_string())?;
+    let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
+    let oos1 = slice_bars(
+        &decision.dataset,
+        plan.development.bar_count,
+        plan.development.bar_count + plan.validation.bar_count,
+    )?;
+    let m1_plan =
+        DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
+            .map_err(|error| error.to_string())?;
+    let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
+    let m1_eval = if bank.execution_data_hash == m1_development.data_hash {
+        &m1_development
+    } else if bank.execution_data_hash == m1.dataset.data_hash {
+        &m1.dataset
+    } else {
+        &m1_development
+    };
+
+    let mut promoted = 0usize;
+    let mut rejected = Vec::new();
+    for fingerprint in fingerprints {
+        let Some(target) = bank
+            .holding
+            .iter()
+            .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+            .map(|elite| elite.structural_fingerprint.clone())
+        else {
+            rejected.push(HoldingBatteryRejectRow {
+                fingerprint: fingerprint.clone(),
+                reason: "not in Holding".into(),
+            });
+            continue;
+        };
+        match quantforge_discover::run_holding_battery_and_promote(
+            bank,
+            &target,
+            &development,
+            Some(&oos1),
+            m1_eval,
+            quote_dataset.as_ref(),
+            &broker,
+        ) {
+            Ok(_) => promoted += 1,
+            Err(reason) => rejected.push(HoldingBatteryRejectRow {
+                fingerprint: fingerprint.clone(),
+                reason: format!("{reason:?}"),
+            }),
+        }
+    }
+    Ok(HoldingBatteryReport { promoted, rejected })
+}
+
+pub(crate) fn slice_bars(
+    dataset: &quantforge_data::BarDataset,
+    start: usize,
+    end: usize,
+) -> Result<quantforge_data::BarDataset, String> {
+    if end > dataset.bars.len() || start > end {
+        return Err(format!(
+            "cannot slice bars [{start}..{end}) from {} bars",
+            dataset.bars.len()
+        ));
+    }
+    let bars = dataset.bars[start..end].to_vec();
+    Ok(quantforge_data::BarDataset {
+        data_hash: quantforge_data::bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
+pub(crate) fn persist_bank_file(databank_path: &str, bank: &Databank) -> Result<(), String> {
+    let path = Path::new(databank_path);
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let mut artifact: EvolveArtifact =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    artifact.databank = bank.clone();
+    artifact.coverage = bank.coverage();
+    artifact.qd_score = bank.qd_score();
+    quantforge_storage::write_json_replacing(path, &artifact).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn persist_loaded_bank(
+    databank_path: &str,
+    bank: &Databank,
+    state: &DesktopState,
+) -> Result<(), String> {
+    persist_bank_file(databank_path, bank)?;
+    {
+        let mut loaded = state
+            .loaded
+            .write()
+            .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+        if let Some(current) = loaded.as_mut() {
+            current.bank = bank.clone();
+        }
+    }
+    Ok(())
 }
 
 fn export_elite_eas_to(
@@ -2266,13 +2502,16 @@ fn get_elite_from_state(
         .read()
         .map_err(|_| DesktopError::StateUnavailable)?;
     let loaded = loaded.as_ref().ok_or(DesktopError::NoDatabank)?;
-    let elite = loaded
-        .bank
-        .elites
-        .iter()
-        .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+    let elite = find_elite_in_bank(&loaded.bank, fingerprint)
         .ok_or_else(|| DesktopError::MissingElite(fingerprint.into()))?;
     elite_detail(elite).map_err(DesktopError::Json)
+}
+
+fn find_elite_in_bank<'a>(bank: &'a Databank, fingerprint: &str) -> Option<&'a Elite> {
+    bank.elites
+        .iter()
+        .chain(bank.holding.iter())
+        .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
 }
 
 fn get_elite_mql5_source_from_state(
@@ -2581,6 +2820,7 @@ fn workspace_view(
         sealed_fraction: manifest_fraction(artifact, "sealed_fraction", 0.2),
         condition_groups: coverage_condition_groups(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
+        holding: bank.holding.iter().map(elite_row).collect(),
     }
 }
 
@@ -2984,6 +3224,10 @@ mod tests {
             coverage_map: BTreeMap::new(),
             accepted_pool: Vec::new(),
             accepted_coverage_map: BTreeMap::new(),
+            specialist_pool: Vec::new(),
+            specialist_coverage_map: BTreeMap::new(),
+            holding: Vec::new(),
+            holding_coverage_map: BTreeMap::new(),
             telemetry: Default::default(),
         };
         let groups = coverage_condition_groups(&bank);
@@ -3022,6 +3266,10 @@ mod tests {
             coverage_map: BTreeMap::new(),
             accepted_pool: Vec::new(),
             accepted_coverage_map: BTreeMap::new(),
+            specialist_pool: Vec::new(),
+            specialist_coverage_map: BTreeMap::new(),
+            holding: Vec::new(),
+            holding_coverage_map: BTreeMap::new(),
             telemetry: Default::default(),
         };
 

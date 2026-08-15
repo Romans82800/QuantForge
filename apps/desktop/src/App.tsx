@@ -38,6 +38,9 @@ import {
   deleteDiscoverProfile,
   deleteSearchRangeProfile,
   loadDatabankPath,
+  startHoldingBatteryJob,
+  getHoldingBatteryJob,
+  stopHoldingBattery,
   loadElite,
   pauseDiscover,
   recordIncubation,
@@ -63,6 +66,7 @@ import type {
   DiscoverJobView,
   DiscoverRequest,
   DiscoverRunModeId,
+  BatteryJobView,
   EliteDetail,
   EliteMql5SourceView,
   EliteRow,
@@ -318,7 +322,10 @@ function App() {
   const [eliteModalOpen, setEliteModalOpen] = useState(false);
   const [resultsDetailFp, setResultsDetailFp] = useState<string | null>(null);
   const [resultsOrigin, setResultsOrigin] = useState<WorkspaceName>("Databank");
-  const [databankTab, setDatabankTab] = useState<"research" | "certified">("research");
+  const [databankTab, setDatabankTab] = useState<"holding" | "databank" | "certified">("holding");
+  const [batteryJob, setBatteryJob] = useState<BatteryJobView | null>(null);
+  const [batteryBusy, setBatteryBusy] = useState(false);
+  const lastBatteryRevision = useRef(0);
   const [discoverResultsOpen, setDiscoverResultsOpen] = useState(false);
   const [stripMessage, setStripMessage] = useState<string | null>(null);
   const detailRequest = useRef(0);
@@ -558,12 +565,120 @@ function App() {
     await selectElite(fingerprint);
   }
 
+  const archiveRows = useMemo(() => {
+    if (!workspace) return [];
+    if (databankTab === "holding") return workspace.holding ?? [];
+    return workspace.elites;
+  }, [workspace, databankTab]);
+
+  const batteryActive =
+    batteryJob?.status === "running"
+    && (batteryJob.total === 0
+      || batteryJob.completed < batteryJob.total
+      || batteryJob.running > 0);
+
+  // Long Holding batteries can be thousands of rows — keep a short live feed.
+  const batteryActivity = useMemo(() => {
+    const items = batteryJob?.items ?? [];
+    const running = items.filter((item) => item.status === "running");
+    const finished = items.filter(
+      (item) => item.status === "passed" || item.status === "rejected",
+    );
+    const limit = 12;
+    const recentFinished = finished.slice(-limit).reverse();
+    const queuedCount = items.filter((item) => item.status === "queued").length;
+    return {
+      rows: [...running, ...recentFinished],
+      queuedCount,
+      finishedCount: finished.length,
+      hiddenFinished: Math.max(0, finished.length - recentFinished.length),
+    };
+  }, [batteryJob?.items, batteryJob?.revision]);
+
+  useEffect(() => {
+    void getHoldingBatteryJob()
+      .then(setBatteryJob)
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!batteryActive && batteryJob?.status !== "running") return;
+    const timer = window.setInterval(() => {
+      void getHoldingBatteryJob()
+        .then((view) => {
+          const done =
+            view.status === "completed"
+            || view.status === "stopped"
+            || view.status === "failed"
+            || (view.total > 0 && view.completed >= view.total && view.running === 0);
+          setBatteryJob(
+            done && view.status === "running"
+              ? {
+                  ...view,
+                  status: "completed",
+                  phase: "Battery complete",
+                  running: 0,
+                  queued: 0,
+                  etaSeconds: 0,
+                }
+              : view,
+          );
+          const shouldReloadArchive =
+            !!view.databankPath
+            && view.revision !== lastBatteryRevision.current
+            && (done || view.passed > 0);
+          if (shouldReloadArchive && view.databankPath) {
+            lastBatteryRevision.current = view.revision;
+            void loadDatabankPath(view.databankPath)
+              .then(setWorkspace)
+              .catch(() => undefined);
+          } else if (view.revision !== lastBatteryRevision.current) {
+            lastBatteryRevision.current = view.revision;
+          }
+        })
+        .catch((reason) => setError(String(reason)));
+    }, 350);
+    return () => window.clearInterval(timer);
+  }, [batteryActive, batteryJob?.status]);
+
+  useEffect(() => {
+    if (!batteryJob?.databankPath) return;
+    if (batteryJob.status !== "completed" && batteryJob.status !== "stopped") return;
+    void loadDatabankPath(batteryJob.databankPath)
+      .then(setWorkspace)
+      .catch(() => undefined);
+  }, [batteryJob?.status, batteryJob?.databankPath]);
+
+  async function startBatteryOnSelection() {
+    const fingerprints = [...batchSelection];
+    if (fingerprints.length === 0) return;
+    setBatteryBusy(true);
+    setError(null);
+    try {
+      const started = await startHoldingBatteryJob(fingerprints);
+      lastBatteryRevision.current = started.revision;
+      setBatteryJob(started);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
+  async function stopBatteryJob() {
+    setBatteryBusy(true);
+    try {
+      setBatteryJob(await stopHoldingBattery());
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
   const filtered = useMemo(
-    () =>
-      workspace
-        ? filterAndSortElites(workspace.elites, query, entryFilter, sort)
-        : [],
-    [workspace, query, entryFilter, sort],
+    () => filterAndSortElites(archiveRows, query, entryFilter, sort),
+    [archiveRows, query, entryFilter, sort],
   );
 
   useEffect(() => {
@@ -636,7 +751,7 @@ function App() {
           <div className="topbar-actions">
             {workspace && (
               <span className="topbar-chip" title={workspace.sourcePath}>
-                {formatNumber(workspace.elites.length)} elites · {workspace.sourcePath.split("/").at(-1)}
+                {formatNumber((workspace.holding?.length ?? 0) + workspace.elites.length)} strategies · {workspace.sourcePath.split("/").at(-1)}
               </span>
             )}
             {activeWorkspace === "Databank" && (
@@ -731,11 +846,20 @@ function App() {
               <button
                 type="button"
                 role="tab"
-                aria-selected={databankTab === "research"}
-                className={databankTab === "research" ? "active" : ""}
-                onClick={() => setDatabankTab("research")}
+                aria-selected={databankTab === "holding"}
+                className={databankTab === "holding" ? "active" : ""}
+                onClick={() => setDatabankTab("holding")}
               >
-                Research
+                Holding{workspace ? ` (${workspace.holding?.length ?? 0})` : ""}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={databankTab === "databank"}
+                className={databankTab === "databank" ? "active" : ""}
+                onClick={() => setDatabankTab("databank")}
+              >
+                Databank{workspace ? ` (${workspace.elites.length})` : ""}
               </button>
               <button
                 type="button"
@@ -866,13 +990,13 @@ function App() {
                 </section>
 
                 <ClusterView
-                  rows={workspace.elites}
+                  rows={archiveRows}
                   selected={detail?.fingerprint ?? null}
                   onSelect={selectElite}
                 />
 
                 <EquityCurvePanel
-                  rows={workspace.elites.filter((row) =>
+                  rows={archiveRows.filter((row) =>
                     batchSelection.size > 0
                       ? batchSelection.has(row.fingerprint)
                       : row.fingerprint === detail?.fingerprint,
@@ -881,13 +1005,125 @@ function App() {
                   m1FidelityVerified={workspace.m1FidelityVerified}
                 />
 
+                {(batteryJob && batteryJob.status !== "idle") && (
+                  <section className="panel" aria-label="Holding battery progress">
+                    <div className="panel-heading">
+                      <div>
+                        <p className="eyebrow">Holding battery</p>
+                        <h2>{batteryJob.phase}</h2>
+                      </div>
+                      <span className="read-only-badge">{batteryJob.status}</span>
+                    </div>
+                    <p>{batteryJob.message}</p>
+                    <div className="kpi-grid" aria-label="Battery counters">
+                      <Kpi
+                        label="Progress"
+                        value={`${formatNumber(batteryJob.completed)}/${formatNumber(batteryJob.total)}`}
+                        note={`${formatNumber(batteryJob.queued)} queued · ${formatNumber(batteryJob.running)} running`}
+                      />
+                      <Kpi
+                        label="Passed → Databank"
+                        value={formatNumber(batteryJob.passed)}
+                        note={`${formatNumber(batteryJob.databankElites)} databank elites`}
+                      />
+                      <Kpi
+                        label="Rejected"
+                        value={formatNumber(batteryJob.rejected)}
+                        note={`${formatNumber(batteryJob.holdingRemaining)} still in Holding`}
+                      />
+                      <Kpi
+                        label="Batteries / hour"
+                        value={formatNumber(batteryJob.batteriesPerHour, 1)}
+                        note={
+                          batteryJob.etaSeconds != null && batteryJob.status === "running"
+                            ? `ETA ~${Math.max(1, Math.round(batteryJob.etaSeconds / 60))} min`
+                            : `${formatNumber(batteryJob.elapsedSeconds, 0)}s elapsed`
+                        }
+                      />
+                    </div>
+                    {batteryActive && (
+                      <div className="form-footer">
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={batteryBusy || batteryJob?.stopRequested}
+                          onClick={() => void stopBatteryJob()}
+                        >
+                          {batteryJob?.stopRequested ? "Stopping…" : "Stop battery"}
+                        </button>
+                      </div>
+                    )}
+                    {batteryActivity.rows.length > 0 && (
+                      <div className="family-tester-results">
+                        <p className="muted" style={{ marginBottom: "0.5rem" }}>
+                          Latest activity
+                          {batteryActivity.hiddenFinished > 0
+                            ? ` · ${formatNumber(batteryActivity.hiddenFinished)} earlier finishes hidden`
+                            : ""}
+                          {batteryActivity.queuedCount > 0
+                            ? ` · ${formatNumber(batteryActivity.queuedCount)} queued`
+                            : ""}
+                        </p>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Status</th>
+                              <th>Strategy</th>
+                              <th>Evidence</th>
+                              <th>Trades</th>
+                              <th>Reason</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {batteryActivity.rows.map((item) => (
+                              <tr key={item.fingerprint}>
+                                <td>{item.status}</td>
+                                <td title={item.fingerprint}>{item.strategyId}</td>
+                                <td>{formatNumber(item.evidence, 1)}</td>
+                                <td>{formatNumber(item.trades)}</td>
+                                <td>{item.reason ?? "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                )}
+
                 <section className="panel elites-panel">
                   <div className="panel-heading table-heading">
                     <div>
-                      <p className="eyebrow">Archive champions</p>
-                      <h2>{filtered.length} elites</h2>
+                      <p className="eyebrow">
+                        {databankTab === "holding"
+                          ? "Untested M1 survivors"
+                          : "Battery-passed elites"}
+                      </p>
+                      <h2>
+                        {filtered.length}{" "}
+                        {databankTab === "holding" ? "holding" : "elites"}
+                      </h2>
                     </div>
                     <div className="table-controls">
+                      {databankTab === "holding" && (
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={
+                            loading
+                            || batteryBusy
+                            || batteryActive
+                            || batchSelection.size === 0
+                          }
+                          onClick={() => void startBatteryOnSelection()}
+                        >
+                          {batteryActive
+                            ? "Battery running…"
+                            : batteryBusy
+                              ? "Starting…"
+                              : `Run battery (${batchSelection.size})`}
+                        </button>
+                      )}
                       <input
                         aria-label="Search elites"
                         onChange={(event) => setQuery(event.target.value)}
@@ -2464,7 +2700,8 @@ function HomeWorkspace({
           <div className="overview-status-kpis">
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
-            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="passed M1 + CPCV + MC + params + OOS1" />
+            <KpiCell label="Holding" value={formatNumber(job?.holdingElites ?? 0)} note="H1 + M1 fidelity; battery deferred" />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="after on-demand battery + OOS1" />
             <KpiCell
               label="Evals / hour · rolling"
               value={formatNumber(job?.rollingEvaluationsPerHour ?? 0)}
@@ -3148,7 +3385,7 @@ function DiscoverWorkspace({
 
   useEffect(() => {
     if (!job?.outputPath) return;
-    const eliteCount = job.databankElites ?? 0;
+    const eliteCount = (job.holdingElites ?? 0) + (job.databankElites ?? 0);
     const liveRevision = job.liveDatabankRevision ?? eliteCount;
     const shouldReload =
       job.status === "completed"
@@ -3173,11 +3410,13 @@ function DiscoverWorkspace({
         });
     }, active ? 1800 : 0);
     return () => window.clearInterval(timer);
-  }, [active, job?.outputPath, job?.databankElites, job?.liveDatabankRevision, job?.status]);
+  }, [active, job?.outputPath, job?.holdingElites, job?.databankElites, job?.liveDatabankRevision, job?.status]);
 
   const liveEliteRows = useMemo(() => {
     if (!liveWorkspace) return [];
-    return [...liveWorkspace.elites].sort((left, right) => right.evidence - left.evidence);
+    return [...(liveWorkspace.holding ?? []), ...liveWorkspace.elites].sort(
+      (left, right) => right.evidence - left.evidence,
+    );
   }, [liveWorkspace]);
 
   async function inspectLiveElite(fingerprint: string) {
@@ -3783,10 +4022,10 @@ function DiscoverWorkspace({
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
-                <summary>Post-breed databank pipeline — starts only after breeding</summary>
-                <p className="immutable-note">{`Development search: reservoir → breed → M1 fidelity → CPCV + MC + ±${perturbationPercent(form)}% plateau → OOS1 validation → databank. OOS1 never affects breeding or ranking; OOS2 remains sealed.`}</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>M1 robustness battery on databank path (Development CPCV / Monte Carlo / param plateau)</span></label>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (SQX RetestWithHigherPrecision bands)</span></label>
+                <summary>Holding admission — fast path after breeding</summary>
+                <p className="immutable-note">Discover deposits to Holding after H1 gates + M1 fidelity. WFO / Monte Carlo / ±param / OOS1 wait until you run the battery from the Holding tab.</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Keep battery settings for later Holding → Databank promote (CPCV / Monte Carlo / param plateau)</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (required for Holding)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="Minimum Development expectancy (R)" value={form.minimumDevelopmentExpectancyR} onChange={(value) => update("minimumDevelopmentExpectancyR", value)} min={0} step={0.05} />
@@ -3891,7 +4130,7 @@ function DiscoverWorkspace({
           </>}
         </fieldset>
         <div className="form-footer">
-          <p>Pipeline: Development gates → reservoir → breed → M1 fidelity + CPCV robustness → OOS1 validation → databank. OOS2 remains sealed. Expectancy in R ($1,000 risk).</p>
+          <p>Pipeline: Development gates → reservoir → breed → Holding (H1 + M1) → on-demand battery → Databank. OOS2 remains sealed.</p>
           <button
             className="primary"
             disabled={
@@ -3930,21 +4169,26 @@ function DiscoverWorkspace({
               note={`${formatNumber(job?.potNewNiches ?? 0)} new · ${job?.breedingActive ? "breeding" : `fill → ${job?.mutateAfterElites ?? 300}`}`}
             />
             <Kpi
-              label="Databank"
+              label="Holding"
               value={
                 job?.targetDatabankElites
-                  ? `${formatNumber(job?.databankElites ?? 0)}/${job.targetDatabankElites}`
-                  : formatNumber(job?.databankElites ?? job?.coverage ?? 0)
+                  ? `${formatNumber(job?.holdingElites ?? 0)}/${job.targetDatabankElites}`
+                  : formatNumber(job?.holdingElites ?? 0)
               }
               note={
                 job?.targetDatabankElites
-                  ? "Quota · post-breed M1 only"
+                  ? "Quota · H1 + M1 fidelity"
                   : job?.breedingActive
-                    ? "Post-breed Development CPCV→M1→OOS1"
+                    ? "Post-breed H1 + M1 → Holding"
                     : "Empty until breeding unlocks"
               }
             />
-            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for databank pipeline" : "Breeding stock only"} />
+            <Kpi
+              label="Databank"
+              value={formatNumber(job?.databankElites ?? job?.coverage ?? 0)}
+              note="After on-demand battery"
+            />
+            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for Holding pipeline" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
             <Kpi
               label="Evals / hour · rolling"
@@ -4047,8 +4291,8 @@ function DiscoverWorkspace({
                   <p className="eyebrow">Results</p>
                   <h2>
                     {liveEliteRows.length
-                      ? `${liveEliteRows.length} databank elites`
-                      : "No elites yet"}
+                      ? `${liveEliteRows.length} holding + databank`
+                      : "No strategies yet"}
                   </h2>
                 </div>
                 <span className="read-only-badge">click a row for full detail</span>
@@ -4196,15 +4440,15 @@ function DiscoverWorkspace({
       )}
       </div>
 
-      {(active || (job?.databankElites ?? 0) > 0) && (
+      {(active || (job?.holdingElites ?? 0) > 0 || (job?.databankElites ?? 0) > 0) && (
         <section className={`panel discover-live-databank ${liveEliteRows.length ? "" : "empty"}`}>
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">Live databank</p>
+              <p className="eyebrow">Live Holding / Databank</p>
               <h2>
                 {liveEliteRows.length
-                  ? `${formatNumber(liveEliteRows.length)} promoted strategies`
-                  : "Waiting for first promotion"}
+                  ? `${formatNumber(liveEliteRows.length)} strategies`
+                  : "Waiting for first Holding deposit"}
               </h2>
             </div>
             <span className="read-only-badge">

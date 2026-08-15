@@ -193,6 +193,8 @@ pub struct DiscoverJobView {
     /// Distinct niches currently occupied (= elites in the pot).
     pot_elites: usize,
     pot_new_niches: u64,
+    /// Pre-battery M1 survivors awaiting on-demand battery.
+    holding_elites: usize,
     databank_elites: usize,
     /// Changes on both databank admission and elite replacement. The UI uses
     /// this instead of the count alone so a same-size improved bank refreshes.
@@ -296,6 +298,7 @@ impl DiscoverJobView {
             accepted_total: 0,
             pot_elites: 0,
             pot_new_niches: 0,
+            holding_elites: 0,
             databank_elites: 0,
             live_databank_revision: 0,
             target_databank_elites: None,
@@ -472,6 +475,7 @@ pub fn start_discover(
         accepted_total: 0,
         pot_elites: 0,
         pot_new_niches: 0,
+        holding_elites: 0,
         databank_elites: 0,
         live_databank_revision: 0,
         target_databank_elites: request.target_databank_elites,
@@ -551,7 +555,7 @@ pub fn get_discover_live_databank(
         .read()
         .map_err(|_| "discover live databank state is unavailable")?
         .clone()
-        .ok_or_else(|| "the live databank has no promoted strategies yet".to_owned())?;
+        .ok_or_else(|| "the live archive has no Holding or Databank strategies yet".to_owned())?;
     let source_path = state
         .job
         .read()
@@ -1056,7 +1060,7 @@ fn run_discovery(
     let quota_met = |bank: &Databank| -> bool {
         bank.config
             .target_databank_elites
-            .is_some_and(|target| bank.elites.len() >= target)
+            .is_some_and(|target| bank.quota_progress_count() >= target)
     };
 
     // Dataset selection is fixed for the run: `validate_resume` requires the
@@ -1500,9 +1504,17 @@ fn finish_discovery(
     let quota_complete = bank
         .config
         .target_databank_elites
-        .is_some_and(|target| bank.elites.len() >= target);
+        .is_some_and(|target| bank.quota_progress_count() >= target);
     view.phase = if quota_complete {
-        format!("Quota complete · {} databank elites", bank.elites.len())
+        format!(
+            "Quota complete · {} {}",
+            bank.quota_progress_count(),
+            if bank.config.build_to_holding {
+                "holding"
+            } else {
+                "databank elites"
+            }
+        )
     } else if stop_was_early(completed_now, soft_budget, run_until_stopped) {
         "Stopped and checkpointed".into()
     } else {
@@ -1512,8 +1524,13 @@ fn finish_discovery(
     view.latest_immutable_snapshot_path = Some(display_path(&snapshot));
     view.message = if quota_complete {
         format!(
-            "Reached databank quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
-            bank.elites.len(),
+            "Reached {} quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
+            if bank.config.build_to_holding {
+                "Holding"
+            } else {
+                "databank"
+            },
+            bank.quota_progress_count(),
             bank.config.target_databank_elites.unwrap_or(0),
             view.evaluation_count
         )
@@ -1733,26 +1750,33 @@ fn publish_live_databank(
     soft_budget: u64,
     run_until_stopped: bool,
 ) -> Result<(), String> {
-    if bank.elites.is_empty() {
+    if bank.elites.is_empty() && bank.holding.is_empty() {
         return Ok(());
     }
-    let revision = bank.telemetry.databank_accepted + bank.telemetry.databank_replaced;
+    let revision = bank.telemetry.databank_accepted
+        + bank.telemetry.databank_replaced
+        + bank.telemetry.holding_accepted
+        + bank.telemetry.holding_replaced;
     let unchanged = live_artifact
         .read()
         .map_err(|_| "discover live databank state is unavailable")?
         .as_ref()
         .is_some_and(|artifact| {
             let old = &artifact.databank.telemetry;
-            old.databank_accepted + old.databank_replaced == revision
+            let old_revision = old.databank_accepted
+                + old.databank_replaced
+                + old.holding_accepted
+                + old.holding_replaced;
+            old_revision == revision
                 && artifact.databank.elites.len() == bank.elites.len()
+                && artifact.databank.holding.len() == bank.holding.len()
         });
     if unchanged {
         return Ok(());
     }
 
-    // The live inspector needs promoted elites, not the potentially enormous
-    // breeding reservoir. Keeping the latter out of the RAM mirror makes live
-    // refresh cheap while the 30-minute recovery artifact remains complete.
+    // The live inspector needs Holding + Databank elites, not the potentially
+    // enormous breeding reservoir.
     let mut live_bank = bank.clone();
     live_bank.accepted_pool.clear();
     live_bank.accepted_coverage_map.clear();
@@ -2205,6 +2229,8 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         max_accepted_pool_elites: 10_000,
         max_specialist_pool_elites: 2_000,
         max_databank_elites: 5_000,
+        max_holding_elites: 5_000,
+        build_to_holding: true,
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(3),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
@@ -2445,37 +2471,44 @@ fn update_bank(
 
     let mutate_after = bank.config.mutate_after_elites;
     let pot_elites = bank.pot_size();
+    let holding_elites = bank.holding_size();
     let databank_elites = bank.coverage();
+    let quota_count = bank.quota_progress_count();
     let target_databank = bank.config.target_databank_elites;
     let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
     let queue_depth = telemetry.promotion_queue_depth;
     let inflight = telemetry.promotion_inflight;
+    let holding_label = if bank.config.build_to_holding {
+        "holding"
+    } else {
+        "databank"
+    };
     let phase = if let Some(target) = target_databank {
         format!(
-            "Quota · databank {databank_elites}/{target} · pot {pot_elites} · gen {completed_now}"
+            "Quota · {holding_label} {quota_count}/{target} · pot {pot_elites} · gen {completed_now}"
         )
     } else if breeding_active {
         format!(
-            "Breeding · pot {pot_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
+            "Breeding · pot {pot_elites} · holding {holding_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
         )
     } else {
         format!(
-            "Filling initial pot · {pot_elites}/{mutate_after} · databank {databank_elites} · gen {completed_now}"
+            "Filling initial pot · {pot_elites}/{mutate_after} · holding {holding_elites} · gen {completed_now}"
         )
     };
     let pot_message = if let Some(target) = target_databank {
         format!(
-            "Quota Harvest: databank {databank_elites}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
+            "Quota Harvest: {holding_label} {quota_count}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
             funnel_summary(bank)
         )
     } else if breeding_active {
         format!(
-            "Build continues; databank pipeline on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · databank {databank_elites}. {}",
+            "Build continues; Holding pipeline on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · holding {holding_elites} · databank {databank_elites}. {}",
             funnel_summary(bank)
         )
     } else {
         format!(
-            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank {databank_elites} only after breeding (CPCV/robustness→M1→OOS1 validation). {} more reservoir members until breeding. {}",
+            "Development reservoir {pot_elites} (breed at {mutate_after}). Holding {holding_elites} after breeding (H1+M1; battery deferred). {} more reservoir members until breeding. {}",
             mutate_after.saturating_sub(pot_elites),
             funnel_summary(bank)
         )
@@ -2496,8 +2529,12 @@ fn update_bank(
     view.accepted_total = accepted_total;
     view.pot_elites = pot_elites;
     view.pot_new_niches = telemetry.pot_accepted;
+    view.holding_elites = holding_elites;
     view.databank_elites = databank_elites;
-    view.live_databank_revision = telemetry.databank_accepted + telemetry.databank_replaced;
+    view.live_databank_revision = telemetry.databank_accepted
+        + telemetry.databank_replaced
+        + telemetry.holding_accepted
+        + telemetry.holding_replaced;
     view.target_databank_elites = target_databank;
     view.mutate_after_elites = mutate_after;
     view.breeding_active = breeding_active;

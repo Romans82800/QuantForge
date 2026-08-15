@@ -219,6 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &broker,
             &robustness,
             &quote_result.metrics,
+            true,
         );
         let label = match result {
             Ok(_) => "passed",
