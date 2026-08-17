@@ -35,10 +35,14 @@ pub(crate) fn deposit_to_accepted_pool(
     }
     // Breeding pot is a bag: fingerprint dedup + correlation only. Strategies
     // with the same behaviour niche are allowed to stack.
+    // Family cap still applies so breeding parents are not one grammar clique.
     let decision = deposit_into_stack(
         &mut bank.accepted_pool,
         &mut bank.accepted_coverage_map,
         bank.config.correlation_threshold,
+        bank.config.max_elites_per_niche,
+        bank.config.max_per_entry_family.saturating_mul(2).max(16),
+        0,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -58,12 +62,21 @@ pub(crate) fn deposit_to_databank(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    // Databank stacks like the pot — no MAP-Elites niche replacement. Niche
-    // labels stay as descriptive metadata only.
+    let family = entry_family_key(&candidate.strategy);
+    let peer_family_count = bank
+        .holding
+        .iter()
+        .filter(|elite| entry_family_key(&elite.strategy) == family)
+        .count();
+    // Databank is a promoted pool: uses the looser promoted-per-niche cap so
+    // battery survivors are not evicted by niche churn.
     let decision = deposit_into_stack(
         &mut bank.elites,
         &mut bank.coverage_map,
         bank.config.correlation_threshold,
+        bank.config.max_promoted_per_niche,
+        bank.config.max_per_entry_family,
+        peer_family_count,
         candidate,
         DepositDecision::AcceptedToDatabank,
         DepositDecision::ReplacedInDatabank,
@@ -80,10 +93,19 @@ pub(crate) fn deposit_to_holding(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
+    let family = entry_family_key(&candidate.strategy);
+    let peer_family_count = bank
+        .elites
+        .iter()
+        .filter(|elite| entry_family_key(&elite.strategy) == family)
+        .count();
     let decision = deposit_into_stack(
         &mut bank.holding,
         &mut bank.holding_coverage_map,
         bank.config.correlation_threshold,
+        bank.config.max_promoted_per_niche,
+        bank.config.max_per_entry_family,
+        peer_family_count,
         candidate,
         DepositDecision::AcceptedToHolding,
         DepositDecision::ReplacedInHolding,
@@ -114,6 +136,9 @@ pub(crate) fn deposit_to_specialist_pool(
         &mut bank.specialist_pool,
         &mut bank.specialist_coverage_map,
         bank.config.correlation_threshold,
+        bank.config.max_elites_per_niche,
+        bank.config.max_per_entry_family.saturating_mul(2).max(16),
+        0,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -149,6 +174,9 @@ fn deposit_into_stack(
     entries: &mut Vec<Elite>,
     coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
     correlation_threshold: f64,
+    max_per_niche: usize,
+    max_per_family: usize,
+    peer_family_count: usize,
     candidate: CandidateEvaluation,
     accepted: DepositDecision,
     replaced: DepositDecision,
@@ -156,6 +184,7 @@ fn deposit_into_stack(
     let fingerprint = candidate
         .strategy
         .structural_fingerprint(FloatPolicy::default())?;
+    let family = entry_family_key(&candidate.strategy);
     let descriptor = descriptor(&candidate.strategy, &candidate.result);
     let niche = niche_key(&descriptor);
     let evidence = evidence(&candidate.strategy, &candidate.result);
@@ -182,28 +211,16 @@ fn deposit_into_stack(
         ) {
             return Ok(DepositDecision::RejectedClone);
         }
-        entries[index] = Elite {
-            strategy: candidate.strategy,
-            structural_fingerprint: fingerprint.clone(),
+        entries[index] = make_elite(
+            candidate,
+            fingerprint.clone(),
             descriptor,
             niche,
             evidence,
             novelty,
             complexity,
-            metrics: candidate.result.metrics,
-            is_expectancy: candidate.is_expectancy,
-            oos1_expectancy: candidate.oos1_expectancy,
-            oos1_expectancy_ratio: candidate.oos1_expectancy_ratio,
-            observed_trade_sharpe: candidate.observed_trade_sharpe,
-            expected_max_lucky_sharpe: candidate.expected_max_lucky_sharpe,
-            deflated_trade_sharpe: candidate.deflated_trade_sharpe,
-            multi_symbol_results: candidate.multi_symbol_results,
-            gate_results: candidate.gate_results,
-            robustness: candidate.robustness,
-            equity_signature: signature,
-            discovered_generation: candidate.generation,
-            island_id: candidate.island_id,
-        };
+            signature,
+        );
         refresh_fingerprint_coverage_map(entries, coverage_map);
         return Ok(replaced);
     }
@@ -212,7 +229,117 @@ fn deposit_into_stack(
         return Ok(DepositDecision::RejectedCorrelated);
     }
 
-    entries.push(Elite {
+    let family_indexes: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, elite)| entry_family_key(&elite.strategy) == family)
+        .map(|(index, _)| index)
+        .collect();
+    if max_per_family > 0 && family_indexes.len() + peer_family_count >= max_per_family {
+        if family_indexes.is_empty() {
+            // Peers already filled this family; this pool cannot add another.
+            return Ok(DepositDecision::RejectedFamilyNotImproved);
+        }
+        let worst_index = family_indexes
+            .into_iter()
+            .min_by(|left, right| {
+                entries[*left]
+                    .evidence
+                    .total
+                    .total_cmp(&entries[*right].evidence.total)
+                    .then_with(|| entries[*left].novelty.total_cmp(&entries[*right].novelty))
+            })
+            .unwrap_or(0);
+        if !better_than(
+            &evidence,
+            novelty,
+            complexity,
+            candidate.result.metrics.trade_count,
+            &entries[worst_index],
+        ) {
+            return Ok(DepositDecision::RejectedFamilyNotImproved);
+        }
+        entries[worst_index] = make_elite(
+            candidate,
+            fingerprint,
+            descriptor,
+            niche,
+            evidence,
+            novelty,
+            complexity,
+            signature,
+        );
+        refresh_fingerprint_coverage_map(entries, coverage_map);
+        return Ok(replaced);
+    }
+
+    if max_per_niche > 0 {
+        let niche_indexes: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, elite)| elite.niche == niche)
+            .map(|(index, _)| index)
+            .collect();
+        if niche_indexes.len() >= max_per_niche {
+            let worst_index = niche_indexes
+                .into_iter()
+                .min_by(|left, right| {
+                    entries[*left]
+                        .evidence
+                        .total
+                        .total_cmp(&entries[*right].evidence.total)
+                        .then_with(|| entries[*left].novelty.total_cmp(&entries[*right].novelty))
+                })
+                .unwrap_or(0);
+            if !better_than(
+                &evidence,
+                novelty,
+                complexity,
+                candidate.result.metrics.trade_count,
+                &entries[worst_index],
+            ) {
+                return Ok(DepositDecision::RejectedNicheNotImproved);
+            }
+            entries[worst_index] = make_elite(
+                candidate,
+                fingerprint,
+                descriptor,
+                niche,
+                evidence,
+                novelty,
+                complexity,
+                signature,
+            );
+            refresh_fingerprint_coverage_map(entries, coverage_map);
+            return Ok(replaced);
+        }
+    }
+
+    entries.push(make_elite(
+        candidate,
+        fingerprint,
+        descriptor,
+        niche,
+        evidence,
+        novelty,
+        complexity,
+        signature,
+    ));
+    refresh_fingerprint_coverage_map(entries, coverage_map);
+    Ok(accepted)
+}
+
+fn make_elite(
+    candidate: CandidateEvaluation,
+    fingerprint: quantforge_core::ContentHash,
+    descriptor: BehaviorDescriptor,
+    niche: NicheKey,
+    evidence: EvidenceComponents,
+    novelty: f64,
+    complexity: usize,
+    signature: Vec<f64>,
+) -> Elite {
+    Elite {
         strategy: candidate.strategy,
         structural_fingerprint: fingerprint,
         descriptor,
@@ -224,6 +351,7 @@ fn deposit_into_stack(
         is_expectancy: candidate.is_expectancy,
         oos1_expectancy: candidate.oos1_expectancy,
         oos1_expectancy_ratio: candidate.oos1_expectancy_ratio,
+        fold_r: crate::fold_r::calendar_year_fold_r(&candidate.result.trades),
         observed_trade_sharpe: candidate.observed_trade_sharpe,
         expected_max_lucky_sharpe: candidate.expected_max_lucky_sharpe,
         deflated_trade_sharpe: candidate.deflated_trade_sharpe,
@@ -233,9 +361,7 @@ fn deposit_into_stack(
         equity_signature: signature,
         discovered_generation: candidate.generation,
         island_id: candidate.island_id,
-    });
-    refresh_fingerprint_coverage_map(entries, coverage_map);
-    Ok(accepted)
+    }
 }
 
 pub(crate) fn passes_gates(result: &ScoutResult, config: &DiscoverConfig) -> bool {
@@ -296,7 +422,10 @@ fn descriptor(strategy: &StrategyIr, result: &ScoutResult) -> BehaviorDescriptor
 pub(crate) fn niche_key(value: &BehaviorDescriptor) -> NicheKey {
     NicheKey {
         entry_conditions: value.entry_conditions,
-        trade_frequency: three_level(value.trades_per_1000_bars, 5.0, 20.0),
+        // Descriptor frequency is trades / equity points * 1000. Equity is M1-
+        // dense, so values cluster near ~0.05–0.15 under one-entry-per-day.
+        // Legacy 5/20 thresholds put every H1 swing strategy in "low".
+        trade_frequency: three_level(value.trades_per_1000_bars, 0.05, 0.12),
         hold_time: three_level(value.average_bars_held, 4.0, 24.0),
         drawdown: three_level(value.drawdown_percent, 5.0, 15.0),
         win_rate: three_level(value.win_rate_percent, 35.0, 55.0),
@@ -307,6 +436,68 @@ pub(crate) fn niche_key(value: &BehaviorDescriptor) -> NicheKey {
         } else {
             LongShortSkewBucket::Balanced
         },
+    }
+}
+
+/// Sorted unique indicator operators on the long (and short) entry tree.
+/// Example: `ema+minus_di+plus_di`. Used to stop one grammar family dominating.
+pub fn entry_family_key(strategy: &StrategyIr) -> String {
+    let mut ops = std::collections::BTreeSet::new();
+    if let Some(expr) = strategy.entry.long.as_ref() {
+        collect_indicator_ops(expr, &mut ops);
+    }
+    if let Some(expr) = strategy.entry.short.as_ref() {
+        collect_indicator_ops(expr, &mut ops);
+    }
+    if ops.is_empty() {
+        "empty".into()
+    } else {
+        ops.into_iter().collect::<Vec<_>>().join("+")
+    }
+}
+
+fn collect_indicator_ops(expr: &quantforge_ir::BoolExpr, out: &mut std::collections::BTreeSet<String>) {
+    use quantforge_ir::BoolExpr;
+    match expr {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossAbove { left, right }
+        | BoolExpr::CrossBelow { left, right } => {
+            collect_numeric_ops(left, out);
+            collect_numeric_ops(right, out);
+        }
+        BoolExpr::Between {
+            value,
+            lower,
+            upper,
+        } => {
+            collect_numeric_ops(value, out);
+            collect_numeric_ops(lower, out);
+            collect_numeric_ops(upper, out);
+        }
+        BoolExpr::And { children } | BoolExpr::Or { children } => {
+            for child in children {
+                collect_indicator_ops(child, out);
+            }
+        }
+        BoolExpr::Not { child } => collect_indicator_ops(child, out),
+    }
+}
+
+fn collect_numeric_ops(expr: &quantforge_ir::NumericExpr, out: &mut std::collections::BTreeSet<String>) {
+    use quantforge_ir::NumericExpr;
+    if let NumericExpr::Indicator { value } = expr {
+        out.insert(indicator_operator_name(value));
+    }
+}
+
+fn indicator_operator_name(expr: &quantforge_ir::IndicatorExpr) -> String {
+    match serde_json::to_value(expr) {
+        Ok(serde_json::Value::Object(fields)) => fields
+            .get("operator")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_owned(),
+        _ => "unknown".into(),
     }
 }
 
@@ -321,16 +512,22 @@ fn three_level(value: f64, first: f64, second: f64) -> ThreeLevelBucket {
 }
 
 fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
-    // Evidence measures quality, not how long a strategy happened to trade.
-    // Compounded return and raw trade count both grow with sample length, so
-    // they previously let mediocre high-frequency strategies outrank compact
-    // high-quality strategies. Use bounded risk-adjusted terms instead.
-    let trades = result.metrics.trade_count.max(1) as f64;
-    let expectancy_r = result.metrics.net_profit / trades / 1_000.0;
-    let expectancy_component = (expectancy_r / 0.40).tanh() * 20.0;
+    // Rank the R that showed up across Development years, not pooled IS dollars.
+    // A 0.4R IS gift concentrated in one year must lose to a 0.10R that repeats.
+    let fold = crate::fold_r::calendar_year_fold_r(&result.trades);
+    let expectancy_r = fold.rank_r();
+    let expectancy_component = (expectancy_r / 0.25).tanh() * 20.0;
+    let stability_penalty = if fold.usable {
+        (fold.fold_spread / 0.15).tanh() * 8.0
+            + if fold.has_negative_fold { 6.0 } else { 0.0 }
+            + ((fold.max_year_share - 0.40).max(0.0) / 0.20).tanh() * 6.0
+    } else {
+        0.0
+    };
     let recovery_component = (recovery_factor(&result.metrics) / 5.0).tanh() * 15.0;
     let sharpe_component = (result.metrics.sharpe_ratio.unwrap_or(0.0) / 3.0).tanh() * 10.0;
-    let return_component = expectancy_component + recovery_component + sharpe_component;
+    let return_component =
+        expectancy_component + recovery_component + sharpe_component - stability_penalty;
     let effective_profit_factor = result.metrics.profit_factor.unwrap_or({
         if result.metrics.net_profit > 0.0 {
             10.0
@@ -347,7 +544,7 @@ fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
     // points. 1,500 trades therefore cannot overwhelm expectancy/recovery/PF.
     let trade_count_bonus = (1.0 - (-(result.metrics.trade_count as f64) / 100.0).exp()) * 5.0;
     let drawdown_penalty = (result.metrics.max_drawdown_percent / 20.0).tanh() * 20.0;
-    let complexity_penalty = strategy.complexity().score as f64 * 0.05;
+    let complexity_penalty = strategy.complexity().score as f64 * 0.40;
     let total = return_component + profit_factor_component + trade_count_bonus
         - drawdown_penalty
         - complexity_penalty;
@@ -541,6 +738,8 @@ mod tests {
                 max_drawdown_percent: 0.0,
                 sharpe_ratio: None,
                 expectancy: 0.0,
+                expectancy_r: 0.0,
+                median_r: 0.0,
             },
             telemetry: ScoutTelemetry::default(),
         }
@@ -747,5 +946,78 @@ mod tests {
             bank.elites[0].structural_fingerprint,
             bank.elites[1].structural_fingerprint
         );
+    }
+
+    #[test]
+    fn promoted_pool_caps_entry_family_share() {
+        let mut bank = bank(0.99);
+        bank.config.max_per_entry_family = 1;
+        bank.config.max_promoted_per_niche = 0;
+        let family = entry_family_key(&generate_seed(7, 0));
+        let first = deposit_to_holding(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(7, 0),
+                result: profitable_result(),
+                generation: 0,
+                island_id: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, DepositDecision::AcceptedToHolding);
+
+        // Same family, uncorrelated equity — must replace or reject, not grow.
+        let mut second_result = profitable_result();
+        for (index, point) in second_result.equity.iter_mut().enumerate() {
+            point.equity = 100_000.0 + (index as f64) * 17.0 + (index as f64).cos() * 40.0;
+        }
+        second_result.metrics.return_percent = 0.5;
+        second_result.metrics.net_profit = 500.0;
+        let same_family = (0..32)
+            .map(|offset| generate_seed(7, offset))
+            .find(|strategy| {
+                entry_family_key(strategy) == family
+                    && strategy.structural_fingerprint(quantforge_core::FloatPolicy::default()).ok()
+                        != generate_seed(7, 0)
+                            .structural_fingerprint(quantforge_core::FloatPolicy::default())
+                            .ok()
+            })
+            .expect("another seed in the same entry family");
+        let second = deposit_to_holding(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: same_family,
+                result: second_result,
+                generation: 1,
+                island_id: 0,
+                is_expectancy: 0.5,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                second,
+                DepositDecision::RejectedFamilyNotImproved | DepositDecision::ReplacedInHolding
+            ),
+            "got {second:?}"
+        );
+        assert_eq!(bank.holding.len(), 1);
     }
 }

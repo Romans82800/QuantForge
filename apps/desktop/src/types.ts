@@ -139,6 +139,12 @@ export interface EliteRow {
   isExpectancy: number;
   oos1Expectancy: number | null;
   oos1ExpectancyRatio: number | null;
+  expectancyR: number;
+  medianR: number;
+  foldMedianR: number;
+  foldSpread: number;
+  foldCount: number;
+  foldUsable: boolean;
   complexity: number;
   generation: number;
   grade: string;
@@ -352,6 +358,11 @@ export interface EliteDetail {
   metrics: Record<string, number | null>;
   oos1Expectancy: number | null;
   oos1ExpectancyRatio: number | null;
+  foldMedianR: number;
+  foldSpread: number;
+  foldPooledR: number;
+  foldCount: number;
+  foldUsable: boolean;
   strategyIr: unknown;
   equitySignature: number[];
   /** Present when Discover persisted robustness gate detail; otherwise UI shows "not recorded". */

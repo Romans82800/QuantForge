@@ -224,6 +224,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let label = match result {
             Ok(_) => "passed",
             Err(RobustnessReject::M1Fidelity) => "m1_fidelity",
+            Err(RobustnessReject::FoldStability) => "fold_stability",
             Err(RobustnessReject::WalkForward) => "development_cpcv",
             Err(RobustnessReject::MonteCarlo) => "monte_carlo",
             Err(RobustnessReject::ParamNeighborhood) => "parameter_plateau",

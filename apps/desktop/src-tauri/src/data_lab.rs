@@ -322,9 +322,8 @@ pub fn import_market_folder_sync(
 
 fn default_import_directory() -> PathBuf {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+    crate::assets::user_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("Documents")
         .join("QuantForge")
         .join("imported-data")

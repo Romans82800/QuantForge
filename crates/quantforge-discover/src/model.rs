@@ -171,10 +171,10 @@ impl SearchRangeProfile {
         Self {
             indicator_period: SearchRange::new(10.0, 20.0, 1.0),
             atr_period: SearchRange::new(10.0, 20.0, 1.0),
-            atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.25),
-            atr_target_multiple: SearchRange::new(1.0, 6.0, 0.5),
-            risk_target_multiple: SearchRange::new(0.75, 4.5, 0.25),
-            pending_distance_atr: SearchRange::new(0.25, 2.0, 0.25),
+            atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.5),
+            atr_target_multiple: SearchRange::new(1.0, 6.0, 1.0),
+            risk_target_multiple: SearchRange::new(0.75, 4.5, 0.5),
+            pending_distance_atr: SearchRange::new(0.25, 2.0, 0.5),
             pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
             time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
             rsi_upper: SearchRange::new(52.0, 65.0, 1.0),
@@ -203,10 +203,10 @@ impl SearchRangeProfile {
         Self {
             indicator_period: SearchRange::new(10.0, 50.0, 1.0),
             atr_period: SearchRange::new(7.0, 28.0, 1.0),
-            atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.25),
-            atr_target_multiple: SearchRange::new(1.5, 8.0, 0.5),
-            risk_target_multiple: SearchRange::new(1.0, 5.0, 0.25),
-            pending_distance_atr: SearchRange::new(0.25, 3.0, 0.25),
+            atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.5),
+            atr_target_multiple: SearchRange::new(1.5, 8.0, 1.0),
+            risk_target_multiple: SearchRange::new(1.0, 5.0, 0.5),
+            pending_distance_atr: SearchRange::new(0.25, 3.0, 0.5),
             pending_expiry_bars: SearchRange::new(1.0, 12.0, 1.0),
             time_stop_bars: SearchRange::new(2.0, 48.0, 1.0),
             rsi_upper: SearchRange::new(55.0, 80.0, 1.0),
@@ -460,7 +460,7 @@ impl Default for UniversalGrammarConfig {
     fn default() -> Self {
         Self {
             minimum_entry_conditions: 2,
-            maximum_entry_conditions: 4,
+            maximum_entry_conditions: 2,
             minimum_exit_conditions: 1,
             maximum_exit_conditions: 3,
             minimum_shift: 1,
@@ -525,7 +525,7 @@ pub enum DiscoverRunMode {
     FastScout,
     #[default]
     FullHarvest,
-    /// Seed-heavy, softer param neighborhood, stop when databank hits quota.
+    /// Seed-heavy, stop when the databank hits quota.
     QuotaHarvest,
     /// Historical high-performance genetic islands with ring migration.
     HighPerformanceIslands,
@@ -578,7 +578,7 @@ pub struct DiscoverConfig {
     #[serde(default)]
     pub search_ranges: SearchRangeProfile,
     /// Required OOS1 expectancy retention after the complete Development
-    /// promotion battery. OOS1 never contributes to breeding or ranking.
+    /// promotion battery. Unused: Discover no longer picks on OOS1.
     #[serde(default = "default_oos1_expectancy_retention")]
     pub oos1_expectancy_retention: f64,
     /// Minimum M1 Development expectancy, expressed in R at the immutable
@@ -661,6 +661,22 @@ pub struct DiscoverConfig {
     /// Maximum Holding (pre-battery) strategies retained in RAM.
     #[serde(default = "default_max_holding_elites")]
     pub max_holding_elites: usize,
+    /// Cap how many elites may share a behaviour niche in the pot / Holding.
+    /// `0` disables the cap. Default 2 stops island clones from flooding.
+    #[serde(default = "default_max_elites_per_niche")]
+    pub max_elites_per_niche: usize,
+    /// Per-niche cap for the promoted pools (Holding / Databank). Kept higher
+    /// than the pot cap so quota runs don't stall once the ~40 reachable
+    /// behaviour niches fill up (2/niche put the ceiling right at ~80).
+    /// `0` disables the cap.
+    #[serde(default = "default_max_promoted_per_niche")]
+    pub max_promoted_per_niche: usize,
+    /// Cap how many elites may share the same entry-indicator family
+    /// (sorted operator set, e.g. `ema+minus_di+plus_di`). Applied across
+    /// Holding+Databank combined so one grammar family cannot dominate the
+    /// battery. `0` disables the cap.
+    #[serde(default = "default_max_per_entry_family")]
+    pub max_per_entry_family: usize,
     /// When true (default), post-breed survivors go to Holding after H1 gates +
     /// M1 fidelity — not Databank. Heavy WFO/MC/±param/OOS1 wait for an
     /// on-demand battery. When false, legacy path deposits straight to Databank.
@@ -759,7 +775,7 @@ fn default_mutate_after_elites() -> usize {
 }
 
 fn default_random_fill_fraction() -> f64 {
-    0.4
+    0.75
 }
 
 fn default_worker_threads() -> usize {
@@ -789,6 +805,19 @@ fn default_max_holding_elites() -> usize {
     5_000
 }
 
+fn default_max_elites_per_niche() -> usize {
+    2
+}
+
+fn default_max_promoted_per_niche() -> usize {
+    4
+}
+
+fn default_max_per_entry_family() -> usize {
+    // Quota packs of ~100: keep any single indicator family to a small share.
+    8
+}
+
 fn default_build_to_holding() -> bool {
     true
 }
@@ -800,11 +829,16 @@ fn default_require_m1_robustness() -> bool {
 }
 
 fn default_robustness_folds() -> usize {
-    3
+    // Chronological sequential walk-forward windows. Three could not see regime
+    // decay; eight is the practical ceiling on ~7y of H1 before each window is
+    // too trade-thin to score. (This is separate from the 15-path CPCV.)
+    8
 }
 
 fn default_robustness_monte_carlo_trials() -> usize {
-    250
+    // Trade-profit resampling is nearly free (no bar replay); the P95 drawdown
+    // percentile it reads needs ~1k paths to stop being noise.
+    1_000
 }
 
 fn default_robustness_monte_carlo_block_length() -> usize {
@@ -824,7 +858,11 @@ fn default_robustness_monte_carlo_max_drawdown_ratio() -> f64 {
 }
 
 fn default_robustness_neighborhood_samples() -> usize {
-    8
+    // Ten deterministic one-axis neighbors run first (sl, tp, atr, entry, manage
+    // × lo/hi); everything past them is randomized joint jitter that perturbs the
+    // entry indicator periods. 100 gives a real survival distribution instead of
+    // a handful of points, so a knife-edge fit has somewhere to fail.
+    100
 }
 
 fn default_allow_market_entries() -> bool {
@@ -866,7 +904,9 @@ impl Default for DiscoverConfig {
         Self {
             initial_candidates: 500,
             batch_size: 200,
-            correlation_threshold: 0.85,
+            // Pack densely just under 0.85 produced cousin stacks with the
+            // same OOS shape; 0.75 forces more equity-path diversity.
+            correlation_threshold: 0.75,
             novelty_weight: 10.0,
             tournament_size: 4,
             structural_mutation_probability: 0.18,
@@ -902,6 +942,9 @@ impl Default for DiscoverConfig {
             max_specialist_pool_elites: default_max_specialist_pool_elites(),
             max_databank_elites: default_max_databank_elites(),
             max_holding_elites: default_max_holding_elites(),
+            max_elites_per_niche: default_max_elites_per_niche(),
+            max_promoted_per_niche: default_max_promoted_per_niche(),
+            max_per_entry_family: default_max_per_entry_family(),
             build_to_holding: default_build_to_holding(),
             require_m1_robustness: default_require_m1_robustness(),
             robustness_folds: default_robustness_folds(),
@@ -955,9 +998,8 @@ impl DiscoverConfig {
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
-                // ~20 Holding survivors: seed-heavy, soft neighborhood knobs kept
-                // for the later on-demand battery. Stop on Holding quota — not pot.
-                // Holding requires M1 fidelity; WFO/MC/±param stay deferred.
+                // ~100 Holding survivors: seed-heavy. Stop on Holding quota — not pot.
+                // Holding requires M1 fidelity plus fold-stable R. OOS1 is not a pick.
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
@@ -974,12 +1016,18 @@ impl DiscoverConfig {
                 // Only the Holding/databank quota stops the run.
                 self.early_stop_pot_elites = None;
                 if self.target_databank_elites.is_none() {
-                    self.target_databank_elites = Some(20);
+                    self.target_databank_elites = Some(100);
                 }
-                self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.min(80);
-                self.robustness_neighborhood_samples = self.robustness_neighborhood_samples.min(5);
+                // MC resamples the trade-profit vector instead of replaying bars, so
+                // trials are nearly free; ~1k paths make the P95 drawdown stable.
+                self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.max(1_000);
+                // Ten deterministic one-axis neighbors run before the randomized
+                // joint draw perturbs entry indicator periods; 100 gives the plateau
+                // test a real distribution to fail on.
+                self.robustness_neighborhood_samples =
+                    self.robustness_neighborhood_samples.max(100);
                 self.minimum_neighborhood_survival_fraction =
-                    self.minimum_neighborhood_survival_fraction.min(0.5);
+                    self.minimum_neighborhood_survival_fraction.max(0.65);
             }
             DiscoverRunMode::HighPerformanceIslands => {
                 // Identical balanced populations with deterministic migration.
@@ -1460,6 +1508,10 @@ pub struct Elite {
     /// `oos1_expectancy / is_expectancy` when IS expectancy is positive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oos1_expectancy_ratio: Option<f64>,
+    /// Calendar-year fold R on the unsealed Development window. This is the
+    /// stability number; `evidence.total` is only a ranking mix.
+    #[serde(default)]
+    pub fold_r: crate::fold_r::FoldRStats,
     /// Observed trade Sharpe proxy at deposit time (primary or pooled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_trade_sharpe: Option<f64>,
@@ -1512,11 +1564,13 @@ pub enum DepositDecision {
     RejectedClone,
     RejectedCorrelated,
     RejectedNicheNotImproved,
+    RejectedFamilyNotImproved,
     RejectedPrecision,
     RejectedAmbiguous,
     RejectedOos1,
     RejectedDevelopmentExpectancy,
     RejectedM1Fidelity,
+    RejectedFoldStability,
     RejectedCpcv,
     RejectedWalkForward,
     RejectedMonteCarlo,
@@ -1551,6 +1605,8 @@ pub struct DiscoverTelemetry {
     pub rejected_clone: u64,
     pub rejected_correlated: u64,
     pub rejected_niche_not_improved: u64,
+    #[serde(default)]
+    pub rejected_family_not_improved: u64,
     pub rejected_precision: u64,
     #[serde(default)]
     pub rejected_ambiguous: u64,
@@ -1560,6 +1616,8 @@ pub struct DiscoverTelemetry {
     pub rejected_development_expectancy: u64,
     #[serde(default)]
     pub rejected_m1_fidelity: u64,
+    #[serde(default)]
+    pub rejected_fold_stability: u64,
     #[serde(default)]
     pub rejected_cpcv: u64,
     #[serde(default)]
@@ -1628,6 +1686,9 @@ impl DiscoverTelemetry {
             DepositDecision::RejectedNicheNotImproved => {
                 self.rejected_niche_not_improved += 1;
             }
+            DepositDecision::RejectedFamilyNotImproved => {
+                self.rejected_family_not_improved += 1;
+            }
             DepositDecision::RejectedPrecision => self.rejected_precision += 1,
             DepositDecision::RejectedAmbiguous => self.rejected_ambiguous += 1,
             DepositDecision::RejectedOos1 => self.rejected_oos1 += 1,
@@ -1635,6 +1696,7 @@ impl DiscoverTelemetry {
                 self.rejected_development_expectancy += 1;
             }
             DepositDecision::RejectedM1Fidelity => self.rejected_m1_fidelity += 1,
+            DepositDecision::RejectedFoldStability => self.rejected_fold_stability += 1,
             DepositDecision::RejectedCpcv => self.rejected_cpcv += 1,
             DepositDecision::RejectedWalkForward => self.rejected_walk_forward += 1,
             DepositDecision::RejectedMonteCarlo => self.rejected_monte_carlo += 1,
@@ -1697,10 +1759,13 @@ impl Databank {
         self.holding.len()
     }
 
-    /// Quota progress: Holding when building to Holding, else Databank elites.
+    /// Quota progress: names produced by this run. When building to Holding,
+    /// battery-promoted names move to the Databank but still count — otherwise
+    /// running the battery mid-run shrinks the counter and the quota becomes a
+    /// moving target.
     pub fn quota_progress_count(&self) -> usize {
         if self.config.build_to_holding {
-            self.holding.len()
+            self.holding.len() + self.elites.len()
         } else {
             self.elites.len()
         }
@@ -1729,9 +1794,7 @@ impl Databank {
             )));
         }
         if self.evaluation_count == 0
-            || (self.elites.is_empty()
-                && self.accepted_pool.is_empty()
-                && self.holding.is_empty())
+            || (self.elites.is_empty() && self.accepted_pool.is_empty() && self.holding.is_empty())
         {
             return Err(DiscoverError::IncompatibleDatabank(
                 "a databank requires evaluations and either an accepted pot, holding, or databank elites"

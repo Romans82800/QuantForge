@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-export type ColumnId = 'sparkline' | 'strategyId' | 'family' | 'conditions' | 'evidence' | 'novelty' | 'returnPercent' | 'trades' | 'winRate' | 'profitFactor' | 'sharpe' | 'drawdownPercent' | 'recoveryFactor' | 'avgTrade' | 'grade';
+export type ColumnId = 'sparkline' | 'strategyId' | 'family' | 'conditions' | 'evidence' | 'expectancyR' | 'foldMedianR' | 'novelty' | 'returnPercent' | 'trades' | 'winRate' | 'profitFactor' | 'sharpe' | 'drawdownPercent' | 'recoveryFactor' | 'avgTrade' | 'grade';
 
 export interface ColumnConfig {
   id: ColumnId;
@@ -13,7 +13,9 @@ export const DEFAULT_COLUMNS: ColumnConfig[] = [
   { id: 'sparkline', label: 'Sparkline', visible: true, width: 80 },
   { id: 'strategyId', label: 'Strategy', visible: true, width: 140 },
   { id: 'conditions', label: 'E/X', visible: true, width: 50 },
-  { id: 'evidence', label: 'Evidence', visible: true, width: 75 },
+  { id: 'expectancyR', label: 'Mean R', visible: true, width: 70 },
+  { id: 'foldMedianR', label: 'Fold R', visible: true, width: 70 },
+  { id: 'evidence', label: 'Evidence', visible: false, width: 75 },
   { id: 'novelty', label: 'Novelty', visible: false, width: 70 },
   { id: 'returnPercent', label: 'Return %', visible: true, width: 80 },
   { id: 'trades', label: 'Trades', visible: true, width: 65 },

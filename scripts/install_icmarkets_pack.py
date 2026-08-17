@@ -10,7 +10,18 @@ import sys
 from pathlib import Path
 
 PACK_PREFIX = "ICMarketsSC-Demo_"
-PACK_SUFFIX = "_2020_present"
+
+
+def pack_suffix_for(pack: Path) -> str:
+    name = pack.name
+    if "2016" in name:
+        return "_2016_present"
+    if "2020" in name:
+        return "_2020_present"
+    # Fall back to trailing segment after EST7_ if present.
+    if "_EST7_" in name:
+        return "_" + name.split("_EST7_", 1)[1]
+    return "_present"
 
 # Guess broker template for newly added symbols.
 TEMPLATE_MAP = {
@@ -46,6 +57,7 @@ def resolve_symbol_stem(staging: Path, symbol: str) -> str | None:
 
 
 def install_symbol(staging: Path, pack: Path, symbol: str, stem: str) -> None:
+    pack_suffix = pack_suffix_for(pack)
     m1_csv = staging / f"{stem}_M1.csv"
     h1_csv = staging / f"{stem}_H1.csv"
     m1_meta = staging / f"{stem}_M1.metadata.csv"
@@ -54,8 +66,8 @@ def install_symbol(staging: Path, pack: Path, symbol: str, stem: str) -> None:
         if not path.exists():
             raise SystemExit(f"missing {path}")
 
-    m1_tsv = pack / f"{PACK_PREFIX}{symbol}_M1{PACK_SUFFIX}.tsv"
-    h1_tsv = pack / f"{PACK_PREFIX}{symbol}_H1{PACK_SUFFIX}.tsv"
+    m1_tsv = pack / f"{PACK_PREFIX}{symbol}_M1{pack_suffix}.tsv"
+    h1_tsv = pack / f"{PACK_PREFIX}{symbol}_H1{pack_suffix}.tsv"
     csv_to_tsv(m1_csv, m1_tsv)
     csv_to_tsv(h1_csv, h1_tsv)
     shutil.copy2(m1_meta, m1_tsv.with_suffix(".metadata.csv"))
@@ -64,8 +76,8 @@ def install_symbol(staging: Path, pack: Path, symbol: str, stem: str) -> None:
     # Bid/ask quote sidecar from tick_bid_ask import (required for stop/limit Judge).
     quotes_csv = staging / f"{stem}_M1.quotes.csv"
     quotes_meta = staging / f"{stem}_M1.quotes.metadata.csv"
-    pack_quotes = pack / f"{PACK_PREFIX}{symbol}_M1{PACK_SUFFIX}.quotes.csv"
-    pack_quotes_meta = pack / f"{PACK_PREFIX}{symbol}_M1{PACK_SUFFIX}.quotes.metadata.csv"
+    pack_quotes = pack / f"{PACK_PREFIX}{symbol}_M1{pack_suffix}.quotes.csv"
+    pack_quotes_meta = pack / f"{PACK_PREFIX}{symbol}_M1{pack_suffix}.quotes.metadata.csv"
     if quotes_csv.exists():
         shutil.copy2(quotes_csv, pack_quotes)
         if quotes_meta.exists():
@@ -187,7 +199,7 @@ def discover_symbols(staging: Path) -> dict[str, str]:
 def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit(
-            "usage: install_icmarkets_pack.py <staging_import_dir> <ICMarkets_EST7_2020_present>"
+            "usage: install_icmarkets_pack.py <staging_import_dir> <ICMarkets_EST7_2016_present>"
         )
     staging = Path(sys.argv[1])
     pack = Path(sys.argv[2])

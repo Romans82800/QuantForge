@@ -3127,7 +3127,6 @@ mod tests {
         }
 
         let mut saw_two_entries = false;
-        let mut saw_three_entries = false;
         let mut saw_one_exit = false;
         let mut saw_three_exits = false;
         for sequence in 0..200 {
@@ -3137,10 +3136,9 @@ mod tests {
             // is on top-level condition blocks, not on leaf predicates.
             let entry_count = entry_condition_count(&strategy);
             let exit_count = exit_condition_count(&strategy);
-            assert!((2..=4).contains(&entry_count));
+            assert_eq!(entry_count, 2);
             assert!((1..=3).contains(&exit_count));
             saw_two_entries |= entry_count == 2;
-            saw_three_entries |= entry_count == 3;
             saw_one_exit |= exit_count == 1;
             saw_three_exits |= exit_count == 3;
 
@@ -3156,7 +3154,7 @@ mod tests {
             );
             strategy.validate_export_safe(IrLimits::default()).unwrap();
         }
-        assert!(saw_two_entries && saw_three_entries);
+        assert!(saw_two_entries);
         assert!(saw_one_exit && saw_three_exits);
     }
 

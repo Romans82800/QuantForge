@@ -5,9 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-const DATA_PACK_DIR_NAME: &str = "ICMarkets_EST7_2020_present";
-const H1_SUFFIX: &str = "_H1_2020_present.tsv";
-const M1_SUFFIX: &str = "_M1_2020_present.tsv";
+/// Preferred pack folder names, newest-first. QUANTFORGE_DATA_PACK overrides.
+const DATA_PACK_CANDIDATES: &[&str] = &[
+    "ICMarkets_EST7_2016_present",
+    "ICMarkets_EST7_2020_present",
+];
 const DEMO_PREFIX: &str = "ICMarketsSC-Demo_";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,49 +199,68 @@ fn validate_asset(asset: &AssetProfile) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 pub fn resolve_data_pack_root() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Ok(override_path) = env::var("QUANTFORGE_DATA_PACK") {
         candidates.push(PathBuf::from(override_path));
     }
-    if let Ok(home) = env::var("HOME") {
-        candidates.push(
-            PathBuf::from(&home)
-                .join("Documents")
-                .join("QuantForge")
-                .join(DATA_PACK_DIR_NAME),
-        );
+    if let Some(home) = user_home_dir() {
+        for name in DATA_PACK_CANDIDATES {
+            candidates.push(home.join("Documents").join("QuantForge").join(name));
+        }
     }
     if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join(DATA_PACK_DIR_NAME));
-        candidates.push(cwd.join("..").join(DATA_PACK_DIR_NAME));
-        candidates.push(
-            cwd.join("Documents")
-                .join("QuantForge")
-                .join(DATA_PACK_DIR_NAME),
-        );
+        for name in DATA_PACK_CANDIDATES {
+            candidates.push(cwd.join(name));
+            candidates.push(cwd.join("..").join(name));
+            candidates.push(cwd.join("Documents").join("QuantForge").join(name));
+        }
     }
     candidates
         .into_iter()
         .find(|path| path.is_dir())
         .ok_or_else(|| {
             format!(
-                "data pack not found; set QUANTFORGE_DATA_PACK or place {DATA_PACK_DIR_NAME} under Documents/QuantForge"
+                "data pack not found; set QUANTFORGE_DATA_PACK or place one of [{}] under Documents/QuantForge",
+                DATA_PACK_CANDIDATES.join(", ")
             )
         })
 }
 
 fn quantforge_runs_root() -> PathBuf {
-    if let Ok(home) = env::var("HOME") {
-        let preferred = PathBuf::from(home)
-            .join("Documents")
-            .join("QuantForge")
-            .join("runs");
+    if let Some(home) = user_home_dir() {
+        let preferred = home.join("Documents").join("QuantForge").join("runs");
         if preferred.parent().is_some_and(|parent| parent.is_dir()) {
             return preferred;
         }
     }
     PathBuf::from("runs")
+}
+
+/// Locate `ICMarketsSC-Demo_{symbol}_{H1|M1}_*.tsv`, preferring the lexicographically
+/// last match so `2016_present` wins over `2020_present` if both somehow coexist.
+fn find_pack_tsv(pack_root: &Path, symbol: &str, timeframe: &str) -> Option<PathBuf> {
+    let prefix = format!("{DEMO_PREFIX}{symbol}_{timeframe}_");
+    let mut matches: Vec<PathBuf> = fs::read_dir(pack_root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".tsv"))
+        })
+        .collect();
+    matches.sort();
+    matches.pop()
 }
 
 fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
@@ -258,16 +279,15 @@ fn scan_symbols(pack_root: &Path) -> Result<Vec<SymbolPack>, String> {
             continue;
         }
         let broker_path = entry.path();
-        let h1 = pack_root.join(format!("{DEMO_PREFIX}{symbol}{H1_SUFFIX}"));
+        let Some(h1) = find_pack_tsv(pack_root, &symbol, "H1") else {
+            continue;
+        };
+        let Some(m1) = find_pack_tsv(pack_root, &symbol, "M1") else {
+            continue;
+        };
         let h1_meta = h1.with_extension("metadata.csv");
-        let m1 = pack_root.join(format!("{DEMO_PREFIX}{symbol}{M1_SUFFIX}"));
         let m1_meta = m1.with_extension("metadata.csv");
-        if !(h1.is_file()
-            && h1_meta.is_file()
-            && m1.is_file()
-            && m1_meta.is_file()
-            && broker_path.is_file())
-        {
+        if !(h1_meta.is_file() && m1_meta.is_file() && broker_path.is_file()) {
             continue;
         }
         let quote_path = infer_pack_quote_path(&m1);

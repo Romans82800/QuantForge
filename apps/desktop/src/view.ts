@@ -9,6 +9,17 @@ export function formatNumber(value: number, maximumFractionDigits = 0): string {
   return new Intl.NumberFormat("en-GB", { maximumFractionDigits }).format(value);
 }
 
+export function splitCaption(validationFraction: number, sealedFraction: number): string {
+  const development = Math.max(0, 1 - validationFraction - sealedFraction);
+  const developmentPct = Math.round(development * 100);
+  const validationPct = Math.round(validationFraction * 100);
+  const sealedPct = Math.round(sealedFraction * 100);
+  if (validationPct <= 0) {
+    return `${developmentPct}/${sealedPct}% Development/Holdout`;
+  }
+  return `${developmentPct}/${validationPct}/${sealedPct}% Development/OOS1/OOS2`;
+}
+
 export function selectionBiasTone(level: SelectionBiasLevel): string {
   return `bias-${level}`;
 }

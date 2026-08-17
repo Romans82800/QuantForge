@@ -131,6 +131,7 @@ import {
   formatDateRange,
   conditionLabel,
   formatNumber,
+  splitCaption,
   entryOrderError,
   entryOrderSummary,
   entryWindowError,
@@ -292,7 +293,7 @@ function NavGlyph({ icon }: { icon: NavIcon }) {
 
 const DEFAULT_UNIVERSAL_GRAMMAR = {
   minimumEntryConditions: 2,
-  maximumEntryConditions: 4,
+  maximumEntryConditions: 2,
   minimumExitConditions: 1,
   maximumExitConditions: 3,
   minimumShift: 1,
@@ -901,9 +902,7 @@ function App() {
                 <div>
                   <dt>Split</dt>
                   <dd>
-                    {formatNumber((1 - workspace.validationFraction - workspace.sealedFraction) * 100, 0)}/
-                    {formatNumber(workspace.validationFraction * 100, 0)}/
-                    {formatNumber(workspace.sealedFraction * 100, 0)}% Development/OOS1/OOS2
+                    {splitCaption(workspace.validationFraction, workspace.sealedFraction)}
                   </dd>
                 </div>
                 <div>
@@ -3302,7 +3301,7 @@ function DiscoverWorkspace({
     entryWindowEndHour: 19,
     maxOneEntryPerDay: true,
     mutateAfterElites: 300,
-    randomFillFraction: 0.4,
+    randomFillFraction: 0.75,
     workerThreads: 0,
     promotionWorkerThreads: 0,
     promotionQueueCapacity: 64,
@@ -3327,8 +3326,8 @@ function DiscoverWorkspace({
     maxSpreadPoints: null,
     initialBalance: 100000,
     promotionSplit: true,
-    validationFraction: 0.2,
-    sealedFraction: 0.2,
+    validationFraction: 0,
+    sealedFraction: 1 / 3,
     ...preset,
   }));
   const [discoverProfiles, setDiscoverProfiles] = useState<SavedDiscoverProfile[]>([]);
@@ -3415,7 +3414,7 @@ function DiscoverWorkspace({
   const liveEliteRows = useMemo(() => {
     if (!liveWorkspace) return [];
     return [...(liveWorkspace.holding ?? []), ...liveWorkspace.elites].sort(
-      (left, right) => right.evidence - left.evidence,
+      (left, right) => (right.foldMedianR ?? right.evidence) - (left.foldMedianR ?? left.evidence),
     );
   }, [liveWorkspace]);
 
@@ -3656,8 +3655,8 @@ function DiscoverWorkspace({
         commissionPerLotRoundTurn: form.commissionPerLotRoundTurn ?? 7,
         slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
         fallbackSpreadPoints: form.fallbackSpreadPoints,
-        validationFraction: form.validationFraction ?? 0.2,
-        sealedFraction: form.sealedFraction ?? 0.2,
+        validationFraction: form.validationFraction ?? 0,
+        sealedFraction: form.sealedFraction ?? 1 / 3,
         entryConditionCounts: testerCounts,
       });
       setTesterReport(report);
@@ -3767,11 +3766,11 @@ function DiscoverWorkspace({
                 </div>
                 <p className="recipe-summary">
                   Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts.
-                  Entry conditions 2–4 · exit conditions 1–3.
+                  Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3.
                 </p>
                 <div className="form-grid universal-grammar-grid">
                   <NumberField label="Entry conditions min" value={form.universalGrammar?.minimumEntryConditions ?? 2} onChange={(value) => updateGrammar("minimumEntryConditions", value ?? 2)} min={2} max={4} />
-                  <NumberField label="Entry conditions max" value={form.universalGrammar?.maximumEntryConditions ?? 4} onChange={(value) => updateGrammar("maximumEntryConditions", value ?? 4)} min={2} max={4} />
+                  <NumberField label="Entry conditions max" value={form.universalGrammar?.maximumEntryConditions ?? 2} onChange={(value) => updateGrammar("maximumEntryConditions", value ?? 2)} min={2} max={4} />
                   <NumberField label="Exit conditions min" value={form.universalGrammar?.minimumExitConditions ?? 1} onChange={(value) => updateGrammar("minimumExitConditions", value ?? 1)} min={1} max={3} />
                   <NumberField label="Exit conditions max" value={form.universalGrammar?.maximumExitConditions ?? 3} onChange={(value) => updateGrammar("maximumExitConditions", value ?? 3)} min={1} max={3} />
                   <NumberField label="Closed-bar shift min" value={form.universalGrammar?.minimumShift ?? 1} onChange={(value) => updateGrammar("minimumShift", value ?? 1)} min={1} />
@@ -3820,10 +3819,10 @@ function DiscoverWorkspace({
                         runMode: "quota_harvest",
                         mutateAfterElites: 25,
                         earlyStopPotElites: null,
-                        targetDatabankElites: 20,
+                        targetDatabankElites: 100,
                         initialCandidates: Math.max(current.initialCandidates ?? 500, 1000),
                         batchSize: Math.max(current.batchSize ?? 200, 300),
-                        randomFillFraction: Math.max(current.randomFillFraction ?? 0.4, 0.75),
+                        randomFillFraction: Math.max(current.randomFillFraction ?? 0.75, 0.75),
                         robustnessMonteCarloTrials: 80,
                         robustnessNeighborhoodSamples: 5,
                         minimumNeighborhoodSurvivalFraction: 0.5,
@@ -3833,7 +3832,7 @@ function DiscoverWorkspace({
                       }))
                     }
                   >
-                    Quota (20)
+                    Quota (100)
                   </button>
                   <button
                     type="button"
@@ -3862,7 +3861,7 @@ function DiscoverWorkspace({
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <p className="recipe-summary">
-                    Stops at 20 databank elites. Softer ±param gate (50% of 5). Pot is only a breeding bag — not the goal.
+                    Stops at 100 Holding names. Fold-stable Development R is the filter. Sealed holdout is 33% and never used to pick.
                   </p>
                 )}
                 {form.runMode === "high_performance_islands" && (
@@ -3967,8 +3966,8 @@ function DiscoverWorkspace({
               <NumberField label="Maximum RAM (MB)" value={form.maxMemoryMb} onChange={(value) => update("maxMemoryMb", value)} min={1024} step={1024} />
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
-              <NumberField label="OOS1 reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} />
-              <NumberField label="OOS2 sealed reserve" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              <NumberField label="OOS1 reserve (0 = off)" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} min={0} />
+              <NumberField label="Sealed holdout" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
               <label className="field-row pack-directory-field">
                 <span>FX pack directory (matching-timeframe screen)</span>
                 <input
@@ -4086,7 +4085,7 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">Development alone drives search and breeding. After breeding starts: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank. OOS2 is never opened.</p>
+            <p className="immutable-note">Development alone drives search and breeding. Holding needs M1 fidelity plus fold-stable R. Sealed holdout is never loaded by Discover.</p>
             <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
@@ -4172,7 +4171,7 @@ function DiscoverWorkspace({
               label="Holding"
               value={
                 job?.targetDatabankElites
-                  ? `${formatNumber(job?.holdingElites ?? 0)}/${job.targetDatabankElites}`
+                  ? `${formatNumber((job?.holdingElites ?? 0) + (job?.databankElites ?? 0))}/${job.targetDatabankElites}`
                   : formatNumber(job?.holdingElites ?? 0)
               }
               note={
@@ -4575,12 +4574,12 @@ function DiscoverContractSummary({
 
       <div className="contract-section">
         <p className="eyebrow">Validation firewall</p>
-        <SummaryLine label="Development / OOS1 / OOS2" value={`${formatNumber((1 - (form.validationFraction ?? .2) - (form.sealedFraction ?? .2)) * 100, 0)} / ${formatNumber((form.validationFraction ?? .2) * 100, 0)} / ${formatNumber((form.sealedFraction ?? .2) * 100, 0)}%`} />
+        <SummaryLine label="Development / Holdout" value={splitCaption(form.validationFraction ?? 0, form.sealedFraction ?? 1 / 3)} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
         <SummaryLine label="Minimum Development expectancy" value={`≥ ${formatNumber(form.minimumDevelopmentExpectancyR ?? 0, 2)}R`} />
-        <SummaryLine label="OOS1 validation" value={`Post-Development · ≥ ${formatNumber(form.oos1ExpectancyRetention ?? .7, 2)}× Development`} />
+        <SummaryLine label="OOS1 pick" value="Off · fold-stable Development R replaces it" />
         <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
-        <SummaryLine label="OOS2" value="Sealed · display only" accent />
+        <SummaryLine label="Sealed holdout" value="Display only · not a Discover gate" accent />
       </div>
 
       <div className="contract-section">
@@ -5225,14 +5224,13 @@ function EliteTable({
         {showBatch && <span>Select</span>}
         <span>Strategy</span>
         <span>Entry/Exit</span>
-        <span>Evidence</span>
-        <span>Novelty</span>
+        <span>Mean R</span>
+        <span>Fold R</span>
         <span>Trades</span>
         <span>Return</span>
         <span>DD</span>
         <span>Recovery</span>
         <span>Sharpe</span>
-        <span>OOS1×</span>
         {showActions && <span>Actions</span>}
       </div>
       <div
@@ -5267,16 +5265,13 @@ function EliteTable({
               )}
               <span className="strategy-cell"><strong>{row.strategyId}</strong><small>{row.fingerprint.slice(0, 10)}</small></span>
               <span>{conditionLabel(row.entryConditions, row.exitConditions)}</span>
-              <span>{row.evidence.toFixed(2)}</span>
-              <span>{row.novelty.toFixed(3)}</span>
+              <span>{(row.expectancyR ?? 0).toFixed(3)}</span>
+              <span title={row.foldUsable ? `spread ${(row.foldSpread ?? 0).toFixed(3)} · ${row.foldCount} years` : "pooled R; too few trades per year"}>{(row.foldMedianR ?? 0).toFixed(3)}</span>
               <span>{formatNumber(row.trades)}</span>
               <span className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</span>
               <span>{row.drawdownPercent.toFixed(2)}%</span>
               <span>{formatRecoveryFactor(row)}</span>
               <span>{row.sharpeRatio === null ? "—" : row.sharpeRatio.toFixed(2)}</span>
-              <span title={row.oos1Expectancy === null ? "No OOS1 pick metrics (legacy databank)" : `OOS1 ${(row.oos1Expectancy / 1000).toFixed(2)}R / IS ${(row.isExpectancy / 1000).toFixed(2)}R`}>
-                {row.oos1ExpectancyRatio === null ? "—" : `${row.oos1ExpectancyRatio.toFixed(2)}×`}
-              </span>
               {showActions && (
                 <span className="row-actions" onClick={(event) => event.stopPropagation()}>
                   <button type="button" className="text-action" onClick={() => onExportIr?.(row.fingerprint)}>IR</button>
@@ -5444,7 +5439,13 @@ function EliteInspector({
                 m1FidelityVerified={m1FidelityVerified}
               />
               <section className="metric-list">
-                <Metric label="Evidence" value={Number(detail.evidence.total).toFixed(2)} />
+                <Metric label="Mean R" value={(Number(detail.metrics.expectancy_r) || 0).toFixed(3)} />
+                <Metric
+                  label="Fold median R"
+                  value={detail.foldUsable ? detail.foldMedianR.toFixed(3) : `${detail.foldPooledR.toFixed(3)} pooled`}
+                />
+                <Metric label="Fold spread" value={detail.foldUsable ? detail.foldSpread.toFixed(3) : "—"} />
+                <Metric label="Evidence (rank mix)" value={Number(detail.evidence.total).toFixed(2)} />
                 <Metric
                   label={displayMetrics.source === "m1-full-run" ? "Return (M1 full run)" : m1FidelityVerified ? "Return (IS stored)" : "Selected-TF return"}
                   value={`${displayMetrics.returnPercent.toFixed(2)}%`}
@@ -5598,6 +5599,14 @@ function PartitionEquityChart({
   const gradientId = large ? "equity-area-large" : "equity-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
+  const totalBars = view.isBars + view.oos1Bars + view.oos2Bars;
+  const isPct = totalBars > 0 ? Math.round((view.isBars / totalBars) * 100) : 0;
+  const oos1Pct = totalBars > 0 ? Math.round((view.oos1Bars / totalBars) * 100) : 0;
+  const oos2Pct = totalBars > 0 ? Math.round((view.oos2Bars / totalBars) * 100) : 0;
+  const twoWay = view.oos1Bars === 0;
+  const splitNote = twoWay
+    ? `${view.executionEngine} · Development ${isPct}% · Holdout ${oos2Pct}% (display only)`
+    : `${view.executionEngine} · Development ${isPct}% · OOS1 ${oos1Pct}% · OOS2 ${oos2Pct}% (display only)`;
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
@@ -5605,7 +5614,7 @@ function PartitionEquityChart({
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
           <small>
-            {view.executionEngine} · Development 60% · OOS1 20% · OOS2 20% (display only)
+            {splitNote}
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>
@@ -5613,9 +5622,9 @@ function PartitionEquityChart({
           <label className="partition-sample-select">Sample
             <select value={sample} onChange={(event) => setSample(event.target.value as typeof sample)}>
               <option value="full">Full (IS + OOS)</option>
-              <option value="is">IS</option>
-              <option value="oos1">OOS 1</option>
-              <option value="oos2">OOS 2</option>
+              <option value="is">Development</option>
+              {!twoWay && <option value="oos1">OOS 1</option>}
+              <option value="oos2">{twoWay ? "Holdout" : "OOS 2"}</option>
             </select>
           </label>
           <span>${formatNumber(Math.max(...equities), 0)} peak</span>
@@ -5663,15 +5672,17 @@ function PartitionEquityChart({
         <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
         {sample === "full" ? <>
           <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
-          <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>
-          <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
+          {!twoWay && <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>}
+          <text x={(twoWay ? isX : oos1X) + 6} y={pad + 14} className="region-label">{twoWay ? "Holdout" : "OOS2"}</text>
         </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
-        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× Development · chart split`} />
-        <Kpi label="OOS2 expectancy (R)" value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
-        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="Development / OOS1 / OOS2 · databank split" />
+        {!twoWay && (
+          <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× Development · chart split`} />
+        )}
+        <Kpi label={twoWay ? "Holdout expectancy (R)" : "OOS2 expectancy (R)"} value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
+        <Kpi label="Bars" value={twoWay ? `${formatNumber(view.isBars)} / ${formatNumber(view.oos2Bars)}` : `${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note={twoWay ? "Development / Holdout · databank split" : "Development / OOS1 / OOS2 · databank split"} />
       </div>
     </section>
   );

@@ -153,6 +153,9 @@ pub struct Trade {
     pub net_profit: f64,
     pub bars_held: usize,
     pub exit_reason: ExitReason,
+    /// `net_profit / dollar risk at the initial stop`. Zero when risk is unknown.
+    #[serde(default)]
+    pub r_multiple: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +183,12 @@ pub struct BacktestMetrics {
     /// Mean net profit per closed trade (account currency). Zero when no trades.
     #[serde(default)]
     pub expectancy: f64,
+    /// Mean per-trade R (`net_profit / initial stop dollar risk`). Zero when no trades.
+    #[serde(default)]
+    pub expectancy_r: f64,
+    /// Median per-trade R. Zero when no trades.
+    #[serde(default)]
+    pub median_r: f64,
 }
 
 impl BacktestMetrics {
@@ -196,6 +205,47 @@ impl BacktestMetrics {
         } else {
             self.net_profit
         }
+    }
+}
+
+/// Mean and median of `Trade::r_multiple`.
+pub fn trade_r_stats(trades: &[Trade]) -> (f64, f64) {
+    if trades.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut values: Vec<f64> = trades.iter().map(|trade| trade.r_multiple).collect();
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values.sort_by(f64::total_cmp);
+    let median = if values.len() % 2 == 1 {
+        values[values.len() / 2]
+    } else {
+        let high = values.len() / 2;
+        (values[high - 1] + values[high]) / 2.0
+    };
+    (mean, median)
+}
+
+/// Dollar risk of the initial stop for `volume` lots.
+pub fn stop_dollar_risk(risk_distance: f64, volume: f64, tick_size: f64, tick_value: f64) -> f64 {
+    if !(risk_distance.is_finite()
+        && volume.is_finite()
+        && tick_size.is_finite()
+        && tick_value.is_finite())
+        || risk_distance <= 0.0
+        || volume <= 0.0
+        || tick_size <= 0.0
+    {
+        return 0.0;
+    }
+    risk_distance / tick_size * tick_value * volume
+}
+
+/// `net_profit / dollar_risk`, or 0 when risk is unusable.
+pub fn r_multiple(net_profit: f64, dollar_risk: f64) -> f64 {
+    if dollar_risk > 1.0e-9 && dollar_risk.is_finite() && net_profit.is_finite() {
+        net_profit / dollar_risk
+    } else {
+        0.0
     }
 }
 
@@ -321,7 +371,7 @@ pub enum EvalError {
 
 #[cfg(test)]
 mod tests {
-    use super::BacktestMetrics;
+    use super::{BacktestMetrics, ExitReason, PositionSide, Trade};
 
     fn metrics(net_profit: f64, max_drawdown: f64) -> BacktestMetrics {
         BacktestMetrics {
@@ -338,6 +388,8 @@ mod tests {
             max_drawdown_percent: max_drawdown / 100_000.0 * 100.0,
             sharpe_ratio: None,
             expectancy: net_profit,
+            expectancy_r: 0.0,
+            median_r: 0.0,
         }
     }
 
@@ -346,5 +398,49 @@ mod tests {
         // MT5: Total Net Profit / Equity Drawdown Maximal
         let value = metrics(29_706.01, 8_593.20).recovery_factor();
         assert!((value - 3.46).abs() < 0.005);
+    }
+
+    #[test]
+    fn trade_r_stats_use_true_r_not_dollar_proxy() {
+        let (mean, median) = super::trade_r_stats(&[
+            Trade {
+                side: PositionSide::Long,
+                entry_timestamp_ms: 0,
+                exit_timestamp_ms: 1,
+                entry_price: 1.0,
+                exit_price: 1.0,
+                volume: 1.0,
+                initial_stop_loss: 0.9,
+                initial_take_profit: 1.2,
+                gross_profit: 200.0,
+                commission: 0.0,
+                swap: 0.0,
+                net_profit: 200.0,
+                bars_held: 1,
+                exit_reason: ExitReason::TakeProfit,
+                r_multiple: 0.20,
+            },
+            Trade {
+                side: PositionSide::Long,
+                entry_timestamp_ms: 0,
+                exit_timestamp_ms: 1,
+                entry_price: 1.0,
+                exit_price: 1.0,
+                volume: 1.0,
+                initial_stop_loss: 0.9,
+                initial_take_profit: 1.2,
+                gross_profit: -1000.0,
+                commission: 0.0,
+                swap: 0.0,
+                net_profit: -1000.0,
+                bars_held: 1,
+                exit_reason: ExitReason::StopLoss,
+                r_multiple: -1.0,
+            },
+        ]);
+        assert!((mean - (-0.40)).abs() < 1e-12);
+        assert!((median - (-0.40)).abs() < 1e-12);
+        assert_eq!(super::r_multiple(250.0, 1_000.0), 0.25);
+        assert_eq!(super::stop_dollar_risk(1.0, 1.0, 0.01, 1.0), 100.0);
     }
 }

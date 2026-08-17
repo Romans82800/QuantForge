@@ -35,6 +35,7 @@ pub struct RobustnessOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RobustnessReject {
     M1Fidelity,
+    FoldStability,
     Cpcv,
     WalkForward,
     MonteCarlo,
@@ -131,6 +132,9 @@ pub fn run_m1_holding_admission(
     ) {
         return Err(RobustnessReject::M1Fidelity);
     }
+    if !crate::fold_r::calendar_year_fold_r(&baseline.trades).passes_stability() {
+        return Err(RobustnessReject::FoldStability);
+    }
     let _retention = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
     Ok(RobustnessOutcome {
         result: baseline_result,
@@ -191,6 +195,9 @@ pub fn run_m1_predeposit_robustness(
         return Err(RobustnessReject::M1Fidelity);
     }
     let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
+    if !crate::fold_r::calendar_year_fold_r(&baseline.trades).passes_stability() {
+        return Err(RobustnessReject::FoldStability);
+    }
 
     let (fold_rows, fold_scheme, purge_bars, embargo_bars, required_fraction) =
         if config.calendar_year_folds {
@@ -774,7 +781,7 @@ fn sequential_walk_forward_ranges(
     bars: usize,
     requested_folds: usize,
 ) -> Option<Vec<(usize, usize)>> {
-    let folds = requested_folds.clamp(3, 10);
+    let folds = requested_folds.clamp(3, 12);
     if bars < folds.saturating_mul(50) {
         return None;
     }
@@ -1112,6 +1119,8 @@ fn combine_group_metrics(
         } else {
             net_profit / trade_count as f64
         },
+        expectancy_r: 0.0,
+        median_r: 0.0,
     }
 }
 
@@ -1205,6 +1214,8 @@ mod tests {
             max_drawdown_percent: 0.0,
             sharpe_ratio: None,
             expectancy: net_profit / net_profits.len() as f64,
+            expectancy_r: 0.0,
+            median_r: 0.0,
         };
         DevelopmentGroupEvaluation {
             fold: WalkForwardFold {
@@ -1365,6 +1376,8 @@ mod tests {
             max_drawdown_percent: 5.0,
             sharpe_ratio: None,
             expectancy: 100.0,
+            expectancy_r: 0.0,
+            median_r: 0.0,
         };
         let mut m1 = h1.clone();
         m1.return_percent = 8.0;

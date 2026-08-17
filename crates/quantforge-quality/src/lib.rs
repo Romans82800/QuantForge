@@ -44,6 +44,11 @@ pub const INDICATOR_PARITY_PROTOCOL: &str = "mt5-indicator-parity-v1";
 pub const SEALED_FINAL_PROTOCOL: &str = "sealed-final-v1";
 pub const INCUBATION_PROTOCOL: &str = "incubation-v1";
 
+/// Discover default: no OOS1 pick slice. Search uses the unsealed 2/3.
+pub const DEFAULT_VALIDATION_FRACTION: f64 = 0.0;
+/// Sealed holdout is 1/3 so a one-shot look has enough trades to read expectancy.
+pub const DEFAULT_SEALED_FRACTION: f64 = 1.0 / 3.0;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataSegment {
     pub start_timestamp_ms: i64,
@@ -155,8 +160,9 @@ pub struct DataSplitPlan {
 }
 
 impl DataSplitPlan {
-    /// Creates three non-overlapping chronological partitions. Only hashes and
-    /// boundaries are retained in the plan; the sealed bars are not copied out.
+    /// Creates chronological partitions. `validation_fraction` may be 0 to skip
+    /// OOS1; search then uses everything except the sealed holdout. Only hashes
+    /// and boundaries are retained; the sealed bars are not copied out.
     pub fn chronological(
         dataset: &BarDataset,
         validation_fraction: f64,
@@ -177,8 +183,12 @@ impl DataSplitPlan {
             return Err(EvidenceError::DatasetHashMismatch);
         }
 
-        let validation_count = ((bars.len() as f64 * validation_fraction).floor() as usize).max(1);
         let sealed_count = ((bars.len() as f64 * sealed_fraction).floor() as usize).max(1);
+        let validation_count = if validation_fraction <= 0.0 {
+            0
+        } else {
+            ((bars.len() as f64 * validation_fraction).floor() as usize).max(1)
+        };
         if validation_count + sealed_count >= bars.len() {
             return Err(EvidenceError::EmptyDevelopmentPartition);
         }
@@ -216,10 +226,14 @@ impl DataSplitPlan {
                 bars[validation_start].timestamp_ms,
             ),
             development_cpcv,
-            validation: segment(
-                &bars[validation_start..sealed_start],
-                bars[sealed_start].timestamp_ms,
-            ),
+            validation: if validation_count == 0 {
+                empty_segment(bars[sealed_start].timestamp_ms)
+            } else {
+                segment(
+                    &bars[validation_start..sealed_start],
+                    bars[sealed_start].timestamp_ms,
+                )
+            },
             sealed_final: segment(&bars[sealed_start..], final_end),
         };
         plan.validate()?;
@@ -263,7 +277,12 @@ impl DataSplitPlan {
             ("validation", &self.validation),
             ("sealed_final", &self.sealed_final),
         ] {
-            if partition.bar_count == 0
+            let empty_oos1_ok = name == "validation" && partition.bar_count == 0;
+            if empty_oos1_ok {
+                if partition.start_timestamp_ms != partition.end_timestamp_ms_exclusive {
+                    return Err(EvidenceError::InvalidPartition(name.into()));
+                }
+            } else if partition.bar_count == 0
                 || partition.start_timestamp_ms >= partition.end_timestamp_ms_exclusive
             {
                 return Err(EvidenceError::InvalidPartition(name.into()));
@@ -271,7 +290,14 @@ impl DataSplitPlan {
             validate_sha256(&partition.data_hash)
                 .map_err(|_| EvidenceError::InvalidPartitionHash(name.into()))?;
         }
-        if self.development.end_timestamp_ms_exclusive != self.validation.start_timestamp_ms
+        if self.validation.bar_count == 0 {
+            if self.development.end_timestamp_ms_exclusive != self.sealed_final.start_timestamp_ms
+                || self.validation.start_timestamp_ms != self.development.end_timestamp_ms_exclusive
+                || self.validation.end_timestamp_ms_exclusive != self.sealed_final.start_timestamp_ms
+            {
+                return Err(EvidenceError::PartitionGapOrOverlap);
+            }
+        } else if self.development.end_timestamp_ms_exclusive != self.validation.start_timestamp_ms
             || self.validation.end_timestamp_ms_exclusive != self.sealed_final.start_timestamp_ms
         {
             return Err(EvidenceError::PartitionGapOrOverlap);
@@ -314,13 +340,22 @@ fn binomial(n: usize, k: usize) -> usize {
 fn validate_fractions(validation: f64, sealed: f64) -> Result<(), EvidenceError> {
     if !validation.is_finite()
         || !sealed.is_finite()
-        || validation <= 0.0
+        || validation < 0.0
         || sealed <= 0.0
         || validation + sealed >= 1.0
     {
         return Err(EvidenceError::InvalidSplitFractions { validation, sealed });
     }
     Ok(())
+}
+
+fn empty_segment(at_timestamp_ms: i64) -> DataSegment {
+    DataSegment {
+        start_timestamp_ms: at_timestamp_ms,
+        end_timestamp_ms_exclusive: at_timestamp_ms,
+        bar_count: 0,
+        data_hash: bar_content_hash(&[]),
+    }
 }
 
 fn segment(bars: &[quantforge_data::Bar], end_timestamp_ms_exclusive: i64) -> DataSegment {
@@ -894,7 +929,7 @@ fn resulting_grade(blockers: &[CertificationBlocker]) -> StrategyGrade {
 #[derive(Debug, Error)]
 pub enum EvidenceError {
     #[error(
-        "validation and sealed fractions must be finite, positive, and sum to less than one (validation={validation}, sealed={sealed})"
+        "validation and sealed fractions must be finite, with sealed > 0, validation ≥ 0, and sum less than one (validation={validation}, sealed={sealed})"
     )]
     InvalidSplitFractions { validation: f64, sealed: f64 },
     #[error(
@@ -1022,6 +1057,27 @@ mod tests {
         assert_eq!(cpcv.combinations, 15);
         assert_eq!(cpcv.test_group_combinations().len(), 15);
         assert_eq!(cpcv.group_ranges(plan.development.bar_count).len(), 6);
+    }
+
+    #[test]
+    fn two_way_split_omits_oos1_and_seals_one_third() {
+        let dataset = dataset(99);
+        let plan = DataSplitPlan::chronological(&dataset, 0.0, DEFAULT_SEALED_FRACTION).unwrap();
+        assert_eq!(plan.development.bar_count, 66);
+        assert_eq!(plan.validation.bar_count, 0);
+        assert_eq!(plan.sealed_final.bar_count, 33);
+        assert_eq!(
+            plan.development.end_timestamp_ms_exclusive,
+            plan.sealed_final.start_timestamp_ms
+        );
+        assert_eq!(
+            plan.validation.start_timestamp_ms,
+            plan.development.end_timestamp_ms_exclusive
+        );
+        assert_eq!(
+            plan.validation.end_timestamp_ms_exclusive,
+            plan.sealed_final.start_timestamp_ms
+        );
     }
 
     #[test]

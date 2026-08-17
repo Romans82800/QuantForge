@@ -215,6 +215,8 @@ struct RejectionTelemetry {
     clone: u64,
     correlated: u64,
     niche_not_improved: u64,
+    #[serde(default)]
+    family_not_improved: u64,
     precision: u64,
     #[serde(default)]
     ambiguous: u64,
@@ -263,6 +265,12 @@ struct EliteRow {
     is_expectancy: f64,
     oos1_expectancy: Option<f64>,
     oos1_expectancy_ratio: Option<f64>,
+    expectancy_r: f64,
+    median_r: f64,
+    fold_median_r: f64,
+    fold_spread: f64,
+    fold_count: usize,
+    fold_usable: bool,
     complexity: usize,
     generation: u64,
     grade: &'static str,
@@ -305,6 +313,11 @@ pub struct EliteDetail {
     metrics: Value,
     oos1_expectancy: Option<f64>,
     oos1_expectancy_ratio: Option<f64>,
+    fold_median_r: f64,
+    fold_spread: f64,
+    fold_pooled_r: f64,
+    fold_count: usize,
+    fold_usable: bool,
     strategy_ir: Value,
     equity_signature: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1174,6 +1187,10 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
             "m1_fidelity",
             "Failed Selected-TF to M1 return, trade-count or drawdown retention.",
         ),
+        RobustnessReject::FoldStability => (
+            "fold_stability",
+            "Development calendar-year R is concentrated, negative, or a pooled-IS illusion.",
+        ),
         RobustnessReject::Cpcv => (
             "cpcv",
             "Failed the purged combinatorial Development cross-validation requirement.",
@@ -1201,9 +1218,9 @@ fn robustness_depth(config: &DiscoverConfig, mode: ResultsRobustnessMode) -> (us
             config.robustness_neighborhood_samples,
         ),
         ResultsRobustnessMode::Deep => (
-            config.robustness_folds.max(5),
-            config.robustness_monte_carlo_trials.max(1_000),
-            config.robustness_neighborhood_samples.max(20),
+            config.robustness_folds.max(12),
+            config.robustness_monte_carlo_trials.max(5_000),
+            config.robustness_neighborhood_samples.max(200),
         ),
     }
 }
@@ -1701,11 +1718,15 @@ fn run_holding_battery_sync(
     let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
-    let oos1 = slice_bars(
-        &decision.dataset,
-        plan.development.bar_count,
-        plan.development.bar_count + plan.validation.bar_count,
-    )?;
+    let oos1 = if plan.validation.bar_count == 0 {
+        None
+    } else {
+        Some(slice_bars(
+            &decision.dataset,
+            plan.development.bar_count,
+            plan.development.bar_count + plan.validation.bar_count,
+        )?)
+    };
     let m1_plan =
         DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
             .map_err(|error| error.to_string())?;
@@ -1737,7 +1758,7 @@ fn run_holding_battery_sync(
             bank,
             &target,
             &development,
-            Some(&oos1),
+            oos1.as_ref(),
             m1_eval,
             quote_dataset.as_ref(),
             &broker,
@@ -2751,6 +2772,7 @@ fn workspace_view(
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
+        + telemetry.rejected_family_not_improved
         + telemetry.rejected_precision
         + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
@@ -2798,6 +2820,7 @@ fn workspace_view(
             clone: telemetry.rejected_clone,
             correlated: telemetry.rejected_correlated,
             niche_not_improved: telemetry.rejected_niche_not_improved,
+            family_not_improved: telemetry.rejected_family_not_improved,
             precision: telemetry.rejected_precision,
             ambiguous: telemetry.rejected_ambiguous,
             oos1: telemetry.rejected_oos1,
@@ -2855,7 +2878,7 @@ fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64
         .config
         .get(key)
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (0.0..1.0).contains(value))
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1.0)
         .unwrap_or(fallback)
 }
 
@@ -2930,6 +2953,12 @@ fn elite_row(elite: &Elite) -> EliteRow {
         is_expectancy: elite.is_expectancy,
         oos1_expectancy: elite.oos1_expectancy,
         oos1_expectancy_ratio: elite.oos1_expectancy_ratio,
+        expectancy_r: elite.metrics.expectancy_r,
+        median_r: elite.metrics.median_r,
+        fold_median_r: elite.fold_r.median_fold_r,
+        fold_spread: elite.fold_r.fold_spread,
+        fold_count: elite.fold_r.fold_count,
+        fold_usable: elite.fold_r.usable,
         complexity: elite.complexity,
         generation: elite.discovered_generation,
         grade: "illuminated",
@@ -2982,6 +3011,11 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         metrics: serde_json::to_value(&elite.metrics)?,
         oos1_expectancy: elite.oos1_expectancy,
         oos1_expectancy_ratio: elite.oos1_expectancy_ratio,
+        fold_median_r: elite.fold_r.median_fold_r,
+        fold_spread: elite.fold_r.fold_spread,
+        fold_pooled_r: elite.fold_r.pooled_r,
+        fold_count: elite.fold_r.fold_count,
+        fold_usable: elite.fold_r.usable,
         strategy_ir: serde_json::to_value(&elite.strategy)?,
         equity_signature: elite.equity_signature.clone(),
         robustness: elite_robustness(elite)?,
@@ -3194,10 +3228,13 @@ mod tests {
                 max_drawdown_percent: 0.5,
                 sharpe_ratio: Some(1.0),
                 expectancy: 100.0,
+                expectancy_r: 0.0,
+                median_r: 0.0,
             },
             is_expectancy: 0.0,
             oos1_expectancy: None,
             oos1_expectancy_ratio: None,
+            fold_r: Default::default(),
             observed_trade_sharpe: None,
             expected_max_lucky_sharpe: None,
             deflated_trade_sharpe: None,
@@ -3206,6 +3243,7 @@ mod tests {
             robustness: None,
             equity_signature: vec![0.0, 1.0],
             discovered_generation: 1,
+            island_id: 0,
         }
     }
 
@@ -3403,6 +3441,7 @@ mod tests {
                 net_profit: 116.25,
                 bars_held: 1,
                 exit_reason: quantforge_eval::ExitReason::TakeProfit,
+                r_multiple: 0.0,
             },
             quantforge_eval::Trade {
                 side: quantforge_eval::PositionSide::Short,
@@ -3419,6 +3458,7 @@ mod tests {
                 net_profit: -108.0,
                 bars_held: 1,
                 exit_reason: quantforge_eval::ExitReason::StopLoss,
+                r_multiple: 0.0,
             },
         ];
         write_sqx_style_trade_csv(

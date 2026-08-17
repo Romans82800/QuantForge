@@ -128,6 +128,8 @@ export function EliteTable({
           case 'strategyId': valA = rowA.strategyId; valB = rowB.strategyId; break;
           case 'conditions': valA = rowA.entryConditions + rowA.exitConditions; valB = rowB.entryConditions + rowB.exitConditions; break;
           case 'evidence': valA = rowA.evidence; valB = rowB.evidence; break;
+          case 'expectancyR': valA = rowA.expectancyR ?? -Infinity; valB = rowB.expectancyR ?? -Infinity; break;
+          case 'foldMedianR': valA = rowA.foldMedianR ?? -Infinity; valB = rowB.foldMedianR ?? -Infinity; break;
           case 'novelty': valA = rowA.novelty; valB = rowB.novelty; break;
           case 'returnPercent': valA = rowA.returnPercent; valB = rowB.returnPercent; break;
           case 'trades': valA = rowA.trades; valB = rowB.trades; break;
@@ -235,6 +237,10 @@ export function EliteTable({
                     return <span key={col.id} style={style}>{conditionLabel(row.entryConditions, row.exitConditions)}</span>;
                   case 'evidence':
                     return <span key={col.id} style={style}>{row.evidence.toFixed(2)}</span>;
+                  case 'expectancyR':
+                    return <span key={col.id} style={style}>{(row.expectancyR ?? 0).toFixed(3)}</span>;
+                  case 'foldMedianR':
+                    return <span key={col.id} style={style} title={row.foldUsable ? `spread ${(row.foldSpread ?? 0).toFixed(3)} · ${row.foldCount} years` : 'too few trades per year; pooled R'}>{(row.foldMedianR ?? 0).toFixed(3)}</span>;
                   case 'novelty':
                     return <span key={col.id} style={style}>{row.novelty.toFixed(3)}</span>;
                   case 'returnPercent':

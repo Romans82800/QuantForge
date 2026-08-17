@@ -190,6 +190,13 @@ export function PartitionEquityChart({
 
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
+  const totalBars = view.isBars + view.oos1Bars + view.oos2Bars;
+  const isPct = totalBars > 0 ? Math.round((view.isBars / totalBars) * 100) : 0;
+  const oos2Pct = totalBars > 0 ? Math.round((view.oos2Bars / totalBars) * 100) : 0;
+  const twoWay = view.oos1Bars === 0;
+  const splitNote = twoWay
+    ? `${view.executionEngine} · Development ${isPct}% · Holdout ${oos2Pct}% (display only)`
+    : `${view.executionEngine} · Development ${isPct}% · OOS1 ${Math.round((view.oos1Bars / Math.max(totalBars, 1)) * 100)}% · OOS2 ${oos2Pct}% (display only)`;
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
@@ -197,7 +204,7 @@ export function PartitionEquityChart({
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
           <small style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>
-            {view.executionEngine} · IS 60% · OOS1 20% · OOS2 20% (display only)
+            {splitNote}
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>

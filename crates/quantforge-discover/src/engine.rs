@@ -298,11 +298,13 @@ enum PromotionOutcome {
 /// Immutable inputs shared by every in-flight promotion job.
 struct PromotionContext {
     dataset: Arc<BarDataset>,
+    #[allow(dead_code)]
     oos1: Option<Arc<BarDataset>>,
     m1: Arc<BarDataset>,
     quotes: Option<Arc<QuoteBarDataset>>,
     broker: Arc<SymbolSpecification>,
     deposit_gates: GateConfig,
+    #[allow(dead_code)]
     oos1_expectancy_retention: f64,
     minimum_development_expectancy_r: f64,
     build_to_holding: bool,
@@ -615,69 +617,13 @@ fn promote_one(
         robustness: m1_outcome.1.clone(),
     };
 
-    // OOS1 is a validation gate, never a breeding or ranking input. It opens
-    // only after the candidate has survived the complete Development battery.
-    // The replay joins Development + OOS1 solely to preserve indicator warmup,
-    // open-position chronology and quote-aware execution across the boundary.
-    let Some(oos1) = context.oos1.as_deref() else {
-        // Explicit unsplit/methodology runs remain research-only. Desktop
-        // production runs always provide the frozen OOS1 partition.
-        return PromotionOutcome::DevelopmentApproved {
-            candidate: development_candidate,
-            oos1_passed: true,
-            oos1_expectancy: None,
-            oos1_expectancy_ratio: None,
-        };
-    };
-    let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
-        return PromotionOutcome::EvaluationError {
-            message: "OOS1 validation partition is empty".into(),
-        };
-    };
-    let validation_decision = join_datasets(context.dataset.as_ref(), oos1);
-    let validation = match evaluate_strategy_m1_with_optional_quotes(
-        strategy,
-        &validation_decision,
-        context.m1.as_ref(),
-        context.quotes.as_deref(),
-        broker,
-        &JudgeConfig {
-            initial_balance: robustness.initial_balance,
-            costs: robustness.costs.clone(),
-            allow_execution_gaps: false,
-            indicator_engine: robustness.indicator_engine,
-            entry_window: robustness.entry_window,
-        },
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            return PromotionOutcome::EvaluationError {
-                message: format!("M1 OOS1 validation replay failed: {error}"),
-            };
-        }
-    };
-    // The Development reference is the already-admitted M1 baseline. The
-    // joined replay exists for warmup/execution continuity only and must not
-    // rewrite Development fitness with information from across the boundary.
-    let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
-    if !passes_oos1_pick(
-        development_expectancy,
-        oos1_expectancy,
-        context.oos1_expectancy_retention,
-    ) {
-        return PromotionOutcome::DevelopmentApproved {
-            candidate: development_candidate,
-            oos1_passed: false,
-            oos1_expectancy: Some(oos1_expectancy),
-            oos1_expectancy_ratio: None,
-        };
-    }
-    let oos1_expectancy_ratio = oos1_expectancy / development_expectancy;
+    // Fold-stable Development R is the promotion objective. OOS1 is not a pick
+    // gate — a single chronological slice manufactures a clean databank.
     PromotionOutcome::DevelopmentApproved {
         candidate: development_candidate,
         oos1_passed: true,
-        oos1_expectancy: Some(oos1_expectancy),
-        oos1_expectancy_ratio: Some(oos1_expectancy_ratio),
+        oos1_expectancy: None,
+        oos1_expectancy_ratio: None,
     }
 }
 
@@ -696,6 +642,10 @@ fn apply_promotion_outcome(
         PromotionOutcome::RobustnessRejected { reject } => match reject {
             crate::robustness::RobustnessReject::M1Fidelity => {
                 bank.telemetry.record(DepositDecision::RejectedM1Fidelity);
+            }
+            crate::robustness::RobustnessReject::FoldStability => {
+                bank.telemetry
+                    .record(DepositDecision::RejectedFoldStability);
             }
             crate::robustness::RobustnessReject::WalkForward => {
                 bank.telemetry.record(DepositDecision::RejectedWalkForward);
@@ -795,8 +745,10 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     }
 }
 
-/// OOS1 validation requires positive expectancy and retention relative to the
-/// M1 Development replay. It must never be used to breed or rank candidates.
+/// OOS1 validation used to require positive expectancy and retention relative
+/// to the M1 Development replay. Kept for tests and old artifacts; Discover no
+/// longer picks on OOS1.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
     is_expectancy.is_finite()
         && oos1_expectancy.is_finite()
@@ -844,13 +796,13 @@ pub struct HoldingBatteryResult {
     pub elite: Elite,
 }
 
-/// Run the full M1 robustness battery + OOS1 on one Holding candidate and,
-/// on pass, promote it into the Databank elites archive.
+/// Run the full M1 robustness battery on one Holding candidate and,
+/// on pass, promote it into the Databank elites archive. OOS1 is not a pick.
 pub fn run_holding_battery_and_promote(
     bank: &mut Databank,
     fingerprint: &quantforge_core::ContentHash,
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
+    _oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
@@ -894,7 +846,7 @@ pub fn run_holding_battery_and_promote(
         return Err(HoldingBatteryReject::DevelopmentExpectancy);
     }
 
-    let mut candidate = CandidateEvaluation {
+    let candidate = CandidateEvaluation {
         strategy: elite.strategy.clone(),
         result: outcome.result,
         generation: elite.discovered_generation,
@@ -910,55 +862,7 @@ pub fn run_holding_battery_and_promote(
         robustness: outcome.evidence,
     };
 
-    if let Some(oos1) = oos1_dataset {
-        let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
-            return Err(HoldingBatteryReject::Evaluation(
-                "OOS1 validation partition is empty".into(),
-            ));
-        };
-        let validation_decision = join_datasets(dataset, oos1);
-        let validation = evaluate_strategy_m1_with_optional_quotes(
-            &elite.strategy,
-            &validation_decision,
-            m1_dataset,
-            quote_dataset,
-            broker,
-            &JudgeConfig {
-                initial_balance: robustness.initial_balance,
-                costs: robustness.costs.clone(),
-                allow_execution_gaps: false,
-                indicator_engine: robustness.indicator_engine,
-                entry_window: robustness.entry_window,
-            },
-        )
-        .map_err(|error| {
-            HoldingBatteryReject::Evaluation(format!("M1 OOS1 validation replay failed: {error}"))
-        })?;
-        let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
-        if !passes_oos1_pick(
-            development_expectancy,
-            oos1_expectancy,
-            bank.config.oos1_expectancy_retention,
-        ) {
-            return Err(HoldingBatteryReject::Oos1);
-        }
-        candidate.oos1_expectancy = Some(oos1_expectancy);
-        candidate.oos1_expectancy_ratio = Some(oos1_expectancy / development_expectancy);
-        candidate.gate_results = build_gate_results(
-            development_expectancy,
-            candidate.oos1_expectancy,
-            candidate.oos1_expectancy_ratio,
-            true,
-            None,
-            &candidate.multi_symbol_results,
-            bank.config.multi_symbol_minimum_pass,
-            candidate.deflated_trade_sharpe,
-            bank.config.minimum_deflated_trade_sharpe,
-        );
-    }
-
-    remove_holding_by_fingerprint(bank, fingerprint)
-        .ok_or(HoldingBatteryReject::NotInHolding)?;
+    remove_holding_by_fingerprint(bank, fingerprint).ok_or(HoldingBatteryReject::NotInHolding)?;
     let decision = deposit_to_databank(bank, candidate)
         .map_err(|error| HoldingBatteryReject::Evaluation(error.to_string()))?;
     bank.telemetry.record(decision);
@@ -979,6 +883,7 @@ pub fn run_holding_battery_and_promote(
 
 /// Concatenate consecutive decision partitions for a validation replay. OOS2
 /// is never accepted by this helper or stored in the promotion context.
+#[allow(dead_code)]
 fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
     let mut bars = Vec::with_capacity(first.bars.len() + second.bars.len());
     bars.extend_from_slice(&first.bars);
@@ -994,6 +899,7 @@ fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
     }
 }
 
+#[allow(dead_code)]
 fn expectancy_from(trades: &[quantforge_eval::Trade], timestamp_ms: i64) -> f64 {
     expectancy_for(trades, |entry| entry >= timestamp_ms)
 }
@@ -2035,6 +1941,9 @@ mod tests {
             max_specialist_pool_elites: 2_000,
             max_databank_elites: 5_000,
             max_holding_elites: 5_000,
+            max_elites_per_niche: 2,
+            max_promoted_per_niche: 4,
+            max_per_entry_family: 8,
             build_to_holding: false,
             require_m1_robustness: true,
             robustness_folds: 3,
@@ -2197,6 +2106,8 @@ mod tests {
             max_drawdown_percent: 8.824,
             sharpe_ratio: Some(0.03),
             expectancy: 311.5 / 76.0,
+            expectancy_r: 0.0,
+            median_r: 0.0,
         };
         let gates = GateConfig {
             minimum_trades: 20,
@@ -2433,6 +2344,23 @@ mod tests {
     }
 
     #[test]
+    fn quota_mode_keeps_the_robustness_battery_discriminating() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
+        // Old presets clamped these down to 80/5/0.5, which passed everything.
+        config.robustness_monte_carlo_trials = 80;
+        config.robustness_neighborhood_samples = 5;
+        config.minimum_neighborhood_survival_fraction = 0.5;
+        config.apply_run_mode();
+        // A P95 drawdown read off fewer than ~1k resampled paths is noise.
+        assert!(config.robustness_monte_carlo_trials >= 1_000);
+        // Ten deterministic axis neighbors come first; sample well past them so the
+        // randomized joint draw actually perturbs entry indicator periods.
+        assert!(config.robustness_neighborhood_samples >= 100);
+        assert!(config.minimum_neighborhood_survival_fraction >= 0.65);
+    }
+
+    #[test]
     fn only_general_islands_and_migration_controls_are_honored() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::HighPerformanceIslands;
@@ -2483,22 +2411,24 @@ mod tests {
     }
 
     #[test]
-    fn oos1_is_used_only_after_development_promotion() {
+    fn oos1_is_not_a_promotion_pick() {
         let dataset = dataset();
         let mut cfg = config();
         cfg.mutate_after_elites = 1;
         cfg.require_m1_robustness = false;
         let oos1 = dataset.clone();
         let bank = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
-            .expect("OOS1 is valid only on the post-Development promotion path");
+            .expect("OOS1 may be supplied but must not be used to pick");
         assert!(
             bank.accepted_pool
                 .iter()
                 .all(|elite| elite.oos1_expectancy.is_none())
         );
-        assert!(bank.elites.iter().all(|elite| {
-            elite.oos1_expectancy.is_some() && elite.oos1_expectancy_ratio.is_some()
-        }));
+        assert!(
+            bank.elites
+                .iter()
+                .all(|elite| elite.oos1_expectancy.is_none())
+        );
     }
 
     #[test]

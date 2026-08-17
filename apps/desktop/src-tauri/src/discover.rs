@@ -157,7 +157,7 @@ pub struct DiscoverRequest {
     migration_elites: Option<usize>,
     /// Early-stop when accepted pot reaches this size (Fast Scout / Quota).
     early_stop_pot_elites: Option<usize>,
-    /// Early-stop when databank reaches this many elites (Quota Harvest default 20).
+    /// Early-stop when databank reaches this many elites (Quota Harvest default 100).
     target_databank_elites: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
     commission_per_lot_round_turn: Option<f64>,
@@ -230,6 +230,8 @@ pub struct DiscoverJobView {
     rejected_clone: u64,
     rejected_correlated: u64,
     rejected_niche_not_improved: u64,
+    #[serde(default)]
+    rejected_family_not_improved: u64,
     rejected_evaluation: u64,
     rejected_total: u64,
     /// Five-minute moving throughput, suitable for detecting current slowdown.
@@ -332,6 +334,7 @@ impl DiscoverJobView {
             rejected_clone: 0,
             rejected_correlated: 0,
             rejected_niche_not_improved: 0,
+            rejected_family_not_improved: 0,
             rejected_evaluation: 0,
             rejected_total: 0,
             rolling_evaluations_per_hour: 0.0,
@@ -392,7 +395,7 @@ pub fn run_condition_bakeoff(
     .map_err(|error| error.to_string())?;
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
-    let validation_fraction = request.validation_fraction.clamp(0.05, 0.4);
+    let validation_fraction = request.validation_fraction.clamp(0.0, 0.4);
     let sealed_fraction = request.sealed_fraction.clamp(0.05, 0.4);
     if validation_fraction + sealed_fraction >= 0.9 {
         return Err(format!(
@@ -509,6 +512,7 @@ pub fn start_discover(
         rejected_clone: 0,
         rejected_correlated: 0,
         rejected_niche_not_improved: 0,
+        rejected_family_not_improved: 0,
         rejected_evaluation: 0,
         rejected_total: 0,
         rolling_evaluations_per_hour: 0.0,
@@ -708,8 +712,12 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
                 ));
             }
         }
-        let validation = request.validation_fraction.unwrap_or(0.2);
-        let sealed = request.sealed_fraction.unwrap_or(0.2);
+        let validation = request
+            .validation_fraction
+            .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
+        let sealed = request
+            .sealed_fraction
+            .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
         normalize_split_fractions(validation, sealed)?;
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
@@ -955,25 +963,34 @@ fn run_discovery(
     };
     let (validation_fraction, sealed_fraction) = match (&request.mode, &continued_artifact) {
         (DiscoverMode::Continue, Some(artifact)) => (
-            recipe_fraction(artifact, "validation_fraction", 0.2),
-            recipe_fraction(artifact, "sealed_fraction", 0.2),
+            recipe_fraction(
+                artifact,
+                "validation_fraction",
+                quantforge_quality::DEFAULT_VALIDATION_FRACTION,
+            ),
+            recipe_fraction(
+                artifact,
+                "sealed_fraction",
+                quantforge_quality::DEFAULT_SEALED_FRACTION,
+            ),
         ),
         _ => (
-            request.validation_fraction.unwrap_or(0.2),
-            request.sealed_fraction.unwrap_or(0.2),
+            request
+                .validation_fraction
+                .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION),
+            request
+                .sealed_fraction
+                .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION),
         ),
     };
     let (validation_fraction, sealed_fraction) =
         normalize_split_fractions(validation_fraction, sealed_fraction)?;
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| development_partition(&search_decision, validation_fraction, sealed_fraction))
+        .then(|| unsealed_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
-    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
-        .transpose()?;
+    let oos1_dataset = None;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
-    // Development alone drives random search and breeding. OOS1 is passed only
-    // to the post-Development promotion gate; OOS2 is never materialized here.
+    // Search uses every bar except the sealed holdout. OOS1 is not a pick gate.
     let m1_eval = &m1.dataset;
     let pack = load_fx_pack(
         request.pack_data_dir.as_deref(),
@@ -990,7 +1007,7 @@ fn run_discovery(
                 job,
                 "Evaluating initial grammar population",
                 &format!(
-                    "Development gates fill the breeding reservoir. After breeding unlocks: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank. OOS2 remains untouched."
+                    "Fold-stable Development R fills Holding. Sealed holdout is never loaded."
                 ),
             )?;
             let mut config = new_config(&request)?;
@@ -1556,7 +1573,7 @@ fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool)
 fn funnel_summary(bank: &Databank) -> String {
     let telemetry = &bank.telemetry;
     format!(
-        "Rejects — scout {}, deposit {}, ambiguous {}, M1 retention {}, Development R {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, eval {}.",
+        "Rejects — scout {}, deposit {}, ambiguous {}, M1 retention {}, Development R {}, WF {}, MC {}, param {}, OOS1 {}, clone {}, corr {}, niche {}, family {}, eval {}.",
         telemetry.rejected_gate,
         telemetry.rejected_deposit_gate,
         telemetry.rejected_ambiguous,
@@ -1569,6 +1586,7 @@ fn funnel_summary(bank: &Databank) -> String {
         telemetry.rejected_clone,
         telemetry.rejected_correlated,
         telemetry.rejected_niche_not_improved,
+        telemetry.rejected_family_not_improved,
         telemetry.rejected_evaluation
     )
 }
@@ -1900,7 +1918,7 @@ fn load_fx_pack(
         let market_broker =
             load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
         let dataset = if apply_promotion_split {
-            development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
+            unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
         } else {
             loaded.dataset
         };
@@ -1970,7 +1988,7 @@ fn recipe_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
         .config
         .get(key)
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (0.0..1.0).contains(value))
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1.0)
         .unwrap_or(fallback)
 }
 
@@ -1992,10 +2010,12 @@ fn normalize_split_fractions(
     // sample.  Reject invalid input explicitly instead.
     if !validation_fraction.is_finite()
         || !sealed_fraction.is_finite()
-        || !(0.05..=0.4).contains(&validation_fraction)
+        || !(0.0..=0.4).contains(&validation_fraction)
         || !(0.05..=0.4).contains(&sealed_fraction)
     {
-        return Err("validation and sealed fractions must each be between 5% and 40%".into());
+        return Err(
+            "OOS1 reserve must be 0–40% and sealed holdout must be 5–40%".into(),
+        );
     }
     let validation = validation_fraction;
     let sealed = sealed_fraction;
@@ -2021,6 +2041,22 @@ fn development_partition(
     slice_partition(dataset, 0, plan.development.bar_count)
 }
 
+fn unsealed_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, String> {
+    let plan = quantforge_quality::DataSplitPlan::chronological(
+        dataset,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let end = plan.development.bar_count + plan.validation.bar_count;
+    slice_partition(dataset, 0, end)
+}
+
+#[allow(dead_code)]
 fn oos1_partition(
     dataset: &BarDataset,
     validation_fraction: f64,
@@ -2176,7 +2212,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
     Ok(DiscoverConfig {
         initial_candidates: request.initial_candidates.unwrap_or(500),
         batch_size: request.batch_size.unwrap_or(200),
-        correlation_threshold: request.correlation_threshold.unwrap_or(0.85),
+        correlation_threshold: request.correlation_threshold.unwrap_or(0.75),
         novelty_weight: request.novelty_weight.unwrap_or(10.0),
         tournament_size: 4,
         structural_mutation_probability: 0.18,
@@ -2222,7 +2258,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         end_of_day_hour: request.end_of_day_hour.unwrap_or(23),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
-        random_fill_fraction: request.random_fill_fraction.unwrap_or(0.4),
+        random_fill_fraction: request.random_fill_fraction.unwrap_or(0.75),
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
         promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(8).min(8),
@@ -2230,10 +2266,13 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         max_specialist_pool_elites: 2_000,
         max_databank_elites: 5_000,
         max_holding_elites: 5_000,
+        max_elites_per_niche: 2,
+        max_promoted_per_niche: 4,
+        max_per_entry_family: 8,
         build_to_holding: true,
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
-        robustness_folds: request.robustness_folds.unwrap_or(3),
-        robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(250),
+        robustness_folds: request.robustness_folds.unwrap_or(8),
+        robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(1_000),
         robustness_monte_carlo_block_length: request
             .robustness_monte_carlo_block_length
             .unwrap_or(5),
@@ -2246,7 +2285,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_monte_carlo_max_drawdown_ratio: request
             .robustness_monte_carlo_max_drawdown_ratio
             .unwrap_or(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
-        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(8),
+        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(100),
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
@@ -2256,7 +2295,13 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
-        island_count: request.general_island_count.unwrap_or(1),
+        // `generalIslandCount` uses 0 as an "auto / single island" sentinel in the
+        // UI, so `unwrap_or(1)` (which only fires on `None`) let an explicit 0
+        // through and tripped `island_count must be at least 1`. Clamp to >=1.
+        island_count: request
+            .general_island_count
+            .filter(|&count| count > 0)
+            .unwrap_or(1),
         migration_interval: request.migration_interval.unwrap_or(10),
         migration_elites: request.migration_elites.unwrap_or(2),
         general_island_count: request.general_island_count.unwrap_or(0),
@@ -2429,6 +2474,7 @@ fn update_bank(
         + telemetry.rejected_clone
         + telemetry.rejected_correlated
         + telemetry.rejected_niche_not_improved
+        + telemetry.rejected_family_not_improved
         + telemetry.rejected_precision
         + telemetry.rejected_ambiguous
         + telemetry.rejected_oos1
@@ -2565,6 +2611,7 @@ fn update_bank(
     view.rejected_clone = telemetry.rejected_clone;
     view.rejected_correlated = telemetry.rejected_correlated;
     view.rejected_niche_not_improved = telemetry.rejected_niche_not_improved;
+    view.rejected_family_not_improved = telemetry.rejected_family_not_improved;
     view.rejected_evaluation = telemetry.rejected_evaluation;
     view.rejected_total = rejected_total;
     let lifetime_evaluations_per_hour = clock.lifetime_evaluations_per_hour(bank.evaluation_count);
@@ -2643,6 +2690,7 @@ mod tests {
             worker_threads: Some(1),
             promotion_worker_threads: Some(1),
             promotion_queue_capacity: Some(8),
+            max_memory_mb: Some(2048),
             require_m1_robustness: Some(false),
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),
@@ -2659,6 +2707,11 @@ mod tests {
             pack_data_dir: None,
             universal_grammar: None,
             run_mode: Some("full_harvest".into()),
+            general_island_count: None,
+            refinement_island_count: None,
+            exploration_island_count: None,
+            migration_interval: None,
+            migration_elites: None,
             early_stop_pot_elites: None,
             target_databank_elites: None,
             search_ranges: None,
@@ -2784,9 +2837,26 @@ mod tests {
     #[test]
     fn split_fractions_reject_an_undersized_is_window() {
         assert!(normalize_split_fractions(0.2, 0.2).is_ok());
+        assert!(normalize_split_fractions(0.0, 1.0 / 3.0).is_ok());
         assert!(normalize_split_fractions(0.2, 0.1).is_ok());
         let error = normalize_split_fractions(0.5, 0.45).expect_err("IS must remain");
         assert!(error.contains("less than 10%"));
+    }
+
+    #[test]
+    fn unsealed_equals_development_when_oos1_is_off() {
+        let loaded = load_data_source(
+            &fixture("EURUSD_M15_sample.tsv"),
+            Some(&fixture("EURUSD_M15_sample.metadata.csv")),
+            None,
+        )
+        .expect("fixture should load");
+        let unsealed = unsealed_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
+            .expect("unsealed");
+        let development = development_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
+            .expect("development");
+        assert_eq!(unsealed.data_hash, development.data_hash);
+        assert_eq!(unsealed.bars.len(), development.bars.len());
     }
 
     #[test]

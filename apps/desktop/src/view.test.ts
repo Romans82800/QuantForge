@@ -16,6 +16,7 @@ import {
   perturbationPercent,
   formatDateRange,
   selectionBiasTone,
+  splitCaption,
   symbolFromDataPath,
   timeframeFromDataPath,
   visibleEliteFingerprint,
@@ -38,6 +39,12 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
   isExpectancy: 12,
   oos1Expectancy: 9,
   oos1ExpectancyRatio: 0.75,
+  expectancyR: 0.12,
+  medianR: 0.05,
+  foldMedianR: 0.10,
+  foldSpread: 0.04,
+  foldCount: 5,
+  foldUsable: true,
   complexity: 8,
   generation: 2,
   grade: "illuminated",
@@ -47,6 +54,10 @@ const elite = (overrides: Partial<EliteRow>): EliteRow => ({
 });
 
 describe("databank view rules", () => {
+  it("labels a 66/33 split without OOS1", () => {
+    expect(splitCaption(0, 1 / 3)).toBe("67/33% Development/Holdout");
+  });
+
   it("keeps selection-bias severity visible", () => {
     expect(selectionBiasTone("elevated")).toBe("bias-elevated");
   });

@@ -94,5 +94,5 @@ pub(crate) fn migrate_islands(bank: &mut Databank) {
 }
 
 fn score(elite: &Elite) -> f64 {
-    elite.evidence.total + elite.novelty * 0.01 - elite.complexity as f64 * 0.001
+    elite.evidence.total + elite.novelty * 2.0 - elite.complexity as f64 * 0.05
 }

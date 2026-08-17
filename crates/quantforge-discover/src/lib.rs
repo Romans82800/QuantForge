@@ -3,6 +3,7 @@
 mod archive;
 mod bakeoff;
 mod engine;
+mod fold_r;
 mod grammar;
 mod islands;
 mod methodology;
@@ -11,14 +12,15 @@ mod multi_symbol;
 mod permutation;
 mod robustness;
 
-pub use archive::niche_label;
+pub use archive::{entry_family_key, niche_label};
 pub use bakeoff::{
     ConditionBakeoffConfig, ConditionBakeoffReport, ConditionBakeoffRow, run_condition_bakeoff,
 };
+pub use fold_r::FoldRStats;
 pub use engine::{
     EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, continue_evolution,
-    continue_evolution_with_pack, evolve_new, evolve_new_with_pack, evolve_new_with_pack_and_quotes,
-    run_holding_battery_and_promote,
+    continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
+    evolve_new_with_pack_and_quotes, run_holding_battery_and_promote,
 };
 pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use methodology::{

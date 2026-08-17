@@ -22,6 +22,7 @@ pub use model::{
     BacktestMetrics, CostModel, EntryWindow, EquityPoint, EvalError, ExitReason, IndicatorEngine,
     MANDATORY_ENTRY_WINDOW_END_HOUR, MANDATORY_ENTRY_WINDOW_START_HOUR, PositionSide,
     SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry, Trade, in_mandatory_entry_window,
+    r_multiple, stop_dollar_risk, trade_r_stats,
 };
 
 pub const ENGINE_TIER: &str = "ohlc-scout";

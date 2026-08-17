@@ -6,7 +6,7 @@ use crate::management::{
 };
 use crate::model::{
     BacktestMetrics, EquityPoint, EvalError, ExitReason, PositionSide, ScoutConfig, ScoutResult,
-    ScoutTelemetry, Trade,
+    ScoutTelemetry, Trade, r_multiple, stop_dollar_risk, trade_r_stats,
 };
 use crate::{SpreadSource, accrue_swap, resolve_spread};
 use chrono::Timelike;
@@ -37,6 +37,8 @@ struct OpenPosition {
     initial_stop_loss: f64,
     initial_take_profit: f64,
     initial_risk_distance: f64,
+    /// Account-currency risk of the initial stop (volume × stop distance).
+    initial_dollar_risk: f64,
     /// Best post-entry favorable price seen on completed bars (fill-aware).
     peak_favorable_price: Option<f64>,
     entry_commission: f64,
@@ -613,6 +615,12 @@ fn open_position(
     if initial_risk_distance <= 0.0 {
         return Ok(None);
     }
+    let initial_dollar_risk = stop_dollar_risk(
+        initial_risk_distance,
+        volume,
+        broker.tick_size,
+        broker.tick_value,
+    );
     let entry_commission = volume * config.costs.commission_per_lot_round_turn / 2.0;
 
     Ok(Some(OpenPosition {
@@ -627,6 +635,7 @@ fn open_position(
         initial_stop_loss: stop_loss,
         initial_take_profit: take_profit,
         initial_risk_distance,
+        initial_dollar_risk,
         peak_favorable_price: None,
         entry_commission,
         swap: 0.0,
@@ -803,6 +812,12 @@ fn fill_pending_order(
     let stop_loss = normalize_price(order.stop_loss, broker);
     let take_profit = normalize_price(order.take_profit, broker);
     let initial_risk_distance = (entry_price - stop_loss).abs().max(order.stop_distance);
+    let initial_dollar_risk = stop_dollar_risk(
+        initial_risk_distance,
+        order.volume,
+        broker.tick_size,
+        broker.tick_value,
+    );
     OpenPosition {
         side: order.side,
         entry_index: index,
@@ -815,6 +830,7 @@ fn fill_pending_order(
         initial_stop_loss: stop_loss,
         initial_take_profit: take_profit,
         initial_risk_distance,
+        initial_dollar_risk,
         peak_favorable_price: None,
         entry_commission: order.volume * config.costs.commission_per_lot_round_turn / 2.0,
         swap: 0.0,
@@ -1170,6 +1186,7 @@ fn close_position(
     let gross_profit = position.realized_gross_profit;
     let commission = position.entry_commission + position.realized_exit_commission;
     let net_profit = gross_profit - commission + position.swap;
+    let r_multiple = r_multiple(net_profit, position.initial_dollar_risk);
 
     trades.push(Trade {
         side: position.side,
@@ -1186,6 +1203,7 @@ fn close_position(
         net_profit,
         bars_held: exit_index - position.entry_index,
         exit_reason: event.reason,
+        r_multiple,
     });
 }
 
@@ -1280,6 +1298,7 @@ fn calculate_metrics(
     } else {
         trades.iter().map(|trade| trade.net_profit).sum::<f64>() / trades.len() as f64
     };
+    let (expectancy_r, median_r) = trade_r_stats(trades);
     BacktestMetrics {
         initial_balance,
         ending_balance,
@@ -1298,6 +1317,8 @@ fn calculate_metrics(
         max_drawdown_percent,
         sharpe_ratio,
         expectancy,
+        expectancy_r,
+        median_r,
     }
 }
 

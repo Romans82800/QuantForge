@@ -339,7 +339,7 @@ struct EvolveArgs {
     /// Minimum mirrored entry conditions (2..=4). Default 2.
     #[arg(long)]
     minimum_entry_conditions: Option<usize>,
-    /// Maximum mirrored entry conditions (2..=4). Default 4.
+    /// Maximum mirrored entry conditions (2..=4). Default 2.
     #[arg(long)]
     maximum_entry_conditions: Option<usize>,
     /// Minimum exit conditions (1..=3). Default 1.
@@ -389,12 +389,12 @@ struct EvolveArgs {
     /// Allow a data-quality Fail and record the override in the manifest.
     #[arg(long)]
     allow_failed_data: bool,
-    /// Search Development only. Frozen OOS1 is reserved for post-shortlist certification.
+    /// Search unsealed history (everything except the sealed holdout). OOS1 is not a pick.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     promotion_split: bool,
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = quantforge_quality::DEFAULT_VALIDATION_FRACTION)]
     validation_fraction: f64,
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = quantforge_quality::DEFAULT_SEALED_FRACTION)]
     sealed_fraction: f64,
 }
 
@@ -851,7 +851,7 @@ struct ChallengeArgs {
     /// Fraction of baseline net profit the MC 80th percentile must retain.
     #[arg(long, default_value_t = 0.60)]
     monte_carlo_minimum_p80_profit_retention: f64,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 100)]
     neighborhood_samples: usize,
     #[arg(long, default_value_t = 0.1)]
     parameter_perturbation_fraction: f64,
@@ -4039,12 +4039,9 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
 
     let development = args
         .promotion_split
-        .then(|| development_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .then(|| unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction))
         .transpose()?;
-    let oos1 = args
-        .promotion_split
-        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
-        .transpose()?;
+    let oos1 = None;
     let search_dataset = development.as_ref().unwrap_or(&dataset);
     let m1_is = args
         .promotion_split
@@ -4704,7 +4701,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
     Ok(DiscoverConfig {
         initial_candidates: args.initial.unwrap_or(500),
         batch_size: args.batch.unwrap_or(200),
-        correlation_threshold: args.correlation.unwrap_or(0.85),
+        correlation_threshold: args.correlation.unwrap_or(0.75),
         novelty_weight: args.novelty_weight.unwrap_or(10.0),
         tournament_size: args.tournament_size.unwrap_or(4),
         structural_mutation_probability: args.structural_mutation_probability.unwrap_or(0.18),
@@ -4746,7 +4743,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         end_of_day_hour: args.end_of_day_hour,
         max_one_entry_per_day: true,
         mutate_after_elites: 300,
-        random_fill_fraction: 0.4,
+        random_fill_fraction: 0.75,
         worker_threads: 0,
         promotion_worker_threads: 0,
         promotion_queue_capacity: 64,
@@ -4754,10 +4751,13 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         max_specialist_pool_elites: 2_000,
         max_databank_elites: 5_000,
         max_holding_elites: 5_000,
+        max_elites_per_niche: 2,
+        max_promoted_per_niche: 4,
+        max_per_entry_family: 8,
         build_to_holding: true,
         require_m1_robustness: true,
-        robustness_folds: 3,
-        robustness_monte_carlo_trials: 250,
+        robustness_folds: 8,
+        robustness_monte_carlo_trials: 1_000,
         robustness_monte_carlo_block_length: 5,
         robustness_monte_carlo_skip_trade_probability:
             quantforge_discover::MONTE_CARLO_SKIP_TRADE_PROBABILITY,
@@ -4765,7 +4765,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION,
         robustness_monte_carlo_max_drawdown_ratio:
             quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO,
-        robustness_neighborhood_samples: 8,
+        robustness_neighborhood_samples: 100,
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
@@ -4807,6 +4807,16 @@ fn development_partition(
 ) -> Result<BarDataset, Box<dyn Error>> {
     let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
     slice_partition(dataset, 0, plan.development.bar_count)
+}
+
+fn unsealed_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
+    let end = plan.development.bar_count + plan.validation.bar_count;
+    slice_partition(dataset, 0, end)
 }
 
 fn oos1_partition(

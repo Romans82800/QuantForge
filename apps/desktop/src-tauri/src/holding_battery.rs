@@ -306,11 +306,15 @@ fn run_battery_job(
     let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
-    let oos1 = slice_bars(
-        &decision.dataset,
-        plan.development.bar_count,
-        plan.development.bar_count + plan.validation.bar_count,
-    )?;
+    let oos1 = if plan.validation.bar_count == 0 {
+        None
+    } else {
+        Some(slice_bars(
+            &decision.dataset,
+            plan.development.bar_count,
+            plan.development.bar_count + plan.validation.bar_count,
+        )?)
+    };
     let m1_plan = DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
@@ -360,7 +364,7 @@ fn run_battery_job(
                 &mut bank,
                 &hash,
                 &development,
-                Some(&oos1),
+                oos1.as_ref(),
                 &m1_owned,
                 quote_dataset.as_ref(),
                 &broker,
