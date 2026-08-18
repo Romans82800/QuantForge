@@ -20,7 +20,7 @@ pub use fold_r::FoldRStats;
 pub use engine::{
     EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, continue_evolution,
     continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
-    evolve_new_with_pack_and_quotes, run_holding_battery_and_promote,
+    evolve_new_with_pack_and_quotes, new_databank, run_holding_battery_and_promote,
 };
 pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use methodology::{

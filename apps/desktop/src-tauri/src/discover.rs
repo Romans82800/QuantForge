@@ -11,7 +11,7 @@ use quantforge_data::{
 use quantforge_discover::{
     ConditionBakeoffConfig, ConditionBakeoffReport, DEFAULT_FX_PACK, Databank, DiscoverConfig,
     DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, UniversalGrammarConfig,
-    evolve_new_with_pack_and_quotes, run_condition_bakeoff as evolve_condition_bakeoff,
+    new_databank, run_condition_bakeoff as evolve_condition_bakeoff,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_replacing};
@@ -135,7 +135,7 @@ pub struct DiscoverRequest {
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
-    /// Fraction of ±param neighbors that must survive (default 0.7; Quota uses 0.5).
+    /// Fraction of ±param neighbors that must survive (default 0.55).
     minimum_neighborhood_survival_fraction: Option<f64>,
     /// Broker-local calendar-year folds; every year must pass (strict opt-in).
     calendar_year_folds: Option<bool>,
@@ -443,6 +443,15 @@ pub fn start_discover(
         request.databank_path = automatic_databank_path(&request)?;
     }
     validate_request(&request)?;
+    if request
+        .run_mode
+        .as_deref()
+        .and_then(parse_run_mode)
+        == Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
+    {
+        request.target_databank_elites =
+            Some(request.target_databank_elites.unwrap_or(5_000).max(5_000));
+    }
     {
         let current = state
             .job
@@ -486,7 +495,7 @@ pub fn start_discover(
         breeding_active: false,
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
-        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(8).min(8),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64).min(64),
         max_memory_mb: request.max_memory_mb.unwrap_or(8_192),
         resident_memory_mb: resident_memory_mb().unwrap_or(0),
         promotion_queue_depth: 0,
@@ -1017,22 +1026,15 @@ fn run_discovery(
             } else if !pack.is_empty()
                 && config.multi_symbol_minimum_pass == 0
                 && request.multi_symbol_minimum_pass.is_none()
+                && config.run_mode != quantforge_discover::DiscoverRunMode::QuotaHarvest
             {
                 // Default to 6-of-N when a pack is supplied and the UI left the gate unset.
+                // Quota Harvest skips this: six extra H1 replays per candidate is why
+                // Looked-at crawls versus a single-symbol scout.
                 config.multi_symbol_minimum_pass = 6.min(pack.len() + 1);
             }
-            let bank = evolve_new_with_pack_and_quotes(
-                new_dataset,
-                oos1_dataset.as_ref(),
-                m1_eval,
-                quote_dataset.as_ref(),
-                &broker,
-                &pack,
-                &broker.symbol,
-                config,
-                0,
-            )
-            .map_err(|error| error.to_string())?;
+            let bank = new_databank(new_dataset, m1_eval, &broker, config)
+                .map_err(|error| error.to_string())?;
             (bank, None, 0u64)
         }
         DiscoverMode::Continue => {
@@ -1100,6 +1102,49 @@ fn run_discovery(
     let session =
         quantforge_discover::EvolutionSession::new(&bank.config, evaluation_dataset.bars.len())
             .map_err(|error| error.to_string())?;
+
+    if request.mode == DiscoverMode::New && bank.evaluation_count == 0 {
+        let mut on_progress = |evaluated: &Databank| -> Result<bool, quantforge_discover::DiscoverError> {
+            update_bank(job, evaluated, 0, soft_budget, run_until_stopped, &clock)
+                .map_err(quantforge_discover::DiscoverError::InvalidConfig)?;
+            Ok(!stop.load(Ordering::SeqCst))
+        };
+        session
+            .seed_initial_population(
+                &mut bank,
+                evaluation_dataset,
+                evaluation_oos1,
+                evaluation_m1,
+                quote_dataset.as_ref(),
+                &broker,
+                &pack,
+                &broker.symbol,
+                &mut on_progress,
+            )
+            .map_err(|error| error.to_string())?;
+        publish_live_databank(
+            live_artifact,
+            &request,
+            &bank,
+            &loaded,
+            &quality,
+            &m1_quality,
+            &m1.dataset.data_hash,
+            validation_fraction,
+            sealed_fraction,
+            starting_generation,
+            continuation_recipe_hash.clone(),
+            0,
+            soft_budget,
+            run_until_stopped,
+        )?;
+        update_bank(job, &bank, 0, soft_budget, run_until_stopped, &clock)?;
+        if stop.load(Ordering::SeqCst) {
+            session
+                .flush_promotions(&mut bank)
+                .map_err(|error| error.to_string())?;
+        }
+    }
 
     loop {
         let pausing_now = paused.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst);
@@ -1318,36 +1363,9 @@ fn run_discovery(
             }
         }
 
-        // Quota Harvest: flush in-flight promotions so the count is current.
-        if bank.config.target_databank_elites.is_some() {
-            session
-                .flush_promotions(&mut bank)
-                .map_err(|error| error.to_string())?;
-            publish_live_databank(
-                live_artifact,
-                &request,
-                &bank,
-                &loaded,
-                &quality,
-                &m1_quality,
-                &m1.dataset.data_hash,
-                validation_fraction,
-                sealed_fraction,
-                starting_generation,
-                continuation_recipe_hash.clone(),
-                completed_now,
-                soft_budget,
-                run_until_stopped,
-            )?;
-            update_bank(
-                job,
-                &bank,
-                completed_now,
-                soft_budget,
-                run_until_stopped,
-                &clock,
-            )?;
-        }
+        // Deposited Holding is enough to stop. Waiting out the M1 queue after
+        // every generation serialized scout behind promotion and is why
+        // Looked-at crawled versus the old pipelined runs.
         if quota_met(&bank) {
             break;
         }
@@ -2245,7 +2263,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
-        minimum_development_expectancy_r: request.minimum_development_expectancy_r.unwrap_or(0.0),
+        minimum_development_expectancy_r: request
+            .minimum_development_expectancy_r
+            .unwrap_or(0.25),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
         allow_break_even: request.allow_break_even.unwrap_or(false),
@@ -2261,11 +2281,11 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         random_fill_fraction: request.random_fill_fraction.unwrap_or(0.75),
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
-        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(8).min(8),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64).min(64),
         max_accepted_pool_elites: 10_000,
         max_specialist_pool_elites: 2_000,
-        max_databank_elites: 5_000,
-        max_holding_elites: 5_000,
+        max_databank_elites: 10_000,
+        max_holding_elites: 10_000,
         max_elites_per_niche: 2,
         max_promoted_per_niche: 4,
         max_per_entry_family: 8,
@@ -2291,7 +2311,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
         minimum_neighborhood_survival_fraction: request
             .minimum_neighborhood_survival_fraction
-            .unwrap_or(0.7),
+            .unwrap_or(0.55),
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),

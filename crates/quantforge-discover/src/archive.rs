@@ -33,9 +33,8 @@ pub(crate) fn deposit_to_accepted_pool(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    // Breeding pot is a bag: fingerprint dedup + correlation only. Strategies
-    // with the same behaviour niche are allowed to stack.
-    // Family cap still applies so breeding parents are not one grammar clique.
+    // Breeding pot: island-local niche bags so each island can keep its own
+    // parents. Family cap still applies so one grammar does not eat the bag.
     let decision = deposit_into_stack(
         &mut bank.accepted_pool,
         &mut bank.accepted_coverage_map,
@@ -43,6 +42,7 @@ pub(crate) fn deposit_to_accepted_pool(
         bank.config.max_elites_per_niche,
         bank.config.max_per_entry_family.saturating_mul(2).max(16),
         0,
+        true,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -62,21 +62,16 @@ pub(crate) fn deposit_to_databank(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    let family = entry_family_key(&candidate.strategy);
-    let peer_family_count = bank
-        .holding
-        .iter()
-        .filter(|elite| entry_family_key(&elite.strategy) == family)
-        .count();
-    // Databank is a promoted pool: uses the looser promoted-per-niche cap so
-    // battery survivors are not evicted by niche churn.
+    // Databank is the quota output: fingerprint only. Correlation, niche and
+    // family inventory belong on the breeding pot so Holding can fill to 5–10k.
     let decision = deposit_into_stack(
         &mut bank.elites,
         &mut bank.coverage_map,
-        bank.config.correlation_threshold,
-        bank.config.max_promoted_per_niche,
-        bank.config.max_per_entry_family,
-        peer_family_count,
+        1.0,
+        0,
+        0,
+        0,
+        false,
         candidate,
         DepositDecision::AcceptedToDatabank,
         DepositDecision::ReplacedInDatabank,
@@ -93,19 +88,16 @@ pub(crate) fn deposit_to_holding(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    let family = entry_family_key(&candidate.strategy);
-    let peer_family_count = bank
-        .elites
-        .iter()
-        .filter(|elite| entry_family_key(&elite.strategy) == family)
-        .count();
+    // Fingerprint clone-replace only. Correlation is a breeding-pot rule; applying
+    // it here stalled Holding at ~100 names on one USDJPY sleeve.
     let decision = deposit_into_stack(
         &mut bank.holding,
         &mut bank.holding_coverage_map,
-        bank.config.correlation_threshold,
-        bank.config.max_promoted_per_niche,
-        bank.config.max_per_entry_family,
-        peer_family_count,
+        1.0,
+        0,
+        0,
+        0,
+        false,
         candidate,
         DepositDecision::AcceptedToHolding,
         DepositDecision::ReplacedInHolding,
@@ -139,6 +131,7 @@ pub(crate) fn deposit_to_specialist_pool(
         bank.config.max_elites_per_niche,
         bank.config.max_per_entry_family.saturating_mul(2).max(16),
         0,
+        true,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -177,6 +170,7 @@ fn deposit_into_stack(
     max_per_niche: usize,
     max_per_family: usize,
     peer_family_count: usize,
+    niche_per_island: bool,
     candidate: CandidateEvaluation,
     accepted: DepositDecision,
     replaced: DepositDecision,
@@ -196,6 +190,7 @@ fn deposit_into_stack(
         .fold(0.0_f64, f64::max);
     let novelty = quantized(1.0 - maximum_correlation.clamp(0.0, 1.0));
     let complexity = candidate.strategy.complexity().score;
+    let island_id = candidate.island_id;
 
     let fingerprint_index = entries
         .iter()
@@ -277,7 +272,10 @@ fn deposit_into_stack(
         let niche_indexes: Vec<usize> = entries
             .iter()
             .enumerate()
-            .filter(|(_, elite)| elite.niche == niche)
+            .filter(|(_, elite)| {
+                elite.niche == niche
+                    && (!niche_per_island || elite.island_id == island_id)
+            })
             .map(|(index, _)| index)
             .collect();
         if niche_indexes.len() >= max_per_niche {
@@ -892,6 +890,62 @@ mod tests {
     }
 
     #[test]
+    fn pot_niche_cap_is_per_island() {
+        let mut bank = bank(0.99);
+        bank.config.max_elites_per_niche = 1;
+        bank.config.max_per_entry_family = 64;
+        let first = deposit_to_accepted_pool(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(7, 0),
+                result: profitable_result(),
+                generation: 0,
+                island_id: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, DepositDecision::AcceptedToPot);
+
+        let mut other_island = profitable_result();
+        for (index, point) in other_island.equity.iter_mut().enumerate() {
+            point.equity = 100_000.0 + (index as f64).sin() * 180.0 + index as f64 * 4.0;
+        }
+        other_island.metrics.return_percent = 1.2;
+        let accepted = deposit_to_accepted_pool(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(7, 3),
+                result: other_island,
+                generation: 0,
+                island_id: 1,
+                is_expectancy: 1.2,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted, DepositDecision::AcceptedToPot);
+        assert_eq!(bank.accepted_pool.len(), 2);
+        let islands: Vec<u16> = bank.accepted_pool.iter().map(|elite| elite.island_id).collect();
+        assert!(islands.contains(&0) && islands.contains(&1));
+    }
+
+    #[test]
     fn databank_stacks_distinct_strategies_in_the_same_niche() {
         let mut bank = bank(0.99);
         let first = deposit_to_databank(
@@ -949,10 +1003,10 @@ mod tests {
     }
 
     #[test]
-    fn promoted_pool_caps_entry_family_share() {
+    fn holding_stacks_uncorrelated_names_in_the_same_entry_family() {
         let mut bank = bank(0.99);
         bank.config.max_per_entry_family = 1;
-        bank.config.max_promoted_per_niche = 0;
+        bank.config.max_promoted_per_niche = 1;
         let family = entry_family_key(&generate_seed(7, 0));
         let first = deposit_to_holding(
             &mut bank,
@@ -975,7 +1029,6 @@ mod tests {
         .unwrap();
         assert_eq!(first, DepositDecision::AcceptedToHolding);
 
-        // Same family, uncorrelated equity — must replace or reject, not grow.
         let mut second_result = profitable_result();
         for (index, point) in second_result.equity.iter_mut().enumerate() {
             point.equity = 100_000.0 + (index as f64) * 17.0 + (index as f64).cos() * 40.0;
@@ -1011,13 +1064,53 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            matches!(
-                second,
-                DepositDecision::RejectedFamilyNotImproved | DepositDecision::ReplacedInHolding
-            ),
-            "got {second:?}"
-        );
-        assert_eq!(bank.holding.len(), 1);
+        assert_eq!(second, DepositDecision::AcceptedToHolding);
+        assert_eq!(bank.holding.len(), 2);
+    }
+
+    #[test]
+    fn holding_accepts_correlated_distinct_fingerprints() {
+        let mut bank = bank(0.50);
+        let first = deposit_to_holding(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(7, 0),
+                result: profitable_result(),
+                generation: 0,
+                island_id: 0,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, DepositDecision::AcceptedToHolding);
+        let second = deposit_to_holding(
+            &mut bank,
+            CandidateEvaluation {
+                strategy: generate_seed(11, 4),
+                result: profitable_result(),
+                generation: 1,
+                island_id: 1,
+                is_expectancy: 1.0,
+                oos1_expectancy: None,
+                oos1_expectancy_ratio: None,
+                observed_trade_sharpe: None,
+                expected_max_lucky_sharpe: None,
+                deflated_trade_sharpe: None,
+                multi_symbol_results: Vec::new(),
+                gate_results: Vec::new(),
+                robustness: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(second, DepositDecision::AcceptedToHolding);
+        assert_eq!(bank.holding.len(), 2);
     }
 }

@@ -3285,7 +3285,7 @@ function DiscoverWorkspace({
     depositMinimumProfitFactor: 1,
     depositMinimumReturnDrawdown: 0,
     minimumM1ReturnRetention: 0.80,
-    minimumDevelopmentExpectancyR: 0,
+    minimumDevelopmentExpectancyR: 0.25,
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: true,
     simpleExits: true,
@@ -3819,20 +3819,22 @@ function DiscoverWorkspace({
                         runMode: "quota_harvest",
                         mutateAfterElites: 25,
                         earlyStopPotElites: null,
-                        targetDatabankElites: 100,
+                        targetDatabankElites: 5000,
                         initialCandidates: Math.max(current.initialCandidates ?? 500, 1000),
                         batchSize: Math.max(current.batchSize ?? 200, 300),
                         randomFillFraction: Math.max(current.randomFillFraction ?? 0.75, 0.75),
-                        robustnessMonteCarloTrials: 80,
-                        robustnessNeighborhoodSamples: 5,
-                        minimumNeighborhoodSurvivalFraction: 0.5,
+                        robustnessMonteCarloTrials: 1000,
+                        robustnessNeighborhoodSamples: 100,
+                        minimumNeighborhoodSurvivalFraction: 0.55,
+                        minimumDevelopmentExpectancyR: 0.25,
                         requireM1Robustness: true,
                         requireM1Precision: true,
                         simpleExits: true,
+                        multiSymbolMinimumPass: 0,
                       }))
                     }
                   >
-                    Quota (100)
+                    Quota (5,000)
                   </button>
                   <button
                     type="button"
@@ -3861,7 +3863,7 @@ function DiscoverWorkspace({
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <p className="recipe-summary">
-                    Stops at 100 Holding names. Fold-stable Development R is the filter. Sealed holdout is 33% and never used to pick.
+                    Stops at {formatNumber(Math.max(form.targetDatabankElites ?? 5000, 5000))} Holding names (hard cap 10,000). Fold-stable Development R above 0.25R is the filter. Sealed holdout is 33% and never used to pick. Pack 6-of-N is off so scout stays on the primary symbol.
                   </p>
                 )}
                 {form.runMode === "high_performance_islands" && (

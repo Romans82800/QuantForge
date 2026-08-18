@@ -855,7 +855,7 @@ struct ChallengeArgs {
     neighborhood_samples: usize,
     #[arg(long, default_value_t = 0.1)]
     parameter_perturbation_fraction: f64,
-    #[arg(long, default_value_t = 0.7)]
+    #[arg(long, default_value_t = 0.55)]
     minimum_neighborhood_survival_fraction: f64,
     #[arg(long, default_value_t = 0.5)]
     minimum_neighborhood_return_ratio: f64,
@@ -4730,7 +4730,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         },
         search_ranges: quantforge_discover::SearchRangeProfile::default(),
         oos1_expectancy_retention: 0.7,
-        minimum_development_expectancy_r: 0.0,
+        minimum_development_expectancy_r: 0.25,
         require_m1_precision: false,
         simple_exits: true,
         allow_break_even: false,
@@ -4749,8 +4749,8 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         promotion_queue_capacity: 64,
         max_accepted_pool_elites: 10_000,
         max_specialist_pool_elites: 2_000,
-        max_databank_elites: 5_000,
-        max_holding_elites: 5_000,
+        max_databank_elites: 10_000,
+        max_holding_elites: 10_000,
         max_elites_per_niche: 2,
         max_promoted_per_niche: 4,
         max_per_entry_family: 8,
@@ -4769,7 +4769,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
-        minimum_neighborhood_survival_fraction: 0.7,
+        minimum_neighborhood_survival_fraction: 0.55,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,

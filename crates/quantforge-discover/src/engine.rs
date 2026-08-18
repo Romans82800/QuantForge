@@ -224,11 +224,19 @@ fn evaluate_and_deposit(
                 };
                 let pot_decision = deposit_to_accepted_pool(bank, pot_evaluation.clone())?;
                 bank.telemetry.record(pot_decision);
-                if matches!(
-                    pot_decision,
-                    DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot
-                ) {
-                    pot_promotions.push(pot_evaluation);
+                // The pot is a small island/niche breeding bag. Holding is the
+                // accumulating output. Diversity rejects still get a shot at M1
+                // when the queue has room; they must not stall Looked-at.
+                match pot_decision {
+                    DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot => {
+                        pot_promotions.push((pot_evaluation, true));
+                    }
+                    DepositDecision::RejectedCorrelated
+                    | DepositDecision::RejectedNicheNotImproved
+                    | DepositDecision::RejectedFamilyNotImproved => {
+                        pot_promotions.push((pot_evaluation, false));
+                    }
+                    _ => {}
                 }
             }
             Ok(CandidateOutcome::CoarseRejected) => {
@@ -267,8 +275,12 @@ fn evaluate_and_deposit(
             quote_dataset,
             broker,
         );
-        for pot_evaluation in pot_promotions {
-            promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
+        for (pot_evaluation, blocking) in pot_promotions {
+            if blocking {
+                promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
+            } else {
+                promotion.try_enqueue(pot_evaluation, Arc::clone(&context), bank)?;
+            }
         }
     }
     promotion.snapshot_telemetry(bank);
@@ -404,8 +416,7 @@ impl PromotionPipeline {
         context: Arc<PromotionContext>,
         bank: &mut Databank,
     ) -> Result<(), DiscoverError> {
-        // Prefer backpressure over dropping pot admissions: wait until a slot
-        // frees, draining any finished promotions while we wait.
+        // Pot admits wait for a slot. Diversity overflow must not stall H1.
         loop {
             self.drain_completed(bank)?;
             let depth = self.shared.inflight.load(Ordering::SeqCst);
@@ -425,7 +436,33 @@ impl PromotionPipeline {
                 .wait_timeout(guard, Duration::from_millis(25))
                 .map_err(|_| DiscoverError::InvalidConfig("promotion wait poisoned".into()))?;
         }
+        self.spawn_promotion(pot_evaluation, context, bank)
+    }
 
+    /// Enqueue if a slot is free. Returns false when the M1 queue is full so
+    /// the H1 scout can keep moving.
+    fn try_enqueue(
+        &self,
+        pot_evaluation: CandidateEvaluation,
+        context: Arc<PromotionContext>,
+        bank: &mut Databank,
+    ) -> Result<bool, DiscoverError> {
+        self.drain_completed(bank)?;
+        if self.shared.inflight.load(Ordering::SeqCst) >= self.shared.capacity {
+            bank.telemetry.promotion_backpressure_events += 1;
+            self.snapshot_telemetry(bank);
+            return Ok(false);
+        }
+        self.spawn_promotion(pot_evaluation, context, bank)?;
+        Ok(true)
+    }
+
+    fn spawn_promotion(
+        &self,
+        pot_evaluation: CandidateEvaluation,
+        context: Arc<PromotionContext>,
+        bank: &mut Databank,
+    ) -> Result<(), DiscoverError> {
         self.shared.inflight.fetch_add(1, Ordering::SeqCst);
         bank.telemetry.promotions_enqueued += 1;
         self.snapshot_telemetry(bank);
@@ -999,25 +1036,16 @@ pub fn evolve_new_with_pack(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn evolve_new_with_pack_and_quotes(
+pub fn new_databank(
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
-    quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
-    pack: &[PackSymbol],
-    primary_symbol: &str,
     mut config: DiscoverConfig,
-    generations: u64,
 ) -> Result<Databank, DiscoverError> {
     config.apply_run_mode();
     config.validate()?;
     broker.validate()?;
-    for market in pack {
-        market.broker.validate()?;
-    }
-    let mut bank = Databank {
+    Ok(Databank {
         schema_version: DATABANK_SCHEMA_VERSION,
         grammar_version: GRAMMAR_VERSION.into(),
         data_hash: dataset.data_hash.clone(),
@@ -1035,28 +1063,46 @@ pub fn evolve_new_with_pack_and_quotes(
         holding: Vec::new(),
         holding_coverage_map: BTreeMap::new(),
         telemetry: Default::default(),
-    };
+    })
+}
 
-    let initial = (0..bank.config.initial_candidates)
+fn generate_initial_population(config: &DiscoverConfig) -> Vec<StrategyIr> {
+    (0..config.initial_candidates)
         .map(|index| {
-            let island_id = index % bank.config.effective_island_count();
-            let mut rng = rng_for(bank.config.seed, 99, index as u64);
+            let island_id = index % config.effective_island_count();
+            let mut rng = rng_for(config.seed, 99, index as u64);
             let mut seeded = build_seed(
                 SearchFamily::Universal,
                 &mut rng,
                 format!("i{island_id}-seed-{index}"),
-                bank.config
-                    .universal_grammar
-                    .maximum_entry_conditions
-                    .max(1),
+                config.universal_grammar.maximum_entry_conditions.max(1),
                 true,
-                bank.config.market_entries_only(),
-                &bank.config.universal_grammar,
+                config.market_entries_only(),
+                &config.universal_grammar,
             );
-            apply_search_ranges(&mut seeded, &mut rng, &bank.config.search_ranges);
-            apply_production_policy(seeded, &bank.config)
+            apply_search_ranges(&mut seeded, &mut rng, &config.search_ranges);
+            apply_production_policy(seeded, config)
         })
-        .collect();
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_new_with_pack_and_quotes(
+    dataset: &BarDataset,
+    oos1_dataset: Option<&BarDataset>,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    pack: &[PackSymbol],
+    primary_symbol: &str,
+    config: DiscoverConfig,
+    generations: u64,
+) -> Result<Databank, DiscoverError> {
+    for market in pack {
+        market.broker.validate()?;
+    }
+    let mut bank = new_databank(dataset, m1_dataset, broker, config)?;
+    let initial = generate_initial_population(&bank.config);
     let pool = build_worker_pool(bank.config.resolved_scout_worker_threads())?;
     let promotion = PromotionPipeline::new(
         bank.config.resolved_promotion_worker_threads(),
@@ -1198,12 +1244,11 @@ impl EvolutionSession {
     /// `decision_bars` must be the bar count of the one decision dataset this
     /// session will be advanced against; buffers are keyed to those bars.
     pub fn new(config: &DiscoverConfig, decision_bars: usize) -> Result<Self, DiscoverError> {
-        // Robustness replays are memory-heavy and a large queued backlog adds
-        // no search quality.  Keep at most two active jobs and eight retained
-        // candidates even when an older profile requested the legacy 64-job
-        // queue.  Scout throughput remains independently configurable.
-        let promotion_workers = config.resolved_promotion_worker_threads().clamp(1, 2);
-        let promotion_capacity = config.promotion_queue_capacity.clamp(1, 8);
+        // Holding admission is one M1 replay; the old 2-worker / 8-slot cap was
+        // sized for the full neighborhood battery sitting on this queue, which
+        // Quota no longer does. Scout throughput stays independently configurable.
+        let promotion_workers = config.resolved_session_promotion_workers();
+        let promotion_capacity = config.resolved_session_promotion_capacity();
         Ok(Self {
             scout_pool: build_worker_pool(config.resolved_scout_worker_threads())?,
             promotion: PromotionPipeline::new(promotion_workers, promotion_capacity)?,
@@ -1278,6 +1323,52 @@ impl EvolutionSession {
             &self.indicator_cache,
         )?;
         Ok(bank)
+    }
+
+    /// Evaluate the grammar seed population in scout-sized chunks so a live
+    /// worker can publish Looked-at before the first generation starts.
+    ///
+    /// Does not flush M1 holding admissions: those keep running on the session
+    /// promotion pool while later generations scout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_initial_population<F>(
+        &self,
+        bank: &mut Databank,
+        dataset: &BarDataset,
+        oos1_dataset: Option<&BarDataset>,
+        m1_dataset: &BarDataset,
+        quote_dataset: Option<&QuoteBarDataset>,
+        broker: &SymbolSpecification,
+        pack: &[PackSymbol],
+        primary_symbol: &str,
+        on_progress: &mut F,
+    ) -> Result<(), DiscoverError>
+    where
+        F: FnMut(&Databank) -> Result<bool, DiscoverError>,
+    {
+        let initial = generate_initial_population(&bank.config);
+        let chunk = bank.config.batch_size.max(64);
+        for piece in initial.chunks(chunk) {
+            evaluate_and_deposit(
+                bank,
+                piece.to_vec(),
+                dataset,
+                oos1_dataset,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                pack,
+                primary_symbol,
+                0,
+                self.scout_pool.as_ref(),
+                &self.promotion,
+                &self.indicator_cache,
+            )?;
+            if !on_progress(bank)? {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2357,7 +2448,56 @@ mod tests {
         // Ten deterministic axis neighbors come first; sample well past them so the
         // randomized joint draw actually perturbs entry indicator periods.
         assert!(config.robustness_neighborhood_samples >= 100);
-        assert!(config.minimum_neighborhood_survival_fraction >= 0.65);
+        assert!(config.minimum_neighborhood_survival_fraction >= 0.55);
+    }
+
+    #[test]
+    fn quota_holding_is_not_capped_by_family_or_niche_inventory() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
+        config.apply_run_mode();
+        assert_eq!(config.target_databank_elites, Some(5_000));
+        assert!(config.max_holding_elites >= 10_000);
+        // Breeding pot still has a niche bag; Holding ignores inventory so a
+        // 5k quota cannot freeze at three full families or a 100-name corr wall.
+        assert!(config.max_elites_per_niche >= 2);
+    }
+
+    #[test]
+    fn quota_mode_floors_leftover_500_and_skips_pack_replays() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
+        config.target_databank_elites = Some(500);
+        config.multi_symbol_minimum_pass = 6;
+        config.apply_run_mode();
+        assert_eq!(config.target_databank_elites, Some(5_000));
+        assert_eq!(config.multi_symbol_minimum_pass, 0);
+    }
+
+    #[test]
+    fn quota_mode_keeps_an_explicit_target_above_5000() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
+        config.target_databank_elites = Some(10_000);
+        config.apply_run_mode();
+        assert_eq!(config.target_databank_elites, Some(10_000));
+    }
+
+    #[test]
+    fn holding_admission_does_not_inherit_the_full_battery_worker_cap() {
+        let mut holding = DiscoverConfig::default();
+        holding.build_to_holding = true;
+        holding.promotion_worker_threads = 8;
+        holding.promotion_queue_capacity = 64;
+        assert_eq!(holding.resolved_session_promotion_workers(), 8);
+        assert_eq!(holding.resolved_session_promotion_capacity(), 64);
+
+        let mut battery = DiscoverConfig::default();
+        battery.build_to_holding = false;
+        battery.promotion_worker_threads = 8;
+        battery.promotion_queue_capacity = 64;
+        assert_eq!(battery.resolved_session_promotion_workers(), 2);
+        assert_eq!(battery.resolved_session_promotion_capacity(), 8);
     }
 
     #[test]

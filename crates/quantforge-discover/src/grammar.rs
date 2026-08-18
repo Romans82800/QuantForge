@@ -890,17 +890,6 @@ fn universal_exit_atoms(
     atoms
 }
 
-/// Build mirrored long/short entries with an exact atom AND-count.
-pub(crate) fn family_entries_with_count(
-    family: SearchFamily,
-    rng: &mut ChaCha8Rng,
-    atom_count: usize,
-) -> (BoolExpr, BoolExpr) {
-    let atoms = family_entry_atoms(family, rng);
-    let count = atom_count.min(atoms.len()).max(1);
-    select_entry_atoms(&atoms, rng, count)
-}
-
 fn select_entry_atoms(
     atoms: &[(BoolExpr, BoolExpr)],
     rng: &mut ChaCha8Rng,
