@@ -322,6 +322,9 @@ struct EvolveArgs {
     /// Number of generations to run now (additional generations on continue).
     #[arg(long, default_value_t = 50)]
     generations: u64,
+    /// Broker-local calendar year of the first bar kept (2016 or 2020).
+    #[arg(long, default_value_t = quantforge_data::DEFAULT_HISTORY_START_YEAR)]
+    history_start_year: u16,
     #[arg(long)]
     initial: Option<usize>,
     #[arg(long)]
@@ -4000,13 +4003,21 @@ fn join_windows_relative(base: &Path, relative: &str) -> PathBuf {
 }
 
 fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
-    let (dataset, metadata) = load_source(&args.source)?;
+    let (mut dataset, metadata) = load_source(&args.source)?;
     let m1_source = DataSourceArgs {
         path: args.m1.clone(),
         source_timezone: args.m1_source_timezone,
         metadata: args.m1_metadata.clone(),
     };
-    let (m1_dataset, m1_metadata) = load_source(&m1_source)?;
+    let (mut m1_dataset, m1_metadata) = load_source(&m1_source)?;
+    let history_start_year = if args.continue_existing {
+        let previous: EvolveArtifact = read_json(&args.databank)?;
+        previous.databank.config.history_start_year
+    } else {
+        quantforge_data::normalize_history_start_year(args.history_start_year)?
+    };
+    dataset.trim_before_calendar_year(history_start_year)?;
+    m1_dataset.trim_before_calendar_year(history_start_year)?;
     let quality = DataQualityReport::analyze(&dataset);
     if quality.grade == QualityGrade::Fail && !args.allow_failed_data {
         return Err(format!(
@@ -4765,7 +4776,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             quantforge_discover::MONTE_CARLO_P80_PROFIT_RETENTION,
         robustness_monte_carlo_max_drawdown_ratio:
             quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO,
-        robustness_neighborhood_samples: 100,
+        robustness_neighborhood_samples: 200,
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
@@ -4773,6 +4784,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        history_start_year: quantforge_data::normalize_history_start_year(args.history_start_year)?,
         island_count: 1,
         migration_interval: 0,
         migration_elites: 2,

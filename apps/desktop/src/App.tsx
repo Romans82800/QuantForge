@@ -2303,12 +2303,45 @@ function ParameterNeighborhoodPanel({
       </RobustnessShell>
     );
   }
-  const passed = evidence.survival_fraction >= evidence.required_survival_fraction;
   const ratio = (value: number | null | undefined) =>
     value === null || value === undefined ? "—" : `${(value * 100).toFixed(1)}%`;
   const samples = evidence.samples ?? [];
   const original = evidence.original_metrics ?? null;
+  const recoveryValues = samples
+    .map((sample) => {
+      if (typeof sample.recovery_factor === "number" && Number.isFinite(sample.recovery_factor)) {
+        return sample.recovery_factor;
+      }
+      if (typeof sample.max_drawdown === "number" && sample.max_drawdown > 1e-12) {
+        return sample.net_profit / sample.max_drawdown;
+      }
+      return null;
+    })
+    .filter((value): value is number => value !== null);
+  const originalRecovery = (() => {
+    const direct = metricNumber(original, "recovery_factor");
+    if (direct !== null) return direct;
+    const profit = metricNumber(original, "net_profit");
+    const dd = metricNumber(original, "max_drawdown");
+    if (profit === null || dd === null || dd <= 1e-12) return null;
+    return profit / dd;
+  })();
+  const recoveryBand =
+    evidence.original_recovery_to_median === null || evidence.original_recovery_to_median === undefined
+      ? null
+      : evidence.original_recovery_to_median;
+  const recoveryBandPassed = evidence.passed_recovery_median_band;
+  const passed =
+    evidence.survival_fraction >= evidence.required_survival_fraction &&
+    recoveryBandPassed !== false;
   const distributionMetrics = ([
+    {
+      key: "recovery_factor",
+      label: "Ret / DD",
+      values: recoveryValues,
+      original: originalRecovery,
+      format: (value: number) => value.toFixed(2),
+    },
     {
       key: "net_profit",
       label: "Net profit",
@@ -2381,6 +2414,12 @@ function ParameterNeighborhoodPanel({
           ["Neighbors", `${formatNumber(evidence.surviving_samples)} / ${formatNumber(evidence.samples_evaluated)} survived`],
           ["Requested", formatNumber(evidence.samples_requested)],
           [
+            "Ret/DD orig ÷ median",
+            recoveryBand === null
+              ? "—"
+              : `${(recoveryBand * 100).toFixed(0)}% (keep 85–125%)`,
+          ],
+          [
             "ADX plateau",
             evidence.plateau_neighbors > 0
               ? `${formatNumber(evidence.plateau_surviving)} / ${formatNumber(evidence.plateau_neighbors)} (${ratio(evidence.plateau_survival_fraction)})`
@@ -2424,10 +2463,12 @@ function ParameterNeighborhoodPanel({
             </table>
           </div>
           <p className="param-hist-caption">
-            {evidence.method === "systematic_axis_plus_seeded_joint"
+            {evidence.method === "h1_cached_axis_plus_seeded_joint"
+              ? "Neighbours replay on the selected TF with a shared indicator cache, not M1 fills. "
+              : evidence.method === "systematic_axis_plus_seeded_joint"
               ? "Each execution axis is tested at both sides of the band before joint perturbations. "
               : "One bar per group of neighbours, so a tall single bar means the plateau is flat and a wide spread means small parameter changes move the result. "}
-            The dashed line is the original strategy: sitting at the edge of the spread is the warning sign.
+            The dashed line is the original strategy. Ret/DD must sit between 85% and 125% of the neighbourhood median or the name is treated as a tail fit.
           </p>
           <div className="param-hist-grid">
             {distributionMetrics.map((metric) => (
@@ -2479,7 +2520,7 @@ function MetricHistogram({
   const min = Math.min(...anchors);
   const max = Math.max(...anchors);
   const span = Math.max(max - min, Math.max(Math.abs(max), 1e-9) * 1e-6);
-  const bins = Math.min(12, Math.max(5, Math.round(Math.sqrt(values.length))));
+  const bins = Math.min(24, Math.max(8, Math.round(Math.sqrt(values.length))));
   const counts = Array.from({ length: bins }, () => 0);
   for (const value of values) {
     const index = Math.min(bins - 1, Math.floor(((value - min) / span) * bins));
@@ -3386,6 +3427,7 @@ function DiscoverWorkspace({
     promotionSplit: true,
     validationFraction: 0,
     sealedFraction: 1 / 3,
+    historyStartYear: 2016,
     ...preset,
   }));
   const [discoverProfiles, setDiscoverProfiles] = useState<SavedDiscoverProfile[]>([]);
@@ -3655,6 +3697,7 @@ function DiscoverWorkspace({
             promotionSplit: null,
             validationFraction: null,
             sealedFraction: null,
+            historyStartYear: null,
           }
         : sourceBoundForm;
       const started = await startDiscover(request);
@@ -3716,6 +3759,7 @@ function DiscoverWorkspace({
         validationFraction: form.validationFraction ?? 0,
         sealedFraction: form.sealedFraction ?? 1 / 3,
         entryConditionCounts: testerCounts,
+        historyStartYear: form.historyStartYear ?? 2016,
       });
       setTesterReport(report);
     } catch (reason) {
@@ -3988,6 +4032,32 @@ function DiscoverWorkspace({
                 <button type="button" className={form.decisionTimeframe === "M15" ? "active" : ""} onClick={() => update("decisionTimeframe", "M15")}>M15</button>
               </div>
             </div>
+            <div className="field-row">
+              <span>History start <small>required</small></span>
+              <div className="mode-toggle">
+                <button
+                  type="button"
+                  disabled={active || busy || form.mode !== "new"}
+                  className={(form.historyStartYear ?? 2016) === 2016 ? "active" : ""}
+                  onClick={() => update("historyStartYear", 2016)}
+                >
+                  2016
+                </button>
+                <button
+                  type="button"
+                  disabled={active || busy || form.mode !== "new"}
+                  className={form.historyStartYear === 2020 ? "active" : ""}
+                  onClick={() => update("historyStartYear", 2020)}
+                >
+                  2020
+                </button>
+              </div>
+            </div>
+            <p className="immutable-note">
+              {form.historyStartYear === 2020
+                ? "Drops bars before 1 Jan 2020 broker time from the 2016 pack. IS and sealed OOS fractions are taken on the remaining history."
+                : "Uses the full ICMarkets 2016–present pack. Continue runs keep the year sealed in the databank."}
+            </p>
             <p className="immutable-note">M15 is built directly from the selected M1 export, keeping decision candles aligned with execution chronology.</p>
             <details className="advanced-settings">
               <summary>Bound paths (auto-filled from symbol)</summary>
@@ -4607,6 +4677,7 @@ function DiscoverContractSummary({
           <strong>{form.decisionTimeframe ?? "—"}</strong>
           <span>{form.runMode === "fast_scout" ? "Fast scout" : form.runMode === "quota_harvest" ? "Quota harvest" : form.runMode === "high_performance_islands" ? "High-performance islands" : "Full harvest"}</span>
         </div>
+        <SummaryLine label="History start" value={String(form.historyStartYear ?? 2016)} />
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
         <SummaryLine label="Closed-bar shifts" value={grammar ? `${grammar.minimumShift}–${grammar.maximumShift}` : "—"} />

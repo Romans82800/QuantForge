@@ -6,7 +6,10 @@ use quantforge_core::FloatPolicy;
 use quantforge_data::{
     BarDataset, QuoteBarDataset, bar_content_hash, infer_median_interval_ms, quote_bar_content_hash,
 };
-use quantforge_eval::{ScoutResult, ScoutTelemetry};
+use quantforge_eval::{
+    IndicatorBufferCache, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry,
+    evaluate_strategy_cached,
+};
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
 use quantforge_quality::{
     DevelopmentCpcvPlan, monte_carlo_trade_resampling_with_skip, parameter_permutation_neighbors,
@@ -91,6 +94,12 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 /// enough that a genuinely robust plateau survives.
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
 /// SQX-style trade manipulation: each resampled path removes 10% of fills.
+/// Original recovery factor must sit this close to the neighbourhood median.
+/// Knife-edge fits land on the tails of the ret/DD histogram and decay in holdout.
+pub const PARAM_RECOVERY_MEDIAN_LOW: f64 = 0.85;
+pub const PARAM_RECOVERY_MEDIAN_HIGH: f64 = 1.25;
+/// Histogram of ret/DD is too noisy below this many finite neighbour recoveries.
+const PARAM_RECOVERY_BAND_MIN_SAMPLES: usize = 20;
 
 /// M1 baseline + Selected-TF retention only. Used for Holding admission so
 /// Discover stays fast while still rejecting pure H1 fantasy.
@@ -312,6 +321,11 @@ pub fn run_m1_predeposit_robustness(
         return Err(RobustnessReject::MonteCarlo);
     }
 
+    // Parameter surface is a decision-TF property. M1 fills are already gated by
+    // retention; replaying every neighbour on M1 made 200–400 samples unusable.
+    // Cached H1 reuses indicator buffers across SL/TP-only permutations.
+    let scout = neighborhood_scout_config(config);
+    let cache = IndicatorBufferCache::new(is_decision.bars.len());
     let mut surviving = 0usize;
     let mut evaluated_samples = 0usize;
     let mut neighborhood_samples = Vec::with_capacity(config.neighborhood_samples);
@@ -333,31 +347,17 @@ pub fn run_m1_predeposit_robustness(
             .ok()
         });
         let Some(neighbor) = neighbor else { continue };
-        let Ok(result) = evaluate_strategy_m1_with_optional_quotes(
-            &neighbor,
-            is_decision,
-            m1_dataset,
-            quote_dataset,
-            broker,
-            &judge,
-        ) else {
+        let Ok(result) =
+            evaluate_strategy_cached(&neighbor, is_decision, broker, &scout, &cache)
+        else {
             continue;
         };
         evaluated_samples += 1;
-        let survived = neighborhood_survives(&result.metrics, &baseline.metrics, config);
+        let survived = neighborhood_survives(&result.metrics, h1_metrics, config);
         if survived {
             surviving += 1;
         }
-        neighborhood_samples.push(ParameterNeighborhoodSample {
-            sample_index: sample,
-            net_profit: result.metrics.net_profit,
-            return_percent: result.metrics.return_percent,
-            max_drawdown_percent: result.metrics.max_drawdown_percent,
-            trade_count: result.metrics.trade_count,
-            profit_factor: result.metrics.profit_factor,
-            sharpe_ratio: result.metrics.sharpe_ratio,
-            survived,
-        });
+        neighborhood_samples.push(neighborhood_sample(sample, &result.metrics, survived));
     }
     // A neighbor that could not be built or replayed says nothing about the width of
     // the plateau, so score against the samples that actually ran. Still demand that
@@ -367,6 +367,18 @@ pub fn run_m1_predeposit_robustness(
     }
     let survival = surviving as f64 / evaluated_samples.max(1) as f64;
     if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+    let recoveries: Vec<f64> = neighborhood_samples
+        .iter()
+        .filter_map(|sample| sample.recovery_factor)
+        .collect();
+    let median_recovery_factor = median_finite(&recoveries);
+    let original_recovery_to_median =
+        recovery_to_median_ratio(h1_metrics.recovery_factor(), &recoveries);
+    let passed_recovery_median_band =
+        passes_recovery_median_band(original_recovery_to_median, recoveries.len());
+    if !passed_recovery_median_band {
         return Err(RobustnessReject::ParamNeighborhood);
     }
 
@@ -381,16 +393,9 @@ pub fn run_m1_predeposit_robustness(
         plateau_surviving = plateau_neighbors
             .iter()
             .filter_map(|neighbor| {
-                evaluate_strategy_m1_with_optional_quotes(
-                    neighbor,
-                    is_decision,
-                    m1_dataset,
-                    quote_dataset,
-                    broker,
-                    &judge,
-                )
-                .ok()
-                .map(|result| neighborhood_survives(&result.metrics, &baseline.metrics, config))
+                evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache)
+                    .ok()
+                    .map(|result| neighborhood_survives(&result.metrics, h1_metrics, config))
             })
             .filter(|passed| *passed)
             .count();
@@ -408,7 +413,7 @@ pub fn run_m1_predeposit_robustness(
             sequential_walk_forward: Some(sequential_walk_forward),
             monte_carlo: mc,
             parameter_neighborhood: ParameterNeighborhoodEvidence {
-                method: "systematic_axis_plus_seeded_joint".into(),
+                method: "h1_cached_axis_plus_seeded_joint".into(),
                 perturbation_fraction: config.parameter_perturbation_fraction,
                 samples_requested: config.neighborhood_samples,
                 samples_evaluated: evaluated_samples,
@@ -418,7 +423,10 @@ pub fn run_m1_predeposit_robustness(
                 plateau_neighbors: plateau_neighbors.len(),
                 plateau_surviving,
                 plateau_survival_fraction,
-                original_metrics: Some(baseline.metrics.clone()),
+                original_metrics: Some(h1_metrics.clone()),
+                median_recovery_factor,
+                original_recovery_to_median,
+                passed_recovery_median_band: Some(passed_recovery_median_band),
                 samples: neighborhood_samples,
             },
         }),
@@ -494,6 +502,77 @@ fn m1_retention_evidence(
         return_retention: ratio(m1.return_percent, h1.return_percent),
         trade_retention: ratio(m1.trade_count as f64, h1.trade_count as f64),
         drawdown_expansion: ratio(m1.max_drawdown_percent, h1.max_drawdown_percent),
+    }
+}
+
+fn neighborhood_scout_config(config: &RobustnessConfig) -> ScoutConfig {
+    ScoutConfig {
+        initial_balance: config.initial_balance,
+        same_bar_policy: SameBarPolicy::Conservative,
+        costs: config.costs.clone(),
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+        abandon_above_drawdown_percent: None,
+    }
+}
+
+fn neighborhood_sample(
+    sample_index: usize,
+    metrics: &quantforge_eval::BacktestMetrics,
+    survived: bool,
+) -> ParameterNeighborhoodSample {
+    let recovery = metrics.recovery_factor();
+    ParameterNeighborhoodSample {
+        sample_index,
+        net_profit: metrics.net_profit,
+        return_percent: metrics.return_percent,
+        max_drawdown_percent: metrics.max_drawdown_percent,
+        max_drawdown: metrics.max_drawdown,
+        trade_count: metrics.trade_count,
+        profit_factor: metrics.profit_factor,
+        sharpe_ratio: metrics.sharpe_ratio,
+        recovery_factor: recovery.is_finite().then_some(recovery),
+        survived,
+    }
+}
+
+fn median_finite(values: &[f64]) -> Option<f64> {
+    let mut sorted: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    })
+}
+
+/// Original recovery ÷ neighbourhood-median recovery when the histogram is dense enough.
+pub fn recovery_to_median_ratio(original: f64, neighbor_recoveries: &[f64]) -> Option<f64> {
+    if !original.is_finite() || original <= 0.0 {
+        return None;
+    }
+    let median = median_finite(neighbor_recoveries)?;
+    if !median.is_finite() || median.abs() < 1e-12 {
+        return None;
+    }
+    Some(original / median)
+}
+
+pub fn passes_recovery_median_band(ratio: Option<f64>, finite_neighbors: usize) -> bool {
+    if finite_neighbors < PARAM_RECOVERY_BAND_MIN_SAMPLES {
+        return true;
+    }
+    match ratio {
+        Some(value) => (PARAM_RECOVERY_MEDIAN_LOW..=PARAM_RECOVERY_MEDIAN_HIGH).contains(&value),
+        None => false,
     }
 }
 
@@ -1400,5 +1479,29 @@ mod tests {
         assert!(!passes_sqx_m1_retention(&h1, &m1, 0.95));
         m1.return_percent = 9.5;
         assert!(passes_sqx_m1_retention(&h1, &m1, 0.95));
+    }
+
+    #[test]
+    fn recovery_median_band_skips_thin_histograms() {
+        let recoveries = vec![1.0; 10];
+        let ratio = recovery_to_median_ratio(2.0, &recoveries);
+        assert!((ratio.unwrap() - 2.0).abs() < 1e-12);
+        assert!(passes_recovery_median_band(ratio, recoveries.len()));
+    }
+
+    #[test]
+    fn recovery_median_band_keeps_original_near_the_plateau() {
+        let recoveries: Vec<f64> = (0..40).map(|i| 1.0 + (i as f64 - 20.0) * 0.01).collect();
+        let ratio = recovery_to_median_ratio(1.05, &recoveries);
+        assert!(passes_recovery_median_band(ratio, recoveries.len()));
+    }
+
+    #[test]
+    fn recovery_median_band_rejects_original_on_the_tail() {
+        let recoveries = vec![1.0; 40];
+        let high = recovery_to_median_ratio(1.40, &recoveries);
+        let low = recovery_to_median_ratio(0.70, &recoveries);
+        assert!(!passes_recovery_median_band(high, recoveries.len()));
+        assert!(!passes_recovery_median_band(low, recoveries.len()));
     }
 }

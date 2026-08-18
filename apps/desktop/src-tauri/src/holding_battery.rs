@@ -1,6 +1,8 @@
 //! Discover-style job runner for on-demand Holding → Databank battery.
 
-use crate::data_lab::{load_bound_broker, load_quote_sidecar};
+use crate::data_lab::{
+    apply_history_start_year, load_bound_broker, load_quote_sidecar, trim_market_history_to_year,
+};
 use crate::databank::{
     DesktopState, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file,
     persist_loaded_bank, reload_workspace_from_path, slice_bars,
@@ -300,15 +302,21 @@ fn run_battery_job(
         "Loading Development / M1 partitions for the battery…",
     );
 
-    let decision = crate::data_lab::load_data_source(&source, metadata_path.as_deref(), None)?;
-    let m1 = crate::data_lab::load_data_source(&m1_source, m1_metadata_path.as_deref(), None)?;
+    let mut decision = crate::data_lab::load_data_source(&source, metadata_path.as_deref(), None)?;
+    let mut m1 = crate::data_lab::load_data_source(&m1_source, m1_metadata_path.as_deref(), None)?;
     let broker = load_bound_broker(&broker_path, decision.metadata.as_ref())?;
     load_bound_broker(&broker_path, m1.metadata.as_ref())?;
-    let quote_dataset = infer_quote_sidecar_path(&m1_source)
+    let mut quote_dataset = infer_quote_sidecar_path(&m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut decision.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        bank.config.history_start_year,
+    )?;
     let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
@@ -612,14 +620,16 @@ pub async fn shrink_holding_by_daily_corr(
     let max_correlation = request.max_correlation;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let loaded = crate::data_lab::load_data_source(&source, metadata_path.as_deref(), None)?;
+        let mut dataset = loaded.dataset;
+        apply_history_start_year(&mut dataset, bank.config.history_start_year)?;
         let broker = load_bound_broker(&broker_path, loaded.metadata.as_ref())?;
         let plan = DataSplitPlan::chronological(
-            &loaded.dataset,
+            &dataset,
             validation_fraction,
             sealed_fraction,
         )
         .map_err(|error| error.to_string())?;
-        let development = slice_bars(&loaded.dataset, 0, plan.development.bar_count)?;
+        let development = slice_bars(&dataset, 0, plan.development.bar_count)?;
         let cache = IndicatorBufferCache::new(development.bars.len());
         let scout = bank.config.scout.clone();
         let timezone = broker.timezone.clone();

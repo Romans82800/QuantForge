@@ -725,6 +725,11 @@ pub struct DiscoverConfig {
     /// symbols before M1 work. `0` disables the multi-symbol screen.
     #[serde(default = "default_multi_symbol_minimum_pass")]
     pub multi_symbol_minimum_pass: usize,
+    /// Broker-local calendar year of the first bar kept. `2016` is the full
+    /// ICMarkets 2016-present pack; `2020` drops 2016–2019 so IS/OOS fractions
+    /// sit on the shorter window. Sealed into the databank.
+    #[serde(default = "default_history_start_year")]
+    pub history_start_year: u16,
     /// Isolated breeding populations. One preserves classic single-pool behaviour.
     #[serde(default = "default_island_count")]
     pub island_count: usize,
@@ -861,9 +866,9 @@ fn default_robustness_monte_carlo_max_drawdown_ratio() -> f64 {
 fn default_robustness_neighborhood_samples() -> usize {
     // Ten deterministic one-axis neighbors run first (sl, tp, atr, entry, manage
     // × lo/hi); everything past them is randomized joint jitter that perturbs the
-    // entry indicator periods. 100 gives a real survival distribution instead of
-    // a handful of points, so a knife-edge fit has somewhere to fail.
-    100
+    // entry indicator periods. 200 H1-cached samples make the ret/DD histogram
+    // dense enough for the 0.85–1.25 orig/median band.
+    200
 }
 
 fn default_allow_market_entries() -> bool {
@@ -894,6 +899,11 @@ fn default_minimum_deflated_trade_sharpe() -> Option<f64> {
 fn default_multi_symbol_minimum_pass() -> usize {
     0
 }
+
+pub fn default_history_start_year() -> u16 {
+    quantforge_data::DEFAULT_HISTORY_START_YEAR
+}
+
 fn default_island_count() -> usize {
     1
 }
@@ -968,6 +978,7 @@ impl Default for DiscoverConfig {
             calendar_year_folds: default_calendar_year_folds(),
             minimum_deflated_trade_sharpe: default_minimum_deflated_trade_sharpe(),
             multi_symbol_minimum_pass: default_multi_symbol_minimum_pass(),
+            history_start_year: default_history_start_year(),
             island_count: default_island_count(),
             migration_interval: default_migration_interval(),
             migration_elites: default_migration_elites(),
@@ -1035,10 +1046,10 @@ impl DiscoverConfig {
                 // trials are nearly free; ~1k paths make the P95 drawdown stable.
                 self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.max(1_000);
                 // Ten deterministic one-axis neighbors run before the randomized
-                // joint draw perturbs entry indicator periods; 100 gives the plateau
-                // test a real distribution to fail on.
+                // joint draw perturbs entry indicator periods; 200 H1-cached
+                // samples make the ret/DD histogram usable.
                 self.robustness_neighborhood_samples =
-                    self.robustness_neighborhood_samples.max(100);
+                    self.robustness_neighborhood_samples.max(200);
                 self.minimum_neighborhood_survival_fraction =
                     self.minimum_neighborhood_survival_fraction.max(0.55);
             }
@@ -1485,11 +1496,17 @@ pub struct ParameterNeighborhoodSample {
     pub net_profit: f64,
     pub return_percent: f64,
     pub max_drawdown_percent: f64,
+    /// Equity drawdown in account currency. Older samples omit this.
+    #[serde(default)]
+    pub max_drawdown: f64,
     pub trade_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profit_factor: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharpe_ratio: Option<f64>,
+    /// MT5 recovery factor (`net_profit / equity DD`). Absent when non-finite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_factor: Option<f64>,
     pub survived: bool,
 }
 
@@ -1510,9 +1527,18 @@ pub struct ParameterNeighborhoodEvidence {
     pub plateau_neighbors: usize,
     pub plateau_surviving: usize,
     pub plateau_survival_fraction: Option<f64>,
-    /// Original (unperturbed) M1 baseline metrics for Orig. reference markers.
+    /// Original unperturbed Selected-TF metrics for Orig. reference markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_metrics: Option<BacktestMetrics>,
+    /// Neighbourhood-median recovery factor used by the 0.85–1.25 orig/median gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_recovery_factor: Option<f64>,
+    /// `original recovery / median recovery` when both are finite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_recovery_to_median: Option<f64>,
+    /// `None` on older records or when the histogram was too thin to score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed_recovery_median_band: Option<bool>,
     /// Per-neighbour metrics for distribution charts. Older elites omit this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<ParameterNeighborhoodSample>,

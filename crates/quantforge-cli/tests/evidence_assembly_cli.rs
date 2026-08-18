@@ -235,6 +235,7 @@ fn write_databank(
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,
+        history_start_year: quantforge_discover::default_history_start_year(),
         island_count: 1,
         migration_interval: 0,
         migration_elites: 2,

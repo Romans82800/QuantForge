@@ -1,5 +1,6 @@
 use crate::data_lab::{
     build_decision_from_m1, build_decision_from_m1_quotes, load_bound_broker, load_quote_sidecar,
+    trim_market_history_to_year,
 };
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::{ContentHash, FloatPolicy};
@@ -187,6 +188,7 @@ struct TradeCsvExportSnapshot {
     data_hash: ContentHash,
     execution_data_hash: ContentHash,
     broker_spec_hash: ContentHash,
+    history_start_year: u16,
 }
 
 struct TradeCsvReplayContext {
@@ -825,6 +827,7 @@ pub async fn get_elite_partition_equity(
             loaded.bank.config.scout.clone(),
             loaded.validation_fraction,
             loaded.sealed_fraction,
+            loaded.bank.config.history_start_year,
         )
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -838,6 +841,7 @@ pub async fn get_elite_partition_equity(
             scout,
             validation_fraction,
             sealed_fraction,
+            history_start_year,
         ) = snapshot;
         partition_equity_for_elite(
             &elite,
@@ -849,6 +853,7 @@ pub async fn get_elite_partition_equity(
             &scout,
             validation_fraction,
             sealed_fraction,
+            history_start_year,
         )
     })
     .await
@@ -926,21 +931,27 @@ fn run_elite_robustness_sync(
     request: &ResultsRobustnessRequest,
     snapshot: &RobustnessSnapshot,
 ) -> Result<ResultsRobustnessView, String> {
-    let decision_source = crate::data_lab::load_data_source(
+    let mut decision_source = crate::data_lab::load_data_source(
         &snapshot.source,
         snapshot.metadata_path.as_deref(),
         None,
     )?;
-    let m1_source = crate::data_lab::load_data_source(
+    let mut m1_source = crate::data_lab::load_data_source(
         &snapshot.m1_source,
         snapshot.m1_metadata_path.as_deref(),
         None,
     )?;
-    let quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
+    let mut quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1_source.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut decision_source.dataset,
+        &mut m1_source.dataset,
+        quote_dataset.as_mut(),
+        snapshot.config.history_start_year,
+    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1_source.dataset)
@@ -1212,7 +1223,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",
-            "Failed the ±20% parameter-neighborhood or ADX plateau requirement.",
+            "Failed the ±20% parameter-neighborhood, ADX plateau, or ret/DD 0.85–1.25-of-median requirement.",
         ),
     }
 }
@@ -1227,7 +1238,7 @@ fn robustness_depth(config: &DiscoverConfig, mode: ResultsRobustnessMode) -> (us
         ResultsRobustnessMode::Deep => (
             config.robustness_folds.max(12),
             config.robustness_monte_carlo_trials.max(5_000),
-            config.robustness_neighborhood_samples.max(200),
+            config.robustness_neighborhood_samples.max(400),
         ),
     }
 }
@@ -1242,21 +1253,28 @@ fn partition_equity_for_elite(
     scout: &quantforge_eval::ScoutConfig,
     validation_fraction: f64,
     sealed_fraction: f64,
+    history_start_year: u16,
 ) -> Result<PartitionEquityView, String> {
-    let loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
+    let mut loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
     // slice whose path still points at full history, this is the right series.
     let broker = crate::data_lab::load_bound_broker(broker_path, loaded.metadata.as_ref())?;
     let m1_source = m1_source.ok_or_else(|| {
         "This legacy databank does not bind its M1 source; reopen it through Discover and run a new M1-verified search before using its full-run curve.".to_owned()
     })?;
-    let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
+    let mut m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
     crate::data_lab::load_bound_broker(broker_path, m1.metadata.as_ref())?;
-    let quote_dataset = infer_quote_sidecar_path(m1_source)
+    let mut quote_dataset = infer_quote_sidecar_path(m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut loaded.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        history_start_year,
+    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1713,15 +1731,21 @@ fn run_holding_battery_sync(
     validation_fraction: f64,
     sealed_fraction: f64,
 ) -> Result<HoldingBatteryReport, String> {
-    let decision = crate::data_lab::load_data_source(source, metadata_path, None)?;
-    let m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
+    let mut decision = crate::data_lab::load_data_source(source, metadata_path, None)?;
+    let mut m1 = crate::data_lab::load_data_source(m1_source, m1_metadata_path, None)?;
     let broker = load_bound_broker(broker_path, decision.metadata.as_ref())?;
     load_bound_broker(broker_path, m1.metadata.as_ref())?;
-    let quote_dataset = infer_quote_sidecar_path(m1_source)
+    let mut quote_dataset = infer_quote_sidecar_path(m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut decision.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        bank.config.history_start_year,
+    )?;
     let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
@@ -2006,6 +2030,7 @@ fn trade_csv_export_snapshot(
         data_hash: loaded.bank.data_hash.clone(),
         execution_data_hash: loaded.bank.execution_data_hash.clone(),
         broker_spec_hash: loaded.bank.broker_spec_hash.clone(),
+        history_start_year: loaded.bank.config.history_start_year,
     })
 }
 
@@ -2091,16 +2116,30 @@ fn export_elite_trade_csvs_to(
 fn prepare_trade_csv_replay(
     snapshot: &TradeCsvExportSnapshot,
 ) -> Result<TradeCsvReplayContext, DesktopError> {
-    let decision = crate::data_lab::load_data_source(
+    let mut decision = crate::data_lab::load_data_source(
         &snapshot.source,
         snapshot.metadata_path.as_deref(),
         None,
     )
     .map_err(DesktopError::InvalidExport)?;
-    let m1 = crate::data_lab::load_data_source(
+    let mut m1 = crate::data_lab::load_data_source(
         &snapshot.m1_source,
         snapshot.m1_metadata_path.as_deref(),
         None,
+    )
+    .map_err(DesktopError::InvalidExport)?;
+    let mut quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| {
+            DesktopError::InvalidExport(format!("cannot load bid/ask quote sidecar: {error}"))
+        })?;
+    trim_market_history_to_year(
+        &mut decision.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        snapshot.history_start_year,
     )
     .map_err(DesktopError::InvalidExport)?;
     let broker = load_bound_broker(&snapshot.broker, m1.metadata.as_ref())
@@ -2119,13 +2158,6 @@ fn prepare_trade_csv_replay(
             "the recovered M1 source does not match this databank".into(),
         ));
     }
-    let quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
-        .filter(|path| path.is_file())
-        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
-        .transpose()
-        .map_err(|error| {
-            DesktopError::InvalidExport(format!("cannot load bid/ask quote sidecar: {error}"))
-        })?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes.validate_against(&m1.dataset).map_err(|error| {
             DesktopError::InvalidExport(format!("quote sidecar does not match M1 data: {error}"))
@@ -3354,7 +3386,7 @@ mod tests {
         );
         assert_eq!(
             robustness_depth(&config, ResultsRobustnessMode::Deep),
-            (5, 1_000, 20)
+            (12, 5_000, 400)
         );
     }
 
@@ -3584,6 +3616,7 @@ pub async fn run_fidelity_demo(request: FidelityDemoRequest) -> Result<FidelityD
 fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoView, String> {
     use crate::data_lab::{
         build_decision_from_m1, display_path, load_bound_broker, load_data_source,
+        trim_market_history_to_year,
     };
     use quantforge_eval::evaluate_strategy;
     use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_versioned};
@@ -3602,7 +3635,7 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     verify_artifact(&artifact).map_err(|error| error.to_string())?;
 
     let h1_metadata = companion_metadata_path(&artifact.source);
-    let h1 = load_data_source(
+    let mut h1 = load_data_source(
         &artifact.source,
         h1_metadata.as_deref(),
         if h1_metadata.is_some() {
@@ -3615,7 +3648,7 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
         .m1_metadata_path
         .clone()
         .or_else(|| companion_metadata_path(&request.m1_data_path));
-    let m1 = load_data_source(
+    let mut m1 = load_data_source(
         &request.m1_data_path,
         m1_metadata.as_deref(),
         if m1_metadata.is_some() {
@@ -3626,11 +3659,17 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
     )?;
     let broker = load_bound_broker(&artifact.broker, h1.metadata.as_ref())?;
     load_bound_broker(&artifact.broker, m1.metadata.as_ref())?;
-    let quote_dataset = infer_quote_sidecar_path(&request.m1_data_path)
+    let mut quote_dataset = infer_quote_sidecar_path(&request.m1_data_path)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut h1.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        artifact.databank.config.history_start_year,
+    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)

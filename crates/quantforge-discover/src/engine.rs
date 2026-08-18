@@ -2052,6 +2052,7 @@ mod tests {
             calendar_year_folds: false,
             minimum_deflated_trade_sharpe: None,
             multi_symbol_minimum_pass: 0,
+            history_start_year: crate::model::default_history_start_year(),
             island_count: 1,
             migration_interval: 0,
             migration_elites: 2,
@@ -2445,9 +2446,9 @@ mod tests {
         config.apply_run_mode();
         // A P95 drawdown read off fewer than ~1k resampled paths is noise.
         assert!(config.robustness_monte_carlo_trials >= 1_000);
-        // Ten deterministic axis neighbors come first; sample well past them so the
-        // randomized joint draw actually perturbs entry indicator periods.
-        assert!(config.robustness_neighborhood_samples >= 100);
+        // Ten deterministic axis neighbors come first; 200 H1-cached samples
+        // make the ret/DD histogram dense enough for the orig/median band.
+        assert!(config.robustness_neighborhood_samples >= 200);
         assert!(config.minimum_neighborhood_survival_fraction >= 0.55);
     }
 

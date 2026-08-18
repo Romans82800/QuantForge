@@ -186,6 +186,20 @@ impl QuoteBarDataset {
         }
         Ok(())
     }
+
+    /// Drop quote bars before `start_ms` (UTC). Rehashes when anything is removed.
+    pub fn trim_before_timestamp_ms(&mut self, start_ms: i64) -> Result<usize, DataError> {
+        let keep_from = self.bars.partition_point(|bar| bar.timestamp_ms < start_ms);
+        if keep_from == self.bars.len() {
+            return Err(DataError::EmptyAfterHistoryTrim { start_ms });
+        }
+        let removed = keep_from;
+        if keep_from > 0 {
+            self.bars.drain(..keep_from);
+            self.data_hash = quote_bar_content_hash(&self.bars);
+        }
+        Ok(removed)
+    }
 }
 
 #[derive(Debug)]
@@ -299,6 +313,50 @@ impl BarDataset {
             data_hash,
         })
     }
+
+    /// Drop bars before `start_ms` (UTC). Rehashes when anything is removed.
+    pub fn trim_before_timestamp_ms(&mut self, start_ms: i64) -> Result<usize, DataError> {
+        let keep_from = self.bars.partition_point(|bar| bar.timestamp_ms < start_ms);
+        if keep_from == self.bars.len() {
+            return Err(DataError::EmptyAfterHistoryTrim { start_ms });
+        }
+        let removed = keep_from;
+        if keep_from > 0 {
+            self.bars.drain(..keep_from);
+            self.data_hash = bar_content_hash(&self.bars);
+        }
+        Ok(removed)
+    }
+
+    /// Drop bars whose broker-local wall time is before 1 Jan of `year`.
+    pub fn trim_before_calendar_year(&mut self, year: u16) -> Result<usize, DataError> {
+        let start_ms = history_start_cutoff_ms(&self.source_timezone, year)?;
+        self.trim_before_timestamp_ms(start_ms)
+    }
+}
+
+/// History-start years the Discover UI may pick. The 2016 pack is sliced in
+/// place when the user asks for 2020 so IS/OOS fractions sit on the shorter window.
+pub const ALLOWED_HISTORY_START_YEARS: [u16; 2] = [2016, 2020];
+pub const DEFAULT_HISTORY_START_YEAR: u16 = 2016;
+
+pub fn normalize_history_start_year(year: u16) -> Result<u16, DataError> {
+    if ALLOWED_HISTORY_START_YEARS.contains(&year) {
+        Ok(year)
+    } else {
+        Err(DataError::InvalidHistoryStartYear(year))
+    }
+}
+
+/// UTC millisecond instant of broker-local `year-01-01 00:00:00`.
+pub fn history_start_cutoff_ms(source_timezone: &str, year: u16) -> Result<i64, DataError> {
+    let timezone: SourceTimezone = source_timezone.parse()?;
+    let stamp = format!("{year:04}.01.01 00:00:00");
+    parse_timestamp(&stamp, timezone).map_err(|reason| DataError::InvalidTimestamp {
+        row: 0,
+        value: stamp,
+        reason,
+    })
 }
 
 const IC_MARKETS_EST_PLUS_7: &str = "ICMarkets/EST+7";
@@ -1098,6 +1156,10 @@ pub enum DataError {
     Csv(#[from] csv::Error),
     #[error("input contains no data rows")]
     NoRows,
+    #[error("history start year must be 2016 or 2020; got {0}")]
+    InvalidHistoryStartYear(u16),
+    #[error("no bars remain after trimming history to timestamp {start_ms}")]
+    EmptyAfterHistoryTrim { start_ms: i64 },
     #[error("could not detect tab, comma, or semicolon delimiter")]
     UnknownDelimiter,
     #[error("missing required column {0}")]
@@ -1630,5 +1692,44 @@ mod tests {
         quote.tick_count = 1;
         quote.ask_close += 0.0001;
         assert_ne!(first, quote_bar_content_hash(std::slice::from_ref(&quote)));
+    }
+
+    #[test]
+    fn trim_before_calendar_year_keeps_broker_local_cutoff() {
+        let utc: SourceTimezone = "Etc/UTC".parse().unwrap();
+        let y2018 = parse_timestamp("2018.06.01 00:00:00", utc).unwrap();
+        let y2020 = parse_timestamp("2020.06.01 00:00:00", utc).unwrap();
+        let y2021 = parse_timestamp("2021.06.01 00:00:00", utc).unwrap();
+        let bar = |timestamp_ms: i64| Bar {
+            timestamp_ms,
+            open: 1.0,
+            high: 1.1,
+            low: 0.9,
+            close: 1.05,
+            tick_volume: 10,
+            real_volume: 0,
+            spread_points: Some(8),
+        };
+        let bars = vec![bar(y2018), bar(y2020), bar(y2021)];
+        let mut dataset = BarDataset {
+            data_hash: bar_content_hash(&bars),
+            bars,
+            source_rows: 3,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+        };
+        let original_hash = dataset.data_hash.clone();
+        assert_eq!(dataset.trim_before_calendar_year(2016).unwrap(), 0);
+        assert_eq!(dataset.data_hash, original_hash);
+        assert_eq!(dataset.trim_before_calendar_year(2020).unwrap(), 1);
+        assert_eq!(dataset.bars.len(), 2);
+        assert_eq!(dataset.bars[0].timestamp_ms, y2020);
+        assert_ne!(dataset.data_hash, original_hash);
+        assert!(matches!(
+            normalize_history_start_year(2018),
+            Err(DataError::InvalidHistoryStartYear(2018))
+        ));
     }
 }

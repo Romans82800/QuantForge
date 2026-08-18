@@ -299,6 +299,9 @@ export interface RobustnessEvidence {
     plateau_surviving: number;
     plateau_survival_fraction?: number | null;
     original_metrics?: Record<string, number | null> | null;
+    median_recovery_factor?: number | null;
+    original_recovery_to_median?: number | null;
+    passed_recovery_median_band?: boolean | null;
     samples?: ParameterNeighborhoodSample[];
   };
 }
@@ -308,9 +311,11 @@ export interface ParameterNeighborhoodSample {
   net_profit: number;
   return_percent: number;
   max_drawdown_percent: number;
+  max_drawdown?: number;
   trade_count: number;
   profit_factor?: number | null;
   sharpe_ratio?: number | null;
+  recovery_factor?: number | null;
   survived: boolean;
 }
 
@@ -522,6 +527,8 @@ export interface ConditionBakeoffRequest {
   sealedFraction: number;
   /** Entry-condition counts to compare; empty defaults to 2, 3, 4 on the backend. */
   entryConditionCounts: number[];
+  /** Broker-local calendar year of the first bar kept (2016 or 2020). */
+  historyStartYear?: number | null;
 }
 
 export interface DiscoverRequest {
@@ -611,6 +618,8 @@ export interface DiscoverRequest {
   promotionSplit: boolean | null;
   validationFraction: number | null;
   sealedFraction: number | null;
+  /** Broker-local calendar year of the first bar kept (2016 or 2020). */
+  historyStartYear: number | null;
 }
 
 export interface SavedDiscoverProfile {

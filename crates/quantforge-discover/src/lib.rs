@@ -39,6 +39,7 @@ pub use model::{
     ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, SearchFamily,
     SearchFamilySpec, SearchRange, SearchRangeProfile, SymbolScreenResult, TRIAL_BUDGET_WARNING,
     ThreeLevelBucket, UniversalGrammarConfig, WalkForwardEvidence, WalkForwardFold,
+    default_history_start_year,
 };
 pub use multi_symbol::{DEFAULT_FX_PACK, DISPLAY_ONLY_SYMBOLS, PackSymbol, screen_multi_symbol};
 pub use permutation::{
@@ -47,8 +48,9 @@ pub use permutation::{
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
     MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
-    RobustnessConfig, RobustnessOutcome, RobustnessReject, development_cpcv_diagnostic,
-    run_m1_holding_admission, run_m1_predeposit_robustness,
+    PARAM_RECOVERY_MEDIAN_HIGH, PARAM_RECOVERY_MEDIAN_LOW, RobustnessConfig, RobustnessOutcome,
+    RobustnessReject, development_cpcv_diagnostic, passes_recovery_median_band,
+    recovery_to_median_ratio, run_m1_holding_admission, run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

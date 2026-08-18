@@ -1,6 +1,6 @@
 use crate::data_lab::{
-    build_decision_from_m1, build_decision_from_m1_quotes, display_path, load_bound_broker,
-    load_data_source, load_quote_sidecar,
+    apply_history_start_year, build_decision_from_m1, build_decision_from_m1_quotes, display_path,
+    load_bound_broker, load_data_source, load_quote_sidecar, trim_market_history_to_year,
 };
 use crate::databank::{
     DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
@@ -168,6 +168,8 @@ pub struct DiscoverRequest {
     promotion_split: Option<bool>,
     validation_fraction: Option<f64>,
     sealed_fraction: Option<f64>,
+    /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
+    history_start_year: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -374,6 +376,9 @@ pub struct ConditionBakeoffRequest {
     /// Entry-condition counts to compare on equal budget. Defaults to 2, 3, 4.
     #[serde(default)]
     entry_condition_counts: Vec<usize>,
+    /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
+    #[serde(default)]
+    history_start_year: Option<u16>,
 }
 
 #[tauri::command]
@@ -381,18 +386,27 @@ pub fn run_condition_bakeoff(
     request: ConditionBakeoffRequest,
 ) -> Result<ConditionBakeoffReport, String> {
     let entry_condition_counts = parse_entry_condition_counts(&request.entry_condition_counts)?;
-    let loaded = load_data_source(
+    let mut loaded = load_data_source(
         &request.data_path,
         request.metadata_path.as_deref(),
         request.source_timezone.as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    let m1_loaded = load_data_source(
+    let mut m1_loaded = load_data_source(
         &request.m1_data_path,
         request.m1_metadata_path.as_deref(),
         request.m1_source_timezone.as_deref(),
     )
     .map_err(|error| error.to_string())?;
+    let history_start_year = request
+        .history_start_year
+        .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR);
+    trim_market_history_to_year(
+        &mut loaded.dataset,
+        &mut m1_loaded.dataset,
+        None,
+        history_start_year,
+    )?;
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
     let validation_fraction = request.validation_fraction.clamp(0.0, 0.4);
@@ -608,6 +622,9 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
         DecisionTimeframe::H1 => "H1",
         DecisionTimeframe::M15 => "M15",
     };
+    let history_year = request
+        .history_start_year
+        .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR);
     let root = source
         .ancestors()
         .find(|candidate| {
@@ -621,7 +638,7 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_millis();
-    let base = format!("{symbol}_{timeframe}_databank_{now_ms}");
+    let base = format!("{symbol}_{timeframe}_{history_year}_databank_{now_ms}");
     let mut candidate = directory.join(format!("{base}.json"));
     let mut suffix = 2usize;
     while candidate.exists() {
@@ -710,7 +727,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         let broker = load_bound_broker(&request.broker_path, None)?;
         validate_selected_symbol(request.selected_symbol.as_deref(), &broker.symbol)?;
     }
-    if request.mode == DiscoverMode::New {
+        if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
             validate_universal_grammar(grammar)?;
         }
@@ -720,6 +737,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
                     "unknown run mode '{mode}' (use fast_scout, full_harvest, quota_harvest, or high_performance_islands)"
                 ));
             }
+        }
+        if let Some(year) = request.history_start_year {
+            quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
         }
         let validation = request
             .validation_fraction
@@ -803,6 +823,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.promotion_split.is_some(),
             request.validation_fraction.is_some(),
             request.sealed_fraction.is_some(),
+            request.history_start_year.is_some(),
         ]
         .into_iter()
         .any(|configured| configured)
@@ -860,22 +881,48 @@ fn run_discovery(
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
-    let loaded = load_data_source(
+    let mut loaded = load_data_source(
         &request.data_path,
         request.metadata_path.as_deref(),
         request.source_timezone.as_deref(),
     )?;
-    let m1 = load_data_source(
+    let mut m1 = load_data_source(
         &request.m1_data_path,
         request.m1_metadata_path.as_deref(),
         request.m1_source_timezone.as_deref(),
     )?;
+    let continued_artifact = match request.mode {
+        DiscoverMode::Continue => {
+            let bytes = fs::read(&request.databank_path)
+                .map_err(|error| format!("cannot read databank: {error}"))?;
+            let artifact: EvolveArtifact = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("databank JSON is invalid: {error}"))?;
+            verify_artifact(&artifact).map_err(|error| error.to_string())?;
+            Some(artifact)
+        }
+        DiscoverMode::New => None,
+    };
+    let history_start_year = match &continued_artifact {
+        Some(artifact) => artifact.databank.config.history_start_year,
+        None => quantforge_data::normalize_history_start_year(
+            request
+                .history_start_year
+                .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR),
+        )
+        .map_err(|error| error.to_string())?,
+    };
     let quote_path = infer_quote_path(&request.m1_data_path);
-    let quote_dataset = quote_path
+    let mut quote_dataset = quote_path
         .as_ref()
         .map(|path| load_quote_sidecar(path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut loaded.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        history_start_year,
+    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -959,17 +1006,6 @@ fn run_discovery(
     // New runs take the UI split. Continuations must reuse the fractions sealed
     // into the databank manifest — defaulting to 0.2/0.2 here used to rewrite
     // checkpoints onto a different Development/OOS1/OOS2 cut.
-    let continued_artifact = match request.mode {
-        DiscoverMode::Continue => {
-            let bytes = fs::read(&request.databank_path)
-                .map_err(|error| format!("cannot read databank: {error}"))?;
-            let artifact: EvolveArtifact = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("databank JSON is invalid: {error}"))?;
-            verify_artifact(&artifact).map_err(|error| error.to_string())?;
-            Some(artifact)
-        }
-        DiscoverMode::New => None,
-    };
     let (validation_fraction, sealed_fraction) = match (&request.mode, &continued_artifact) {
         (DiscoverMode::Continue, Some(artifact)) => (
             recipe_fraction(
@@ -1008,6 +1044,7 @@ fn run_discovery(
         sealed_fraction,
         promotion_split || request.mode == DiscoverMode::Continue,
         &decision_timeframe,
+        history_start_year,
     )?;
 
     let (mut bank, continuation_recipe_hash, starting_generation) = match request.mode {
@@ -1891,6 +1928,7 @@ fn load_fx_pack(
     sealed_fraction: f64,
     apply_promotion_split: bool,
     decision_timeframe: &str,
+    history_start_year: u16,
 ) -> Result<Vec<PackSymbol>, String> {
     let Some(dir) = pack_dir.filter(|value| !value.is_empty()) else {
         return Ok(Vec::new());
@@ -1920,7 +1958,7 @@ fn load_fx_pack(
                 .unwrap_or("");
             decision_path.with_file_name(format!("{stem}.metadata.csv"))
         };
-        let loaded = if meta_beside.is_file() {
+        let mut loaded = if meta_beside.is_file() {
             load_data_source(
                 &display_path(&decision_path),
                 Some(&display_path(&meta_beside)),
@@ -1935,6 +1973,7 @@ fn load_fx_pack(
         };
         let market_broker =
             load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
+        apply_history_start_year(&mut loaded.dataset, history_start_year)?;
         let dataset = if apply_promotion_split {
             unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
         } else {
@@ -2305,7 +2344,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_monte_carlo_max_drawdown_ratio: request
             .robustness_monte_carlo_max_drawdown_ratio
             .unwrap_or(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
-        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(100),
+        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(200),
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
@@ -2315,6 +2354,12 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
+        history_start_year: quantforge_data::normalize_history_start_year(
+            request
+                .history_start_year
+                .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR),
+        )
+        .map_err(|error| error.to_string())?,
         // `generalIslandCount` uses 0 as an "auto / single island" sentinel in the
         // UI, so `unwrap_or(1)` (which only fires on `None`) let an explicit 0
         // through and tripped `island_count must be at least 1`. Clamp to >=1.
@@ -2743,6 +2788,7 @@ mod tests {
             promotion_split: Some(false),
             validation_fraction: None,
             sealed_fraction: None,
+            history_start_year: None,
         }
     }
 

@@ -1189,6 +1189,42 @@ pub(crate) fn load_data_source(
     Ok(LoadedDataSource { dataset, metadata })
 }
 
+pub(crate) fn apply_history_start_year(
+    dataset: &mut BarDataset,
+    year: u16,
+) -> Result<usize, String> {
+    let year = quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
+    dataset
+        .trim_before_calendar_year(year)
+        .map_err(|error| error.to_string())
+}
+
+/// Trim decision, M1, and optional quotes to the same broker-local calendar year.
+/// Uses the M1 timezone for the cutoff so all three series share one instant.
+pub(crate) fn trim_market_history_to_year(
+    decision: &mut BarDataset,
+    m1: &mut BarDataset,
+    quotes: Option<&mut QuoteBarDataset>,
+    year: u16,
+) -> Result<usize, String> {
+    let year = quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
+    let cutoff = quantforge_data::history_start_cutoff_ms(&m1.source_timezone, year)
+        .or_else(|_| quantforge_data::history_start_cutoff_ms(&decision.source_timezone, year))
+        .map_err(|error| error.to_string())?;
+    let removed = m1
+        .trim_before_timestamp_ms(cutoff)
+        .map_err(|error| error.to_string())?;
+    decision
+        .trim_before_timestamp_ms(cutoff)
+        .map_err(|error| error.to_string())?;
+    if let Some(quotes) = quotes {
+        quotes
+            .trim_before_timestamp_ms(cutoff)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(removed)
+}
+
 /// Load a bid/ask quote sidecar in the clock used by its bound M1 pack.
 /// Imported packs are normalized to UTC; the capture EA writes raw MT5
 /// server-wall timestamps and therefore needs the metadata timezone mapping.
