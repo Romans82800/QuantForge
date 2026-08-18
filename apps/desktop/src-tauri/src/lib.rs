@@ -48,6 +48,7 @@ pub fn run() {
             holding_battery::start_holding_battery_job,
             holding_battery::get_holding_battery_job,
             holding_battery::stop_holding_battery,
+            holding_battery::shrink_holding_by_daily_corr,
             databank::run_fidelity_demo,
             data_lab::inspect_data,
             data_lab::import_market_folder,

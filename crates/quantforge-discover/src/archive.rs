@@ -621,7 +621,7 @@ fn better_than(
         .is_gt()
 }
 
-fn refresh_fingerprint_coverage_map(
+pub(crate) fn refresh_fingerprint_coverage_map(
     entries: &[Elite],
     coverage_map: &mut std::collections::BTreeMap<String, quantforge_core::ContentHash>,
 ) {

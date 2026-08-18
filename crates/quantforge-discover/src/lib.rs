@@ -5,6 +5,7 @@ mod bakeoff;
 mod engine;
 mod fold_r;
 mod grammar;
+mod holding_corr;
 mod islands;
 mod methodology;
 mod model;
@@ -17,6 +18,10 @@ pub use bakeoff::{
     ConditionBakeoffConfig, ConditionBakeoffReport, ConditionBakeoffRow, run_condition_bakeoff,
 };
 pub use fold_r::FoldRStats;
+pub use holding_corr::{
+    HoldingCorrShrinkReport, align_daily_pnl, apply_holding_daily_corr_shrink,
+    daily_pnl_from_trades,
+};
 pub use engine::{
     EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, continue_evolution,
     continue_evolution_with_pack, evolve_new, evolve_new_with_pack,

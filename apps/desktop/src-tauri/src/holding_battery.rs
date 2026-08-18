@@ -2,12 +2,18 @@
 
 use crate::data_lab::{load_bound_broker, load_quote_sidecar};
 use crate::databank::{
-    DesktopState, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file, slice_bars,
+    DesktopState, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file,
+    persist_loaded_bank, reload_workspace_from_path, slice_bars,
 };
 use quantforge_data::BarDataset;
-use quantforge_discover::Databank;
+use quantforge_discover::{
+    Databank, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
+};
+use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_quality::DataSplitPlan;
-use serde::Serialize;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -520,4 +526,136 @@ fn set_running_counts(
         view.passed = passed;
         view.rejected = rejected;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingCorrShrinkRequest {
+    pub max_correlation: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingCorrShrinkView {
+    kept: usize,
+    dropped: usize,
+    max_correlation: f64,
+    replayed: usize,
+    workspace: crate::databank::DatabankWorkspace,
+}
+
+#[tauri::command]
+pub async fn shrink_holding_by_daily_corr(
+    request: HoldingCorrShrinkRequest,
+    desktop: State<'_, DesktopState>,
+    state: State<'_, BatteryJobState>,
+) -> Result<HoldingCorrShrinkView, String> {
+    let allowed = [0.3, 0.4, 0.5, 0.6];
+    if !allowed
+        .iter()
+        .any(|value| (request.max_correlation - value).abs() < 1e-9)
+    {
+        return Err("pick a daily P/L correlation cap of 0.3, 0.4, 0.5 or 0.6".into());
+    }
+    {
+        let current = state
+            .job
+            .read()
+            .map_err(|_| "battery job state is unavailable")?;
+        let stale_running = current.status == "running"
+            && current.total > 0
+            && current.completed >= current.total
+            && current.running == 0;
+        if current.status == "running" && !stale_running {
+            return Err(
+                "stop or finish the Holding battery before shrinking Holding".into(),
+            );
+        }
+    }
+
+    let snapshot = {
+        let loaded = desktop
+            .loaded
+            .read()
+            .map_err(|_| "desktop databank state is unavailable".to_owned())?;
+        let loaded = loaded.as_ref().ok_or_else(|| {
+            "no databank is loaded — open the Discover checkpoint first".to_owned()
+        })?;
+        if loaded.legacy_read_only {
+            return Err(
+                "Schema-v5 databanks are read-only. Run a fresh Discover archive before shrinking Holding."
+                    .into(),
+            );
+        }
+        if loaded.bank.holding.is_empty() {
+            return Err("Holding is empty".into());
+        }
+        (
+            loaded.bank.clone(),
+            loaded.databank_path.clone(),
+            loaded.source.clone(),
+            loaded.broker.clone(),
+            loaded.metadata_path.clone(),
+            loaded.validation_fraction,
+            loaded.sealed_fraction,
+        )
+    };
+    let (
+        mut bank,
+        databank_path,
+        source,
+        broker_path,
+        metadata_path,
+        validation_fraction,
+        sealed_fraction,
+    ) = snapshot;
+    let max_correlation = request.max_correlation;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let loaded = crate::data_lab::load_data_source(&source, metadata_path.as_deref(), None)?;
+        let broker = load_bound_broker(&broker_path, loaded.metadata.as_ref())?;
+        let plan = DataSplitPlan::chronological(
+            &loaded.dataset,
+            validation_fraction,
+            sealed_fraction,
+        )
+        .map_err(|error| error.to_string())?;
+        let development = slice_bars(&loaded.dataset, 0, plan.development.bar_count)?;
+        let cache = IndicatorBufferCache::new(development.bars.len());
+        let scout = bank.config.scout.clone();
+        let timezone = broker.timezone.clone();
+        let daily_pnl: Vec<_> = bank
+            .holding
+            .par_iter()
+            .map(|elite| {
+                evaluate_strategy_cached(
+                    &elite.strategy,
+                    &development,
+                    &broker,
+                    &scout,
+                    &cache,
+                )
+                .map(|result| daily_pnl_from_trades(&result.trades, &timezone))
+                .unwrap_or_default()
+            })
+            .collect();
+        let replayed = daily_pnl
+            .iter()
+            .filter(|days| !days.is_empty())
+            .count();
+        let report = apply_holding_daily_corr_shrink(&mut bank, &daily_pnl, max_correlation);
+        persist_bank_file(&databank_path, &bank)?;
+        Ok::<_, String>((report, replayed, databank_path, bank))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let (report, replayed, databank_path, bank) = result;
+    persist_loaded_bank(&databank_path, &bank, &desktop)?;
+    let workspace = reload_workspace_from_path(Path::new(&databank_path), &desktop)?;
+    Ok(HoldingCorrShrinkView {
+        kept: report.kept,
+        dropped: report.dropped,
+        max_correlation: report.max_correlation,
+        replayed,
+        workspace,
+    })
 }

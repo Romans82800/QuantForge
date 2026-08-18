@@ -469,6 +469,13 @@ pub fn load_databank(
     load_databank_path(Path::new(&path), &state).map_err(|error| error.to_string())
 }
 
+pub(crate) fn reload_workspace_from_path(
+    path: &Path,
+    state: &DesktopState,
+) -> Result<DatabankWorkspace, String> {
+    load_databank_path(path, state).map_err(|error| error.to_string())
+}
+
 fn load_databank_path(
     path: &Path,
     state: &DesktopState,

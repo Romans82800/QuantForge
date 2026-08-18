@@ -97,6 +97,18 @@ export function stopHoldingBattery(): Promise<BatteryJobView> {
   return invoke<BatteryJobView>("stop_holding_battery");
 }
 
+export function shrinkHoldingByDailyCorr(maxCorrelation: number): Promise<{
+  kept: number;
+  dropped: number;
+  maxCorrelation: number;
+  replayed: number;
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("shrink_holding_by_daily_corr", {
+    request: { maxCorrelation },
+  });
+}
+
 export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityDemoView> {
   return invoke<FidelityDemoView>("run_fidelity_demo", { request });
 }

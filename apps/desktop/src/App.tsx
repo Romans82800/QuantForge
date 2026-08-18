@@ -41,6 +41,7 @@ import {
   startHoldingBatteryJob,
   getHoldingBatteryJob,
   stopHoldingBattery,
+  shrinkHoldingByDailyCorr,
   loadElite,
   pauseDiscover,
   recordIncubation,
@@ -326,6 +327,8 @@ function App() {
   const [databankTab, setDatabankTab] = useState<"holding" | "databank" | "certified">("holding");
   const [batteryJob, setBatteryJob] = useState<BatteryJobView | null>(null);
   const [batteryBusy, setBatteryBusy] = useState(false);
+  const [holdingCorrCap, setHoldingCorrCap] = useState(0.5);
+  const [holdingShrinkBusy, setHoldingShrinkBusy] = useState(false);
   const lastBatteryRevision = useRef(0);
   const [discoverResultsOpen, setDiscoverResultsOpen] = useState(false);
   const [stripMessage, setStripMessage] = useState<string | null>(null);
@@ -674,6 +677,29 @@ function App() {
       setError(String(reason));
     } finally {
       setBatteryBusy(false);
+    }
+  }
+
+  async function shrinkHoldingByCorr() {
+    const holdingCount = workspace?.holding?.length ?? 0;
+    if (holdingCount === 0) return;
+    const confirmed = window.confirm(
+      `Replay Holding on Development H1, keep the stronger name of each pair whose daily P/L correlation is above ${holdingCorrCap}, and write the archive?\n\n${holdingCount} names in Holding now. This is not a Discover setting and does not run the battery.`,
+    );
+    if (!confirmed) return;
+    setHoldingShrinkBusy(true);
+    setError(null);
+    try {
+      const result = await shrinkHoldingByDailyCorr(holdingCorrCap);
+      setWorkspace(result.workspace);
+      setBatchSelection(new Set());
+      setBatchMessage(
+        `Holding shrink at max daily P/L corr ${holdingCorrCap}: kept ${result.kept}, dropped ${result.dropped} (${result.replayed} H1 replays).`,
+      );
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setHoldingShrinkBusy(false);
     }
   }
 
@@ -1105,23 +1131,55 @@ function App() {
                     </div>
                     <div className="table-controls">
                       {databankTab === "holding" && (
-                        <button
-                          type="button"
-                          className="primary"
-                          disabled={
-                            loading
-                            || batteryBusy
-                            || batteryActive
-                            || batchSelection.size === 0
-                          }
-                          onClick={() => void startBatteryOnSelection()}
-                        >
-                          {batteryActive
-                            ? "Battery running…"
-                            : batteryBusy
-                              ? "Starting…"
-                              : `Run battery (${batchSelection.size})`}
-                        </button>
+                        <>
+                          <label>
+                            Max daily P/L corr
+                            <select
+                              aria-label="Maximum daily P/L correlation"
+                              disabled={loading || holdingShrinkBusy || batteryBusy || batteryActive}
+                              onChange={(event) => setHoldingCorrCap(Number(event.target.value))}
+                              value={holdingCorrCap}
+                            >
+                              <option value={0.3}>0.3</option>
+                              <option value={0.4}>0.4</option>
+                              <option value={0.5}>0.5</option>
+                              <option value={0.6}>0.6</option>
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={
+                              loading
+                              || holdingShrinkBusy
+                              || batteryBusy
+                              || batteryActive
+                              || (workspace?.holding?.length ?? 0) === 0
+                            }
+                            onClick={() => void shrinkHoldingByCorr()}
+                            title="Drop correlated Holding clones using Development H1 daily P/L. Not a Discover start setting."
+                          >
+                            {holdingShrinkBusy ? "Shrinking…" : "Shrink Holding"}
+                          </button>
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={
+                              loading
+                              || batteryBusy
+                              || batteryActive
+                              || holdingShrinkBusy
+                              || batchSelection.size === 0
+                            }
+                            onClick={() => void startBatteryOnSelection()}
+                          >
+                            {batteryActive
+                              ? "Battery running…"
+                              : batteryBusy
+                                ? "Starting…"
+                                : `Run battery (${batchSelection.size})`}
+                          </button>
+                        </>
                       )}
                       <input
                         aria-label="Search elites"
