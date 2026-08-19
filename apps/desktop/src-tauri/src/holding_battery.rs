@@ -9,7 +9,7 @@ use crate::databank::{
 };
 use quantforge_data::BarDataset;
 use quantforge_discover::{
-    Databank, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
+    Databank, apply_holding_daily_corr_shrink, daily_pnl_from_trades, holding_factory_score,
 };
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_quality::DataSplitPlan;
@@ -31,6 +31,19 @@ pub struct BatteryItemView {
     reason: Option<String>,
     evidence: f64,
     trades: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BatteryKillMix {
+    neighborhood: usize,
+    monte_carlo: usize,
+    folds: usize,
+    m1: usize,
+    deposit: usize,
+    expectancy: usize,
+    oos1: usize,
+    other: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -56,6 +69,10 @@ pub struct BatteryJobView {
     /// Bumps whenever a strategy finishes so the UI can reload the archive.
     revision: u64,
     items: Vec<BatteryItemView>,
+    kill_mix: BatteryKillMix,
+    holding_before_shrink: usize,
+    holding_after_shrink: usize,
+    target_databank: Option<usize>,
 }
 
 impl BatteryJobView {
@@ -80,13 +97,17 @@ impl BatteryJobView {
             stop_requested: false,
             revision: 0,
             items: Vec::new(),
+            kill_mix: BatteryKillMix::default(),
+            holding_before_shrink: 0,
+            holding_after_shrink: 0,
+            target_databank: None,
         }
     }
 }
 
 pub struct BatteryJobState {
-    job: Arc<RwLock<BatteryJobView>>,
-    stop: Arc<AtomicBool>,
+    pub(crate) job: Arc<RwLock<BatteryJobView>>,
+    pub(crate) stop: Arc<AtomicBool>,
 }
 
 impl Default for BatteryJobState {
@@ -123,17 +144,9 @@ pub fn stop_holding_battery(state: State<'_, BatteryJobState>) -> Result<Battery
     Ok(view.clone())
 }
 
-#[tauri::command]
-pub fn start_holding_battery_job(
-    request: HoldingBatteryRequest,
-    desktop: State<'_, DesktopState>,
-    state: State<'_, BatteryJobState>,
-) -> Result<BatteryJobView, String> {
-    if request.fingerprints.is_empty() {
-        return Err("select at least one Holding strategy".into());
-    }
-    {
-        let current = state
+impl BatteryJobState {
+    pub(crate) fn is_busy(&self) -> Result<bool, String> {
+        let current = self
             .job
             .read()
             .map_err(|_| "battery job state is unavailable")?;
@@ -141,79 +154,36 @@ pub fn start_holding_battery_job(
             && current.total > 0
             && current.completed >= current.total
             && current.running == 0;
-        if current.status == "running" && !stale_running {
-            return Err("a Holding battery job is already running".into());
-        }
+        Ok(current.status == "running" && !stale_running)
+    }
+}
+
+const DEFAULT_FACTORY_CORR: f64 = 0.5;
+
+fn optional_positive(value: Option<usize>) -> Option<usize> {
+    value.filter(|&n| n > 0)
+}
+
+#[tauri::command]
+pub fn start_holding_battery_job(
+    request: HoldingBatteryRequest,
+    desktop: State<'_, DesktopState>,
+    state: State<'_, BatteryJobState>,
+) -> Result<BatteryJobView, String> {
+    if state.is_busy()? {
+        return Err("a Holding battery job is already running".into());
+    }
+    if !request.ranked && request.fingerprints.is_empty() {
+        return Err("select Holding strategies or start the ranked factory".into());
     }
 
-    let snapshot = {
-        let loaded = desktop
-            .loaded
-            .read()
-            .map_err(|_| "desktop databank state is unavailable".to_owned())?;
-        let loaded = loaded
-            .as_ref()
-            .ok_or_else(|| "no databank is loaded — open the Discover checkpoint first".to_owned())?;
-        if loaded.legacy_read_only {
-            return Err(
-                "Schema-v5 databanks are read-only. Run a fresh Discover archive before Holding battery."
-                    .into(),
-            );
-        }
-        let mut fingerprints = Vec::new();
-        let mut items = Vec::new();
-        for fingerprint in &request.fingerprints {
-            let Some(elite) = loaded
-                .bank
-                .holding
-                .iter()
-                .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
-            else {
-                return Err(format!("{fingerprint} is not in Holding"));
-            };
-            fingerprints.push(fingerprint.clone());
-            items.push(BatteryItemView {
-                fingerprint: fingerprint.clone(),
-                strategy_id: elite.strategy.id.clone(),
-                status: "queued",
-                reason: None,
-                evidence: elite.evidence.total,
-                trades: elite.metrics.trade_count,
-            });
-        }
-        (
-            loaded.bank.clone(),
-            loaded.databank_path.clone(),
-            loaded.source.clone(),
-            loaded.broker.clone(),
-            loaded.metadata_path.clone(),
-            loaded
-                .m1_source
-                .clone()
-                .ok_or_else(|| {
-                    "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
-                })?,
-            loaded.m1_metadata_path.clone(),
-            loaded.validation_fraction,
-            loaded.sealed_fraction,
-            fingerprints,
-            items,
-        )
-    };
-
-    let (
-        bank,
-        databank_path,
-        source,
-        broker_path,
-        metadata_path,
-        m1_source,
-        m1_metadata_path,
-        validation_fraction,
-        sealed_fraction,
-        fingerprints,
-        items,
-    ) = snapshot;
+    let snapshot = snapshot_loaded_archive(&desktop)?;
+    if snapshot.legacy_read_only {
+        return Err(
+            "Schema-v5 databanks are read-only. Run a fresh Discover archive before Holding battery."
+                .into(),
+        );
+    }
 
     state.stop.store(false, Ordering::SeqCst);
     let now_ms = SystemTime::now()
@@ -223,26 +193,38 @@ pub fn start_holding_battery_job(
     let started = BatteryJobView {
         job_id: Some(format!("battery-{now_ms}")),
         status: "running",
-        phase: "Loading market data".into(),
-        message: format!(
-            "Queued {} Holding strategies for the robustness battery.",
-            items.len()
-        ),
-        databank_path: Some(databank_path.clone()),
-        total: items.len(),
-        queued: items.len(),
+        phase: if request.shrink_first || request.ranked {
+            "Preparing factory".into()
+        } else {
+            "Loading market data".into()
+        },
+        message: if request.ranked {
+            "Ranking Holding after shrink, then running the robustness battery on the remaining names.".into()
+        } else {
+            format!(
+                "Queued {} Holding strategies for the robustness battery.",
+                request.fingerprints.len()
+            )
+        },
+        databank_path: Some(snapshot.databank_path.clone()),
+        total: 0,
+        queued: 0,
         running: 0,
         completed: 0,
         passed: 0,
         rejected: 0,
-        holding_remaining: bank.holding.len(),
-        databank_elites: bank.elites.len(),
+        holding_remaining: snapshot.bank.holding.len(),
+        databank_elites: snapshot.bank.elites.len(),
         batteries_per_hour: 0.0,
         eta_seconds: None,
         elapsed_seconds: 0.0,
         stop_requested: false,
         revision: 0,
-        items,
+        items: Vec::new(),
+        kill_mix: BatteryKillMix::default(),
+        holding_before_shrink: snapshot.bank.holding.len(),
+        holding_after_shrink: snapshot.bank.holding.len(),
+        target_databank: request.target_databank,
     };
     *state
         .job
@@ -252,22 +234,8 @@ pub fn start_holding_battery_job(
     let job = Arc::clone(&state.job);
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
-
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_battery_job(
-            job,
-            stop,
-            bank,
-            databank_path,
-            source,
-            metadata_path,
-            m1_source,
-            m1_metadata_path,
-            broker_path,
-            validation_fraction,
-            sealed_fraction,
-            fingerprints,
-        ) {
+        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request) {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -278,6 +246,289 @@ pub fn start_holding_battery_job(
     });
 
     Ok(started)
+}
+
+/// Overnight Discover → shrink → ranked battery. Safe to call after a checkpoint write.
+pub(crate) fn spawn_factory_from_archive(
+    databank_path: String,
+    request: HoldingBatteryRequest,
+    state: &BatteryJobState,
+) -> Result<BatteryJobView, String> {
+    if state.is_busy()? {
+        return Err("a Holding battery job is already running".into());
+    }
+    let snapshot = snapshot_archive_file(&databank_path)?;
+    state.stop.store(false, Ordering::SeqCst);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as u64;
+    let started = BatteryJobView {
+        job_id: Some(format!("factory-{now_ms}")),
+        status: "running",
+        phase: "Preparing factory".into(),
+        message: "Discover finished — shrinking Holding and ranking the battery queue.".into(),
+        databank_path: Some(databank_path),
+        total: 0,
+        queued: 0,
+        running: 0,
+        completed: 0,
+        passed: 0,
+        rejected: 0,
+        holding_remaining: snapshot.bank.holding.len(),
+        databank_elites: snapshot.bank.elites.len(),
+        batteries_per_hour: 0.0,
+        eta_seconds: None,
+        elapsed_seconds: 0.0,
+        stop_requested: false,
+        revision: 0,
+        items: Vec::new(),
+        kill_mix: BatteryKillMix::default(),
+        holding_before_shrink: snapshot.bank.holding.len(),
+        holding_after_shrink: snapshot.bank.holding.len(),
+        target_databank: request.target_databank,
+    };
+    *state
+        .job
+        .write()
+        .map_err(|_| "battery job state is unavailable")? = started.clone();
+    let job = Arc::clone(&state.job);
+    let stop = Arc::clone(&state.stop);
+    let job_for_err = Arc::clone(&job);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request) {
+            if let Ok(mut view) = job_for_err.write() {
+                view.status = "failed";
+                view.phase = "Stopped with an error".into();
+                view.message = error;
+                view.running = 0;
+            }
+        }
+    });
+    Ok(started)
+}
+
+struct ArchiveSnapshot {
+    bank: Databank,
+    databank_path: String,
+    source: String,
+    broker_path: String,
+    metadata_path: Option<String>,
+    m1_source: String,
+    m1_metadata_path: Option<String>,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    legacy_read_only: bool,
+}
+
+fn snapshot_loaded_archive(desktop: &DesktopState) -> Result<ArchiveSnapshot, String> {
+    let loaded = desktop
+        .loaded
+        .read()
+        .map_err(|_| "desktop databank state is unavailable".to_owned())?;
+    let loaded = loaded
+        .as_ref()
+        .ok_or_else(|| "no databank is loaded — open the Discover checkpoint first".to_owned())?;
+    Ok(ArchiveSnapshot {
+        bank: loaded.bank.clone(),
+        databank_path: loaded.databank_path.clone(),
+        source: loaded.source.clone(),
+        broker_path: loaded.broker.clone(),
+        metadata_path: loaded.metadata_path.clone(),
+        m1_source: loaded
+            .m1_source
+            .clone()
+            .ok_or_else(|| {
+                "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
+            })?,
+        m1_metadata_path: loaded.m1_metadata_path.clone(),
+        validation_fraction: loaded.validation_fraction,
+        sealed_fraction: loaded.sealed_fraction,
+        legacy_read_only: loaded.legacy_read_only,
+    })
+}
+
+fn snapshot_archive_file(databank_path: &str) -> Result<ArchiveSnapshot, String> {
+    let path = Path::new(databank_path);
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let artifact: crate::databank::EvolveArtifact =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let source = artifact.source.clone();
+    let broker_path = artifact.broker.clone();
+    let m1_source = crate::databank::manifest_path(&artifact, "m1_source")
+        .ok_or_else(|| "This archive does not bind an M1 source; cannot run the factory.".to_owned())?;
+    let validation_fraction =
+        crate::databank::manifest_fraction(&artifact, "validation_fraction", 0.0);
+    let sealed_fraction =
+        crate::databank::manifest_fraction(&artifact, "sealed_fraction", 1.0 / 3.0);
+    let metadata_path = Path::new(&source)
+        .with_extension("metadata.csv")
+        .is_file()
+        .then(|| Path::new(&source).with_extension("metadata.csv").display().to_string());
+    let m1_metadata_path = Path::new(&m1_source)
+        .with_extension("metadata.csv")
+        .is_file()
+        .then(|| Path::new(&m1_source).with_extension("metadata.csv").display().to_string());
+    Ok(ArchiveSnapshot {
+        bank: artifact.databank,
+        databank_path: databank_path.to_string(),
+        source,
+        broker_path,
+        metadata_path,
+        m1_source,
+        m1_metadata_path,
+        validation_fraction,
+        sealed_fraction,
+        legacy_read_only: false,
+    })
+}
+
+fn ranked_holding_fingerprints(bank: &Databank, limit: Option<usize>) -> Vec<String> {
+    let mut rows: Vec<_> = bank.holding.iter().collect();
+    rows.sort_by(|left, right| {
+        holding_factory_score(right.metrics.trade_count, right.metrics.expectancy_r)
+            .partial_cmp(&holding_factory_score(
+                left.metrics.trade_count,
+                left.metrics.expectancy_r,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.metrics.trade_count.cmp(&left.metrics.trade_count))
+    });
+    let fingerprints = rows
+        .into_iter()
+        .map(|elite| elite.structural_fingerprint.to_string());
+    match limit {
+        Some(n) => fingerprints.take(n).collect(),
+        None => fingerprints.collect(),
+    }
+}
+
+fn run_factory_or_battery(
+    job: Arc<RwLock<BatteryJobView>>,
+    stop: Arc<AtomicBool>,
+    mut snapshot: ArchiveSnapshot,
+    request: HoldingBatteryRequest,
+) -> Result<(), String> {
+    let holding_before = snapshot.bank.holding.len();
+    if request.shrink_first {
+        update_phase(
+            &job,
+            "Shrinking Holding",
+            "Dropping daily P/L clones before the battery.",
+        );
+        shrink_holding_snapshot(&mut snapshot, request.max_correlation.unwrap_or(DEFAULT_FACTORY_CORR))?;
+        persist_bank_file(&snapshot.databank_path, &snapshot.bank)?;
+    }
+    let holding_after = snapshot.bank.holding.len();
+    let queue_take = optional_positive(request.queue_limit);
+    let target_databank = optional_positive(request.target_databank);
+    let fingerprints = if request.ranked || request.fingerprints.is_empty() {
+        ranked_holding_fingerprints(&snapshot.bank, queue_take)
+    } else {
+        request.fingerprints.clone()
+    };
+    if fingerprints.is_empty() {
+        return Err("Holding is empty after shrink — nothing to battery".into());
+    }
+    let items: Vec<_> = fingerprints
+        .iter()
+        .filter_map(|fingerprint| {
+            snapshot.bank.holding.iter().find(|elite| {
+                elite.structural_fingerprint.as_str() == fingerprint
+            }).map(|elite| BatteryItemView {
+                fingerprint: fingerprint.clone(),
+                strategy_id: elite.strategy.id.clone(),
+                status: "queued",
+                reason: None,
+                evidence: elite.evidence.total,
+                trades: elite.metrics.trade_count,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return Err("none of the queued fingerprints are still in Holding".into());
+    }
+    if let Ok(mut view) = job.write() {
+        view.total = items.len();
+        view.queued = items.len();
+        view.items = items;
+        view.holding_before_shrink = holding_before;
+        view.holding_after_shrink = holding_after;
+        view.holding_remaining = snapshot.bank.holding.len();
+        view.databank_elites = snapshot.bank.elites.len();
+        view.target_databank = target_databank;
+        view.revision += 1;
+        view.phase = "Loading market data".into();
+        let stop_note = match target_databank {
+            Some(n) => format!("Battery until {n} Databank names."),
+            None => "Battery everyone queued; keep every passer.".to_owned(),
+        };
+        view.message = format!(
+            "Funnel {} Holding → {} after shrink → {} queued. {stop_note}",
+            holding_before,
+            holding_after,
+            fingerprints.len(),
+        );
+    }
+
+    run_battery_job(
+        job,
+        stop,
+        snapshot.bank,
+        snapshot.databank_path,
+        snapshot.source,
+        snapshot.metadata_path,
+        snapshot.m1_source,
+        snapshot.m1_metadata_path,
+        snapshot.broker_path,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+        fingerprints,
+        target_databank,
+    )
+}
+
+fn shrink_holding_snapshot(
+    snapshot: &mut ArchiveSnapshot,
+    max_correlation: f64,
+) -> Result<(), String> {
+    let allowed = [0.3, 0.4, 0.5, 0.6];
+    if !allowed
+        .iter()
+        .any(|value| (max_correlation - value).abs() < 1e-9)
+    {
+        return Err("pick a daily P/L correlation cap of 0.3, 0.4, 0.5 or 0.6".into());
+    }
+    let loaded = crate::data_lab::load_data_source(
+        &snapshot.source,
+        snapshot.metadata_path.as_deref(),
+        None,
+    )?;
+    let mut dataset = loaded.dataset;
+    apply_history_start_year(&mut dataset, snapshot.bank.config.history_start_year)?;
+    let broker = load_bound_broker(&snapshot.broker_path, loaded.metadata.as_ref())?;
+    let plan = DataSplitPlan::chronological(
+        &dataset,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let development = slice_bars(&dataset, 0, plan.development.bar_count)?;
+    let cache = IndicatorBufferCache::new(development.bars.len());
+    let scout = snapshot.bank.config.scout.clone();
+    let timezone = broker.timezone.clone();
+    let daily_pnl: Vec<_> = snapshot
+        .bank
+        .holding
+        .par_iter()
+        .map(|elite| {
+            evaluate_strategy_cached(&elite.strategy, &development, &broker, &scout, &cache)
+                .map(|result| daily_pnl_from_trades(&result.trades, &timezone))
+                .unwrap_or_default()
+        })
+        .collect();
+    apply_holding_daily_corr_shrink(&mut snapshot.bank, &daily_pnl, max_correlation);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -294,6 +545,7 @@ fn run_battery_job(
     validation_fraction: f64,
     sealed_fraction: f64,
     fingerprints: Vec<String>,
+    target_databank: Option<usize>,
 ) -> Result<(), String> {
     let started = Instant::now();
     update_phase(
@@ -373,7 +625,7 @@ fn run_battery_job(
             .map(|elite| elite.structural_fingerprint.clone());
 
         let outcome = match target {
-            None => Err("not in Holding".to_owned()),
+            None => Err(("other".to_owned(), "not in Holding".to_owned())),
             Some(hash) => quantforge_discover::run_holding_battery_and_promote(
                 &mut bank,
                 &hash,
@@ -384,7 +636,7 @@ fn run_battery_job(
                 &broker,
             )
             .map(|_| ())
-            .map_err(|error| error.to_string()),
+            .map_err(|error| (error.kill_bucket().to_string(), error.to_string())),
         };
 
         completed += 1;
@@ -395,16 +647,18 @@ fn run_battery_job(
                 bank_changed = true;
                 mark_item(&job, fingerprint, "passed", None);
             }
-            Err(reason) => {
+            Err((bucket, reason)) => {
                 rejected += 1;
+                bump_kill_mix(&job, &bucket);
                 mark_item(&job, fingerprint, "rejected", Some(reason));
             }
         }
 
         let elapsed = started.elapsed().as_secs_f64().max(1e-6);
         let rate = completed as f64 / elapsed * 3600.0;
+        let target_hit = target_databank.is_some_and(|target| bank.elites.len() >= target);
         let remaining = total.saturating_sub(completed);
-        let eta = if completed > 0 && remaining > 0 {
+        let eta = if completed > 0 && remaining > 0 && !target_hit {
             Some(remaining as f64 / (completed as f64 / elapsed))
         } else {
             Some(0.0)
@@ -414,7 +668,7 @@ fn run_battery_job(
         // When the queue is empty, flip to a terminal status in the same write so
         // the UI can re-enable Run battery without waiting on checkpoint I/O.
         let stopped_now = stop.load(Ordering::SeqCst);
-        let finished = remaining == 0 || stopped_now;
+        let finished = remaining == 0 || stopped_now || target_hit;
         if let Ok(mut view) = job.write() {
             view.queued = remaining;
             view.running = 0;
@@ -431,18 +685,20 @@ fn run_battery_job(
                 view.status = if stopped_now { "stopped" } else { "completed" };
                 view.phase = if stopped_now {
                     "Stopped".into()
+                } else if target_hit {
+                    "Databank target reached".into()
                 } else {
                     "Battery complete".into()
                 };
-                view.message = format!(
-                    "{passed} passed into Databank, {rejected} rejected (still in Holding) after {completed} strategies."
-                );
+                view.message = funnel_message(&view, passed, rejected, completed, target_hit);
                 view.stop_requested = false;
                 view.eta_seconds = Some(0.0);
             } else {
                 view.phase = format!("Battery {completed}/{total}");
                 view.message = format!(
-                    "{passed} passed → Databank · {rejected} rejected (still Holding) · {rate:.1}/hr"
+                    "{} → {} after shrink → {completed} battered → {passed} pass / {rejected} fail · {rate:.1}/hr",
+                    view.holding_before_shrink,
+                    view.holding_after_shrink
                 );
             }
         }
@@ -484,14 +740,52 @@ fn run_battery_job(
             } else {
                 "Battery complete".into()
             };
-            view.message = format!(
-                "{} passed into Databank, {} rejected (still in Holding) after {} strategies.",
-                view.passed, view.rejected, view.completed
-            );
+            view.message = funnel_message(&view, view.passed, view.rejected, view.completed, false);
             view.stop_requested = false;
         }
     }
     Ok(())
+}
+
+fn funnel_message(
+    view: &BatteryJobView,
+    passed: usize,
+    rejected: usize,
+    completed: usize,
+    target_hit: bool,
+) -> String {
+    let mix = &view.kill_mix;
+    let target = if target_hit {
+        " Databank target reached."
+    } else {
+        ""
+    };
+    format!(
+        "{} Holding → {} after shrink → {completed} battered → {passed} Databank / {rejected} fail.{target} Kills: neighborhood {} · MC {} · folds {} · M1 {} · deposit {} · other {}.",
+        view.holding_before_shrink,
+        view.holding_after_shrink,
+        mix.neighborhood,
+        mix.monte_carlo,
+        mix.folds,
+        mix.m1,
+        mix.deposit + mix.expectancy + mix.oos1,
+        mix.other
+    )
+}
+
+fn bump_kill_mix(job: &Arc<RwLock<BatteryJobView>>, bucket: &str) {
+    if let Ok(mut view) = job.write() {
+        match bucket {
+            "neighborhood" => view.kill_mix.neighborhood += 1,
+            "monte_carlo" => view.kill_mix.monte_carlo += 1,
+            "folds" => view.kill_mix.folds += 1,
+            "m1" => view.kill_mix.m1 += 1,
+            "deposit" => view.kill_mix.deposit += 1,
+            "expectancy" => view.kill_mix.expectancy += 1,
+            "oos1" => view.kill_mix.oos1 += 1,
+            _ => view.kill_mix.other += 1,
+        }
+    }
 }
 
 fn update_phase(job: &Arc<RwLock<BatteryJobView>>, phase: &str, message: &str) {

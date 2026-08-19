@@ -620,6 +620,11 @@ export interface DiscoverRequest {
   sealedFraction: number | null;
   /** Broker-local calendar year of the first bar kept (2016 or 2020). */
   historyStartYear: number | null;
+  /** After Discover checkpoints, shrink Holding and battery remaining names. */
+  factoryAfterDiscover: boolean | null;
+  factoryQueueLimit: number | null;
+  factoryTargetDatabank: number | null;
+  factoryMaxCorrelation: number | null;
 }
 
 export interface SavedDiscoverProfile {
@@ -799,6 +804,19 @@ export interface BatteryJobView {
   stopRequested: boolean;
   revision: number;
   items: BatteryItemView[];
+  killMix?: {
+    neighborhood: number;
+    monteCarlo: number;
+    folds: number;
+    m1: number;
+    deposit: number;
+    expectancy: number;
+    oos1: number;
+    other: number;
+  };
+  holdingBeforeShrink?: number;
+  holdingAfterShrink?: number;
+  targetDatabank?: number | null;
 }
 
 export interface ChallengeRequest {

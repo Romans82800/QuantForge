@@ -5,8 +5,8 @@ use quantforge_eval::Trade;
 use serde::{Deserialize, Serialize};
 
 const MIN_TRADES_PER_FOLD: usize = 5;
-const MAX_YEAR_PNL_SHARE: f64 = 0.55;
-const MAX_POOLED_OVER_MEDIAN: f64 = 2.5;
+const MAX_YEAR_PNL_SHARE: f64 = 0.70;
+const MAX_POOLED_OVER_MEDIAN: f64 = 3.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,7 +47,9 @@ impl FoldRStats {
         if !self.usable {
             return self.pooled_r > 0.0;
         }
-        !self.has_negative_fold
+        // A genuine ~0.05–0.10R edge can have a negative calendar year.
+        // `has_negative_fold` stays on the record for ranking; it is not a veto.
+        self.pooled_r > 0.0
             && self.median_fold_r > 0.0
             && self.max_year_share <= MAX_YEAR_PNL_SHARE
             && self.pooled_r <= self.median_fold_r * MAX_POOLED_OVER_MEDIAN + 0.05
@@ -191,5 +193,29 @@ mod tests {
         assert!(stable_stats.rank_r() > lucky_stats.rank_r());
         assert!(!lucky_stats.passes_stability());
         assert!(stable_stats.passes_stability());
+    }
+
+    #[test]
+    fn one_negative_year_is_not_an_automatic_reject() {
+        let mut trades = many(2020, 0.10, 12);
+        trades.extend(many(2021, 0.08, 12));
+        trades.extend(many(2022, -0.04, 12));
+        trades.extend(many(2023, 0.09, 12));
+        let stats = calendar_year_fold_r(&trades);
+        assert!(stats.has_negative_fold);
+        assert!(stats.pooled_r > 0.0);
+        assert!(stats.median_fold_r > 0.0);
+        assert!(stats.max_year_share <= MAX_YEAR_PNL_SHARE);
+        assert!(stats.passes_stability());
+    }
+
+    #[test]
+    fn concentrated_year_still_fails() {
+        let mut trades = many(2020, 0.80, 40);
+        trades.extend(many(2021, 0.02, 8));
+        trades.extend(many(2022, 0.02, 8));
+        let stats = calendar_year_fold_r(&trades);
+        assert!(stats.pooled_r > 0.0);
+        assert!(!stats.passes_stability());
     }
 }

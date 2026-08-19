@@ -170,6 +170,15 @@ pub struct DiscoverRequest {
     sealed_fraction: Option<f64>,
     /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
     history_start_year: Option<u16>,
+    /// After Discover checkpoints, shrink Holding and battery remaining names.
+    #[serde(default)]
+    factory_after_discover: Option<bool>,
+    #[serde(default)]
+    factory_queue_limit: Option<usize>,
+    #[serde(default)]
+    factory_target_databank: Option<usize>,
+    #[serde(default)]
+    factory_max_correlation: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -452,6 +461,7 @@ pub fn run_condition_bakeoff(
 pub fn start_discover(
     mut request: DiscoverRequest,
     state: State<'_, DiscoverState>,
+    battery: State<'_, crate::holding_battery::BatteryJobState>,
 ) -> Result<DiscoverJobView, String> {
     if request.mode == DiscoverMode::New && request.databank_path.trim().is_empty() {
         request.databank_path = automatic_databank_path(&request)?;
@@ -464,7 +474,7 @@ pub fn start_discover(
         == Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
     {
         request.target_databank_elites =
-            Some(request.target_databank_elites.unwrap_or(5_000).max(5_000));
+            Some(request.target_databank_elites.unwrap_or(400).clamp(40, 10_000));
     }
     {
         let current = state
@@ -560,12 +570,60 @@ pub fn start_discover(
     let paused = Arc::clone(&state.paused);
     let stop = Arc::clone(&state.stop);
     let live_artifact = Arc::clone(&state.live_artifact);
+    let battery_state = crate::holding_battery::BatteryJobState {
+        job: Arc::clone(&battery.job),
+        stop: Arc::clone(&battery.stop),
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_discovery(request, &job, &live_artifact, &paused, &stop) {
-            if let Ok(mut view) = job.write() {
-                view.status = "failed";
-                view.phase = "Stopped with an error".into();
-                view.message = error;
+        match run_discovery(request.clone(), &job, &live_artifact, &paused, &stop) {
+            Err(error) => {
+                if let Ok(mut view) = job.write() {
+                    view.status = "failed";
+                    view.phase = "Stopped with an error".into();
+                    view.message = error;
+                }
+            }
+            Ok(()) => {
+                if request.factory_after_discover.unwrap_or(false) {
+                    let factory_queue = request.factory_queue_limit.filter(|&n| n > 0);
+                    let factory_target = request.factory_target_databank.filter(|&n| n > 0);
+                    let factory = crate::databank::HoldingBatteryRequest {
+                        fingerprints: Vec::new(),
+                        ranked: true,
+                        shrink_first: true,
+                        max_correlation: request.factory_max_correlation,
+                        queue_limit: factory_queue,
+                        target_databank: factory_target,
+                    };
+                    match crate::holding_battery::spawn_factory_from_archive(
+                        request.databank_path.clone(),
+                        factory,
+                        &battery_state,
+                    ) {
+                        Ok(_) => {
+                            if let Ok(mut view) = job.write() {
+                                let factory_note = match factory_target {
+                                    Some(n) => format!(
+                                        "Factory started: shrink Holding, then battery until {n} Databank names."
+                                    ),
+                                    None => {
+                                        "Factory started: shrink Holding, then battery everyone left after shrink."
+                                            .to_owned()
+                                    }
+                                };
+                                view.message = format!("{}. {factory_note}", view.message);
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut view) = job.write() {
+                                view.message = format!(
+                                    "{}. Factory did not start: {error}",
+                                    view.message
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     });
@@ -1112,11 +1170,20 @@ fn run_discovery(
 
     let mut completed_now = 0u64;
     let mut last_checkpoint_active_seconds = clock.active_seconds();
+    let mut last_holding_count = bank.holding.len();
+    let mut holding_stall_generations = 0u64;
+    const HOLDING_STALL_GENERATIONS: u64 = 25;
+    const HOLDING_STALL_MIN: usize = 40;
 
     let quota_met = |bank: &Databank| -> bool {
         bank.config
             .target_databank_elites
             .is_some_and(|target| bank.quota_progress_count() >= target)
+    };
+    let holding_plateaued = |bank: &Databank, stall: u64| -> bool {
+        bank.config.build_to_holding
+            && stall >= HOLDING_STALL_GENERATIONS
+            && bank.holding.len() >= HOLDING_STALL_MIN
     };
 
     // Dataset selection is fixed for the run: `validate_resume` requires the
@@ -1282,6 +1349,15 @@ fn run_discovery(
         if quota_met(&bank) {
             break;
         }
+        if holding_plateaued(&bank, holding_stall_generations) {
+            if let Ok(mut view) = job.write() {
+                view.message = format!(
+                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
+                    bank.holding.len()
+                );
+            }
+            break;
+        }
         if !run_until_stopped && completed_now >= soft_budget {
             break;
         }
@@ -1320,6 +1396,15 @@ fn run_discovery(
             )
             .map_err(|error| error.to_string())?;
         completed_now += 1;
+        if bank.config.build_to_holding {
+            let holding_now = bank.holding.len();
+            if holding_now > last_holding_count {
+                last_holding_count = holding_now;
+                holding_stall_generations = 0;
+            } else {
+                holding_stall_generations += 1;
+            }
+        }
         publish_live_databank(
             live_artifact,
             &request,
@@ -1402,8 +1487,19 @@ fn run_discovery(
 
         // Deposited Holding is enough to stop. Waiting out the M1 queue after
         // every generation serialized scout behind promotion and is why
-        // Looked-at crawled versus the old pipelined runs.
+        // Looked-at crawled versus the old pipelined runs. A Holding plateau
+        // (no new names for many generations) also stops so thin symbols can
+        // factory instead of waiting on a quota they will never fill.
         if quota_met(&bank) {
+            break;
+        }
+        if holding_plateaued(&bank, holding_stall_generations) {
+            if let Ok(mut view) = job.write() {
+                view.message = format!(
+                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
+                    bank.holding.len()
+                );
+            }
             break;
         }
     }
@@ -2789,6 +2885,10 @@ mod tests {
             validation_fraction: None,
             sealed_fraction: None,
             history_start_year: None,
+            factory_after_discover: None,
+            factory_queue_limit: None,
+            factory_target_databank: None,
+            factory_max_correlation: None,
         }
     }
 

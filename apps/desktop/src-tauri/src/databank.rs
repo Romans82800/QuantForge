@@ -1207,7 +1207,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::FoldStability => (
             "fold_stability",
-            "Development calendar-year R is concentrated, negative, or a pooled-IS illusion.",
+            "Development calendar-year R failed pooled/median positivity, year concentration, or pooled-vs-median sanity.",
         ),
         RobustnessReject::Cpcv => (
             "cpcv",
@@ -1617,7 +1617,21 @@ pub fn promote_elite_to_vault(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HoldingBatteryRequest {
+    #[serde(default)]
     pub fingerprints: Vec<String>,
+    /// Rank Holding by trades × R-expectancy instead of using `fingerprints`.
+    #[serde(default)]
+    pub ranked: bool,
+    #[serde(default)]
+    pub shrink_first: bool,
+    #[serde(default)]
+    pub max_correlation: Option<f64>,
+    /// Ranked factory queue cap. `None` or `0` batteries everyone left after shrink.
+    #[serde(default)]
+    pub queue_limit: Option<usize>,
+    /// Stop the battery once Databank reaches this many elites. `None` or `0` keeps every passer.
+    #[serde(default)]
+    pub target_databank: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2900,7 +2914,7 @@ pub(crate) fn artifact_m1_fidelity_verified(artifact: &EvolveArtifact) -> bool {
     )
 }
 
-fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
+pub(crate) fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
     artifact
         .manifest
         .recipe
@@ -2910,7 +2924,7 @@ fn manifest_path(artifact: &EvolveArtifact, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
+pub(crate) fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
     artifact
         .manifest
         .recipe

@@ -83,9 +83,25 @@ export function runHoldingBattery(fingerprints: string[]): Promise<{
   return invoke("run_holding_battery", { request: { fingerprints } });
 }
 
-export function startHoldingBatteryJob(fingerprints: string[]): Promise<BatteryJobView> {
+export function startHoldingBatteryJob(
+  fingerprints: string[],
+  options?: {
+    ranked?: boolean;
+    shrinkFirst?: boolean;
+    maxCorrelation?: number;
+    queueLimit?: number;
+    targetDatabank?: number;
+  },
+): Promise<BatteryJobView> {
   return invoke<BatteryJobView>("start_holding_battery_job", {
-    request: { fingerprints },
+    request: {
+      fingerprints,
+      ranked: options?.ranked ?? false,
+      shrinkFirst: options?.shrinkFirst ?? false,
+      maxCorrelation: options?.maxCorrelation ?? null,
+      queueLimit: options?.queueLimit ?? null,
+      targetDatabank: options?.targetDatabank ?? null,
+    },
   });
 }
 

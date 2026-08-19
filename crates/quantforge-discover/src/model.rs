@@ -685,7 +685,9 @@ pub struct DiscoverConfig {
     pub build_to_holding: bool,
     /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
     /// neighborhood battery before databank admission. Ignored when
-    /// `build_to_holding` is true (battery is deferred). Pot fill never waits on this.
+    /// `build_to_holding` is true (battery is deferred). Holding promotion
+    /// never waits on a full M1 queue; full-harvest Databank promotion still
+    /// blocks on pot admits.
     #[serde(default = "default_require_m1_robustness")]
     pub require_m1_robustness: bool,
     #[serde(default = "default_robustness_folds")]
@@ -1014,9 +1016,9 @@ impl DiscoverConfig {
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
-                // Thousands of Holding survivors: seed-heavy. Stop on Holding quota —
-                // not pot. Holding requires M1 fidelity plus fold-stable R. OOS1 is
-                // not a pick. The param/MC battery stays on-demand.
+                // Modest Holding fill, then on-demand factory. Most symbols plateau
+                // well below 5k; a 400 default plus stall-stop is the harvest. OOS1
+                // is not a pick. The param/MC battery stays on-demand.
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
@@ -1033,9 +1035,9 @@ impl DiscoverConfig {
                 // Only the Holding/databank quota stops the run.
                 self.early_stop_pot_elites = None;
                 self.target_databank_elites =
-                    Some(self.target_databank_elites.unwrap_or(5_000).max(5_000));
-                self.max_holding_elites = self.max_holding_elites.max(10_000);
-                self.max_databank_elites = self.max_databank_elites.max(10_000);
+                    Some(self.target_databank_elites.unwrap_or(400).clamp(40, 10_000));
+                self.max_holding_elites = self.max_holding_elites.max(2_000);
+                self.max_databank_elites = self.max_databank_elites.max(2_000);
                 // 6-of-N pack replays belong to Full Harvest. Quota is a
                 // single-symbol volume scout; leftover pack defaults made
                 // Looked-at crawl versus the previous ~3M evals/hour runs.

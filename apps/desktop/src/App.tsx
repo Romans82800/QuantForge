@@ -329,6 +329,8 @@ function App() {
   const [batteryBusy, setBatteryBusy] = useState(false);
   const [holdingCorrCap, setHoldingCorrCap] = useState(0.5);
   const [holdingShrinkBusy, setHoldingShrinkBusy] = useState(false);
+  const [factoryQueueLimit, setFactoryQueueLimit] = useState(0);
+  const [factoryTargetDatabank, setFactoryTargetDatabank] = useState(0);
   const lastBatteryRevision = useRef(0);
   const [discoverResultsOpen, setDiscoverResultsOpen] = useState(false);
   const [stripMessage, setStripMessage] = useState<string | null>(null);
@@ -600,9 +602,14 @@ function App() {
   }, [batteryJob?.items, batteryJob?.revision]);
 
   useEffect(() => {
-    void getHoldingBatteryJob()
-      .then(setBatteryJob)
-      .catch(() => undefined);
+    const pull = () => {
+      void getHoldingBatteryJob()
+        .then(setBatteryJob)
+        .catch(() => undefined);
+    };
+    pull();
+    const timer = window.setInterval(pull, 2000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -660,6 +667,27 @@ function App() {
     setError(null);
     try {
       const started = await startHoldingBatteryJob(fingerprints);
+      lastBatteryRevision.current = started.revision;
+      setBatteryJob(started);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
+  async function startHoldingFactory() {
+    if ((workspace?.holding?.length ?? 0) === 0) return;
+    setBatteryBusy(true);
+    setError(null);
+    try {
+      const started = await startHoldingBatteryJob([], {
+        ranked: true,
+        shrinkFirst: true,
+        maxCorrelation: holdingCorrCap,
+        queueLimit: factoryQueueLimit,
+        targetDatabank: factoryTargetDatabank,
+      });
       lastBatteryRevision.current = started.revision;
       setBatteryJob(started);
     } catch (reason) {
@@ -1040,6 +1068,17 @@ function App() {
                       <span className="read-only-badge">{batteryJob.status}</span>
                     </div>
                     <p>{batteryJob.message}</p>
+                    {(batteryJob.holdingBeforeShrink ?? 0) > 0 && (
+                      <p className="muted">
+                        Funnel {formatNumber(batteryJob.holdingBeforeShrink ?? 0)} Holding
+                        → {formatNumber(batteryJob.holdingAfterShrink ?? batteryJob.holdingBeforeShrink ?? 0)} after shrink
+                        → {formatNumber(batteryJob.total)} queued
+                        → {formatNumber(batteryJob.passed)} Databank
+                        {batteryJob.targetDatabank
+                          ? ` (stop at ${formatNumber(batteryJob.targetDatabank)})`
+                          : ""}
+                      </p>
+                    )}
                     <div className="kpi-grid" aria-label="Battery counters">
                       <Kpi
                         label="Progress"
@@ -1066,6 +1105,24 @@ function App() {
                         }
                       />
                     </div>
+                    {batteryJob.killMix && batteryJob.rejected > 0 && (
+                      <div className="kpi-grid" aria-label="Battery kill mix">
+                        <Kpi label="Neighborhood / RetDD" value={formatNumber(batteryJob.killMix.neighborhood)} note="0.85–1.25 of median" />
+                        <Kpi label="Monte Carlo" value={formatNumber(batteryJob.killMix.monteCarlo)} note="P80 profit retention" />
+                        <Kpi label="Folds" value={formatNumber(batteryJob.killMix.folds)} note="CPCV / walk-forward / years" />
+                        <Kpi
+                          label="Other kills"
+                          value={formatNumber(
+                            batteryJob.killMix.m1
+                              + batteryJob.killMix.deposit
+                              + batteryJob.killMix.expectancy
+                              + batteryJob.killMix.oos1
+                              + batteryJob.killMix.other,
+                          )}
+                          note={`M1 ${batteryJob.killMix.m1} · deposit ${batteryJob.killMix.deposit}`}
+                        />
+                      </div>
+                    )}
                     {batteryActive && (
                       <div className="form-footer">
                         <button
@@ -1160,6 +1217,43 @@ function App() {
                             title="Drop correlated Holding clones using Development H1 daily P/L. Not a Discover start setting."
                           >
                             {holdingShrinkBusy ? "Shrinking…" : "Shrink Holding"}
+                          </button>
+                          <label>
+                            Queue
+                            <input
+                              aria-label="Factory queue limit"
+                              min={0}
+                              max={10000}
+                              onChange={(event) => setFactoryQueueLimit(Math.max(0, Number(event.target.value) || 0))}
+                              type="number"
+                              value={factoryQueueLimit}
+                            />
+                          </label>
+                          <label>
+                            Databank target
+                            <input
+                              aria-label="Factory Databank target"
+                              min={0}
+                              max={10000}
+                              onChange={(event) => setFactoryTargetDatabank(Math.max(0, Number(event.target.value) || 0))}
+                              type="number"
+                              value={factoryTargetDatabank}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={
+                              loading
+                              || batteryBusy
+                              || batteryActive
+                              || holdingShrinkBusy
+                              || (workspace?.holding?.length ?? 0) === 0
+                            }
+                            onClick={() => void startHoldingFactory()}
+                            title="Shrink correlated clones, rank by trades × R-expectancy, then battery the queue. Queue 0 = everyone after shrink. Databank target 0 = keep every passer."
+                          >
+                            {batteryActive ? "Factory running…" : "Run factory"}
                           </button>
                           <button
                             type="button"
@@ -3428,6 +3522,10 @@ function DiscoverWorkspace({
     validationFraction: 0,
     sealedFraction: 1 / 3,
     historyStartYear: 2016,
+    factoryAfterDiscover: true,
+    factoryQueueLimit: 0,
+    factoryTargetDatabank: 0,
+    factoryMaxCorrelation: 0.5,
     ...preset,
   }));
   const [discoverProfiles, setDiscoverProfiles] = useState<SavedDiscoverProfile[]>([]);
@@ -3630,6 +3728,8 @@ function DiscoverWorkspace({
           ?? symbolFromDataPath(form.brokerPath)
           ?? symbolFromDataPath(form.dataPath),
         promotionSplit: true,
+        // Generations 0 means SQX-style run-until-stopped, never a hard start block.
+        runUntilStopped: (form.runUntilStopped ?? true) || form.generations < 1,
       });
       const request = form.mode === "continue"
           ? {
@@ -3806,6 +3906,27 @@ function DiscoverWorkspace({
   );
   const lookedAt = job?.evaluationCount ?? 0;
   const rejected = job?.rejectedTotal ?? 0;
+  const resolvedSymbol =
+    form.selectedSymbol
+    || symbolFromDataPath(form.brokerPath)
+    || symbolFromDataPath(form.dataPath);
+  const startBlocker = active
+    ? "A Discover job is already running. Open Live progress to pause or stop it."
+    : busy
+      ? "Starting…"
+      : !resolvedSymbol
+        ? "Choose a symbol. If the list is empty, the IC Markets 2016 pack is not visible to the app."
+        : !form.dataPath || !form.m1DataPath || !form.brokerPath
+          ? "Symbol paths are incomplete (H1, M1, or broker missing)."
+          : form.mode === "continue" && !form.databankPath
+            ? "Continuation needs an existing databank path."
+            : form.mode === "new" && !form.universalGrammar
+              ? "Universal grammar is missing."
+              : entryWindowError(form)
+                ?? entryOrderError(form)
+                ?? perturbationError(form);
+  const canStart = !startBlocker;
+
   return (
     <div className="discover-layout">
       <div className="discover-dashboard">
@@ -3845,10 +3966,22 @@ function DiscoverWorkspace({
         <div className="panel-heading">
           <div><p className="eyebrow">Discover</p><h2>Configure deterministic evolution</h2></div>
           <div className="mode-toggle">
-            <button className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
-            <button className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
+            <button type="button" className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
+            <button type="button" className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
+            <button
+              type="button"
+              className="primary"
+              disabled={!canStart}
+              title={startBlocker ?? "Start Discover"}
+              onClick={() => void start()}
+            >
+              {busy ? "Starting…" : form.mode === "new" ? "Start Discover" : "Continue"}
+            </button>
           </div>
         </div>
+        {startBlocker && !busy && (
+          <p className="field-error" style={{ margin: "0 16px 8px" }}>{startBlocker}</p>
+        )}
         <fieldset disabled={active || busy}>
           {form.mode === "new" ? (
             <>
@@ -3921,7 +4054,7 @@ function DiscoverWorkspace({
                         runMode: "quota_harvest",
                         mutateAfterElites: 25,
                         earlyStopPotElites: null,
-                        targetDatabankElites: 5000,
+                        targetDatabankElites: 400,
                         initialCandidates: Math.max(current.initialCandidates ?? 500, 1000),
                         batchSize: Math.max(current.batchSize ?? 200, 300),
                         randomFillFraction: Math.max(current.randomFillFraction ?? 0.75, 0.75),
@@ -3933,10 +4066,14 @@ function DiscoverWorkspace({
                         requireM1Precision: true,
                         simpleExits: true,
                         multiSymbolMinimumPass: 0,
+                        factoryAfterDiscover: true,
+                        factoryQueueLimit: current.factoryQueueLimit ?? 0,
+                        factoryTargetDatabank: current.factoryTargetDatabank ?? 0,
+                        factoryMaxCorrelation: current.factoryMaxCorrelation ?? 0.5,
                       }))
                     }
                   >
-                    Quota (5,000)
+                    Quota (fill then factory)
                   </button>
                   <button
                     type="button"
@@ -3964,9 +4101,28 @@ function DiscoverWorkspace({
                   </button>
                 </div>
                 {form.runMode === "quota_harvest" && (
-                  <p className="recipe-summary">
-                    Stops at {formatNumber(Math.max(form.targetDatabankElites ?? 5000, 5000))} Holding names (hard cap 10,000). Fold-stable Development R above 0.25R is the filter. Sealed holdout is 33% and never used to pick. Pack 6-of-N is off so scout stays on the primary symbol.
-                  </p>
+                  <div className="form-stack compact">
+                    <p className="recipe-summary">
+                      Stops at {formatNumber(form.targetDatabankElites ?? 400)} Holding names, or sooner if Holding stops growing for 25 generations after at least 40 names. Fold-stable Development R above 0.25R is the filter. Sealed holdout is 33% and never used to pick. Pack 6-of-N is off so scout stays on the primary symbol.
+                    </p>
+                    <label className="field-row">
+                      <span>Overnight factory</span>
+                      <input
+                        type="checkbox"
+                        checked={form.factoryAfterDiscover !== false}
+                        disabled={active || busy}
+                        onChange={(event) => setForm((current) => ({ ...current, factoryAfterDiscover: event.target.checked }))}
+                      />
+                      <small>
+                        When Discover checkpoints, shrink Holding at daily P/L corr {form.factoryMaxCorrelation ?? 0.5}, rank by trades × R-expectancy, then battery {(form.factoryQueueLimit ?? 0) > 0 ? `the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "everyone left after shrink"}. {(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}
+                      </small>
+                    </label>
+                    <div className="form-grid universal-grammar-grid">
+                      <NumberField label="Holding quota" value={form.targetDatabankElites ?? 400} onChange={(value) => setForm((current) => ({ ...current, targetDatabankElites: value ?? 400 }))} min={40} max={10000} />
+                      <NumberField label="Factory queue (0 = all)" value={form.factoryQueueLimit ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryQueueLimit: value ?? 0 }))} min={0} max={10000} />
+                      <NumberField label="Databank target (0 = all passers)" value={form.factoryTargetDatabank ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryTargetDatabank: value ?? 0 }))} min={0} max={10000} />
+                    </div>
+                  </div>
                 )}
                 {form.runMode === "high_performance_islands" && (
                   <div className="form-stack compact">
@@ -4014,6 +4170,7 @@ function DiscoverWorkspace({
                 }));
               }}
               selectedSymbol={form.selectedSymbol}
+              selectedDataPath={form.dataPath}
             />
             <PathField
               label={form.mode === "new" ? "New databank (auto if blank)" : "Existing databank"}
@@ -4258,22 +4415,18 @@ function DiscoverWorkspace({
             )}
           </>}
         </fieldset>
-        <div className="form-footer">
-          <p>Pipeline: Development gates → reservoir → breed → Holding (H1 + M1) → on-demand battery → Databank. OOS2 remains sealed.</p>
+        <div className="form-footer discover-start-footer">
+          <p>
+            {startBlocker
+              ? startBlocker
+              : "Pipeline: Development gates → reservoir → breed → Holding (H1 + M1) → on-demand battery → Databank. OOS2 remains sealed."}
+          </p>
           <button
+            type="button"
             className="primary"
-            disabled={
-              active
-              || busy
-              || !form.selectedSymbol
-              || !form.dataPath
-              || !form.m1DataPath
-              || !form.brokerPath
-              || (form.mode === "continue" && !form.databankPath)
-              || (form.mode === "new" && !form.universalGrammar)
-              || (!(form.runUntilStopped ?? true) && form.generations < 1)
-            }
-            onClick={start}
+            disabled={!canStart}
+            title={startBlocker ?? "Start Discover"}
+            onClick={() => void start()}
           >
             {busy ? "Starting…" : form.mode === "new" ? "Start Discover" : "Continue optimization"}
           </button>

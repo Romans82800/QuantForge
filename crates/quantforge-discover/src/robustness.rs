@@ -45,6 +45,30 @@ pub enum RobustnessReject {
     ParamNeighborhood,
 }
 
+impl RobustnessReject {
+    pub fn kill_bucket(self) -> &'static str {
+        match self {
+            Self::M1Fidelity => "m1",
+            Self::FoldStability | Self::Cpcv | Self::WalkForward => "folds",
+            Self::MonteCarlo => "monte_carlo",
+            Self::ParamNeighborhood => "neighborhood",
+        }
+    }
+}
+
+impl std::fmt::Display for RobustnessReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::M1Fidelity => "M1 fidelity",
+            Self::FoldStability => "calendar-year fold stability (pooled/median R, concentration)",
+            Self::Cpcv => "CPCV folds",
+            Self::WalkForward => "walk-forward",
+            Self::MonteCarlo => "Monte Carlo",
+            Self::ParamNeighborhood => "parameter neighborhood / Ret/DD 0.85–1.25",
+        })
+    }
+}
+
 pub struct RobustnessConfig {
     pub folds: usize,
     pub monte_carlo_trials: usize,

@@ -276,7 +276,11 @@ fn evaluate_and_deposit(
             broker,
         );
         for (pot_evaluation, blocking) in pot_promotions {
-            if blocking {
+            // Holding exists so M1 work cannot stall H1 generations. A full
+            // promotion queue skips this candidate until a later admit; it
+            // must not wait. Full-harvest Databank promotion still blocks on
+            // pot admits so elites are not silently dropped.
+            if blocking && !bank.config.build_to_holding {
                 promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
             } else {
                 promotion.try_enqueue(pot_evaluation, Arc::clone(&context), bank)?;
@@ -812,17 +816,34 @@ pub enum HoldingBatteryReject {
     Evaluation(String),
 }
 
+impl HoldingBatteryReject {
+    pub fn kill_bucket(&self) -> &'static str {
+        match self {
+            Self::Robustness(reject) => reject.kill_bucket(),
+            Self::DepositGate => "deposit",
+            Self::DevelopmentExpectancy => "expectancy",
+            Self::Oos1 => "oos1",
+            Self::NotInHolding | Self::Evaluation(_) => "other",
+        }
+    }
+}
+
 impl std::fmt::Display for HoldingBatteryReject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotInHolding => write!(f, "not in Holding"),
-            Self::Robustness(reject) => write!(f, "robustness: {reject:?}"),
+            Self::Robustness(reject) => write!(f, "{reject}"),
             Self::DepositGate => write!(f, "deposit gates"),
             Self::DevelopmentExpectancy => write!(f, "Development expectancy floor"),
             Self::Oos1 => write!(f, "OOS1 retention"),
             Self::Evaluation(message) => write!(f, "evaluation: {message}"),
         }
     }
+}
+
+/// Rank Holding for the overnight factory: more trades × non-negative R-expectancy first.
+pub fn holding_factory_score(trade_count: usize, expectancy_r: f64) -> f64 {
+    trade_count as f64 * expectancy_r.max(0.0)
 }
 
 /// Successful Holding battery: strategy removed from Holding and deposited.
@@ -2457,31 +2478,37 @@ mod tests {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.apply_run_mode();
-        assert_eq!(config.target_databank_elites, Some(5_000));
-        assert!(config.max_holding_elites >= 10_000);
+        assert_eq!(config.target_databank_elites, Some(400));
+        assert!(config.max_holding_elites >= 2_000);
         // Breeding pot still has a niche bag; Holding ignores inventory so a
-        // 5k quota cannot freeze at three full families or a 100-name corr wall.
+        // a few-hundred quota cannot freeze at three full families or a corr wall.
         assert!(config.max_elites_per_niche >= 2);
     }
 
     #[test]
-    fn quota_mode_floors_leftover_500_and_skips_pack_replays() {
+    fn quota_mode_keeps_an_explicit_holding_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.target_databank_elites = Some(500);
         config.multi_symbol_minimum_pass = 6;
         config.apply_run_mode();
-        assert_eq!(config.target_databank_elites, Some(5_000));
+        assert_eq!(config.target_databank_elites, Some(500));
         assert_eq!(config.multi_symbol_minimum_pass, 0);
     }
 
     #[test]
-    fn quota_mode_keeps_an_explicit_target_above_5000() {
+    fn quota_mode_keeps_a_large_explicit_holding_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
-        config.target_databank_elites = Some(10_000);
+        config.target_databank_elites = Some(2_000);
         config.apply_run_mode();
-        assert_eq!(config.target_databank_elites, Some(10_000));
+        assert_eq!(config.target_databank_elites, Some(2_000));
+    }
+
+    #[test]
+    fn factory_score_ranks_busy_positive_expectancy_ahead_of_heroes() {
+        assert!(super::holding_factory_score(200, 0.12) > super::holding_factory_score(40, 0.40));
+        assert_eq!(super::holding_factory_score(500, -0.10), 0.0);
     }
 
     #[test]
