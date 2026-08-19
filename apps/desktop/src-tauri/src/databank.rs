@@ -1223,7 +1223,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",
-            "Failed the ±20% parameter-neighborhood, ADX plateau, or ret/DD 0.85–1.25-of-median requirement.",
+            "Failed ±param survival or orig Ret/DD outside 0.85–1.25 of the neighbourhood median.",
         ),
     }
 }
@@ -1841,16 +1841,28 @@ pub(crate) fn slice_bars(
     })
 }
 
-pub(crate) fn persist_bank_file(databank_path: &str, bank: &Databank) -> Result<(), String> {
+pub(crate) fn persist_bank_file(databank_path: &str, bank: &mut Databank) -> Result<(), String> {
     let path = Path::new(databank_path);
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let mut artifact: EvolveArtifact =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    artifact.databank = bank.clone();
-    artifact.coverage = bank.coverage();
-    artifact.qd_score = bank.qd_score();
-    quantforge_storage::write_json_replacing(path, &artifact).map_err(|error| error.to_string())?;
-    Ok(())
+    persist_evolve_artifact(path, &mut artifact, bank)
+}
+
+/// Write `bank` into an already-parsed artifact. Battery must not re-read the
+/// multi-MB checkpoint after every passer.
+pub(crate) fn persist_evolve_artifact(
+    path: &Path,
+    artifact: &mut EvolveArtifact,
+    bank: &mut Databank,
+) -> Result<(), String> {
+    std::mem::swap(&mut artifact.databank, bank);
+    artifact.coverage = artifact.databank.coverage();
+    artifact.qd_score = artifact.databank.qd_score();
+    let written = quantforge_storage::write_json_replacing(path, artifact)
+        .map_err(|error| error.to_string());
+    std::mem::swap(&mut artifact.databank, bank);
+    written
 }
 
 pub(crate) fn persist_loaded_bank(
@@ -1858,7 +1870,7 @@ pub(crate) fn persist_loaded_bank(
     bank: &Databank,
     state: &DesktopState,
 ) -> Result<(), String> {
-    persist_bank_file(databank_path, bank)?;
+    persist_bank_file(databank_path, &mut bank.clone())?;
     {
         let mut loaded = state
             .loaded

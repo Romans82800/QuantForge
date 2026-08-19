@@ -233,7 +233,7 @@ pub fn resolve_data_pack_root() -> Result<PathBuf, String> {
         })
 }
 
-fn quantforge_runs_root() -> PathBuf {
+pub(crate) fn quantforge_runs_root() -> PathBuf {
     if let Some(home) = user_home_dir() {
         let preferred = home.join("Documents").join("QuantForge").join("runs");
         if preferred.parent().is_some_and(|parent| parent.is_dir()) {

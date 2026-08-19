@@ -4,21 +4,24 @@ use crate::data_lab::{
     apply_history_start_year, load_bound_broker, load_quote_sidecar, trim_market_history_to_year,
 };
 use crate::databank::{
-    DesktopState, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file,
+    DesktopState, EvolveArtifact, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file,
     persist_loaded_bank, reload_workspace_from_path, slice_bars,
 };
 use quantforge_data::BarDataset;
 use quantforge_discover::{
-    Databank, apply_holding_daily_corr_shrink, daily_pnl_from_trades, holding_factory_score,
+    Databank, Elite, RobustnessEvidence, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
+    holding_factory_score,
 };
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_quality::DataSplitPlan;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -43,6 +46,8 @@ pub struct BatteryKillMix {
     deposit: usize,
     expectancy: usize,
     oos1: usize,
+    correlation: usize,
+    clone: usize,
     other: usize,
 }
 
@@ -213,8 +218,8 @@ pub fn start_holding_battery_job(
         completed: 0,
         passed: 0,
         rejected: 0,
-        holding_remaining: snapshot.bank.holding.len(),
-        databank_elites: snapshot.bank.elites.len(),
+        holding_remaining: snapshot.artifact.databank.holding.len(),
+        databank_elites: snapshot.artifact.databank.elites.len(),
         batteries_per_hour: 0.0,
         eta_seconds: None,
         elapsed_seconds: 0.0,
@@ -222,8 +227,8 @@ pub fn start_holding_battery_job(
         revision: 0,
         items: Vec::new(),
         kill_mix: BatteryKillMix::default(),
-        holding_before_shrink: snapshot.bank.holding.len(),
-        holding_after_shrink: snapshot.bank.holding.len(),
+        holding_before_shrink: snapshot.artifact.databank.holding.len(),
+        holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
     };
     *state
@@ -275,8 +280,8 @@ pub(crate) fn spawn_factory_from_archive(
         completed: 0,
         passed: 0,
         rejected: 0,
-        holding_remaining: snapshot.bank.holding.len(),
-        databank_elites: snapshot.bank.elites.len(),
+        holding_remaining: snapshot.artifact.databank.holding.len(),
+        databank_elites: snapshot.artifact.databank.elites.len(),
         batteries_per_hour: 0.0,
         eta_seconds: None,
         elapsed_seconds: 0.0,
@@ -284,8 +289,8 @@ pub(crate) fn spawn_factory_from_archive(
         revision: 0,
         items: Vec::new(),
         kill_mix: BatteryKillMix::default(),
-        holding_before_shrink: snapshot.bank.holding.len(),
-        holding_after_shrink: snapshot.bank.holding.len(),
+        holding_before_shrink: snapshot.artifact.databank.holding.len(),
+        holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
     };
     *state
@@ -309,7 +314,7 @@ pub(crate) fn spawn_factory_from_archive(
 }
 
 struct ArchiveSnapshot {
-    bank: Databank,
+    artifact: EvolveArtifact,
     databank_path: String,
     source: String,
     broker_path: String,
@@ -330,7 +335,13 @@ fn snapshot_loaded_archive(desktop: &DesktopState) -> Result<ArchiveSnapshot, St
         .as_ref()
         .ok_or_else(|| "no databank is loaded — open the Discover checkpoint first".to_owned())?;
     Ok(ArchiveSnapshot {
-        bank: loaded.bank.clone(),
+        artifact: {
+            let bytes = std::fs::read(&loaded.databank_path).map_err(|error| error.to_string())?;
+            let mut artifact: EvolveArtifact =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            artifact.databank = loaded.bank.clone();
+            artifact
+        },
         databank_path: loaded.databank_path.clone(),
         source: loaded.source.clone(),
         broker_path: loaded.broker.clone(),
@@ -370,7 +381,7 @@ fn snapshot_archive_file(databank_path: &str) -> Result<ArchiveSnapshot, String>
         .is_file()
         .then(|| Path::new(&m1_source).with_extension("metadata.csv").display().to_string());
     Ok(ArchiveSnapshot {
-        bank: artifact.databank,
+        artifact,
         databank_path: databank_path.to_string(),
         source,
         broker_path,
@@ -403,13 +414,23 @@ fn ranked_holding_fingerprints(bank: &Databank, limit: Option<usize>) -> Vec<Str
     }
 }
 
+fn persist_snapshot(snapshot: &mut ArchiveSnapshot) -> Result<(), String> {
+    snapshot.artifact.coverage = snapshot.artifact.databank.coverage();
+    snapshot.artifact.qd_score = snapshot.artifact.databank.qd_score();
+    quantforge_storage::write_json_replacing(
+        Path::new(&snapshot.databank_path),
+        &snapshot.artifact,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn run_factory_or_battery(
     job: Arc<RwLock<BatteryJobView>>,
     stop: Arc<AtomicBool>,
     mut snapshot: ArchiveSnapshot,
     request: HoldingBatteryRequest,
 ) -> Result<(), String> {
-    let holding_before = snapshot.bank.holding.len();
+    let holding_before = snapshot.artifact.databank.holding.len();
     if request.shrink_first {
         update_phase(
             &job,
@@ -417,13 +438,13 @@ fn run_factory_or_battery(
             "Dropping daily P/L clones before the battery.",
         );
         shrink_holding_snapshot(&mut snapshot, request.max_correlation.unwrap_or(DEFAULT_FACTORY_CORR))?;
-        persist_bank_file(&snapshot.databank_path, &snapshot.bank)?;
+        persist_snapshot(&mut snapshot)?;
     }
-    let holding_after = snapshot.bank.holding.len();
+    let holding_after = snapshot.artifact.databank.holding.len();
     let queue_take = optional_positive(request.queue_limit);
     let target_databank = optional_positive(request.target_databank);
     let fingerprints = if request.ranked || request.fingerprints.is_empty() {
-        ranked_holding_fingerprints(&snapshot.bank, queue_take)
+        ranked_holding_fingerprints(&snapshot.artifact.databank, queue_take)
     } else {
         request.fingerprints.clone()
     };
@@ -433,7 +454,7 @@ fn run_factory_or_battery(
     let items: Vec<_> = fingerprints
         .iter()
         .filter_map(|fingerprint| {
-            snapshot.bank.holding.iter().find(|elite| {
+            snapshot.artifact.databank.holding.iter().find(|elite| {
                 elite.structural_fingerprint.as_str() == fingerprint
             }).map(|elite| BatteryItemView {
                 fingerprint: fingerprint.clone(),
@@ -454,8 +475,8 @@ fn run_factory_or_battery(
         view.items = items;
         view.holding_before_shrink = holding_before;
         view.holding_after_shrink = holding_after;
-        view.holding_remaining = snapshot.bank.holding.len();
-        view.databank_elites = snapshot.bank.elites.len();
+        view.holding_remaining = snapshot.artifact.databank.holding.len();
+        view.databank_elites = snapshot.artifact.databank.elites.len();
         view.target_databank = target_databank;
         view.revision += 1;
         view.phase = "Loading market data".into();
@@ -471,21 +492,7 @@ fn run_factory_or_battery(
         );
     }
 
-    run_battery_job(
-        job,
-        stop,
-        snapshot.bank,
-        snapshot.databank_path,
-        snapshot.source,
-        snapshot.metadata_path,
-        snapshot.m1_source,
-        snapshot.m1_metadata_path,
-        snapshot.broker_path,
-        snapshot.validation_fraction,
-        snapshot.sealed_fraction,
-        fingerprints,
-        target_databank,
-    )
+    run_battery_job(job, stop, snapshot, fingerprints, target_databank)
 }
 
 fn shrink_holding_snapshot(
@@ -505,7 +512,7 @@ fn shrink_holding_snapshot(
         None,
     )?;
     let mut dataset = loaded.dataset;
-    apply_history_start_year(&mut dataset, snapshot.bank.config.history_start_year)?;
+    apply_history_start_year(&mut dataset, snapshot.artifact.databank.config.history_start_year)?;
     let broker = load_bound_broker(&snapshot.broker_path, loaded.metadata.as_ref())?;
     let plan = DataSplitPlan::chronological(
         &dataset,
@@ -515,10 +522,11 @@ fn shrink_holding_snapshot(
     .map_err(|error| error.to_string())?;
     let development = slice_bars(&dataset, 0, plan.development.bar_count)?;
     let cache = IndicatorBufferCache::new(development.bars.len());
-    let scout = snapshot.bank.config.scout.clone();
+    let scout = snapshot.artifact.databank.config.scout.clone();
     let timezone = broker.timezone.clone();
     let daily_pnl: Vec<_> = snapshot
-        .bank
+        .artifact
+        .databank
         .holding
         .par_iter()
         .map(|elite| {
@@ -527,23 +535,14 @@ fn shrink_holding_snapshot(
                 .unwrap_or_default()
         })
         .collect();
-    apply_holding_daily_corr_shrink(&mut snapshot.bank, &daily_pnl, max_correlation);
+    apply_holding_daily_corr_shrink(&mut snapshot.artifact.databank, &daily_pnl, max_correlation);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_battery_job(
     job: Arc<RwLock<BatteryJobView>>,
     stop: Arc<AtomicBool>,
-    mut bank: Databank,
-    databank_path: String,
-    source: String,
-    metadata_path: Option<String>,
-    m1_source: String,
-    m1_metadata_path: Option<String>,
-    broker_path: String,
-    validation_fraction: f64,
-    sealed_fraction: f64,
+    mut snapshot: ArchiveSnapshot,
     fingerprints: Vec<String>,
     target_databank: Option<usize>,
 ) -> Result<(), String> {
@@ -554,11 +553,19 @@ fn run_battery_job(
         "Loading Development / M1 partitions for the battery…",
     );
 
-    let mut decision = crate::data_lab::load_data_source(&source, metadata_path.as_deref(), None)?;
-    let mut m1 = crate::data_lab::load_data_source(&m1_source, m1_metadata_path.as_deref(), None)?;
-    let broker = load_bound_broker(&broker_path, decision.metadata.as_ref())?;
-    load_bound_broker(&broker_path, m1.metadata.as_ref())?;
-    let mut quote_dataset = infer_quote_sidecar_path(&m1_source)
+    let mut decision = crate::data_lab::load_data_source(
+        &snapshot.source,
+        snapshot.metadata_path.as_deref(),
+        None,
+    )?;
+    let mut m1 = crate::data_lab::load_data_source(
+        &snapshot.m1_source,
+        snapshot.m1_metadata_path.as_deref(),
+        None,
+    )?;
+    let broker = load_bound_broker(&snapshot.broker_path, decision.metadata.as_ref())?;
+    load_bound_broker(&snapshot.broker_path, m1.metadata.as_ref())?;
+    let mut quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
@@ -567,10 +574,14 @@ fn run_battery_job(
         &mut decision.dataset,
         &mut m1.dataset,
         quote_dataset.as_mut(),
-        bank.config.history_start_year,
+        snapshot.artifact.databank.config.history_start_year,
     )?;
-    let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
-        .map_err(|error| error.to_string())?;
+    let plan = DataSplitPlan::chronological(
+        &decision.dataset,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
     let oos1 = if plan.validation.bar_count == 0 {
         None
@@ -581,16 +592,21 @@ fn run_battery_job(
             plan.development.bar_count + plan.validation.bar_count,
         )?)
     };
-    let m1_plan = DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
-        .map_err(|error| error.to_string())?;
+    let m1_plan = DataSplitPlan::chronological(
+        &m1.dataset,
+        snapshot.validation_fraction,
+        snapshot.sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
     let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
-    let m1_owned: BarDataset = if bank.execution_data_hash == m1_development.data_hash {
-        m1_development
-    } else if bank.execution_data_hash == m1.dataset.data_hash {
-        m1.dataset.clone()
-    } else {
-        m1_development
-    };
+    let m1_owned: BarDataset =
+        if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
+            m1_development
+        } else if snapshot.artifact.databank.execution_data_hash == m1.dataset.data_hash {
+            m1.dataset.clone()
+        } else {
+            m1_development
+        };
 
     update_phase(
         &job,
@@ -601,6 +617,7 @@ fn run_battery_job(
     let mut passed = 0usize;
     let mut rejected = 0usize;
     let mut completed = 0usize;
+    let mut dirty = false;
     let total = fingerprints.len();
 
     for (index, fingerprint) in fingerprints.iter().enumerate() {
@@ -618,16 +635,21 @@ fn run_battery_job(
             rejected,
         );
 
-        let target = bank
+        let holding_elite = snapshot
+            .artifact
+            .databank
             .holding
             .iter()
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+            .cloned();
+        let target = holding_elite
+            .as_ref()
             .map(|elite| elite.structural_fingerprint.clone());
 
         let outcome = match target {
             None => Err(("other".to_owned(), "not in Holding".to_owned())),
             Some(hash) => quantforge_discover::run_holding_battery_and_promote(
-                &mut bank,
+                &mut snapshot.artifact.databank,
                 &hash,
                 &development,
                 oos1.as_ref(),
@@ -640,23 +662,43 @@ fn run_battery_job(
         };
 
         completed += 1;
-        let mut bank_changed = false;
+        let mut status = "rejected";
+        let mut reason: Option<String> = None;
         match outcome {
             Ok(()) => {
                 passed += 1;
-                bank_changed = true;
+                dirty = true;
+                status = "passed";
                 mark_item(&job, fingerprint, "passed", None);
             }
-            Err((bucket, reason)) => {
+            Err((bucket, reject_reason)) => {
                 rejected += 1;
                 bump_kill_mix(&job, &bucket);
-                mark_item(&job, fingerprint, "rejected", Some(reason));
+                reason = Some(reject_reason.clone());
+                mark_item(&job, fingerprint, "rejected", Some(reject_reason));
             }
+        }
+        if let Some(elite) = holding_elite.as_ref() {
+            let robustness = snapshot
+                .artifact
+                .databank
+                .elites
+                .iter()
+                .find(|row| row.structural_fingerprint.as_str() == fingerprint)
+                .and_then(|row| row.robustness.clone());
+            let _ = write_battery_csv_row(
+                &snapshot.databank_path,
+                elite,
+                robustness.as_ref(),
+                status,
+                reason.as_deref(),
+            );
         }
 
         let elapsed = started.elapsed().as_secs_f64().max(1e-6);
         let rate = completed as f64 / elapsed * 3600.0;
-        let target_hit = target_databank.is_some_and(|target| bank.elites.len() >= target);
+        let target_hit = target_databank
+            .is_some_and(|target| snapshot.artifact.databank.elites.len() >= target);
         let remaining = total.saturating_sub(completed);
         let eta = if completed > 0 && remaining > 0 && !target_hit {
             Some(remaining as f64 / (completed as f64 / elapsed))
@@ -664,19 +706,21 @@ fn run_battery_job(
             Some(0.0)
         };
 
-        // Publish counters immediately — do not wait on the multi-MB archive write.
-        // When the queue is empty, flip to a terminal status in the same write so
-        // the UI can re-enable Run battery without waiting on checkpoint I/O.
         let stopped_now = stop.load(Ordering::SeqCst);
         let finished = remaining == 0 || stopped_now || target_hit;
+        if !finished {
+            if let Some(next) = fingerprints.get(index + 1) {
+                mark_item(&job, next, "running", None);
+            }
+        }
         if let Ok(mut view) = job.write() {
-            view.queued = remaining;
-            view.running = 0;
+            view.queued = remaining.saturating_sub(if finished { 0 } else { 1 });
+            view.running = if finished { 0 } else { 1 };
             view.completed = completed;
             view.passed = passed;
             view.rejected = rejected;
-            view.holding_remaining = bank.holding.len();
-            view.databank_elites = bank.elites.len();
+            view.holding_remaining = snapshot.artifact.databank.holding.len();
+            view.databank_elites = snapshot.artifact.databank.elites.len();
             view.batteries_per_hour = rate;
             view.eta_seconds = eta;
             view.elapsed_seconds = elapsed;
@@ -693,6 +737,8 @@ fn run_battery_job(
                 view.message = funnel_message(&view, passed, rejected, completed, target_hit);
                 view.stop_requested = false;
                 view.eta_seconds = Some(0.0);
+                view.running = 0;
+                view.queued = 0;
             } else {
                 view.phase = format!("Battery {completed}/{total}");
                 view.message = format!(
@@ -703,35 +749,38 @@ fn run_battery_job(
             }
         }
 
-        // Rejects leave Holding unchanged — skip the expensive full-archive rewrite.
-        if bank_changed {
-            persist_bank_file(&databank_path, &bank)?;
-            if let Ok(mut view) = job.write() {
-                view.revision += 1;
+        // Rejects leave Holding unchanged. Passers checkpoint from the
+        // in-memory artifact so the next name is not stalled on a full
+        // re-parse of the pretty JSON archive.
+        if dirty && (finished || passed == 1 || passed % 5 == 0) {
+            if !finished {
+                let phase = format!("Saving checkpoint ({passed} Databank)");
+                update_phase(
+                    &job,
+                    &phase,
+                    "Writing the archive compactly; the next name is already queued.",
+                );
             }
+            persist_snapshot(&mut snapshot)?;
+            dirty = false;
         }
 
         if finished {
             break;
         }
-
-        std::thread::sleep(Duration::from_millis(5));
     }
 
-    // Extra checkpoint only if a pass landed and we may have broken before writing.
-    if passed > 0 {
-        let _ = persist_bank_file(&databank_path, &bank);
+    if dirty {
+        let _ = persist_snapshot(&mut snapshot);
     }
-    // Ensure terminal status even if the loop exited via stop before the
-    // per-item finish write (e.g. stop before first strategy).
     if let Ok(mut view) = job.write() {
         if view.status == "running" {
             let stopped = stop.load(Ordering::SeqCst);
             view.status = if stopped { "stopped" } else { "completed" };
             view.running = 0;
             view.queued = 0;
-            view.holding_remaining = bank.holding.len();
-            view.databank_elites = bank.elites.len();
+            view.holding_remaining = snapshot.artifact.databank.holding.len();
+            view.databank_elites = snapshot.artifact.databank.elites.len();
             view.elapsed_seconds = started.elapsed().as_secs_f64();
             view.eta_seconds = Some(0.0);
             view.revision += 1;
@@ -761,7 +810,7 @@ fn funnel_message(
         ""
     };
     format!(
-        "{} Holding → {} after shrink → {completed} battered → {passed} Databank / {rejected} fail.{target} Kills: neighborhood {} · MC {} · folds {} · M1 {} · deposit {} · other {}.",
+        "{} Holding → {} after shrink → {completed} battered → {passed} Databank / {rejected} fail.{target} Kills: neighborhood {} · MC {} · folds {} · M1 {} · deposit {} · corr {} · clone {} · other {}.",
         view.holding_before_shrink,
         view.holding_after_shrink,
         mix.neighborhood,
@@ -769,8 +818,145 @@ fn funnel_message(
         mix.folds,
         mix.m1,
         mix.deposit + mix.expectancy + mix.oos1,
+        mix.correlation,
+        mix.clone,
         mix.other
     )
+}
+
+fn battery_log_paths(databank_path: &str) -> (PathBuf, PathBuf) {
+    let path = Path::new(databank_path);
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("databank");
+    (
+        path.with_file_name(format!("{stem}_battery.csv")),
+        path.with_file_name(format!("{stem}_param")),
+    )
+}
+
+fn csv_cell_f64(value: Option<f64>) -> String {
+    value
+        .filter(|number| number.is_finite())
+        .map(|number| format!("{number:.6}"))
+        .unwrap_or_default()
+}
+
+fn csv_cell_bool(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "true".into(),
+        Some(false) => "false".into(),
+        None => String::new(),
+    }
+}
+
+fn write_battery_csv_row(
+    databank_path: &str,
+    elite: &Elite,
+    robustness: Option<&RobustnessEvidence>,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let (summary_path, param_dir) = battery_log_paths(databank_path);
+    let neighborhood = robustness.map(|evidence| &evidence.parameter_neighborhood);
+    let monte_carlo = robustness.map(|evidence| &evidence.monte_carlo);
+    let orig_recovery = neighborhood
+        .and_then(|row| row.original_metrics.as_ref())
+        .map(|metrics| metrics.recovery_factor())
+        .or_else(|| {
+            let value = elite.metrics.recovery_factor();
+            value.is_finite().then_some(value)
+        });
+    let new_file = !summary_path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&summary_path)
+        .map_err(|error| error.to_string())?;
+    if new_file {
+        writeln!(
+            file,
+            "status,strategy_id,fingerprint,evidence,trades,reason,orig_recovery_factor,neighborhood_median_recovery,orig_recovery_to_median,passed_retdd_0_85_1_25,neighborhood_samples_requested,neighborhood_samples_evaluated,neighborhood_surviving,neighborhood_survival_fraction,required_survival_fraction,adx_plateau_neighbors,adx_plateau_surviving,adx_plateau_survival_fraction,mc_passed,mc_p80_net_profit,mc_baseline_net_profit,mc_minimum_p80_retention"
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let reason = reason.unwrap_or("").replace(',', ";");
+    writeln!(
+        file,
+        "{},{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        status,
+        elite.strategy.id.replace(',', ";"),
+        elite.structural_fingerprint,
+        elite.evidence.total,
+        elite.metrics.trade_count,
+        reason,
+        csv_cell_f64(orig_recovery),
+        csv_cell_f64(neighborhood.and_then(|row| row.median_recovery_factor)),
+        csv_cell_f64(neighborhood.and_then(|row| row.original_recovery_to_median)),
+        csv_cell_bool(neighborhood.and_then(|row| row.passed_recovery_median_band)),
+        neighborhood
+            .map(|row| row.samples_requested.to_string())
+            .unwrap_or_default(),
+        neighborhood
+            .map(|row| row.samples_evaluated.to_string())
+            .unwrap_or_default(),
+        neighborhood
+            .map(|row| row.surviving_samples.to_string())
+            .unwrap_or_default(),
+        csv_cell_f64(neighborhood.map(|row| row.survival_fraction)),
+        csv_cell_f64(neighborhood.map(|row| row.required_survival_fraction)),
+        neighborhood
+            .map(|row| row.plateau_neighbors.to_string())
+            .unwrap_or_default(),
+        neighborhood
+            .map(|row| row.plateau_surviving.to_string())
+            .unwrap_or_default(),
+        csv_cell_f64(neighborhood.and_then(|row| row.plateau_survival_fraction)),
+        csv_cell_bool(monte_carlo.map(|row| row.passed)),
+        csv_cell_f64(monte_carlo.map(|row| row.p80_net_profit)),
+        csv_cell_f64(monte_carlo.map(|row| row.baseline_net_profit)),
+        csv_cell_f64(monte_carlo.map(|row| row.minimum_p80_profit_retention)),
+    )
+    .map_err(|error| error.to_string())?;
+
+    if let Some(neighborhood) = neighborhood {
+        if !neighborhood.samples.is_empty() {
+            std::fs::create_dir_all(&param_dir).map_err(|error| error.to_string())?;
+            let sample_path = param_dir.join(format!("{}.csv", elite.strategy.id));
+            let mut writer = csv::Writer::from_path(&sample_path).map_err(|error| error.to_string())?;
+            writer
+                .write_record([
+                    "sample_index",
+                    "survived",
+                    "recovery_factor",
+                    "net_profit",
+                    "return_percent",
+                    "max_drawdown_percent",
+                    "trade_count",
+                    "profit_factor",
+                    "sharpe_ratio",
+                ])
+                .map_err(|error| error.to_string())?;
+            for sample in &neighborhood.samples {
+                writer
+                    .write_record([
+                        sample.sample_index.to_string(),
+                        sample.survived.to_string(),
+                        csv_cell_f64(sample.recovery_factor),
+                        format!("{:.6}", sample.net_profit),
+                        format!("{:.6}", sample.return_percent),
+                        format!("{:.6}", sample.max_drawdown_percent),
+                        sample.trade_count.to_string(),
+                        csv_cell_f64(sample.profit_factor),
+                        csv_cell_f64(sample.sharpe_ratio),
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+            writer.flush().map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn bump_kill_mix(job: &Arc<RwLock<BatteryJobView>>, bucket: &str) {
@@ -783,6 +969,8 @@ fn bump_kill_mix(job: &Arc<RwLock<BatteryJobView>>, bucket: &str) {
             "deposit" => view.kill_mix.deposit += 1,
             "expectancy" => view.kill_mix.expectancy += 1,
             "oos1" => view.kill_mix.oos1 += 1,
+            "correlation" => view.kill_mix.correlation += 1,
+            "clone" => view.kill_mix.clone += 1,
             _ => view.kill_mix.other += 1,
         }
     }
@@ -947,7 +1135,7 @@ pub async fn shrink_holding_by_daily_corr(
             .filter(|days| !days.is_empty())
             .count();
         let report = apply_holding_daily_corr_shrink(&mut bank, &daily_pnl, max_correlation);
-        persist_bank_file(&databank_path, &bank)?;
+        persist_bank_file(&databank_path, &mut bank)?;
         Ok::<_, String>((report, replayed, databank_path, bank))
     })
     .await

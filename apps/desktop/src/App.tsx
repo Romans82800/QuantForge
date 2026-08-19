@@ -637,7 +637,7 @@ function App() {
           const shouldReloadArchive =
             !!view.databankPath
             && view.revision !== lastBatteryRevision.current
-            && (done || view.passed > 0);
+            && done;
           if (shouldReloadArchive && view.databankPath) {
             lastBatteryRevision.current = view.revision;
             void loadDatabankPath(view.databankPath)
@@ -2892,8 +2892,8 @@ function HomeWorkspace({
           <div className="overview-status-kpis">
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
-            <KpiCell label="Holding" value={formatNumber(job?.holdingElites ?? 0)} note="H1 + M1 fidelity; battery deferred" />
-            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="after on-demand battery + OOS1" />
+            <KpiCell label="Holding" value={formatNumber(job?.holdingElites ?? 0)} note="M1 80/130" />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="after Holding battery" />
             <KpiCell
               label="Evals / hour · rolling"
               value={formatNumber(job?.rollingEvaluationsPerHour ?? 0)}
@@ -3500,15 +3500,16 @@ function DiscoverWorkspace({
     promotionQueueCapacity: 64,
     maxMemoryMb: 8192,
     requireM1Robustness: true,
+    buildToHolding: true,
     robustnessFolds: 3,
     robustnessMonteCarloTrials: 250,
     robustnessMonteCarloBlockLength: 5,
     robustnessMonteCarloSkipTradeProbability: 0.10,
     robustnessMonteCarloP80ProfitRetention: 0.60,
     robustnessMonteCarloMaxDrawdownRatio: 1.75,
-    robustnessNeighborhoodSamples: 8,
+    robustnessNeighborhoodSamples: 200,
     robustnessPerturbationFraction: 0.2,
-    minimumNeighborhoodSurvivalFraction: 0.7,
+    minimumNeighborhoodSurvivalFraction: 0.55,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
     multiSymbolMinimumPass: null,
@@ -3522,7 +3523,7 @@ function DiscoverWorkspace({
     validationFraction: 0,
     sealedFraction: 1 / 3,
     historyStartYear: 2016,
-    factoryAfterDiscover: true,
+    factoryAfterDiscover: false,
     factoryQueueLimit: 0,
     factoryTargetDatabank: 0,
     factoryMaxCorrelation: 0.5,
@@ -3780,6 +3781,7 @@ function DiscoverWorkspace({
             promotionWorkerThreads: null,
             promotionQueueCapacity: null,
             requireM1Robustness: null,
+            buildToHolding: null,
             robustnessFolds: null,
             robustnessMonteCarloTrials: null,
             robustnessNeighborhoodSamples: null,
@@ -4037,9 +4039,11 @@ function DiscoverWorkspace({
                         mutateAfterElites: 300,
                         earlyStopPotElites: null,
                         targetDatabankElites: null,
-                        robustnessMonteCarloTrials: 250,
-                        robustnessNeighborhoodSamples: 8,
-                        minimumNeighborhoodSurvivalFraction: 0.7,
+                        robustnessMonteCarloTrials: 1000,
+                        robustnessNeighborhoodSamples: 200,
+                        minimumNeighborhoodSurvivalFraction: 0.55,
+                        requireM1Robustness: true,
+                        buildToHolding: true,
                       }))
                     }
                   >
@@ -4059,21 +4063,22 @@ function DiscoverWorkspace({
                         batchSize: Math.max(current.batchSize ?? 200, 300),
                         randomFillFraction: Math.max(current.randomFillFraction ?? 0.75, 0.75),
                         robustnessMonteCarloTrials: 1000,
-                        robustnessNeighborhoodSamples: 100,
+                        robustnessNeighborhoodSamples: 200,
                         minimumNeighborhoodSurvivalFraction: 0.55,
                         minimumDevelopmentExpectancyR: 0.25,
                         requireM1Robustness: true,
+                        buildToHolding: true,
                         requireM1Precision: true,
                         simpleExits: true,
                         multiSymbolMinimumPass: 0,
-                        factoryAfterDiscover: true,
+                        factoryAfterDiscover: false,
                         factoryQueueLimit: current.factoryQueueLimit ?? 0,
                         factoryTargetDatabank: current.factoryTargetDatabank ?? 0,
                         factoryMaxCorrelation: current.factoryMaxCorrelation ?? 0.5,
                       }))
                     }
                   >
-                    Quota (fill then factory)
+                    Quota (grow Holding overnight)
                   </button>
                   <button
                     type="button"
@@ -4089,6 +4094,7 @@ function DiscoverWorkspace({
                         batchSize: Math.max(current.batchSize ?? 200, 500),
                         requireM1Robustness: true,
                         requireM1Precision: true,
+                        buildToHolding: true,
                         generalIslandCount: (current.generalIslandCount ?? 0) > 0 ? current.generalIslandCount : 4,
                         refinementIslandCount: 0,
                         explorationIslandCount: 0,
@@ -4103,13 +4109,13 @@ function DiscoverWorkspace({
                 {form.runMode === "quota_harvest" && (
                   <div className="form-stack compact">
                     <p className="recipe-summary">
-                      Stops at {formatNumber(form.targetDatabankElites ?? 400)} Holding names, or sooner if Holding stops growing for 25 generations after at least 40 names. Fold-stable Development R above 0.25R is the filter. Sealed holdout is 33% and never used to pick. Pack 6-of-N is off so scout stays on the primary symbol.
+                      Grows Holding overnight: H1 scout on the pot, then a cheap side queue (M1 80/130 only). Fold-R, plateau, CPCV, and Monte Carlo wait for the Holding tab. Stops at {formatNumber(form.targetDatabankElites ?? 400)} Holding names. Sealed holdout is unused to pick.
                     </p>
                     <label className="field-row">
                       <span>Overnight factory</span>
                       <input
                         type="checkbox"
-                        checked={form.factoryAfterDiscover !== false}
+                        checked={form.factoryAfterDiscover === true}
                         disabled={active || busy}
                         onChange={(event) => setForm((current) => ({ ...current, factoryAfterDiscover: event.target.checked }))}
                       />
@@ -4127,7 +4133,7 @@ function DiscoverWorkspace({
                 {form.runMode === "high_performance_islands" && (
                   <div className="form-stack compact">
                     <p className="recipe-summary">
-                      Independent general islands use the same balanced mutation policy. Controlled migration shares only Development-approved parents; OOS1 and OOS2 never influence evolution.
+                      Four islands, large batches, no quota stop. Scout breeds; side workers admit M1 80/130 into Holding. Run fold-R, plateau, CPCV, and Monte Carlo from the Holding tab when you want Databank names.
                     </p>
                     <div className="form-grid universal-grammar-grid">
                       <NumberField label="General islands" value={form.generalIslandCount ?? 4} onChange={(value) => setForm((current) => ({ ...current, generalIslandCount: value ?? 4 }))} min={1} max={32} />
@@ -4180,7 +4186,7 @@ function DiscoverWorkspace({
               required={form.mode !== "new"}
             />
             {form.mode === "new" && !form.databankPath && (
-              <p className="immutable-note">QuantForge will create a unique archive under <code>runs/SYMBOL/Databank</code> when you start. Choose a path only if you want a specific location.</p>
+              <p className="immutable-note">QuantForge will create a unique archive under <code>Documents/QuantForge/runs/SYMBOL/Databank</code> when you start. Choose a path only if you want a specific location.</p>
             )}
             <div className="field-row">
               <span>Decision timeframe <small>required</small></span>
@@ -4308,10 +4314,11 @@ function DiscoverWorkspace({
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
-                <summary>Holding admission — fast path after breeding</summary>
-                <p className="immutable-note">Discover deposits to Holding after H1 gates + M1 fidelity. WFO / Monte Carlo / ±param / OOS1 wait until you run the battery from the Holding tab.</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Keep battery settings for later Holding → Databank promote (CPCV / Monte Carlo / param plateau)</span></label>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 fidelity retention vs Selected-TF (required for Holding)</span></label>
+                <summary>Holding admission — cheap path after breeding</summary>
+                <p className="immutable-note">Discover deposits to Holding after H1 gates + M1 80/130 only. Fold-R, permutation (Ret/DD 0.85–1.25, 55% neighbours), CPCV, and Monte Carlo wait until you run the battery from the Holding tab.</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.buildToHolding ?? true} onChange={(event) => update("buildToHolding", event.target.checked)} /><span>Build to Holding (recommended). Uncheck only to send the full battery during Discover</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Keep battery settings for later Holding → Databank (CPCV / Monte Carlo / param plateau)</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 80% trades / 130% DD retention vs Selected-TF (required)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="Minimum Development expectancy (R)" value={form.minimumDevelopmentExpectancyR} onChange={(value) => update("minimumDevelopmentExpectancyR", value)} min={0} step={0.05} />
@@ -4372,7 +4379,7 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">Development alone drives search and breeding. Holding needs M1 fidelity plus fold-stable R. Sealed holdout is never loaded by Discover.</p>
+            <p className="immutable-note">Development alone drives search and breeding. Holding needs M1 80/130 fidelity only. Sealed holdout is never loaded by Discover.</p>
             <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
@@ -4419,7 +4426,7 @@ function DiscoverWorkspace({
           <p>
             {startBlocker
               ? startBlocker
-              : "Pipeline: Development gates → reservoir → breed → Holding (H1 + M1) → on-demand battery → Databank. OOS2 remains sealed."}
+              : "Pipeline: Development gates → reservoir → breed → Holding (M1 80/130) → on-demand battery → Databank. OOS2 remains sealed."}
           </p>
           <button
             type="button"
@@ -4459,16 +4466,16 @@ function DiscoverWorkspace({
               }
               note={
                 job?.targetDatabankElites
-                  ? "Quota · H1 + M1 fidelity"
+                  ? "Quota · M1 80/130"
                   : job?.breedingActive
-                    ? "Post-breed H1 + M1 → Holding"
+                    ? "Post-breed M1 80/130"
                     : "Empty until breeding unlocks"
               }
             />
             <Kpi
               label="Databank"
               value={formatNumber(job?.databankElites ?? job?.coverage ?? 0)}
-              note="After on-demand battery"
+              note="After Holding battery"
             />
             <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for Holding pipeline" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
@@ -4504,7 +4511,7 @@ function DiscoverWorkspace({
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
             </ul>
-            <p className="funnel-group-label">Post-breed databank pipeline — after breeding unlocks</p>
+            <p className="funnel-group-label">Post-breed Holding pipeline — after breeding unlocks</p>
             <ul>
               <li><span>OOS1 leakage guard (must remain 0)</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
               <li><span>Development expectancy floor</span><strong>{formatNumber(job?.rejectedDevelopmentExpectancy ?? 0)}</strong></li>

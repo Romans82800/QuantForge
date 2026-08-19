@@ -597,6 +597,7 @@ export interface DiscoverRequest {
   /** Hard resident-memory ceiling in MiB; reaching it stops and checkpoints safely. */
   maxMemoryMb: number | null;
   requireM1Robustness: boolean | null;
+  buildToHolding: boolean | null;
   robustnessFolds: number | null;
   robustnessMonteCarloTrials: number | null;
   robustnessMonteCarloBlockLength: number | null;
@@ -812,6 +813,8 @@ export interface BatteryJobView {
     deposit: number;
     expectancy: number;
     oos1: number;
+    correlation: number;
+    clone: number;
     other: number;
   };
   holdingBeforeShrink?: number;

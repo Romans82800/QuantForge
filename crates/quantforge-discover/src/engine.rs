@@ -26,10 +26,17 @@ use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_wi
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// Side-queue overflow when all promotion worker slots are busy. Pot admits are
+/// retried next generation instead of being dropped.
+const PROMOTION_OVERFLOW_CAPACITY: usize = 2048;
+
+/// After breeding unlocks, cap random seeding so more batch slots breed from pot parents.
+const POST_BREED_RANDOM_FILL_CAP: f64 = 0.40;
 
 enum CandidateOutcome {
     CoarseRejected,
@@ -224,17 +231,11 @@ fn evaluate_and_deposit(
                 };
                 let pot_decision = deposit_to_accepted_pool(bank, pot_evaluation.clone())?;
                 bank.telemetry.record(pot_decision);
-                // The pot is a small island/niche breeding bag. Holding is the
-                // accumulating output. Diversity rejects still get a shot at M1
-                // when the queue has room; they must not stall Looked-at.
+                // Only real pot admits need M1 replay. Diversity rejects cannot
+                // enter the breeding pot and must not steal promotion slots.
                 match pot_decision {
                     DepositDecision::AcceptedToPot | DepositDecision::ReplacedInPot => {
-                        pot_promotions.push((pot_evaluation, true));
-                    }
-                    DepositDecision::RejectedCorrelated
-                    | DepositDecision::RejectedNicheNotImproved
-                    | DepositDecision::RejectedFamilyNotImproved => {
-                        pot_promotions.push((pot_evaluation, false));
+                        pot_promotions.push(pot_evaluation);
                     }
                     _ => {}
                 }
@@ -263,8 +264,7 @@ fn evaluate_and_deposit(
     }
 
     // Discovery is development-only. Once breeding unlocks, the side pool runs
-    // M1 fidelity + Development CPCV/robustness, then the separate OOS1
-    // validation gate. OOS1 never feeds breeding/ranking; OOS2 is absent.
+    // M1 80/130 into Holding. Plateau / fold-R / CPCV / MC wait for the battery.
     let breeding_unlocked = bank.accepted_pool.len() >= bank.config.mutate_after_elites;
     if breeding_unlocked && !pot_promotions.is_empty() {
         let context = promotion.context_for(
@@ -275,16 +275,9 @@ fn evaluate_and_deposit(
             quote_dataset,
             broker,
         );
-        for (pot_evaluation, blocking) in pot_promotions {
-            // Holding exists so M1 work cannot stall H1 generations. A full
-            // promotion queue skips this candidate until a later admit; it
-            // must not wait. Full-harvest Databank promotion still blocks on
-            // pot admits so elites are not silently dropped.
-            if blocking && !bank.config.build_to_holding {
-                promotion.enqueue(pot_evaluation, Arc::clone(&context), bank)?;
-            } else {
-                promotion.try_enqueue(pot_evaluation, Arc::clone(&context), bank)?;
-            }
+        promotion.drain_overflow(Arc::clone(&context), bank)?;
+        for pot_evaluation in pot_promotions {
+            promotion.try_enqueue_or_buffer(pot_evaluation, Arc::clone(&context), bank)?;
         }
     }
     promotion.snapshot_telemetry(bank);
@@ -330,6 +323,7 @@ struct PromotionContext {
 
 struct PromotionShared {
     completed: Mutex<Vec<PromotionOutcome>>,
+    overflow: Mutex<VecDeque<CandidateEvaluation>>,
     /// Waiting + running promotion jobs. Cap this for backpressure.
     inflight: AtomicUsize,
     /// Actively executing on the promotion pool (subset of inflight).
@@ -358,6 +352,7 @@ impl PromotionPipeline {
             pool: build_worker_pool(worker_threads.max(1))?,
             shared: Arc::new(PromotionShared {
                 completed: Mutex::new(Vec::new()),
+                overflow: Mutex::new(VecDeque::new()),
                 inflight: AtomicUsize::new(0),
                 running: AtomicUsize::new(0),
                 capacity: capacity.max(1),
@@ -414,6 +409,7 @@ impl PromotionPipeline {
         context
     }
 
+    #[allow(dead_code)]
     fn enqueue(
         &self,
         pot_evaluation: CandidateEvaluation,
@@ -443,8 +439,24 @@ impl PromotionPipeline {
         self.spawn_promotion(pot_evaluation, context, bank)
     }
 
+    fn try_enqueue_or_buffer(
+        &self,
+        pot_evaluation: CandidateEvaluation,
+        context: Arc<PromotionContext>,
+        bank: &mut Databank,
+    ) -> Result<(), DiscoverError> {
+        self.drain_completed(bank)?;
+        if self.shared.inflight.load(Ordering::SeqCst) >= self.shared.capacity {
+            bank.telemetry.promotion_backpressure_events += 1;
+            self.snapshot_telemetry(bank);
+            self.push_overflow(pot_evaluation, bank)
+        } else {
+            self.spawn_promotion(pot_evaluation, context, bank)
+        }
+    }
+
     /// Enqueue if a slot is free. Returns false when the M1 queue is full so
-    /// the H1 scout can keep moving.
+    /// the caller can buffer the job for the next generation.
     fn try_enqueue(
         &self,
         pot_evaluation: CandidateEvaluation,
@@ -459,6 +471,54 @@ impl PromotionPipeline {
         }
         self.spawn_promotion(pot_evaluation, context, bank)?;
         Ok(true)
+    }
+
+    fn push_overflow(
+        &self,
+        pot_evaluation: CandidateEvaluation,
+        bank: &mut Databank,
+    ) -> Result<(), DiscoverError> {
+        let mut overflow = self
+            .shared
+            .overflow
+            .lock()
+            .map_err(|_| DiscoverError::InvalidConfig("promotion overflow lock poisoned".into()))?;
+        if overflow.len() >= PROMOTION_OVERFLOW_CAPACITY {
+            overflow.pop_front();
+            bank.telemetry.promotion_overflow_dropped += 1;
+        }
+        overflow.push_back(pot_evaluation);
+        Ok(())
+    }
+
+    fn drain_overflow(
+        &self,
+        context: Arc<PromotionContext>,
+        bank: &mut Databank,
+    ) -> Result<(), DiscoverError> {
+        loop {
+            self.drain_completed(bank)?;
+            if self.shared.inflight.load(Ordering::SeqCst) >= self.shared.capacity {
+                break;
+            }
+            let next = {
+                let mut overflow = self
+                    .shared
+                    .overflow
+                    .lock()
+                    .map_err(|_| {
+                        DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
+                    })?;
+                overflow.pop_front()
+            };
+            match next {
+                Some(pot_evaluation) => {
+                    self.spawn_promotion(pot_evaluation, Arc::clone(&context), bank)?;
+                }
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     fn spawn_promotion(
@@ -542,7 +602,7 @@ fn promote_one(
     let broker = context.broker.as_ref();
     let robustness = &context.robustness;
 
-    // Holding path: one M1 fidelity check, then stop. Battery + OOS1 wait.
+    // Holding path: M1 80/130 retention only. Battery + OOS1 wait.
     if context.build_to_holding {
         let m1_outcome = match crate::robustness::run_m1_holding_admission(
             strategy,
@@ -773,7 +833,8 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
         minimum_passing_fold_fraction: 0.6,
         minimum_neighborhood_survival_fraction: config
             .minimum_neighborhood_survival_fraction
-            .clamp(0.25, 1.0),
+            .max(0.55)
+            .min(1.0),
         parameter_perturbation_fraction: config.robustness_perturbation_fraction,
         adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
         adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
@@ -813,6 +874,8 @@ pub enum HoldingBatteryReject {
     DepositGate,
     DevelopmentExpectancy,
     Oos1,
+    /// Battery passed but Databank inventory rejected the deposit (clone / correlation).
+    DatabankDeposit(DepositDecision),
     Evaluation(String),
 }
 
@@ -823,6 +886,11 @@ impl HoldingBatteryReject {
             Self::DepositGate => "deposit",
             Self::DevelopmentExpectancy => "expectancy",
             Self::Oos1 => "oos1",
+            Self::DatabankDeposit(decision) => match decision {
+                DepositDecision::RejectedCorrelated => "correlation",
+                DepositDecision::RejectedClone => "clone",
+                _ => "databank",
+            },
             Self::NotInHolding | Self::Evaluation(_) => "other",
         }
     }
@@ -836,6 +904,7 @@ impl std::fmt::Display for HoldingBatteryReject {
             Self::DepositGate => write!(f, "deposit gates"),
             Self::DevelopmentExpectancy => write!(f, "Development expectancy floor"),
             Self::Oos1 => write!(f, "OOS1 retention"),
+            Self::DatabankDeposit(decision) => write!(f, "Databank deposit: {decision:?}"),
             Self::Evaluation(message) => write!(f, "evaluation: {message}"),
         }
     }
@@ -920,23 +989,34 @@ pub fn run_holding_battery_and_promote(
         robustness: outcome.evidence,
     };
 
-    remove_holding_by_fingerprint(bank, fingerprint).ok_or(HoldingBatteryReject::NotInHolding)?;
     let decision = deposit_to_databank(bank, candidate)
         .map_err(|error| HoldingBatteryReject::Evaluation(error.to_string()))?;
-    bank.telemetry.record(decision);
-    let promoted = bank
-        .elites
-        .iter()
-        .find(|entry| &entry.structural_fingerprint == fingerprint)
-        .cloned()
-        .ok_or_else(|| {
-            HoldingBatteryReject::Evaluation("promoted elite missing after deposit".into())
-        })?;
-    Ok(HoldingBatteryResult {
-        fingerprint: fingerprint.clone(),
-        decision,
-        elite: promoted,
-    })
+    match decision {
+        DepositDecision::AcceptedToDatabank | DepositDecision::ReplacedInDatabank => {
+            remove_holding_by_fingerprint(bank, fingerprint)
+                .ok_or(HoldingBatteryReject::NotInHolding)?;
+            bank.telemetry.record(decision);
+            let promoted = bank
+                .elites
+                .iter()
+                .find(|entry| &entry.structural_fingerprint == fingerprint)
+                .cloned()
+                .ok_or_else(|| {
+                    HoldingBatteryReject::Evaluation(
+                        "promoted elite missing after deposit".into(),
+                    )
+                })?;
+            Ok(HoldingBatteryResult {
+                fingerprint: fingerprint.clone(),
+                decision,
+                elite: promoted,
+            })
+        }
+        other => {
+            bank.telemetry.record(other);
+            Err(HoldingBatteryReject::DatabankDeposit(other))
+        }
+    }
 }
 
 /// Concatenate consecutive decision partitions for a validation replay. OOS2
@@ -1483,7 +1563,13 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 apply_search_ranges(&mut seeded, rng, &bank.config.search_ranges);
                 apply_production_policy(seeded, &bank.config)
             };
-            let random_fill = bank.config.random_fill_fraction;
+            let random_fill = if breeding_unlocked {
+                bank.config
+                    .random_fill_fraction
+                    .min(POST_BREED_RANDOM_FILL_CAP)
+            } else {
+                bank.config.random_fill_fraction
+            };
             let keep_filling =
                 !breeding_unlocked || bank.accepted_pool.is_empty() || rng.gen_bool(random_fill);
             if keep_filling {
@@ -2479,10 +2565,9 @@ mod tests {
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.apply_run_mode();
         assert_eq!(config.target_databank_elites, Some(400));
+        assert!(config.build_to_holding);
         assert!(config.max_holding_elites >= 2_000);
-        // Breeding pot still has a niche bag; Holding ignores inventory so a
-        // a few-hundred quota cannot freeze at three full families or a corr wall.
-        assert!(config.max_elites_per_niche >= 2);
+        assert!(config.max_elites_per_niche >= 8);
     }
 
     #[test]
@@ -2493,6 +2578,7 @@ mod tests {
         config.multi_symbol_minimum_pass = 6;
         config.apply_run_mode();
         assert_eq!(config.target_databank_elites, Some(500));
+        assert!(config.build_to_holding);
         assert_eq!(config.multi_symbol_minimum_pass, 0);
     }
 
@@ -2512,6 +2598,15 @@ mod tests {
     }
 
     #[test]
+    fn high_performance_islands_skips_pack_replay_overhead() {
+        let mut config = DiscoverConfig::default();
+        config.run_mode = crate::DiscoverRunMode::HighPerformanceIslands;
+        config.multi_symbol_minimum_pass = 6;
+        config.apply_run_mode();
+        assert_eq!(config.multi_symbol_minimum_pass, 0);
+    }
+
+    #[test]
     fn holding_admission_does_not_inherit_the_full_battery_worker_cap() {
         let mut holding = DiscoverConfig::default();
         holding.build_to_holding = true;
@@ -2524,8 +2619,8 @@ mod tests {
         battery.build_to_holding = false;
         battery.promotion_worker_threads = 8;
         battery.promotion_queue_capacity = 64;
-        assert_eq!(battery.resolved_session_promotion_workers(), 2);
-        assert_eq!(battery.resolved_session_promotion_capacity(), 8);
+        assert_eq!(battery.resolved_session_promotion_workers(), 8);
+        assert_eq!(battery.resolved_session_promotion_capacity(), 64);
     }
 
     #[test]

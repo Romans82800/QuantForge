@@ -62,12 +62,12 @@ pub(crate) fn deposit_to_databank(
     if !passes_gate_config(&candidate.result, &bank.config.deposit_gates) {
         return Ok(DepositDecision::RejectedDepositGate);
     }
-    // Databank is the quota output: fingerprint only. Correlation, niche and
-    // family inventory belong on the breeding pot so Holding can fill to 5–10k.
+    // Databank is the overnight output: fingerprint uniqueness plus equity-path
+    // correlation (0.5) as the clone janitor. Niches and families stay on the pot.
     let decision = deposit_into_stack(
         &mut bank.elites,
         &mut bank.coverage_map,
-        1.0,
+        0.5,
         0,
         0,
         0,
@@ -971,7 +971,7 @@ mod tests {
 
         let mut second_result = profitable_result();
         for (index, point) in second_result.equity.iter_mut().enumerate() {
-            point.equity = 100_000.0 + (index as f64).sin() * 300.0 + index as f64 * 5.0;
+            point.equity = 102_000.0 - index as f64 * 1_000.0;
         }
         second_result.metrics.return_percent = 1.8;
         let second = deposit_to_databank(

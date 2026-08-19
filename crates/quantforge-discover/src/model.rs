@@ -814,7 +814,7 @@ fn default_max_holding_elites() -> usize {
 }
 
 fn default_max_elites_per_niche() -> usize {
-    2
+    8
 }
 
 fn default_max_promoted_per_niche() -> usize {
@@ -882,10 +882,8 @@ fn default_robustness_perturbation_fraction() -> f64 {
 }
 
 fn default_minimum_neighborhood_survival_fraction() -> f64 {
-    // Only the first ten neighbors are one-axis; the rest jitter every numeric
-    // gene at once, and each still has to keep half the return and half the
-    // trades. At 100 samples that mix lands a robust strategy near 0.5-0.6, so a
-    // 0.7 floor rejected almost everything regardless of plateau quality.
+    // Joint ±20% jitter of every numeric gene; a real plateau lands near 0.5–0.6.
+    // Orig Ret/DD 0.85–1.25 of the neighbourhood median is the overfitting veto.
     0.55
 }
 
@@ -1016,9 +1014,8 @@ impl DiscoverConfig {
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
-                // Modest Holding fill, then on-demand factory. Most symbols plateau
-                // well below 5k; a 400 default plus stall-stop is the harvest. OOS1
-                // is not a pick. The param/MC battery stays on-demand.
+                // Overnight Holding fill: cheap M1 80/130 + fold-R. Plateau /
+                // CPCV / MC stay on the Holding → Databank battery.
                 if !self.has_complex_execution() {
                     self.simple_exits = true;
                 } else {
@@ -1054,6 +1051,7 @@ impl DiscoverConfig {
                     self.robustness_neighborhood_samples.max(200);
                 self.minimum_neighborhood_survival_fraction =
                     self.minimum_neighborhood_survival_fraction.max(0.55);
+                self.max_elites_per_niche = self.max_elites_per_niche.max(8);
             }
             DiscoverRunMode::HighPerformanceIslands => {
                 // Identical balanced populations with deterministic migration.
@@ -1076,6 +1074,8 @@ impl DiscoverConfig {
                 self.max_databank_elites = self.max_databank_elites.max(10_000);
                 self.require_m1_precision = true;
                 self.require_m1_robustness = true;
+                self.build_to_holding = true;
+                self.multi_symbol_minimum_pass = 0;
             }
         }
     }
@@ -1296,9 +1296,8 @@ impl DiscoverConfig {
 
     /// Dedicated promotion-pool size. `0` → auto from available CPUs.
     ///
-    /// Holding admission is a single M1 replay, so it can spend about half the
-    /// machine on that queue. The full inline battery still gets a smaller
-    /// pool via [`Self::resolved_session_promotion_workers`].
+    /// H1 permutation/folds/MC after one M1 fidelity check is cheap enough to
+    /// use about half the machine, same as Holding admission.
     pub fn resolved_promotion_worker_threads(&self) -> usize {
         if self.promotion_worker_threads > 0 {
             return self.promotion_worker_threads;
@@ -1306,33 +1305,17 @@ impl DiscoverConfig {
         let cpus = std::thread::available_parallelism()
             .map(|cores| cores.get())
             .unwrap_or(4);
-        if self.build_to_holding {
-            (cpus / 2).clamp(2, 8)
-        } else {
-            (cpus / 4).clamp(2, 4)
-        }
+        (cpus / 2).clamp(2, 8)
     }
 
-    /// Workers the live session actually starts. Full-battery promotions stay
-    /// at two concurrent jobs because each one replays ~100 M1 neighbors.
-    /// Holding admission does not.
+    /// Workers the live session actually starts.
     pub fn resolved_session_promotion_workers(&self) -> usize {
-        let resolved = self.resolved_promotion_worker_threads();
-        if self.build_to_holding {
-            resolved.clamp(1, 8)
-        } else {
-            resolved.clamp(1, 2)
-        }
+        self.resolved_promotion_worker_threads().clamp(1, 8)
     }
 
-    /// Queue depth the live session actually uses. Shared market-data context
-    /// means Holding can retain more candidates without cloning the M1 feed.
+    /// Queue depth the live session actually uses.
     pub fn resolved_session_promotion_capacity(&self) -> usize {
-        if self.build_to_holding {
-            self.promotion_queue_capacity.clamp(8, 64)
-        } else {
-            self.promotion_queue_capacity.clamp(1, 8)
-        }
+        self.promotion_queue_capacity.clamp(8, 256)
     }
 
     /// H1 scout-pool size. `0` → auto (`cpus − 1 − promotion`), leaving room
@@ -1716,6 +1699,9 @@ pub struct DiscoverTelemetry {
     /// Times enqueue waited because the promotion queue was at capacity.
     #[serde(default)]
     pub promotion_backpressure_events: u64,
+    /// Pot admits dropped from the overflow buffer when it exceeds capacity.
+    #[serde(default)]
+    pub promotion_overflow_dropped: u64,
     /// Last observed depth: waiting + in-flight promotion jobs.
     #[serde(default)]
     pub promotion_queue_depth: u64,

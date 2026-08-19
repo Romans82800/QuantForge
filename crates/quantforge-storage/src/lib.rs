@@ -473,7 +473,10 @@ fn serialized_temp_file<T: Serialize>(
     fs::create_dir_all(parent)?;
 
     let mut temp = NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value)?;
+    // Live recovery checkpoints are rewritten often and can hold hundreds of
+    // Holding names. Pretty JSON made the first battery pass look paused for
+    // minutes while the whole archive was re-serialized.
+    serde_json::to_writer(&mut temp, value)?;
     temp.write_all(b"\n")?;
     temp.as_file().sync_all()?;
     Ok(temp)

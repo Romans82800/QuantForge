@@ -126,6 +126,9 @@ pub struct DiscoverRequest {
     /// artifact before the operating system is forced to kill it.
     max_memory_mb: Option<u64>,
     require_m1_robustness: Option<bool>,
+    /// When true, Discover fills Holding instead of Databank. Default false:
+    /// overnight Discover grows Databank after H1 permutation/folds/MC.
+    build_to_holding: Option<bool>,
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_monte_carlo_block_length: Option<usize>,
@@ -519,7 +522,7 @@ pub fn start_discover(
         breeding_active: false,
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
-        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64).min(64),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
         max_memory_mb: request.max_memory_mb.unwrap_or(8_192),
         resident_memory_mb: resident_memory_mb().unwrap_or(0),
         promotion_queue_depth: 0,
@@ -683,15 +686,11 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
     let history_year = request
         .history_start_year
         .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR);
-    let root = source
-        .ancestors()
-        .find(|candidate| {
-            candidate.file_name().and_then(|name| name.to_str()) == Some("QuantForge")
-        })
-        .map(Path::to_path_buf)
-        .or_else(|| source.parent().map(Path::to_path_buf))
-        .ok_or_else(|| "cannot derive an archive directory from decision OHLC path".to_owned())?;
-    let directory = root.join("runs").join(&symbol).join("Databank");
+    // Always Documents/QuantForge/runs — never beside the Wine/MT5 data pack,
+    // even when the pack itself lives under a folder named QuantForge.
+    let directory = crate::assets::quantforge_runs_root()
+        .join(&symbol)
+        .join("Databank");
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -1376,9 +1375,9 @@ fn run_discovery(
         };
         let breeding = bank.pot_size() >= bank.config.mutate_after_elites;
         let status_message = if breeding {
-            "Build continues on scout workers; Development CPCV/robustness→M1→OOS1 validation runs on side workers. OOS2 is untouched."
+            "Scout keeps breeding. Side workers run M1 80/130 into Holding. Fold-R, plateau, CPCV, and Monte Carlo wait for the Holding battery. OOS2 is untouched."
         } else {
-            "Candidates enter the Development reservoir only. After breeding unlocks: M1 fidelity → Development CPCV/robustness → OOS1 validation → databank."
+            "Candidates enter the Development reservoir only. After breeding unlocks: M1 80/130 → Holding. Databank tests run from the Holding tab."
         };
         update_phase(job, &phase_label, status_message)?;
 
@@ -2416,15 +2415,15 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         random_fill_fraction: request.random_fill_fraction.unwrap_or(0.75),
         worker_threads: request.worker_threads.unwrap_or(0),
         promotion_worker_threads: request.promotion_worker_threads.unwrap_or(0),
-        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64).min(64),
+        promotion_queue_capacity: request.promotion_queue_capacity.unwrap_or(64),
         max_accepted_pool_elites: 10_000,
         max_specialist_pool_elites: 2_000,
         max_databank_elites: 10_000,
         max_holding_elites: 10_000,
-        max_elites_per_niche: 2,
+        max_elites_per_niche: 8,
         max_promoted_per_niche: 4,
-        max_per_entry_family: 8,
-        build_to_holding: true,
+        max_per_entry_family: 24,
+        build_to_holding: request.build_to_holding.unwrap_or(true),
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(8),
         robustness_monte_carlo_trials: request.robustness_monte_carlo_trials.unwrap_or(1_000),
@@ -2853,6 +2852,7 @@ mod tests {
             promotion_queue_capacity: Some(8),
             max_memory_mb: Some(2048),
             require_m1_robustness: Some(false),
+            build_to_holding: Some(false),
             robustness_folds: Some(3),
             robustness_monte_carlo_trials: Some(50),
             robustness_monte_carlo_block_length: Some(5),

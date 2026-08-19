@@ -4780,7 +4780,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         robustness_perturbation_fraction: args
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
-        minimum_neighborhood_survival_fraction: 0.55,
+        minimum_neighborhood_survival_fraction: 0.70,
         calendar_year_folds: false,
         minimum_deflated_trade_sharpe: None,
         multi_symbol_minimum_pass: 0,

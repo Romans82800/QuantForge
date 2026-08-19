@@ -1,10 +1,10 @@
-//! M1 robustness battery on Development, before the separate OOS1 validation gate.
+//! H1 robustness battery on Development after one M1 80/130 fidelity check.
 
 use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::FloatPolicy;
 use quantforge_data::{
-    BarDataset, QuoteBarDataset, bar_content_hash, infer_median_interval_ms, quote_bar_content_hash,
+    BarDataset, QuoteBarDataset, bar_content_hash, quote_bar_content_hash,
 };
 use quantforge_eval::{
     IndicatorBufferCache, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry,
@@ -119,14 +119,14 @@ pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
 pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
 /// SQX-style trade manipulation: each resampled path removes 10% of fills.
 /// Original recovery factor must sit this close to the neighbourhood median.
-/// Knife-edge fits land on the tails of the ret/DD histogram and decay in holdout.
+/// Knife-edge fits land on the tails of the ret/DD histogram and collapse in holdout.
 pub const PARAM_RECOVERY_MEDIAN_LOW: f64 = 0.85;
 pub const PARAM_RECOVERY_MEDIAN_HIGH: f64 = 1.25;
 /// Histogram of ret/DD is too noisy below this many finite neighbour recoveries.
 const PARAM_RECOVERY_BAND_MIN_SAMPLES: usize = 20;
 
-/// M1 baseline + Selected-TF retention only. Used for Holding admission so
-/// Discover stays fast while still rejecting pure H1 fantasy.
+/// M1 80/130 fidelity only. Fold stability, plateau, CPCV, and Monte Carlo are
+/// the Databank battery, not Holding admission.
 pub fn run_m1_holding_admission(
     strategy: &StrategyIr,
     is_decision: &BarDataset,
@@ -164,9 +164,6 @@ pub fn run_m1_holding_admission(
         config.minimum_return_retention,
     ) {
         return Err(RobustnessReject::M1Fidelity);
-    }
-    if !crate::fold_r::calendar_year_fold_r(&baseline.trades).passes_stability() {
-        return Err(RobustnessReject::FoldStability);
     }
     let _retention = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
     Ok(RobustnessOutcome {
@@ -228,9 +225,22 @@ pub fn run_m1_predeposit_robustness(
         return Err(RobustnessReject::M1Fidelity);
     }
     let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
-    if !crate::fold_r::calendar_year_fold_r(&baseline.trades).passes_stability() {
+    let h1_scout = neighborhood_scout_config(config);
+    let h1_cache = IndicatorBufferCache::new(is_decision.bars.len());
+    let h1_run = evaluate_strategy_cached(
+        strategy,
+        is_decision,
+        broker,
+        &h1_scout,
+        &h1_cache,
+    )
+    .map_err(|_| RobustnessReject::ParamNeighborhood)?;
+    if !crate::fold_r::calendar_year_fold_r(&h1_run.trades).passes_stability() {
         return Err(RobustnessReject::FoldStability);
     }
+    // H1 permutation / Ret/DD before CPCV or Monte Carlo.
+    let parameter_neighborhood =
+        evaluate_h1_neighborhood(strategy, is_decision, broker, config, &h1_run.metrics)?;
 
     let (fold_rows, fold_scheme, purge_bars, embargo_bars, required_fraction) =
         if config.calendar_year_folds {
@@ -261,7 +271,7 @@ pub fn run_m1_predeposit_robustness(
             )?;
             (
                 rows,
-                "development_cpcv_6_choose_2".into(),
+                "development_cpcv_6_choose_2_h1".into(),
                 contract.purge_bars,
                 contract.embargo_bars,
                 config.minimum_passing_fold_fraction,
@@ -308,7 +318,7 @@ pub fn run_m1_predeposit_robustness(
         return Err(RobustnessReject::WalkForward);
     }
     let sequential_walk_forward = WalkForwardEvidence {
-        fold_scheme: "development_sequential_walk_forward".into(),
+        fold_scheme: "development_sequential_walk_forward_h1".into(),
         total_folds: sequential_rows.len(),
         passing_folds: sequential_passing,
         passing_fraction: sequential_fraction,
@@ -318,13 +328,13 @@ pub fn run_m1_predeposit_robustness(
         folds: sequential_rows,
     };
 
-    let profits: Vec<_> = baseline
+    let profits: Vec<_> = h1_run
         .trades
         .iter()
         .map(|trade| trade.net_profit)
         .collect();
     let maximum_p95_drawdown_percent =
-        baseline.metrics.max_drawdown_percent * config.monte_carlo_max_drawdown_ratio;
+        h1_run.metrics.max_drawdown_percent * config.monte_carlo_max_drawdown_ratio;
     let mut mc = monte_carlo_trade_resampling_with_skip(
         &profits,
         config.initial_balance,
@@ -334,10 +344,10 @@ pub fn run_m1_predeposit_robustness(
         config.seed,
         0.0,
         maximum_p95_drawdown_percent,
-        baseline.metrics.net_profit,
+        h1_run.metrics.net_profit,
         config.monte_carlo_minimum_p80_profit_retention,
     );
-    mc.baseline_max_drawdown_percent = baseline.metrics.max_drawdown_percent;
+    mc.baseline_max_drawdown_percent = h1_run.metrics.max_drawdown_percent;
     mc.maximum_drawdown_ratio = config.monte_carlo_max_drawdown_ratio;
     // Require a non-negative median path and the configured P80 retention gate
     // encoded in `mc.passed`.
@@ -345,90 +355,6 @@ pub fn run_m1_predeposit_robustness(
         return Err(RobustnessReject::MonteCarlo);
     }
 
-    // Parameter surface is a decision-TF property. M1 fills are already gated by
-    // retention; replaying every neighbour on M1 made 200–400 samples unusable.
-    // Cached H1 reuses indicator buffers across SL/TP-only permutations.
-    let scout = neighborhood_scout_config(config);
-    let cache = IndicatorBufferCache::new(is_decision.bars.len());
-    let mut surviving = 0usize;
-    let mut evaluated_samples = 0usize;
-    let mut neighborhood_samples = Vec::with_capacity(config.neighborhood_samples);
-    // Test deterministic one-axis low/high permutations first.  A joint
-    // seeded perturbation fills any remaining budget, preserving the existing
-    // fast/deep runtime presets while making the result a real plateau test.
-    let mut permutation_neighbors =
-        parameter_permutation_neighbors(strategy, config.parameter_perturbation_fraction)
-            .unwrap_or_default()
-            .into_iter();
-    for sample in 0..config.neighborhood_samples {
-        let neighbor = permutation_neighbors.next().or_else(|| {
-            perturb_strategy_parameters(
-                strategy,
-                config.parameter_perturbation_fraction,
-                sample,
-                config.seed,
-            )
-            .ok()
-        });
-        let Some(neighbor) = neighbor else { continue };
-        let Ok(result) =
-            evaluate_strategy_cached(&neighbor, is_decision, broker, &scout, &cache)
-        else {
-            continue;
-        };
-        evaluated_samples += 1;
-        let survived = neighborhood_survives(&result.metrics, h1_metrics, config);
-        if survived {
-            surviving += 1;
-        }
-        neighborhood_samples.push(neighborhood_sample(sample, &result.metrics, survived));
-    }
-    // A neighbor that could not be built or replayed says nothing about the width of
-    // the plateau, so score against the samples that actually ran. Still demand that
-    // most of them ran, otherwise the evidence is too thin to promote on.
-    if evaluated_samples * 2 < config.neighborhood_samples {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
-    let survival = surviving as f64 / evaluated_samples.max(1) as f64;
-    if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
-    let recoveries: Vec<f64> = neighborhood_samples
-        .iter()
-        .filter_map(|sample| sample.recovery_factor)
-        .collect();
-    let median_recovery_factor = median_finite(&recoveries);
-    let original_recovery_to_median =
-        recovery_to_median_ratio(h1_metrics.recovery_factor(), &recoveries);
-    let passed_recovery_median_band =
-        passes_recovery_median_band(original_recovery_to_median, recoveries.len());
-    if !passed_recovery_median_band {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
-
-    // ADX gets an explicit local plateau check. The generic ±20% neighborhood
-    // perturbs many genes at once; that cannot prove that ADX itself is not a
-    // single lucky threshold or period. These neighbours isolate one search
-    // profile step in each available direction and require 3 of 4 to survive.
-    let plateau_neighbors = adx_plateau_neighbors(strategy, config);
-    let mut plateau_surviving = 0usize;
-    let mut plateau_survival_fraction = None;
-    if !plateau_neighbors.is_empty() {
-        plateau_surviving = plateau_neighbors
-            .iter()
-            .filter_map(|neighbor| {
-                evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache)
-                    .ok()
-                    .map(|result| neighborhood_survives(&result.metrics, h1_metrics, config))
-            })
-            .filter(|passed| *passed)
-            .count();
-        let plateau_survival = plateau_surviving as f64 / plateau_neighbors.len() as f64;
-        plateau_survival_fraction = Some(plateau_survival);
-        if plateau_survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
-            return Err(RobustnessReject::ParamNeighborhood);
-        }
-    }
     Ok(RobustnessOutcome {
         result: baseline_result,
         evidence: Some(RobustnessEvidence {
@@ -436,23 +362,7 @@ pub fn run_m1_predeposit_robustness(
             walk_forward: walk_forward_evidence,
             sequential_walk_forward: Some(sequential_walk_forward),
             monte_carlo: mc,
-            parameter_neighborhood: ParameterNeighborhoodEvidence {
-                method: "h1_cached_axis_plus_seeded_joint".into(),
-                perturbation_fraction: config.parameter_perturbation_fraction,
-                samples_requested: config.neighborhood_samples,
-                samples_evaluated: evaluated_samples,
-                surviving_samples: surviving,
-                survival_fraction: survival,
-                required_survival_fraction: config.minimum_neighborhood_survival_fraction,
-                plateau_neighbors: plateau_neighbors.len(),
-                plateau_surviving,
-                plateau_survival_fraction,
-                original_metrics: Some(h1_metrics.clone()),
-                median_recovery_factor,
-                original_recovery_to_median,
-                passed_recovery_median_band: Some(passed_recovery_median_band),
-                samples: neighborhood_samples,
-            },
+            parameter_neighborhood,
         }),
     })
 }
@@ -527,6 +437,112 @@ fn m1_retention_evidence(
         trade_retention: ratio(m1.trade_count as f64, h1.trade_count as f64),
         drawdown_expansion: ratio(m1.max_drawdown_percent, h1.max_drawdown_percent),
     }
+}
+
+fn evaluate_h1_neighborhood(
+    strategy: &StrategyIr,
+    is_decision: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+    h1_metrics: &quantforge_eval::BacktestMetrics,
+) -> Result<ParameterNeighborhoodEvidence, RobustnessReject> {
+    use rayon::prelude::*;
+    let scout = neighborhood_scout_config(config);
+    let cache = IndicatorBufferCache::new(is_decision.bars.len());
+    let mut permutation_neighbors =
+        parameter_permutation_neighbors(strategy, config.parameter_perturbation_fraction)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+    let sample_rows: Vec<(usize, Option<StrategyIr>)> = (0..config.neighborhood_samples)
+        .map(|sample| {
+            let neighbor = permutation_neighbors
+                .first()
+                .cloned()
+                .map(|first| {
+                    permutation_neighbors.remove(0);
+                    first
+                })
+                .or_else(|| {
+                    perturb_strategy_parameters(
+                        strategy,
+                        config.parameter_perturbation_fraction,
+                        sample,
+                        config.seed,
+                    )
+                    .ok()
+                });
+            (sample, neighbor)
+        })
+        .collect();
+    let neighborhood_samples: Vec<ParameterNeighborhoodSample> = sample_rows
+        .par_iter()
+        .filter_map(|(sample, neighbor)| {
+            let neighbor = neighbor.as_ref()?;
+            let result =
+                evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache).ok()?;
+            let survived = neighborhood_survives(&result.metrics, h1_metrics, config);
+            Some(neighborhood_sample(*sample, &result.metrics, survived))
+        })
+        .collect();
+    let evaluated_samples = neighborhood_samples.len();
+    let surviving = neighborhood_samples.iter().filter(|row| row.survived).count();
+    if evaluated_samples * 2 < config.neighborhood_samples {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+    let survival = surviving as f64 / evaluated_samples.max(1) as f64;
+    if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+    let recoveries: Vec<f64> = neighborhood_samples
+        .iter()
+        .filter_map(|sample| sample.recovery_factor)
+        .collect();
+    let median_recovery_factor = median_finite(&recoveries);
+    let original_recovery_to_median =
+        recovery_to_median_ratio(h1_metrics.recovery_factor(), &recoveries);
+    let passed_recovery_median_band =
+        passes_recovery_median_band(original_recovery_to_median, recoveries.len());
+    if !passed_recovery_median_band {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+
+    let plateau_neighbors = adx_plateau_neighbors(strategy, config);
+    let mut plateau_surviving = 0usize;
+    let mut plateau_survival_fraction = None;
+    if !plateau_neighbors.is_empty() {
+        plateau_surviving = plateau_neighbors
+            .iter()
+            .filter_map(|neighbor| {
+                evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache)
+                    .ok()
+                    .map(|result| neighborhood_survives(&result.metrics, h1_metrics, config))
+            })
+            .filter(|passed| *passed)
+            .count();
+        let plateau_survival = plateau_surviving as f64 / plateau_neighbors.len() as f64;
+        plateau_survival_fraction = Some(plateau_survival);
+        if plateau_survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
+            return Err(RobustnessReject::ParamNeighborhood);
+        }
+    }
+    Ok(ParameterNeighborhoodEvidence {
+        method: "h1_cached_axis_plus_seeded_joint".into(),
+        perturbation_fraction: config.parameter_perturbation_fraction,
+        samples_requested: config.neighborhood_samples,
+        samples_evaluated: evaluated_samples,
+        surviving_samples: surviving,
+        survival_fraction: survival,
+        required_survival_fraction: config.minimum_neighborhood_survival_fraction,
+        plateau_neighbors: plateau_neighbors.len(),
+        plateau_surviving,
+        plateau_survival_fraction,
+        original_metrics: Some(h1_metrics.clone()),
+        median_recovery_factor,
+        original_recovery_to_median,
+        passed_recovery_median_band: Some(passed_recovery_median_band),
+        samples: neighborhood_samples,
+    })
 }
 
 fn neighborhood_scout_config(config: &RobustnessConfig) -> ScoutConfig {
@@ -1069,10 +1085,10 @@ fn evaluate_development_cpcv(
 fn evaluate_development_window(
     strategy: &StrategyIr,
     development: &BarDataset,
-    m1_dataset: &BarDataset,
-    quote_dataset: Option<&QuoteBarDataset>,
+    _m1_dataset: &BarDataset,
+    _quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
-    judge: &JudgeConfig,
+    _judge: &JudgeConfig,
     config: &RobustnessConfig,
     fold: usize,
     test_groups: Vec<usize>,
@@ -1082,35 +1098,19 @@ fn evaluate_development_window(
     if end <= start + 1 || end > development.bars.len() {
         return Err(RobustnessReject::WalkForward);
     }
-    // Match the judge/EA parity warm-up exactly. With a shorter prefix the
-    // judge's fixed 320-bar warm-up delayed every CPCV group by the missing
-    // bars (formerly 200), so the fold silently omitted part of its test
-    // window. A full prefix also guarantees no pre-fold entry can be scored.
     let lookback = 320usize;
     let decision_slice = slice_dataset(development, start.saturating_sub(lookback), end);
     let start_ms = development.bars[start].timestamp_ms;
     let last_open_ms = development.bars[end - 1].timestamp_ms;
-    let interval_ms = infer_median_interval_ms(&development.bars).unwrap_or(3_600_000);
-    let decision_start_ms = decision_slice
+    let _ = decision_slice
         .bars
         .first()
         .map(|bar| bar.timestamp_ms)
         .ok_or(RobustnessReject::WalkForward)?;
-    let m1_slice = slice_m1_covering(
-        m1_dataset,
-        decision_start_ms,
-        last_open_ms.saturating_add(interval_ms),
-    );
-    let quote_slice = quote_dataset.map(|quotes| slice_quotes_covering(quotes, &m1_slice));
-    let result = evaluate_strategy_m1_with_optional_quotes(
-        strategy,
-        &decision_slice,
-        &m1_slice,
-        quote_slice.as_ref(),
-        broker,
-        judge,
-    )
-    .map_err(|_| RobustnessReject::WalkForward)?;
+    let scout = neighborhood_scout_config(config);
+    let cache = IndicatorBufferCache::new(decision_slice.bars.len());
+    let result = evaluate_strategy_cached(strategy, &decision_slice, broker, &scout, &cache)
+        .map_err(|_| RobustnessReject::WalkForward)?;
     let trades = result
         .trades
         .iter()
@@ -1247,6 +1247,7 @@ fn slice_dataset(source: &BarDataset, start: usize, end: usize) -> BarDataset {
 /// across weekend/session calendars and a source of cross-asset CPCV bias.
 /// `end_exclusive_ms` must be the open of the last decision bar **plus** that
 /// bar's interval, or the final decision bar is truncated.
+#[allow(dead_code)]
 fn slice_m1_covering(m1: &BarDataset, start_ms: i64, end_exclusive_ms: i64) -> BarDataset {
     let bars: Vec<_> = m1
         .bars
@@ -1265,6 +1266,7 @@ fn slice_m1_covering(m1: &BarDataset, start_ms: i64, end_exclusive_ms: i64) -> B
     }
 }
 
+#[allow(dead_code)]
 fn slice_quotes_covering(quotes: &QuoteBarDataset, m1: &BarDataset) -> QuoteBarDataset {
     let (Some(first), Some(last)) = (m1.bars.first(), m1.bars.last()) else {
         return QuoteBarDataset {
