@@ -102,6 +102,7 @@ pub struct DatabankWorkspace {
     run_id: String,
     created_at: String,
     data_hash: String,
+    decision_timeframe: String,
     broker_spec_hash: String,
     grammar_version: String,
     legacy_read_only: bool,
@@ -2868,6 +2869,7 @@ fn workspace_view(
         run_id: artifact.manifest.run_id.clone(),
         created_at: artifact.manifest.created_at.to_rfc3339(),
         data_hash: bank.data_hash.as_str().into(),
+        decision_timeframe: archive_decision_timeframe(artifact, source_path).into(),
         broker_spec_hash: bank.broker_spec_hash.as_str().into(),
         grammar_version: bank.grammar_version.clone(),
         legacy_read_only: bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION,
@@ -2915,6 +2917,39 @@ fn workspace_view(
         condition_groups: coverage_condition_groups(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
         holding: bank.holding.iter().map(elite_row).collect(),
+    }
+}
+
+/// New archives record the lane in their recipe. Older archives are identified
+/// from their immutable databank filename first, then their source filename.
+/// This is only used to choose the correct desktop action; the battery still
+/// verifies the exact Development hash before it evaluates anything.
+pub(crate) fn archive_decision_timeframe(artifact: &EvolveArtifact, source_path: &Path) -> &'static str {
+    if let Some(timeframe) = artifact
+        .manifest
+        .recipe
+        .config
+        .get("decision_timeframe")
+        .and_then(Value::as_str)
+    {
+        return match timeframe.to_ascii_uppercase().as_str() {
+            "H4" => "H4",
+            "M15" => "M15",
+            _ => "H1",
+        };
+    }
+    let filename = source_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .or_else(|| Path::new(&artifact.source).file_stem().and_then(|name| name.to_str()))
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if filename.contains("_H4_") || filename.ends_with("_H4") {
+        "H4"
+    } else if filename.contains("_M15_") || filename.ends_with("_M15") {
+        "M15"
+    } else {
+        "H1"
     }
 }
 

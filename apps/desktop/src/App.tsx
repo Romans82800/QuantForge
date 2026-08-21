@@ -1287,7 +1287,7 @@ function App() {
                     <div className="table-controls">
                       {databankTab === "holding" && (
                         <>
-                          <button
+                          {workspace?.decisionTimeframe === "H4" && <button
                             type="button"
                             className="primary"
                             disabled={
@@ -1303,7 +1303,7 @@ function App() {
                             {batteryActive && batteryJob?.jobKind === "production_lane"
                               ? "Production Lane running…"
                               : `Run Production Lane v1 (${workspace?.holding?.length ?? 0})`}
-                          </button>
+                          </button>}
                           <button
                             type="button"
                             className="secondary"

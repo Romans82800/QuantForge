@@ -166,6 +166,7 @@ export interface DatabankWorkspace {
   runId: string;
   createdAt: string;
   dataHash: string;
+  decisionTimeframe: "H1" | "M15" | "H4" | string;
   brokerSpecHash: string;
   grammarVersion: string;
   legacyReadOnly: boolean;

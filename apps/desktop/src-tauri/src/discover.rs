@@ -2067,6 +2067,14 @@ fn build_discover_artifact(
             "m1_source".into(),
             json!(display_path(Path::new(&request.m1_data_path))),
         ),
+        (
+            "decision_timeframe".into(),
+            json!(match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
+                DecisionTimeframe::H1 => "H1",
+                DecisionTimeframe::M15 => "M15",
+                DecisionTimeframe::H4 => "H4",
+            }),
+        ),
         ("databank".into(), json!(display_path(output_path))),
         ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
         (

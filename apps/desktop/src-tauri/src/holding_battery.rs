@@ -358,6 +358,15 @@ pub fn start_production_lane_job(
     if snapshot.sealed_fraction <= 0.0 {
         return Err("Production Lane requires a non-zero sealed partition".into());
     }
+    let timeframe = crate::databank::archive_decision_timeframe(
+        &snapshot.artifact,
+        Path::new(&snapshot.databank_path),
+    );
+    if timeframe != "H4" {
+        return Err(format!(
+            "This is a {timeframe} Holding archive. Production Lane v1 is H4-only; use Run full robustness battery for this cohort. Nothing was evaluated or promoted."
+        ));
+    }
 
     state.stop.store(false, Ordering::SeqCst);
     let now_ms = SystemTime::now()
