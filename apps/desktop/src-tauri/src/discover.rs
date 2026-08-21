@@ -1056,6 +1056,14 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
             validate_universal_grammar(grammar)?;
+            if request.sl_tp_only_exits.unwrap_or(true)
+                && grammar.minimum_entry_conditions > 3
+            {
+                return Err(
+                    "SL/TP-only exits allow 2–3 entry conditions; lower the minimum entry conditions or switch that profile off"
+                        .into(),
+                );
+            }
         }
         if let Some(mode) = request.run_mode.as_deref() {
             if parse_run_mode(mode).is_none() {
@@ -2685,6 +2693,14 @@ fn broker_symbol_from_path(path: &str) -> Option<String> {
 
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
     let sl_tp_only_exits = request.sl_tp_only_exits.unwrap_or(true);
+    let mut universal_grammar = request.universal_grammar.clone().unwrap_or_default();
+    if sl_tp_only_exits {
+        // The constrained production lane intentionally leaves at most three
+        // entry conditions. Exit bounds remain part of the legacy grammar
+        // contract but are erased before evaluation.
+        universal_grammar.maximum_entry_conditions = universal_grammar.maximum_entry_conditions.min(3);
+        universal_grammar.maximum_exit_conditions = universal_grammar.maximum_exit_conditions.min(2);
+    }
     let mut commission = request
         .commission_per_lot_round_turn
         .ok_or_else(|| "commission is required for a new databank".to_owned())?;
@@ -2703,7 +2719,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         tournament_size: 4,
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
-        universal_grammar: request.universal_grammar.clone().unwrap_or_default(),
+        universal_grammar,
         run_mode: request
             .run_mode
             .as_deref()
@@ -3291,6 +3307,14 @@ mod tests {
         });
         let error = validate_request(&request).expect_err("inverted range must fail");
         assert!(error.contains("entry conditions"));
+
+        request.universal_grammar = Some(UniversalGrammarConfig {
+            minimum_entry_conditions: 4,
+            maximum_entry_conditions: 4,
+            ..UniversalGrammarConfig::default()
+        });
+        let error = validate_request(&request).expect_err("constrained profile caps at three");
+        assert!(error.contains("SL/TP-only"));
     }
 
     #[test]
