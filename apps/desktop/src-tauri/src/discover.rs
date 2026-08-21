@@ -112,6 +112,11 @@ pub struct DiscoverRequest {
     simple_exits: Option<bool>,
     /// Constrained profile: only SL, TP and end-of-day close can exit.
     sl_tp_only_exits: Option<bool>,
+    /// Add a fixed-pip SL/TP family beside the ATR/R protective family.
+    allow_fixed_pip_stops: Option<bool>,
+    /// Explicit research-only exit genes. They are off in the constrained recipe.
+    allow_indicator_exit_rules: Option<bool>,
+    allow_time_stops: Option<bool>,
     allow_break_even: Option<bool>,
     allow_trailing_stops: Option<bool>,
     allow_partial_exits: Option<bool>,
@@ -1123,6 +1128,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.require_m1_precision.is_some(),
             request.simple_exits.is_some(),
             request.sl_tp_only_exits.is_some(),
+            request.allow_fixed_pip_stops.is_some(),
+            request.allow_indicator_exit_rules.is_some(),
+            request.allow_time_stops.is_some(),
             request.allow_break_even.is_some(),
             request.allow_trailing_stops.is_some(),
             request.allow_partial_exits.is_some(),
@@ -2693,6 +2701,19 @@ fn broker_symbol_from_path(path: &str) -> Option<String> {
 
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
     let sl_tp_only_exits = request.sl_tp_only_exits.unwrap_or(true);
+    let allow_fixed_pip_stops = request.allow_fixed_pip_stops.unwrap_or(false);
+    let broker = load_bound_broker(&request.broker_path, None)?;
+    if allow_fixed_pip_stops && !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
+        return Err(format!(
+            "fixed pip SL/TP is currently available for FX symbols only; {} should use ATR/R protection",
+            broker.symbol
+        ));
+    }
+    let fixed_pip_size_points = if matches!(broker.digits, 3 | 5) {
+        10.0
+    } else {
+        1.0
+    };
     let mut universal_grammar = request.universal_grammar.clone().unwrap_or_default();
     if sl_tp_only_exits {
         // The constrained production lane intentionally leaves at most three
@@ -2751,6 +2772,10 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
         sl_tp_only_exits,
+        allow_fixed_pip_stops,
+        fixed_pip_size_points,
+        allow_indicator_exit_rules: request.allow_indicator_exit_rules.unwrap_or(false),
+        allow_time_stops: request.allow_time_stops.unwrap_or(false),
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
         allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
@@ -3197,6 +3222,9 @@ mod tests {
             require_m1_precision: Some(false),
             simple_exits: Some(true),
             sl_tp_only_exits: Some(true),
+            allow_fixed_pip_stops: Some(false),
+            allow_indicator_exit_rules: Some(false),
+            allow_time_stops: Some(false),
             allow_break_even: Some(false),
             allow_trailing_stops: Some(false),
             allow_partial_exits: Some(false),

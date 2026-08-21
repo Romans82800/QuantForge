@@ -253,6 +253,16 @@ impl SearchRangeProfile {
             ("base_bars", &self.base_bars),
             ("liquidity_sweep_threshold", &self.liquidity_sweep_threshold),
         ] {
+            // Optional pending expiry and time-stop genes use an all-zero
+            // range as their saved "off" state. They are never sampled until
+            // their execution-module switch is enabled.
+            if matches!(name, "pending_expiry_bars" | "time_stop_bars")
+                && range.minimum == 0.0
+                && range.maximum == 0.0
+                && range.step == 0.0
+            {
+                continue;
+            }
             range.validate(name)?;
         }
         Ok(())
@@ -600,6 +610,21 @@ pub struct DiscoverConfig {
     /// are not searchable in this profile.
     #[serde(default = "default_sl_tp_only_exits")]
     pub sl_tp_only_exits: bool,
+    /// Allow a fixed-pip SL/TP pair alongside the ATR/R protective pair. The
+    /// desktop binds a pip to the selected FX broker's quote precision.
+    #[serde(default)]
+    pub allow_fixed_pip_stops: bool,
+    /// Number of broker points in one pip for the bound symbol (10 for 5- and
+    /// 3-decimal FX quotes, otherwise 1). Stored with the recipe so replays
+    /// cannot silently change the fixed-distance interpretation.
+    #[serde(default = "default_fixed_pip_size_points")]
+    pub fixed_pip_size_points: f64,
+    /// Permit indicator-based exit rules as an explicit research gene.
+    #[serde(default)]
+    pub allow_indicator_exit_rules: bool,
+    /// Permit a time stop / "exit after N bars" as an explicit research gene.
+    #[serde(default)]
+    pub allow_time_stops: bool,
     /// Individually opt-in execution genes. Off in the high-parity Selected-TF
     /// baseline; enabling them widens search and makes M1/MT5 final gates more
     /// important — they do not block Discover breeding.
@@ -781,6 +806,10 @@ fn default_sl_tp_only_exits() -> bool {
     false
 }
 
+fn default_fixed_pip_size_points() -> f64 {
+    10.0
+}
+
 fn default_max_one_entry_per_day() -> bool {
     true
 }
@@ -951,6 +980,10 @@ impl Default for DiscoverConfig {
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
             sl_tp_only_exits: default_sl_tp_only_exits(),
+            allow_fixed_pip_stops: false,
+            fixed_pip_size_points: default_fixed_pip_size_points(),
+            allow_indicator_exit_rules: false,
+            allow_time_stops: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
@@ -1010,7 +1043,9 @@ impl DiscoverConfig {
                 self.initial_candidates = self.initial_candidates.clamp(40, 80);
                 self.batch_size = self.batch_size.clamp(20, 40);
                 // Pot-only scout: stop before breeding so M1/databank never starts.
-                self.simple_exits = !self.has_complex_execution();
+                if self.has_complex_execution() {
+                    self.simple_exits = false;
+                }
                 if self.early_stop_pot_elites.is_none() {
                     self.early_stop_pot_elites = Some(8);
                 }
@@ -1019,18 +1054,14 @@ impl DiscoverConfig {
             DiscoverRunMode::FullHarvest => {
                 // Do not silently erase an explicitly selected execution module.
                 // A run with no modules retains the selected-TF high-parity shape.
-                if !self.has_complex_execution() {
-                    self.simple_exits = true;
-                } else {
+                if self.has_complex_execution() {
                     self.simple_exits = false;
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
                 // Overnight Holding fill: cheap M1 80/130 + fold-R. Plateau /
                 // CPCV / MC stay on the Holding → Databank battery.
-                if !self.has_complex_execution() {
-                    self.simple_exits = true;
-                } else {
+                if self.has_complex_execution() {
                     self.simple_exits = false;
                 }
                 self.require_m1_precision = true;
@@ -1068,7 +1099,9 @@ impl DiscoverConfig {
             DiscoverRunMode::HighPerformanceIslands => {
                 // Identical balanced populations with deterministic migration.
                 // Asymmetric refinement/exploration roles encouraged overfitting.
-                self.simple_exits = !self.has_complex_execution();
+                if self.has_complex_execution() {
+                    self.simple_exits = false;
+                }
                 self.refinement_island_count = 0;
                 self.exploration_island_count = 0;
                 if self.general_island_count == 0 {
@@ -1106,7 +1139,9 @@ impl DiscoverConfig {
     }
 
     pub const fn has_complex_execution(&self) -> bool {
-        self.allow_break_even
+        self.allow_indicator_exit_rules
+            || self.allow_time_stops
+            || self.allow_break_even
             || self.allow_trailing_stops
             || self.allow_partial_exits
             || self.allow_stop_entries
@@ -1134,6 +1169,13 @@ impl DiscoverConfig {
         if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
             return Err(DiscoverError::InvalidConfig(
                 "enable at least one entry order kind: market, stop or limit".into(),
+            ));
+        }
+        if self.allow_fixed_pip_stops
+            && (!self.fixed_pip_size_points.is_finite() || self.fixed_pip_size_points <= 0.0)
+        {
+            return Err(DiscoverError::InvalidConfig(
+                "fixed pip stops require a positive broker pip size".into(),
             ));
         }
         if self.island_count == 0 {

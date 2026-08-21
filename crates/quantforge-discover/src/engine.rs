@@ -1892,6 +1892,7 @@ fn apply_production_policy(
     } else {
         enforce_execution_feature_flags(&mut strategy, config);
     }
+    enforce_fixed_pip_protection(&mut strategy, config);
     strategy
 }
 
@@ -1906,6 +1907,40 @@ fn enforce_sl_tp_only_exits(strategy: &mut StrategyIr) {
     strategy.manage.trailing = None;
     strategy.manage.break_even_at_r = None;
     strategy.manage.partial_exits.clear();
+}
+
+/// Fixed distances are deliberately a small, explicit alternative to the
+/// volatility-scaled SL/TP pair. The desktop stores the bound broker's pip
+/// size with the run recipe, so EURUSD and JPY pairs use the same human pip
+/// ladder despite different quote precisions.
+fn enforce_fixed_pip_protection(strategy: &mut StrategyIr, config: &crate::model::DiscoverConfig) {
+    if !config.allow_fixed_pip_stops {
+        return;
+    }
+    let selector = strategy
+        .id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        });
+    // Keep an equal-sized ATR/R comparison arm. A fixed stop and target are a
+    // single protective-exit family, rather than two independently tuned ways
+    // to fit the same sample.
+    if execution_gene_lane(selector, 0x6669_7865_645f_736c) & 1 != 0 {
+        return;
+    }
+    const STOP_PIPS: [f64; 9] = [10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 80.0];
+    const TARGET_PIPS: [f64; 9] = [15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0];
+    let pip_points = config.fixed_pip_size_points;
+    let stop_pips = STOP_PIPS[execution_gene_lane(selector, 0x6669_7865_645f_7374) as usize % STOP_PIPS.len()];
+    let target_pips = TARGET_PIPS
+        [execution_gene_lane(selector, 0x6669_7865_645f_7470) as usize % TARGET_PIPS.len()];
+    strategy.stops.stop_loss = quantforge_ir::StopLossPolicy::FixedPoints {
+        points: stop_pips * pip_points,
+    };
+    strategy.stops.take_profit = quantforge_ir::TakeProfitPolicy::FixedPoints {
+        points: target_pips * pip_points,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -1998,6 +2033,28 @@ fn enforce_execution_feature_flags(
     let break_even_lane = execution_gene_lane(selector, 0x6272_6561_6b5f_6576);
     let trailing_lane = execution_gene_lane(selector, 0x7472_6169_6c69_6e67);
     let partial_lane = execution_gene_lane(selector, 0x7061_7274_6961_6c73);
+    let exit_rule_lane = execution_gene_lane(selector, 0x696e_6469_6361_746f);
+    let time_stop_lane = execution_gene_lane(selector, 0x7469_6d65_5f73_746f);
+
+    if !config.allow_indicator_exit_rules || exit_rule_lane % 3 == 0 {
+        strategy.exit = None;
+        strategy.exit_long = None;
+        strategy.exit_short = None;
+    }
+    if !config.allow_time_stops || time_stop_lane % 3 == 0 {
+        strategy.manage.time_stop_bars = None;
+    } else if strategy.manage.time_stop_bars.is_none() {
+        let range = &config.search_ranges.time_stop_bars;
+        let (minimum, maximum) = if range.minimum == 0.0 && range.maximum == 0.0 && range.step == 0.0 {
+            (4_u16, 16_u16)
+        } else {
+            let minimum = range.minimum.round().max(1.0) as u16;
+            let maximum = range.maximum.round().max(f64::from(minimum)) as u16;
+            (minimum, maximum)
+        };
+        let span = usize::from(maximum.saturating_sub(minimum)) + 1;
+        strategy.manage.time_stop_bars = Some(minimum + (time_stop_lane as usize % span) as u16);
+    }
 
     if !config.allow_break_even || break_even_lane % 3 == 0 {
         strategy.manage.break_even_at_r = None;
@@ -2317,6 +2374,10 @@ mod tests {
             require_m1_precision: true,
             simple_exits: true,
             sl_tp_only_exits: false,
+            allow_fixed_pip_stops: false,
+            fixed_pip_size_points: 10.0,
+            allow_indicator_exit_rules: false,
+            allow_time_stops: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
@@ -2400,6 +2461,37 @@ mod tests {
         assert!(result.manage.trailing.is_none());
         assert!(result.manage.partial_exits.is_empty());
         assert!(result.manage.flatten_end_of_day);
+    }
+
+    #[test]
+    fn fixed_pip_protection_is_an_explicit_symbol_scaled_sl_tp_arm() {
+        let mut constrained = config();
+        constrained.sl_tp_only_exits = true;
+        constrained.allow_fixed_pip_stops = true;
+        constrained.fixed_pip_size_points = 10.0;
+
+        let candidates: Vec<_> = (0..48)
+            .map(|index| {
+                super::apply_production_policy(
+                    crate::grammar::generate_seed(19, index),
+                    &constrained,
+                )
+            })
+            .collect();
+        let fixed: Vec<_> = candidates
+            .iter()
+            .filter(|strategy| {
+                matches!(strategy.stops.stop_loss, quantforge_ir::StopLossPolicy::FixedPoints { .. })
+                    && matches!(strategy.stops.take_profit, quantforge_ir::TakeProfitPolicy::FixedPoints { .. })
+            })
+            .collect();
+        assert!(!fixed.is_empty());
+        assert!(fixed.iter().all(|strategy| {
+            matches!(strategy.stops.stop_loss, quantforge_ir::StopLossPolicy::FixedPoints { points } if points >= 100.0)
+                && matches!(strategy.stops.take_profit, quantforge_ir::TakeProfitPolicy::FixedPoints { points } if points >= 150.0)
+                && strategy.exit.is_none()
+                && strategy.manage.time_stop_bars.is_none()
+        }));
     }
 
     #[test]

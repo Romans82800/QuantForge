@@ -3689,6 +3689,9 @@ function DiscoverWorkspace({
     requireM1Precision: true,
     simpleExits: true,
     slTpOnlyExits: true,
+    allowFixedPipStops: false,
+    allowIndicatorExitRules: false,
+    allowTimeStops: false,
     allowBreakEven: false,
     allowTrailingStops: false,
     allowPartialExits: false,
@@ -3980,6 +3983,9 @@ function DiscoverWorkspace({
             requireM1Precision: null,
             simpleExits: null,
             slTpOnlyExits: null,
+            allowFixedPipStops: null,
+            allowIndicatorExitRules: null,
+            allowTimeStops: null,
             allowBreakEven: null,
             allowTrailingStops: null,
             allowPartialExits: null,
@@ -4661,7 +4667,10 @@ function DiscoverWorkspace({
               <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Use the constrained lane when the goal is holdout stability: it removes exit degrees of freedom that can fit particular historical years. Switch it off only to deliberately research exit logic.</p>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowIndicatorExitRules: false, allowTimeStops: false, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false, simpleExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowFixedPipStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowFixedPipStops: event.target.checked }))} /><span>Fixed-pip SL/TP pair <small>(FX only; sampled alongside ATR/R using the bound symbol’s pip size)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowIndicatorExitRules ?? false} onChange={(event) => setForm((current) => ({ ...current, allowIndicatorExitRules: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Indicator exit rule <small>(research only; turning it on leaves the constrained lane)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTimeStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTimeStops: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Exit after N bars <small>(research only; turning it on leaves the constrained lane)</small></span></label>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
@@ -5159,6 +5168,9 @@ function DiscoverContractSummary({
     form.allowBreakEven ? "Break-even" : null,
     form.allowTrailingStops ? "Trailing stop" : null,
     form.allowPartialExits ? "Partial exits" : null,
+    form.allowFixedPipStops ? "Fixed-pip SL/TP" : null,
+    form.allowIndicatorExitRules ? "Indicator exit" : null,
+    form.allowTimeStops ? "Exit after N bars" : null,
     form.flattenAt22 ? `EOD exit ${String(form.endOfDayHour ?? 23).padStart(2, "0")}:00` : null,
     entryWindowSummary(form).replace("Entries allowed ", "Entries "),
     form.maxOneEntryPerDay ? "One fill / day" : null,
