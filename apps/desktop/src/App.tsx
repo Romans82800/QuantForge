@@ -176,7 +176,7 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
 const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
   indicatorPeriod: { minimum: 10, maximum: 20, step: 1 }, atrPeriod: { minimum: 10, maximum: 20, step: 1 },
   atrStopMultiple: { minimum: 1, maximum: 4, step: .25 }, atrTargetMultiple: { minimum: 1, maximum: 6, step: .5 },
-  riskTargetMultiple: { minimum: .75, maximum: 4.5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
+  riskTargetMultiple: { minimum: .75, maximum: 4.5, step: .25 }, fixedStopPips: { minimum: 10, maximum: 80, step: 5 }, fixedTargetPips: { minimum: 15, maximum: 120, step: 5 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
   pendingExpiryBars: { minimum: 2, maximum: 8, step: 1 }, timeStopBars: { minimum: 4, maximum: 16, step: 1 },
   rsiUpper: { minimum: 52, maximum: 65, step: 1 }, rsiLower: { minimum: 20, maximum: 40, step: 1 }, adxThreshold: { minimum: 20, maximum: 35, step: 1 },
   rocThreshold: { minimum: .1, maximum: 2.5, step: .1 }, percentileLow: { minimum: 5, maximum: 25, step: 1 },
@@ -191,7 +191,7 @@ const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
 const SQX_RANDOM_SEARCH_RANGES: SearchRangeProfile = {
   indicatorPeriod: { minimum: 10, maximum: 50, step: 1 }, atrPeriod: { minimum: 7, maximum: 28, step: 1 },
   atrStopMultiple: { minimum: 1, maximum: 5, step: .25 }, atrTargetMultiple: { minimum: 1.5, maximum: 8, step: .5 },
-  riskTargetMultiple: { minimum: 1, maximum: 5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 3, step: .25 },
+  riskTargetMultiple: { minimum: 1, maximum: 5, step: .25 }, fixedStopPips: { minimum: 10, maximum: 100, step: 5 }, fixedTargetPips: { minimum: 15, maximum: 150, step: 5 }, pendingDistanceAtr: { minimum: .25, maximum: 3, step: .25 },
   pendingExpiryBars: { minimum: 1, maximum: 12, step: 1 }, timeStopBars: { minimum: 2, maximum: 48, step: 1 },
   rsiUpper: { minimum: 55, maximum: 80, step: 1 }, rsiLower: { minimum: 20, maximum: 45, step: 1 }, adxThreshold: { minimum: 15, maximum: 40, step: 1 },
   rocThreshold: { minimum: .05, maximum: 5, step: .05 }, percentileLow: { minimum: 5, maximum: 30, step: 1 },
@@ -5489,7 +5489,7 @@ function PathField({
 function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onChange: (next: SearchRangeProfile) => void }) {
   const groups: Array<[string, Array<[keyof SearchRangeProfile, string]>]> = [
     ["Indicators", [["indicatorPeriod", "General indicator period"], ["atrPeriod", "ATR period"], ["rsiUpper", "RSI upper"], ["rsiLower", "RSI lower"], ["adxThreshold", "ADX strength threshold"], ["rocThreshold", "ROC threshold"], ["percentileLow", "Percentile low"], ["zscoreThreshold", "Z-score threshold"]]],
-    ["Stops and orders", [["atrStopMultiple", "ATR stop"], ["atrTargetMultiple", "ATR target"], ["riskTargetMultiple", "R target"], ["pendingDistanceAtr", "Pending distance (ATR)"], ["pendingExpiryBars", "Pending expiry bars"], ["timeStopBars", "Time-stop bars"]]],
+    ["Stops and orders", [["atrStopMultiple", "ATR stop"], ["atrTargetMultiple", "ATR target"], ["riskTargetMultiple", "R target"], ["fixedStopPips", "Fixed pip stop (FX)"], ["fixedTargetPips", "Fixed pip target (FX)"], ["pendingDistanceAtr", "Pending distance (ATR)"], ["pendingExpiryBars", "Pending expiry bars"], ["timeStopBars", "Time-stop bars"]]],
     ["Price action and sessions", [["impulseBodyRatio", "Impulse body ratio"], ["impulseCloseLocation", "Impulse close location"], ["atrPercentileMax", "ATR percentile maximum"], ["atrPercentileLookback", "ATR percentile lookback"], ["sessionStartHour", "Session start hour"], ["sessionRangeBars", "Session range bars"], ["swingBars", "Swing bars"], ["baseBars", "Base bars"], ["liquiditySweepThreshold", "Liquidity sweep score"]]],
   ];
   function set(key: keyof SearchRangeProfile, field: "minimum" | "maximum" | "step", next: number) {

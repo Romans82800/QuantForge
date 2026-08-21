@@ -1929,12 +1929,19 @@ fn enforce_fixed_pip_protection(strategy: &mut StrategyIr, config: &crate::model
     if execution_gene_lane(selector, 0x6669_7865_645f_736c) & 1 != 0 {
         return;
     }
-    const STOP_PIPS: [f64; 9] = [10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 80.0];
-    const TARGET_PIPS: [f64; 9] = [15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0];
     let pip_points = config.fixed_pip_size_points;
-    let stop_pips = STOP_PIPS[execution_gene_lane(selector, 0x6669_7865_645f_7374) as usize % STOP_PIPS.len()];
-    let target_pips = TARGET_PIPS
-        [execution_gene_lane(selector, 0x6669_7865_645f_7470) as usize % TARGET_PIPS.len()];
+    let fixed_pips = |lane: u64, range: &crate::model::SearchRange| {
+        let steps = ((range.maximum - range.minimum) / range.step).floor().max(0.0) as u64;
+        range.minimum + (lane % (steps + 1)) as f64 * range.step
+    };
+    let stop_pips = fixed_pips(
+        execution_gene_lane(selector, 0x6669_7865_645f_7374),
+        &config.search_ranges.fixed_stop_pips,
+    );
+    let target_pips = fixed_pips(
+        execution_gene_lane(selector, 0x6669_7865_645f_7470),
+        &config.search_ranges.fixed_target_pips,
+    );
     strategy.stops.stop_loss = quantforge_ir::StopLossPolicy::FixedPoints {
         points: stop_pips * pip_points,
     };

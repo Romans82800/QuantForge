@@ -719,6 +719,8 @@ export interface SearchRangeProfile {
   atrStopMultiple: SearchRange;
   atrTargetMultiple: SearchRange;
   riskTargetMultiple: SearchRange;
+  fixedStopPips: SearchRange;
+  fixedTargetPips: SearchRange;
   pendingDistanceAtr: SearchRange;
   pendingExpiryBars: SearchRange;
   timeStopBars: SearchRange;

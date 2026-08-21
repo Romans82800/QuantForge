@@ -114,6 +114,12 @@ pub struct SearchRangeProfile {
     pub atr_target_multiple: SearchRange,
     #[serde(rename = "riskTargetMultiple", alias = "risk_target_multiple")]
     pub risk_target_multiple: SearchRange,
+    /// FX pips, converted to the bound broker's quote points only when the
+    /// optional fixed-pip protective-exit arm is enabled.
+    #[serde(rename = "fixedStopPips", alias = "fixed_stop_pips")]
+    pub fixed_stop_pips: SearchRange,
+    #[serde(rename = "fixedTargetPips", alias = "fixed_target_pips")]
+    pub fixed_target_pips: SearchRange,
     #[serde(rename = "pendingDistanceAtr", alias = "pending_distance_atr")]
     pub pending_distance_atr: SearchRange,
     #[serde(rename = "pendingExpiryBars", alias = "pending_expiry_bars")]
@@ -174,6 +180,8 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.5),
             atr_target_multiple: SearchRange::new(1.0, 6.0, 1.0),
             risk_target_multiple: SearchRange::new(0.75, 4.5, 0.5),
+            fixed_stop_pips: SearchRange::new(10.0, 80.0, 5.0),
+            fixed_target_pips: SearchRange::new(15.0, 120.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 2.0, 0.5),
             pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
             time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
@@ -206,6 +214,8 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.5),
             atr_target_multiple: SearchRange::new(1.5, 8.0, 1.0),
             risk_target_multiple: SearchRange::new(1.0, 5.0, 0.5),
+            fixed_stop_pips: SearchRange::new(10.0, 100.0, 5.0),
+            fixed_target_pips: SearchRange::new(15.0, 150.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 3.0, 0.5),
             pending_expiry_bars: SearchRange::new(1.0, 12.0, 1.0),
             time_stop_bars: SearchRange::new(2.0, 48.0, 1.0),
@@ -234,6 +244,8 @@ impl SearchRangeProfile {
             ("atr_stop_multiple", &self.atr_stop_multiple),
             ("atr_target_multiple", &self.atr_target_multiple),
             ("risk_target_multiple", &self.risk_target_multiple),
+            ("fixed_stop_pips", &self.fixed_stop_pips),
+            ("fixed_target_pips", &self.fixed_target_pips),
             ("pending_distance_atr", &self.pending_distance_atr),
             ("pending_expiry_bars", &self.pending_expiry_bars),
             ("time_stop_bars", &self.time_stop_bars),
