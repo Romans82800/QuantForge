@@ -76,9 +76,10 @@ pub use production_lane::{
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
     MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAM_RECOVERY_MEDIAN_HIGH, PARAM_RECOVERY_MEDIAN_LOW,
-    PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessConfig, RobustnessOutcome,
-    RobustnessReject, development_cpcv_diagnostic, passes_recovery_median_band,
-    recovery_to_median_ratio, run_m1_holding_admission, run_m1_predeposit_robustness,
+    PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessAuditOutcome, RobustnessConfig,
+    RobustnessOutcome, RobustnessReject, development_cpcv_diagnostic,
+    passes_recovery_median_band, recovery_to_median_ratio, run_m1_holding_admission,
+    run_m1_predeposit_robustness, run_m1_predeposit_robustness_audit,
 };
 pub use timeframe_bakeoff::{
     TimeframeAblationComparison, TimeframeAblationConfig, TimeframeAblationReport,

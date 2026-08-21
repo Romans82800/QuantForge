@@ -20,8 +20,8 @@ pub use quantforge_quality::{
 };
 
 use crate::model::{
-    M1RetentionEvidence, ParameterNeighborhoodEvidence, ParameterNeighborhoodSample,
-    RobustnessEvidence, WalkForwardEvidence, WalkForwardFold,
+    GateResult, M1RetentionEvidence, ParameterNeighborhoodEvidence,
+    ParameterNeighborhoodSample, RobustnessEvidence, WalkForwardEvidence, WalkForwardFold,
 };
 use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 
@@ -31,6 +31,18 @@ use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_wi
 pub struct RobustnessOutcome {
     pub result: ScoutResult,
     pub evidence: Option<RobustnessEvidence>,
+}
+
+/// Full diagnostic result for the non-gating Holding audit. Unlike the
+/// promotion runner, this deliberately continues through every independent
+/// Development test after a failure so the Databank can show the complete
+/// evidence rather than only the first rejection reason.
+pub struct RobustnessAuditOutcome {
+    pub result: ScoutResult,
+    pub evidence: RobustnessEvidence,
+    pub passed: bool,
+    pub gates: Vec<GateResult>,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +367,303 @@ pub fn run_m1_predeposit_robustness(
     })
 }
 
+/// Execute every independent pre-deposit test and retain its evidence even
+/// when another test fails. This is deliberately diagnostic-only: callers
+/// decide whether to promote after seeing the recorded result.
+pub fn run_m1_predeposit_robustness_audit(
+    strategy: &StrategyIr,
+    is_decision: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+    h1_metrics: &quantforge_eval::BacktestMetrics,
+    enforce_m1_retention: bool,
+) -> Result<RobustnessAuditOutcome, RobustnessReject> {
+    let judge = JudgeConfig {
+        initial_balance: config.initial_balance,
+        costs: config.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+    };
+    let baseline = evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        is_decision,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+    )
+    .map_err(|_| RobustnessReject::M1Fidelity)?;
+    let baseline_result = ScoutResult {
+        trades: baseline.trades.clone(),
+        equity: baseline.equity.clone(),
+        metrics: baseline.metrics.clone(),
+        telemetry: ScoutTelemetry::default(),
+    };
+    let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
+    let m1_passed = !enforce_m1_retention
+        || passes_sqx_m1_retention(h1_metrics, &baseline.metrics, config.minimum_return_retention);
+
+    let h1_scout = neighborhood_scout_config(config);
+    let h1_cache = IndicatorBufferCache::new(is_decision.bars.len());
+    let h1_run = evaluate_strategy_cached(strategy, is_decision, broker, &h1_scout, &h1_cache)
+        .map_err(|_| RobustnessReject::ParamNeighborhood)?;
+    let calendar_stats = crate::fold_r::calendar_year_fold_r(&h1_run.trades);
+    let calendar_passed = calendar_stats.passes_stability();
+    let (parameter_neighborhood, neighborhood_passed) =
+        evaluate_h1_neighborhood_audit(strategy, is_decision, broker, config, &h1_run.metrics)?;
+
+    let (walk_forward, cpcv_passed, cpcv_detail) = if config.calendar_year_folds {
+        let ranges = calendar_year_fold_ranges(is_decision, &broker.timezone);
+        match ranges.map_err(|_| RobustnessReject::Cpcv).and_then(|ranges| {
+            evaluate_development_ranges(
+                strategy,
+                is_decision,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &judge,
+                config,
+                &ranges,
+            )
+        }) {
+            Ok(rows) => audit_walk_forward_evidence(
+                "development_calendar_year",
+                rows,
+                0,
+                0,
+                1.0,
+            ),
+            Err(_) => (
+                empty_walk_forward_evidence("development_calendar_year", 1.0),
+                false,
+                "could not evaluate calendar-year Development folds".to_owned(),
+            ),
+        }
+    } else {
+        let contract = DevelopmentCpcvPlan::for_development_bars(is_decision.bars.len());
+        match evaluate_development_cpcv(
+            strategy,
+            is_decision,
+            m1_dataset,
+            quote_dataset,
+            broker,
+            &judge,
+            config,
+            &contract,
+        ) {
+            Ok(rows) => audit_walk_forward_evidence(
+                "development_cpcv_6_choose_2_h1",
+                rows,
+                contract.purge_bars,
+                contract.embargo_bars,
+                config.minimum_passing_fold_fraction,
+            ),
+            Err(_) => (
+                empty_walk_forward_evidence(
+                    "development_cpcv_6_choose_2_h1",
+                    config.minimum_passing_fold_fraction,
+                ),
+                false,
+                "could not evaluate Development CPCV folds".to_owned(),
+            ),
+        }
+    };
+
+    let (sequential_walk_forward, sequential_passed, sequential_detail) =
+        match sequential_walk_forward_ranges(is_decision.bars.len(), config.folds.max(3)) {
+            Some(ranges) => match evaluate_development_ranges(
+                strategy,
+                is_decision,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &judge,
+                config,
+                &ranges,
+            ) {
+                Ok(rows) => audit_walk_forward_evidence(
+                    "development_sequential_walk_forward_h1",
+                    rows,
+                    0,
+                    0,
+                    config.minimum_passing_fold_fraction,
+                ),
+                Err(_) => (
+                    empty_walk_forward_evidence(
+                        "development_sequential_walk_forward_h1",
+                        config.minimum_passing_fold_fraction,
+                    ),
+                    false,
+                    "could not evaluate sequential Development folds".to_owned(),
+                ),
+            },
+            None => (
+                empty_walk_forward_evidence(
+                    "development_sequential_walk_forward_h1",
+                    config.minimum_passing_fold_fraction,
+                ),
+                false,
+                "not enough Development bars for sequential folds".to_owned(),
+            ),
+        };
+
+    let profits: Vec<_> = h1_run.trades.iter().map(|trade| trade.net_profit).collect();
+    let maximum_p95_drawdown_percent =
+        h1_run.metrics.max_drawdown_percent * config.monte_carlo_max_drawdown_ratio;
+    let mut monte_carlo = monte_carlo_trade_resampling_with_skip(
+        &profits,
+        config.initial_balance,
+        config.monte_carlo_trials,
+        config.monte_carlo_block_length.max(1),
+        config.monte_carlo_skip_trade_probability,
+        config.seed,
+        0.0,
+        maximum_p95_drawdown_percent,
+        h1_run.metrics.net_profit,
+        config.monte_carlo_minimum_p80_profit_retention,
+    );
+    monte_carlo.baseline_max_drawdown_percent = h1_run.metrics.max_drawdown_percent;
+    monte_carlo.maximum_drawdown_ratio = config.monte_carlo_max_drawdown_ratio;
+    let monte_carlo_passed = monte_carlo.passed && monte_carlo.median_net_profit >= 0.0;
+    let monte_carlo_retention = if monte_carlo.baseline_net_profit > 0.0 {
+        monte_carlo.p80_net_profit / monte_carlo.baseline_net_profit
+    } else {
+        0.0
+    };
+
+    let mut gates = vec![
+        GateResult {
+            name: "robustness_audit_m1".into(),
+            passed: m1_passed,
+            detail: if enforce_m1_retention {
+                "M1 replay and 80/130 retention check.".into()
+            } else {
+                "M1 replay completed; 80/130 retention was already the Holding admission check.".into()
+            },
+        },
+        GateResult {
+            name: "robustness_audit_calendar_year".into(),
+            passed: calendar_passed,
+            detail: format!(
+                "Calendar-year fold stability: pooled R {:.3}, median R {:.3}.",
+                calendar_stats.pooled_r, calendar_stats.median_fold_r
+            ),
+        },
+        GateResult {
+            name: "robustness_audit_parameter_neighborhood".into(),
+            passed: neighborhood_passed,
+            detail: format!(
+                "{} of {} parameter neighbours survived ({:.1}%).",
+                parameter_neighborhood.surviving_samples,
+                parameter_neighborhood.samples_evaluated,
+                parameter_neighborhood.survival_fraction * 100.0
+            ),
+        },
+        GateResult {
+            name: "robustness_audit_cpcv".into(),
+            passed: cpcv_passed,
+            detail: cpcv_detail,
+        },
+        GateResult {
+            name: "robustness_audit_walk_forward".into(),
+            passed: sequential_passed,
+            detail: sequential_detail,
+        },
+        GateResult {
+            name: "robustness_audit_monte_carlo".into(),
+            passed: monte_carlo_passed,
+            detail: format!(
+                "Monte Carlo P80 profit retention {:.1}% and median net profit {:.2}.",
+                monte_carlo_retention * 100.0,
+                monte_carlo.median_net_profit
+            ),
+        },
+    ];
+    let mut blockers = gates
+        .iter()
+        .filter(|gate| !gate.passed)
+        .map(|gate| gate.name.trim_start_matches("robustness_audit_").replace('_', " "))
+        .collect::<Vec<_>>();
+    let passed = blockers.is_empty();
+    gates.push(GateResult {
+        name: "robustness_audit".into(),
+        passed,
+        detail: if passed {
+            "Full Development/M1 audit passed. Recorded only; it was not used as a selection gate.".into()
+        } else {
+            format!(
+                "Full Development/M1 audit completed; failed checks: {}. Recorded only; this was not used as a selection gate.",
+                blockers.join(", ")
+            )
+        },
+    });
+
+    Ok(RobustnessAuditOutcome {
+        result: baseline_result,
+        evidence: RobustnessEvidence {
+            m1_retention: retention_evidence,
+            walk_forward,
+            sequential_walk_forward: Some(sequential_walk_forward),
+            monte_carlo,
+            parameter_neighborhood,
+        },
+        passed,
+        gates,
+        blockers: std::mem::take(&mut blockers),
+    })
+}
+
+fn audit_walk_forward_evidence(
+    scheme: &str,
+    folds: Vec<WalkForwardFold>,
+    purge_bars: usize,
+    embargo_bars: usize,
+    required_passing_fraction: f64,
+) -> (WalkForwardEvidence, bool, String) {
+    let passing_folds = folds.iter().filter(|fold| fold.passed).count();
+    let passing_fraction = passing_folds as f64 / folds.len().max(1) as f64;
+    let passed = !folds.is_empty() && passing_fraction + 1e-12 >= required_passing_fraction;
+    let detail = format!(
+        "{passing_folds}/{} folds passed ({:.1}%); requires {:.1}%.",
+        folds.len(),
+        passing_fraction * 100.0,
+        required_passing_fraction * 100.0
+    );
+    (
+        WalkForwardEvidence {
+            fold_scheme: scheme.into(),
+            total_folds: folds.len(),
+            passing_folds,
+            passing_fraction,
+            required_passing_fraction,
+            purge_bars,
+            embargo_bars,
+            folds,
+        },
+        passed,
+        detail,
+    )
+}
+
+fn empty_walk_forward_evidence(
+    scheme: &str,
+    required_passing_fraction: f64,
+) -> WalkForwardEvidence {
+    WalkForwardEvidence {
+        fold_scheme: scheme.into(),
+        total_folds: 0,
+        passing_folds: 0,
+        passing_fraction: 0.0,
+        required_passing_fraction,
+        purge_bars: 0,
+        embargo_bars: 0,
+        folds: Vec::new(),
+    }
+}
+
 /// Evaluate the reusable Development CPCV rows without running the later
 /// Monte Carlo and parameter-neighborhood gates. This is intentionally a
 /// diagnostic surface: it makes cross-asset gate failures inspectable instead
@@ -434,6 +743,24 @@ fn evaluate_h1_neighborhood(
     config: &RobustnessConfig,
     h1_metrics: &quantforge_eval::BacktestMetrics,
 ) -> Result<ParameterNeighborhoodEvidence, RobustnessReject> {
+    let (evidence, passed) =
+        evaluate_h1_neighborhood_audit(strategy, is_decision, broker, config, h1_metrics)?;
+    if passed {
+        Ok(evidence)
+    } else {
+        Err(RobustnessReject::ParamNeighborhood)
+    }
+}
+
+/// Evaluate the entire parameter neighbourhood and report its measurements
+/// even when one of its pass conditions is not met.
+fn evaluate_h1_neighborhood_audit(
+    strategy: &StrategyIr,
+    is_decision: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+    h1_metrics: &quantforge_eval::BacktestMetrics,
+) -> Result<(ParameterNeighborhoodEvidence, bool), RobustnessReject> {
     use rayon::prelude::*;
     let scout = neighborhood_scout_config(config);
     let cache = IndicatorBufferCache::new(is_decision.bars.len());
@@ -478,13 +805,9 @@ fn evaluate_h1_neighborhood(
         .iter()
         .filter(|row| row.survived)
         .count();
-    if evaluated_samples * 2 < config.neighborhood_samples {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
     let survival = surviving as f64 / evaluated_samples.max(1) as f64;
-    if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
+    let enough_evaluated = evaluated_samples * 2 >= config.neighborhood_samples;
+    let survival_passed = survival + 1e-12 >= config.minimum_neighborhood_survival_fraction;
     let recoveries: Vec<f64> = neighborhood_samples
         .iter()
         .filter_map(|sample| sample.recovery_factor)
@@ -494,13 +817,11 @@ fn evaluate_h1_neighborhood(
         recovery_to_median_ratio(h1_metrics.recovery_factor(), &recoveries);
     let passed_recovery_median_band =
         passes_recovery_median_band(original_recovery_to_median, recoveries.len());
-    if !passed_recovery_median_band {
-        return Err(RobustnessReject::ParamNeighborhood);
-    }
 
     let plateau_neighbors = adx_plateau_neighbors(strategy, config);
     let mut plateau_surviving = 0usize;
     let mut plateau_survival_fraction = None;
+    let mut plateau_passed = true;
     if !plateau_neighbors.is_empty() {
         plateau_surviving = plateau_neighbors
             .iter()
@@ -513,27 +834,28 @@ fn evaluate_h1_neighborhood(
             .count();
         let plateau_survival = plateau_surviving as f64 / plateau_neighbors.len() as f64;
         plateau_survival_fraction = Some(plateau_survival);
-        if plateau_survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
-            return Err(RobustnessReject::ParamNeighborhood);
-        }
+        plateau_passed = plateau_survival + 1e-12 >= config.minimum_neighborhood_survival_fraction;
     }
-    Ok(ParameterNeighborhoodEvidence {
-        method: "h1_cached_axis_plus_seeded_joint".into(),
-        perturbation_fraction: config.parameter_perturbation_fraction,
-        samples_requested: config.neighborhood_samples,
-        samples_evaluated: evaluated_samples,
-        surviving_samples: surviving,
-        survival_fraction: survival,
-        required_survival_fraction: config.minimum_neighborhood_survival_fraction,
-        plateau_neighbors: plateau_neighbors.len(),
-        plateau_surviving,
-        plateau_survival_fraction,
-        original_metrics: Some(h1_metrics.clone()),
-        median_recovery_factor,
-        original_recovery_to_median,
-        passed_recovery_median_band: Some(passed_recovery_median_band),
-        samples: neighborhood_samples,
-    })
+    Ok((
+        ParameterNeighborhoodEvidence {
+            method: "h1_cached_axis_plus_seeded_joint".into(),
+            perturbation_fraction: config.parameter_perturbation_fraction,
+            samples_requested: config.neighborhood_samples,
+            samples_evaluated: evaluated_samples,
+            surviving_samples: surviving,
+            survival_fraction: survival,
+            required_survival_fraction: config.minimum_neighborhood_survival_fraction,
+            plateau_neighbors: plateau_neighbors.len(),
+            plateau_surviving,
+            plateau_survival_fraction,
+            original_metrics: Some(h1_metrics.clone()),
+            median_recovery_factor,
+            original_recovery_to_median,
+            passed_recovery_median_band: Some(passed_recovery_median_band),
+            samples: neighborhood_samples,
+        },
+        enough_evaluated && survival_passed && passed_recovery_median_band && plateau_passed,
+    ))
 }
 
 fn neighborhood_scout_config(config: &RobustnessConfig) -> ScoutConfig {

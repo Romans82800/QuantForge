@@ -8,7 +8,7 @@ use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_h
 use quantforge_discover::{
     Databank, DiscoverConfig, Elite, LongShortSkewBucket, NicheKey, RobustnessConfig,
     RobustnessEvidence, RobustnessReject, ThreeLevelBucket, niche_label,
-    run_m1_predeposit_robustness,
+    run_m1_predeposit_robustness_audit,
 };
 use quantforge_eval::evaluate_strategy;
 use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
@@ -908,9 +908,40 @@ pub async fn run_elite_robustness(
             config: loaded.bank.config.clone(),
         }
     };
-    tauri::async_runtime::spawn_blocking(move || run_elite_robustness_sync(&request, &snapshot))
+    let databank_path = snapshot.databank_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || run_elite_robustness_sync(&request, &snapshot))
         .await
-        .map_err(|error| format!("Results robustness task failed: {error}"))?
+        .map_err(|error| format!("Results robustness task failed: {error}"))??;
+    // Results audits are evidence only: persist them so an inspected strategy
+    // keeps its panels after the window is closed or the app restarts.
+    if let Some(evidence) = result.evidence.clone() {
+        let mut bank = {
+            let loaded = state
+                .loaded
+                .read()
+                .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+            loaded
+                .as_ref()
+                .ok_or_else(|| DesktopError::NoDatabank.to_string())?
+                .bank
+                .clone()
+        };
+        if let Some(elite) = bank
+            .elites
+            .iter_mut()
+            .find(|elite| elite.structural_fingerprint.as_str() == result.fingerprint)
+        {
+            elite.robustness = Some(evidence);
+            elite.gate_results.retain(|gate| gate.name != "results_robustness_audit");
+            elite.gate_results.push(quantforge_discover::GateResult {
+                name: "results_robustness_audit".into(),
+                passed: result.passed,
+                detail: "Detailed Results audit saved after Databank admission; it was not used for selection.".into(),
+            });
+            persist_loaded_bank(&databank_path, &bank, &state)?;
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn infer_quote_sidecar_path(m1_path: &str) -> Option<PathBuf> {
@@ -1057,7 +1088,7 @@ fn run_elite_robustness_sync(
         indicator_engine: snapshot.config.scout.indicator_engine,
         calendar_year_folds: snapshot.config.calendar_year_folds,
     };
-    let outcome = run_m1_predeposit_robustness(
+    let outcome = run_m1_predeposit_robustness_audit(
         &snapshot.elite.strategy,
         &is_decision,
         &m1_source.dataset,
@@ -1068,13 +1099,18 @@ fn run_elite_robustness_sync(
         true,
     );
     let (passed, blocker, message, evidence) = match outcome {
-        Ok(outcome) => (
-            true,
-            None,
-            "Passed M1 retention, walk-forward, Monte Carlo and parameter-neighborhood gates."
-                .to_owned(),
-            outcome.evidence,
-        ),
+        Ok(outcome) => {
+            let blocker = (!outcome.passed).then(|| outcome.blockers.join("; "));
+            let message = if outcome.passed {
+                "Completed and passed every M1/Development robustness check.".to_owned()
+            } else {
+                format!(
+                    "Completed every M1/Development robustness check. Failed: {}.",
+                    blocker.as_deref().unwrap_or("robustness gate")
+                )
+            };
+            (outcome.passed, blocker, message, Some(outcome.evidence))
+        }
         Err(reject) => {
             let (blocker, message) = robustness_reject_detail(reject);
             (false, Some(blocker.to_owned()), message.to_owned(), None)

@@ -2075,7 +2075,7 @@ function ResultsDetailPage({
             disabled={robustnessBusy || loading || !detail}
             onClick={() => void runRobustness()}
           >
-            {robustnessBusy ? "Running battery…" : robustnessRun ? "Run again" : "Run robustness battery"}
+            {robustnessBusy ? "Running and saving audit…" : robustnessRun ? "Run again" : "Run and save detailed audit"}
           </button>
         </div>
         <div className="results-robustness-note">
@@ -2093,7 +2093,7 @@ function ResultsDetailPage({
           ) : (
             <span>
               {robustnessMode === "standard"
-                ? "Standard repeats the promotion battery already sealed into the databank."
+                ? "Standard runs every independent promotion check, saves the detailed panels into this Databank, and does not change selection."
                 : "Deep raises compute depth without changing thresholds or searching for a better seed."}
             </span>
           )}

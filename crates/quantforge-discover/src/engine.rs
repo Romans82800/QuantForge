@@ -1029,7 +1029,7 @@ pub fn audit_holding_battery(
         .as_ref()
         .map(|evidence| evidence.m1_retention.selected_timeframe_metrics.clone())
         .unwrap_or_else(|| elite.metrics.clone());
-    let outcome = crate::robustness::run_m1_predeposit_robustness(
+    let outcome = crate::robustness::run_m1_predeposit_robustness_audit(
         &elite.strategy,
         dataset,
         m1_dataset,
@@ -1039,26 +1039,43 @@ pub fn audit_holding_battery(
         &prior_h1,
         false,
     );
-    let (passed, reason, evidence) = match outcome {
-        Err(reject) => (false, Some(reject.to_string()), None),
-        Ok(outcome)
-            if !crate::archive::passes_gate_config(&outcome.result, &bank.config.deposit_gates) =>
-        {
-            (false, Some("deposit gates".into()), outcome.evidence)
-        }
-        Ok(outcome)
-            if !passes_development_expectancy(
+    let (passed, reason, evidence, mut gates) = match outcome {
+        Err(reject) => (false, Some(reject.to_string()), None, Vec::new()),
+        Ok(outcome) => {
+            let deposit_passed = crate::archive::passes_gate_config(
+                &outcome.result,
+                &bank.config.deposit_gates,
+            );
+            let expectancy_passed = passes_development_expectancy(
                 outcome.result.metrics.expectancy,
                 bank.config.minimum_development_expectancy_r,
-            ) =>
-        {
-            (
-                false,
-                Some("Development expectancy floor".into()),
-                outcome.evidence,
-            )
+            );
+            let mut blockers = outcome.blockers;
+            if !deposit_passed {
+                blockers.push("deposit gates".into());
+            }
+            if !expectancy_passed {
+                blockers.push("Development expectancy floor".into());
+            }
+            let mut gates = outcome.gates;
+            gates.push(GateResult {
+                name: "robustness_audit_deposit_gates".into(),
+                passed: deposit_passed,
+                detail: "Development deposit gates evaluated as audit evidence only.".into(),
+            });
+            gates.push(GateResult {
+                name: "robustness_audit_development_expectancy".into(),
+                passed: expectancy_passed,
+                detail: format!(
+                    "Development expectancy {:.3}R; required {:.3}R.",
+                    outcome.result.metrics.expectancy,
+                    bank.config.minimum_development_expectancy_r,
+                ),
+            });
+            let passed = blockers.is_empty();
+            let reason = (!passed).then(|| blockers.join("; "));
+            (passed, reason, Some(outcome.evidence), gates)
         }
-        Ok(outcome) => (true, None, outcome.evidence),
     };
     let audited = bank
         .holding
@@ -1070,17 +1087,20 @@ pub fn audit_holding_battery(
     }
     audited
         .gate_results
-        .retain(|gate| gate.name != "robustness_audit");
-    audited.gate_results.push(GateResult {
-        name: "robustness_audit".into(),
-        passed,
-        detail: match &reason {
-            Some(reason) => format!(
-                "Full Development/M1 battery audit failed: {reason}. This was recorded only; the strategy can still be graduated."
-            ),
-            None => "Full Development/M1 battery audit passed. This was recorded only; it was not used as a selection gate.".into(),
-        },
-    });
+        .retain(|gate| !gate.name.starts_with("robustness_audit"));
+    if gates.is_empty() {
+        gates.push(GateResult {
+            name: "robustness_audit".into(),
+            passed,
+            detail: match &reason {
+                Some(reason) => format!(
+                    "Full Development/M1 battery audit could not complete: {reason}. This was recorded only; the strategy can still be graduated."
+                ),
+                None => "Full Development/M1 battery audit passed. This was recorded only; it was not used as a selection gate.".into(),
+            },
+        });
+    }
+    audited.gate_results.extend(gates);
     Ok(HoldingBatteryAuditResult {
         fingerprint: fingerprint.clone(),
         passed,
