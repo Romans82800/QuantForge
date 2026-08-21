@@ -4240,7 +4240,7 @@ function DiscoverWorkspace({
               onClick={() => setExpertMode((current) => !current)}
               title="Show worker, gate, robustness and search-range controls"
             >
-              {expertMode ? "Hide expert settings" : "Expert settings"}
+              {expertMode ? "Hide technical settings" : "Technical settings"}
             </button>
             <button type="button" className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
             <button type="button" className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
@@ -4261,15 +4261,25 @@ function DiscoverWorkspace({
         <fieldset disabled={active || busy}>
           {form.mode === "new" ? (
             <>
-              <details className="advanced-settings" open>
-                <summary>Discover profile — save this whole new-job setup</summary>
-                <p className="immutable-note">Profiles are saved locally and restore the symbol paths, timeframe, gates, costs, robustness and search ranges. A new databank location is always required, so an old archive cannot be overwritten by accident.</p>
+              <section className="production-recipe-card">
+                <div className="production-recipe-heading"><div><p className="eyebrow">Saved production recipe</p><h3>Choose your full Discover setup</h3></div><span className="recipe-badge">restores everything</span></div>
+                <p className="recipe-summary">A profile restores the symbol paths, timeframe, entry and exit recipe, gates, costs, robustness and search ranges. Pick one and start; use technical settings only when you deliberately want to change the recipe.</p>
                 <div className="form-stack compact">
                   <label className="field-row"><span>Saved Discover profile</span><select value={selectedDiscoverProfileId} onChange={(event) => { const profile = discoverProfiles.find((item) => item.id === event.target.value); if (profile) applyDiscoverProfile(profile); else setSelectedDiscoverProfileId(""); }}><option value="">Current unsaved form</option>{discoverProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{selectedDiscoverProfileId ? "Loaded profile is applied. Save to update it." : "Save this form once, then select it here next time."}</small></label>
                   <label className="field-row"><span>Profile name</span><input value={discoverProfileName} onChange={(event) => setDiscoverProfileName(event.target.value)} placeholder="e.g. AUDUSD H1 conservative" /></label>
                 </div>
                 <div className="form-footer"><p>{discoverProfileBusy ? "Saving profile…" : selectedDiscoverProfileId ? "This profile can be updated without affecting any existing databank." : "New profiles start from the form currently on screen."}</p><div className="button-row"><button type="button" className="secondary" disabled={discoverProfileBusy} onClick={() => { setSelectedDiscoverProfileId(""); setDiscoverProfileName("My Discover profile"); }}>Save as new</button><button type="button" className="primary" disabled={discoverProfileBusy || !discoverProfileName.trim()} onClick={() => void saveCurrentDiscoverProfile()}>{discoverProfileBusy ? "Saving…" : selectedDiscoverProfileId ? "Update profile" : "Save profile"}</button>{selectedDiscoverProfileId && <button type="button" className="danger" disabled={discoverProfileBusy} onClick={() => void removeCurrentDiscoverProfile()}>Delete</button>}</div></div>
-              </details>
+              </section>
+              <section className="production-recipe-card production-exits-card">
+                <div className="production-recipe-heading"><div><p className="eyebrow">Production recipe</p><h3>Exit modules</h3></div><span className="recipe-badge">used by next run</span></div>
+                <p className="recipe-summary">The constrained SL/TP-only lane is the default because it removes the exit degrees of freedom most likely to overfit a particular period. These choices are saved in the profile above.</p>
+                <div className="production-module-grid">
+                  <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowIndicatorExitRules: false, allowTimeStops: false, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false, simpleExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
+                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowFixedPipStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowFixedPipStops: event.target.checked }))} /><span>Fixed-pip SL/TP pair <small>(FX only; sampled alongside ATR/R using the bound symbol’s pip size)</small></span></label>
+                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowIndicatorExitRules ?? false} onChange={(event) => setForm((current) => ({ ...current, allowIndicatorExitRules: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Indicator exit rule <small>(research only; turning it on leaves the constrained lane)</small></span></label>
+                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowTimeStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTimeStops: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Exit after N bars <small>(research only; turning it on leaves the constrained lane)</small></span></label>
+                </div>
+              </section>
               <div className="hypothesis-strip">
                 <div className="hypothesis-heading">
                   <p className="eyebrow">Hypothesis</p>
@@ -4280,7 +4290,7 @@ function DiscoverWorkspace({
                     ? form.slTpOnlyExits
                       ? "Constrained production lane: 2–3 mirrored entry conditions plus ATR/R stop-loss and take-profit. No indicator exit, time stop, break-even, trailing or partial exit is searchable; every trade closes at end of day if SL/TP has not fired."
                       : "Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts. Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3."
-                    : "Start with a bounded research path. QuantForge keeps the grammar, gates and validation firewall on safe defaults; choose how much of the pipeline to run below."}
+                    : "Pick a saved recipe above, then choose how much of the pipeline to run. QuantForge keeps the grammar, gates and validation firewall on safe defaults."}
                 </p>
                 {expertMode && <div className="form-grid universal-grammar-grid">
                   <NumberField label="Entry conditions min" value={form.universalGrammar?.minimumEntryConditions ?? 2} onChange={(value) => updateGrammar("minimumEntryConditions", value ?? 2)} min={2} max={4} />
@@ -4663,14 +4673,10 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note simple-mode-note">Development drives search and breeding. Holding receives the cheap M1 fidelity screen; the full robustness battery runs later from the Holding tab. Sealed holdout is never loaded by Discover. Turn on Expert settings to tune gates, robustness, execution modules and search ranges.</p>
+            <p className="immutable-note simple-mode-note">Development drives search and breeding. Holding receives the cheap M1 fidelity screen; the full robustness battery runs later from the Holding tab. Sealed holdout is never loaded by Discover. Open Technical settings only to deliberately tune gates, robustness, additional execution modules or search ranges.</p>
               <details className="advanced-settings" open>
-              <summary>Execution modules — search genes (pot only until breeding)</summary>
-              <p className="immutable-note">Use the constrained lane when the goal is holdout stability: it removes exit degrees of freedom that can fit particular historical years. Switch it off only to deliberately research exit logic.</p>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowIndicatorExitRules: false, allowTimeStops: false, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false, simpleExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowFixedPipStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowFixedPipStops: event.target.checked }))} /><span>Fixed-pip SL/TP pair <small>(FX only; sampled alongside ATR/R using the bound symbol’s pip size)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowIndicatorExitRules ?? false} onChange={(event) => setForm((current) => ({ ...current, allowIndicatorExitRules: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Indicator exit rule <small>(research only; turning it on leaves the constrained lane)</small></span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTimeStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTimeStops: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Exit after N bars <small>(research only; turning it on leaves the constrained lane)</small></span></label>
+              <summary>Additional execution research modules</summary>
+              <p className="immutable-note">The core exit recipe is at the top of this page. These additional modules deliberately widen the search and are only for a specific research experiment.</p>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
               <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
