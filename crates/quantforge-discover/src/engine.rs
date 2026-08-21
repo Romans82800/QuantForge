@@ -1881,16 +1881,31 @@ fn apply_production_policy(
     mut strategy: StrategyIr,
     config: &crate::model::DiscoverConfig,
 ) -> StrategyIr {
-    strategy.manage.flatten_end_of_day = config.flatten_at_22;
+    strategy.manage.flatten_end_of_day = config.flatten_at_22 || config.sl_tp_only_exits;
     strategy.manage.end_of_day_hour = config.end_of_day_hour;
     strategy.manage.max_one_entry_per_day = config.max_one_entry_per_day;
     strategy.meta.thesis_hint = format!("{:?}", classify_family(&strategy)).to_ascii_lowercase();
-    if config.simple_exits {
+    if config.sl_tp_only_exits {
+        enforce_sl_tp_only_exits(&mut strategy);
+    } else if config.simple_exits {
         enforce_simple_exits(&mut strategy, &config.search_ranges);
     } else {
         enforce_execution_feature_flags(&mut strategy, config);
     }
     strategy
+}
+
+/// Remove every exit degree of freedom except the protective SL/TP pair and
+/// the common broker-local end-of-day flatten. This runs after every seed and
+/// mutation, so no hidden exit gene can survive into evaluation or export.
+fn enforce_sl_tp_only_exits(strategy: &mut StrategyIr) {
+    strategy.exit = None;
+    strategy.exit_long = None;
+    strategy.exit_short = None;
+    strategy.manage.time_stop_bars = None;
+    strategy.manage.trailing = None;
+    strategy.manage.break_even_at_r = None;
+    strategy.manage.partial_exits.clear();
 }
 
 #[derive(Clone, Copy)]
@@ -1922,7 +1937,7 @@ fn enforce_execution_feature_flags(
     strategy: &mut StrategyIr,
     config: &crate::model::DiscoverConfig,
 ) {
-    use quantforge_ir::{EntryDistancePolicy, EntryOrderPolicy, PartialExit, TrailingPolicy};
+    use quantforge_ir::{EntryDistancePolicy, EntryOrderPolicy};
 
     let selector = strategy
         .id
@@ -1993,7 +2008,7 @@ fn enforce_execution_feature_flags(
     if !config.allow_trailing_stops || trailing_lane % 3 == 0 {
         strategy.manage.trailing = None;
     } else if strategy.manage.trailing.is_none() {
-        strategy.manage.trailing = Some(TrailingPolicy::RiskMultiple {
+        strategy.manage.trailing = Some(quantforge_ir::TrailingPolicy::RiskMultiple {
             activate_at_r: [1.0, 1.5, 2.0][trailing_lane as usize % 3],
             distance_r: [0.5, 0.75, 1.0]
                 [execution_gene_lane(selector, 0x7472_6169_6c5f_7061) as usize % 3],
@@ -2002,7 +2017,7 @@ fn enforce_execution_feature_flags(
     if !config.allow_partial_exits || partial_lane % 3 == 0 {
         strategy.manage.partial_exits.clear();
     } else if strategy.manage.partial_exits.is_empty() {
-        strategy.manage.partial_exits.push(PartialExit {
+        strategy.manage.partial_exits.push(quantforge_ir::PartialExit {
             at_r: [0.75, 1.0, 1.25, 1.5][partial_lane as usize % 4],
             fraction: [0.25, 0.5, 0.75]
                 [execution_gene_lane(selector, 0x7061_7274_5f66_7261) as usize % 3],
@@ -2301,6 +2316,7 @@ mod tests {
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: true,
             simple_exits: true,
+            sl_tp_only_exits: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
@@ -2356,6 +2372,34 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn sl_tp_only_profile_removes_every_searchable_exit_gene() {
+        let mut strategy = crate::grammar::generate_seed(7, 11);
+        strategy.manage.time_stop_bars = Some(12);
+        strategy.manage.break_even_at_r = Some(1.0);
+        strategy.manage.trailing = Some(quantforge_ir::TrailingPolicy::RiskMultiple {
+            activate_at_r: 1.0,
+            distance_r: 0.5,
+        });
+        strategy.manage.partial_exits.push(quantforge_ir::PartialExit {
+            at_r: 1.0,
+            fraction: 0.5,
+        });
+        let mut constrained = config();
+        constrained.sl_tp_only_exits = true;
+
+        let result = super::apply_production_policy(strategy, &constrained);
+
+        assert!(result.exit.is_none());
+        assert!(result.exit_long.is_none());
+        assert!(result.exit_short.is_none());
+        assert!(result.manage.time_stop_bars.is_none());
+        assert!(result.manage.break_even_at_r.is_none());
+        assert!(result.manage.trailing.is_none());
+        assert!(result.manage.partial_exits.is_empty());
+        assert!(result.manage.flatten_end_of_day);
     }
 
     #[test]

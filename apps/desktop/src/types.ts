@@ -182,6 +182,7 @@ export interface DatabankWorkspace {
   requireM1Precision: boolean;
   m1FidelityVerified: boolean;
   simpleExits: boolean;
+  slTpOnlyExits: boolean;
   allowBreakEven: boolean;
   allowTrailingStops: boolean;
   allowPartialExits: boolean;
@@ -640,6 +641,7 @@ export interface DiscoverRequest {
   oos1ExpectancyRetention: number | null;
   requireM1Precision: boolean | null;
   simpleExits: boolean | null;
+  slTpOnlyExits: boolean | null;
   allowBreakEven: boolean | null;
   allowTrailingStops: boolean | null;
   allowPartialExits: boolean | null;

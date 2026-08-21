@@ -5664,6 +5664,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         minimum_development_expectancy_r: 0.25,
         require_m1_precision: false,
         simple_exits: true,
+        sl_tp_only_exits: true,
         allow_break_even: false,
         allow_trailing_stops: false,
         allow_partial_exits: false,

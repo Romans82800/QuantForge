@@ -298,9 +298,9 @@ function NavGlyph({ icon }: { icon: NavIcon }) {
 
 const DEFAULT_UNIVERSAL_GRAMMAR = {
   minimumEntryConditions: 2,
-  maximumEntryConditions: 2,
+  maximumEntryConditions: 3,
   minimumExitConditions: 1,
-  maximumExitConditions: 3,
+  maximumExitConditions: 2,
   minimumShift: 1,
   maximumShift: 3,
 };
@@ -3688,6 +3688,7 @@ function DiscoverWorkspace({
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: true,
     simpleExits: true,
+    slTpOnlyExits: true,
     allowBreakEven: false,
     allowTrailingStops: false,
     allowPartialExits: false,
@@ -3978,6 +3979,7 @@ function DiscoverWorkspace({
             oos1ExpectancyRetention: null,
             requireM1Precision: null,
             simpleExits: null,
+            slTpOnlyExits: null,
             allowBreakEven: null,
             allowTrailingStops: null,
             allowPartialExits: null,
@@ -4269,7 +4271,9 @@ function DiscoverWorkspace({
                 </div>
                 <p className="recipe-summary">
                   {expertMode
-                    ? "Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts. Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3."
+                    ? form.slTpOnlyExits
+                      ? "Constrained production lane: 2–3 mirrored entry conditions plus ATR/R stop-loss and take-profit. No indicator exit, time stop, break-even, trailing or partial exit is searchable; every trade closes at end of day if SL/TP has not fired."
+                      : "Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts. Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3."
                     : "Start with a bounded research path. QuantForge keeps the grammar, gates and validation firewall on safe defaults; choose how much of the pipeline to run below."}
                 </p>
                 {expertMode && <div className="form-grid universal-grammar-grid">
@@ -4654,12 +4658,13 @@ function DiscoverWorkspace({
           ) : null}
           {form.mode === "new" && <>
             <p className="immutable-note simple-mode-note">Development drives search and breeding. Holding receives the cheap M1 fidelity screen; the full robustness battery runs later from the Holding tab. Sealed holdout is never loaded by Discover. Turn on Expert settings to tune gates, robustness, execution modules and search ranges.</p>
-            <details className="advanced-settings" open>
+              <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
-              <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
-              <label className="check-field discover-split"><input type="checkbox" checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
+              <p className="immutable-note">Use the constrained lane when the goal is holdout stability: it removes exit degrees of freedom that can fit particular historical years. Switch it off only to deliberately research exit logic.</p>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
+              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
+              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
+              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
             </details>
             <details className="advanced-settings" open>
               <summary>Entry order types — sampled in equal shares</summary>

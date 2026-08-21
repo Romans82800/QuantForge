@@ -110,6 +110,8 @@ pub struct DiscoverRequest {
     /// Legacy selected-TF compatibility profile. Explicit feature toggles below
     /// take precedence; they widen search without forcing M1 during Discover.
     simple_exits: Option<bool>,
+    /// Constrained profile: only SL, TP and end-of-day close can exit.
+    sl_tp_only_exits: Option<bool>,
     allow_break_even: Option<bool>,
     allow_trailing_stops: Option<bool>,
     allow_partial_exits: Option<bool>,
@@ -1112,6 +1114,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.minimum_development_expectancy_r.is_some(),
             request.require_m1_precision.is_some(),
             request.simple_exits.is_some(),
+            request.sl_tp_only_exits.is_some(),
             request.allow_break_even.is_some(),
             request.allow_trailing_stops.is_some(),
             request.allow_partial_exits.is_some(),
@@ -2681,6 +2684,7 @@ fn broker_symbol_from_path(path: &str) -> Option<String> {
 }
 
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
+    let sl_tp_only_exits = request.sl_tp_only_exits.unwrap_or(true);
     let mut commission = request
         .commission_per_lot_round_turn
         .ok_or_else(|| "commission is required for a new databank".to_owned())?;
@@ -2730,13 +2734,14 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         minimum_development_expectancy_r: request.minimum_development_expectancy_r.unwrap_or(0.25),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
+        sl_tp_only_exits,
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
         allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
         allow_market_entries: request.allow_market_entries.unwrap_or(true),
         allow_stop_entries: request.allow_stop_entries.unwrap_or(false),
         allow_limit_entries: request.allow_limit_entries.unwrap_or(false),
-        flatten_at_22: request.flatten_at_22.unwrap_or(false),
+        flatten_at_22: request.flatten_at_22.unwrap_or(false) || sl_tp_only_exits,
         end_of_day_hour: request.end_of_day_hour.unwrap_or(23),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
@@ -3175,6 +3180,7 @@ mod tests {
             oos1_expectancy_retention: Some(0.7),
             require_m1_precision: Some(false),
             simple_exits: Some(true),
+            sl_tp_only_exits: Some(true),
             allow_break_even: Some(false),
             allow_trailing_stops: Some(false),
             allow_partial_exits: Some(false),

@@ -595,6 +595,11 @@ pub struct DiscoverConfig {
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
+    /// Constrained production lane: only protective stop, take-profit and the
+    /// end-of-day flatten can close a trade. Indicator exits and time stops
+    /// are not searchable in this profile.
+    #[serde(default = "default_sl_tp_only_exits")]
+    pub sl_tp_only_exits: bool,
     /// Individually opt-in execution genes. Off in the high-parity Selected-TF
     /// baseline; enabling them widens search and makes M1/MT5 final gates more
     /// important — they do not block Discover breeding.
@@ -770,6 +775,12 @@ fn default_simple_exits() -> bool {
     true
 }
 
+fn default_sl_tp_only_exits() -> bool {
+    // Keep old serialized archives and direct library callers behaviourally
+    // stable. The desktop new-job recipe explicitly enables this profile.
+    false
+}
+
 fn default_max_one_entry_per_day() -> bool {
     true
 }
@@ -939,6 +950,7 @@ impl Default for DiscoverConfig {
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
+            sl_tp_only_exits: default_sl_tp_only_exits(),
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,

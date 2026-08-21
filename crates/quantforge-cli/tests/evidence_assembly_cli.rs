@@ -200,6 +200,7 @@ fn write_databank(
         minimum_development_expectancy_r: 0.0,
         require_m1_precision: false,
         simple_exits: false,
+        sl_tp_only_exits: false,
         allow_break_even: false,
         allow_trailing_stops: false,
         allow_partial_exits: false,
