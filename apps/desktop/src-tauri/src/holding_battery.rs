@@ -1222,21 +1222,31 @@ fn run_battery_job(
         .first()
         .map(|bar| bar.timestamp_ms)
         .ok_or_else(|| "H4 Development partition is empty".to_owned())?;
-    let m1_owned = slice_dataset_by_time(&m1.dataset, development_start, development_end)?;
+    let m1_development = slice_dataset_by_time(&m1.dataset, development_start, development_end)?;
     let quote_development = quote_dataset
         .as_ref()
         .map(|quotes| slice_quotes_by_time(quotes, development_start, development_end));
-    if snapshot.artifact.databank.execution_data_hash != m1_owned.data_hash {
+    // Older Holding archives bind the complete M1 execution stream. This is
+    // safe: the judge receives Development decision bars only and iterates its
+    // M1 cursor only through those decision-bar intervals. Newer archives may
+    // instead bind the time-clipped Development M1 stream. Accept either exact
+    // binding; never substitute a third dataset.
+    let (m1_owned, quote_for_battery, execution_binding) =
+        if snapshot.artifact.databank.execution_data_hash == m1.dataset.data_hash {
+            (m1.dataset.clone(), quote_dataset.clone(), "full M1")
+        } else if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
+            (m1_development, quote_development, "Development M1")
+        } else {
         return Err(format!(
-            "This Holding archive is not bound to the reconstructed {decision_timeframe} Development M1 data (archive {}, reconstructed {}). Nothing was evaluated or promoted.",
-            snapshot.artifact.databank.execution_data_hash, m1_owned.data_hash,
+            "This Holding archive is not bound to either approved {decision_timeframe} M1 execution dataset (archive {}, full {}, Development {}). Nothing was evaluated or promoted.",
+            snapshot.artifact.databank.execution_data_hash, m1.dataset.data_hash, m1_development.data_hash,
         ));
-    }
+        };
 
     update_phase(
         &job,
         "Running battery",
-        &format!("Verified {decision_timeframe} Development data. Only full passes move to Databank; failures stay in Holding."),
+        &format!("Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."),
     );
 
     let mut passed = 0usize;
@@ -1279,7 +1289,7 @@ fn run_battery_job(
                 &development,
                 None,
                 &m1_owned,
-                quote_development.as_ref(),
+                quote_for_battery.as_ref(),
                 &broker,
             )
             .map(|_| ())
