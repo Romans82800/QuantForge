@@ -838,6 +838,9 @@ main { min-width: 0; }
 .range-row input { width: 100%; height: 27px; padding: 0 7px; color: #c0ccd7; border: 1px solid var(--line); border-radius: 3px; background: #070b0f; outline: none; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .range-row input:focus { border-color: #23514b; }
 .range-row.invalid input { border-color: #5d322f; }
+.range-row.disabled > span { color: var(--dim); }
+.range-row.disabled > span small { display: block; margin-top: 2px; color: #6ea69e; font-size: 8px; }
+.range-row.disabled input { border-color: #1d514a; color: #7a958f; }
 .profile-list { display: grid; gap: 6px; padding: 14px 16px 16px; grid-template-columns: minmax(0, 1fr); }
 .profile-row { display: grid; gap: 3px; text-align: left; padding: 10px 11px; color: var(--text); background: #080c11; border: 1px solid var(--line-soft); border-radius: 4px; cursor: pointer; }
 .profile-row strong { font-size: 11px; font-weight: 550; }

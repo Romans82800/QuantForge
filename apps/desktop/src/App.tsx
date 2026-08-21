@@ -5489,7 +5489,10 @@ function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onCh
         <div className="range-group" key={title}>
           <div className="range-group-head">
             <p className="eyebrow">{title}</p>
-            <span>{rows.length} genes</span>
+            <span>{rows.filter(([key]) => {
+              const range = value[key];
+              return !(range.minimum === 0 && range.maximum === 0 && range.step === 0);
+            }).length} active · {rows.length} available</span>
           </div>
           <div className="range-group-body">
             <div className="range-row range-row-head">
@@ -5500,10 +5503,14 @@ function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onCh
             </div>
             {rows.map(([key, label]) => {
               const range = value[key];
-              const invalid = !(range.minimum <= range.maximum) || !(range.step > 0);
+              // A zeroed range is an intentional opt-out for an optional gene,
+              // not a malformed numeric range. This is how the constrained
+              // SL/TP-only recipe records time stops and pending expiry.
+              const disabled = range.minimum === 0 && range.maximum === 0 && range.step === 0;
+              const invalid = !disabled && (!(range.minimum <= range.maximum) || !(range.step > 0));
               return (
-                <div className={invalid ? "range-row invalid" : "range-row"} key={key}>
-                  <span>{label}</span>
+                <div className={invalid ? "range-row invalid" : disabled ? "range-row disabled" : "range-row"} key={key}>
+                  <span>{label}{disabled && <small>Off — not searched</small>}</span>
                   <label>
                     <input aria-label={`${label} minimum`} type="number" value={range.minimum} step="any" onChange={(event) => set(key, "minimum", Number(event.target.value))} />
                   </label>
