@@ -24,6 +24,8 @@ import type {
   EliteMql5SourceView,
   ConditionBakeoffReport,
   ConditionBakeoffRequest,
+  TimeframeBakeoffReport,
+  TimeframeBakeoffRequest,
   ExportRequest,
   ExportView,
   FidelityDemoRequest,
@@ -105,12 +107,24 @@ export function startHoldingBatteryJob(
   });
 }
 
+export function startProductionLaneJob(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("start_production_lane_job");
+}
+
 export function getHoldingBatteryJob(): Promise<BatteryJobView> {
   return invoke<BatteryJobView>("get_holding_battery_job");
 }
 
 export function stopHoldingBattery(): Promise<BatteryJobView> {
   return invoke<BatteryJobView>("stop_holding_battery");
+}
+
+export function promoteHoldingWithoutRobustness(): Promise<{
+  promoted: number;
+  replaced: number;
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("promote_holding_without_robustness");
 }
 
 export function shrinkHoldingByDailyCorr(maxCorrelation: number): Promise<{
@@ -257,6 +271,12 @@ export function runConditionBakeoff(
   request: ConditionBakeoffRequest,
 ): Promise<ConditionBakeoffReport> {
   return invoke<ConditionBakeoffReport>("run_condition_bakeoff", { request });
+}
+
+export function runTimeframeBakeoff(
+  request: TimeframeBakeoffRequest,
+): Promise<TimeframeBakeoffReport> {
+  return invoke<TimeframeBakeoffReport>("run_timeframe_bakeoff", { request });
 }
 
 export async function promoteEliteToVault(fingerprint: string): Promise<string | null> {

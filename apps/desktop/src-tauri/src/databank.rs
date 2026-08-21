@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tauri::State;
 use thiserror::Error;
 
@@ -81,9 +81,9 @@ struct RobustnessSnapshot {
     config: DiscoverConfig,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DesktopState {
-    pub(crate) loaded: RwLock<Option<LoadedDatabank>>,
+    pub(crate) loaded: Arc<RwLock<Option<LoadedDatabank>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -322,6 +322,9 @@ pub struct EliteDetail {
     fold_usable: bool,
     strategy_ir: Value,
     equity_signature: Vec<f64>,
+    /// Production Lane entries must not trigger the normal full-history chart,
+    /// because that chart includes the sealed final partition.
+    sealed_protected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     robustness: Option<EliteRobustnessView>,
 }
@@ -817,6 +820,12 @@ pub async fn get_elite_partition_equity(
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
             .clone();
+        if elite_is_sealed_protected(&elite) {
+            return Err(
+                "This Production Lane strategy is sealed-protected. Use the explicit one-shot Sealed Final workflow after the shortlist is frozen."
+                    .into(),
+            );
+        }
         (
             elite,
             loaded.source.clone(),
@@ -1679,12 +1688,9 @@ pub async fn run_holding_battery(
             loaded.source.clone(),
             loaded.broker.clone(),
             loaded.metadata_path.clone(),
-            loaded
-                .m1_source
-                .clone()
-                .ok_or_else(|| {
-                    "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
-                })?,
+            loaded.m1_source.clone().ok_or_else(|| {
+                "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
+            })?,
             loaded.m1_metadata_path.clone(),
             loaded.validation_fraction,
             loaded.sealed_fraction,
@@ -1720,8 +1726,8 @@ pub async fn run_holding_battery(
     .map_err(|error| format!("Holding battery task failed: {error}"))??;
     let (bank, report) = result;
     persist_loaded_bank(&databank_path, &bank, &state)?;
-    let workspace = load_databank_path(Path::new(&databank_path), &state)
-        .map_err(|error| error.to_string())?;
+    let workspace =
+        load_databank_path(Path::new(&databank_path), &state).map_err(|error| error.to_string())?;
     Ok(HoldingBatteryView {
         promoted: report.promoted,
         rejected: report.rejected,
@@ -1760,8 +1766,9 @@ fn run_holding_battery_sync(
         quote_dataset.as_mut(),
         bank.config.history_start_year,
     )?;
-    let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
-        .map_err(|error| error.to_string())?;
+    let plan =
+        DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
+            .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
     let oos1 = if plan.validation.bar_count == 0 {
         None
@@ -1772,9 +1779,8 @@ fn run_holding_battery_sync(
             plan.development.bar_count + plan.validation.bar_count,
         )?)
     };
-    let m1_plan =
-        DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
-            .map_err(|error| error.to_string())?;
+    let m1_plan = DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
+        .map_err(|error| error.to_string())?;
     let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
     let m1_eval = if bank.execution_data_hash == m1_development.data_hash {
         &m1_development
@@ -1859,8 +1865,8 @@ pub(crate) fn persist_evolve_artifact(
     std::mem::swap(&mut artifact.databank, bank);
     artifact.coverage = artifact.databank.coverage();
     artifact.qd_score = artifact.databank.qd_score();
-    let written = quantforge_storage::write_json_replacing(path, artifact)
-        .map_err(|error| error.to_string());
+    let written =
+        quantforge_storage::write_json_replacing(path, artifact).map_err(|error| error.to_string());
     std::mem::swap(&mut artifact.databank, bank);
     written
 }
@@ -3083,8 +3089,16 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         fold_usable: elite.fold_r.usable,
         strategy_ir: serde_json::to_value(&elite.strategy)?,
         equity_signature: elite.equity_signature.clone(),
+        sealed_protected: elite_is_sealed_protected(elite),
         robustness: elite_robustness(elite)?,
     })
+}
+
+fn elite_is_sealed_protected(elite: &Elite) -> bool {
+    elite
+        .gate_results
+        .iter()
+        .any(|gate| gate.name == "production_lane_v1" && gate.passed)
 }
 
 fn elite_robustness(elite: &Elite) -> Result<Option<EliteRobustnessView>, serde_json::Error> {

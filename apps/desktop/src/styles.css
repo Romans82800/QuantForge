@@ -180,6 +180,29 @@ main { min-width: 0; }
 .table-controls input, .table-controls select { height: 29px; color: #afbac6; background: #0b1117; border: 1px solid var(--line); border-radius: 3px; padding: 0 8px; font-size: 9px; outline: none; }
 .table-controls input { width: 165px; }
 .table-controls input:focus, .table-controls select:focus { border-color: #3b7776; }
+.holding-advanced-controls {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.holding-advanced-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.holding-advanced-controls input,
+.holding-advanced-controls select {
+  width: 72px;
+}
 .batch-controls { width: 100%; display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
 .batch-controls label { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
 .batch-controls input { width: 55px; height: 31px; padding: 0 7px; color: #bdc8d3; border: 1px solid var(--line); background: #0a1016; }
@@ -1086,6 +1109,23 @@ button,
 
 .panel.discover-form {
   overflow: visible;
+}
+
+/* Discover opens as a recipe picker. Worker, gate, robustness and gene-space
+   controls remain available, but do not compete with the first-run decision. */
+.discover-form.simple-mode .advanced-settings {
+  display: none;
+}
+
+.discover-form.simple-mode .simple-mode-note {
+  padding: 10px 12px;
+  border: 1px solid #284842;
+  background: #10201f;
+  color: #9cc7c1;
+}
+
+.discover-form.simple-mode .discover-start-footer p {
+  max-width: 720px;
 }
 
 .discover-start-footer {

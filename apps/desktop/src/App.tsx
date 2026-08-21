@@ -39,6 +39,7 @@ import {
   deleteSearchRangeProfile,
   loadDatabankPath,
   startHoldingBatteryJob,
+  startProductionLaneJob,
   getHoldingBatteryJob,
   stopHoldingBattery,
   shrinkHoldingByDailyCorr,
@@ -47,7 +48,9 @@ import {
   recordIncubation,
   resumeDiscover,
   runConditionBakeoff,
+  runTimeframeBakeoff,
   promoteEliteToVault,
+  promoteHoldingWithoutRobustness,
   runFidelityDemo,
   runEliteRobustness,
   runM1Judge,
@@ -77,6 +80,7 @@ import type {
   ExportView,
   EvidenceView,
   ConditionBakeoffReport,
+  TimeframeBakeoffReport,
   ConditionCoverage,
   JudgeRequest,
   JudgeView,
@@ -325,6 +329,7 @@ function App() {
   const [resultsDetailFp, setResultsDetailFp] = useState<string | null>(null);
   const [resultsOrigin, setResultsOrigin] = useState<WorkspaceName>("Databank");
   const [databankTab, setDatabankTab] = useState<"holding" | "databank" | "certified">("holding");
+  const [holdingControlsOpen, setHoldingControlsOpen] = useState(false);
   const [batteryJob, setBatteryJob] = useState<BatteryJobView | null>(null);
   const [batteryBusy, setBatteryBusy] = useState(false);
   const [holdingCorrCap, setHoldingCorrCap] = useState(0.5);
@@ -588,7 +593,10 @@ function App() {
     const items = batteryJob?.items ?? [];
     const running = items.filter((item) => item.status === "running");
     const finished = items.filter(
-      (item) => item.status === "passed" || item.status === "rejected",
+      (item) => item.status === "passed"
+        || item.status === "rejected"
+        || item.status === "selected"
+        || item.status === "eligible",
     );
     const limit = 12;
     const recentFinished = finished.slice(-limit).reverse();
@@ -634,15 +642,30 @@ function App() {
                 }
               : view,
           );
+          // A battery checkpoint includes a fresh workspace after every pass,
+          // so Databank updates strategy-by-strategy rather than only when the
+          // complete queue finishes.
+          if (view.workspace && view.revision !== lastBatteryRevision.current) {
+            setWorkspace(view.workspace);
+            lastBatteryRevision.current = view.revision;
+            if (done && view.jobKind === "production_lane") {
+              setDatabankTab("databank");
+              setQuery("");
+              setEntryFilter("all");
+              setBatchSelection(new Set());
+              setDetail(null);
+            }
+          }
           const shouldReloadArchive =
             !!view.databankPath
+            && !view.workspace
             && view.revision !== lastBatteryRevision.current
             && done;
           if (shouldReloadArchive && view.databankPath) {
             lastBatteryRevision.current = view.revision;
             void loadDatabankPath(view.databankPath)
               .then(setWorkspace)
-              .catch(() => undefined);
+              .catch((reason) => setError(String(reason)));
           } else if (view.revision !== lastBatteryRevision.current) {
             lastBatteryRevision.current = view.revision;
           }
@@ -653,12 +676,21 @@ function App() {
   }, [batteryActive, batteryJob?.status]);
 
   useEffect(() => {
-    if (!batteryJob?.databankPath) return;
+    if (!batteryJob) return;
     if (batteryJob.status !== "completed" && batteryJob.status !== "stopped") return;
+    if (batteryJob.workspace) {
+      setWorkspace(batteryJob.workspace);
+      if (batteryJob.jobKind === "production_lane") {
+        switchDatabankTab("databank");
+        setDetail(null);
+      }
+      return;
+    }
+    if (!batteryJob.databankPath) return;
     void loadDatabankPath(batteryJob.databankPath)
       .then(setWorkspace)
-      .catch(() => undefined);
-  }, [batteryJob?.status, batteryJob?.databankPath]);
+      .catch((reason) => setError(String(reason)));
+  }, [batteryJob?.status, batteryJob?.databankPath, batteryJob?.workspace]);
 
   async function startBatteryOnSelection() {
     const fingerprints = [...batchSelection];
@@ -683,8 +715,10 @@ function App() {
     try {
       const started = await startHoldingBatteryJob([], {
         ranked: true,
-        shrinkFirst: true,
-        maxCorrelation: holdingCorrCap,
+        // Full battery works from the visible Holding cohort. Correlation
+        // shrinking is a separate, deliberate action; it must not silently
+        // remove names when the user starts the battery.
+        shrinkFirst: false,
         queueLimit: factoryQueueLimit,
         targetDatabank: factoryTargetDatabank,
       });
@@ -695,6 +729,59 @@ function App() {
     } finally {
       setBatteryBusy(false);
     }
+  }
+
+  async function runProductionLane() {
+    const holdingCount = workspace?.holding?.length ?? 0;
+    if (holdingCount === 0) return;
+    const confirmed = window.confirm(
+      `Run Production Lane v1 on all ${holdingCount} frozen Holding strategies?\n\nOnly H4 Development data will be used for 3/6/12-month stability and expectancy × √trades ranking. The sealed final partition will stay unopened. Selected strategies will move to Databank; the rest remain in Holding.`,
+    );
+    if (!confirmed) return;
+    setBatteryBusy(true);
+    setError(null);
+    try {
+      const started = await startProductionLaneJob();
+      lastBatteryRevision.current = started.revision;
+      setBatteryJob(started);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
+  async function graduateAllHoldingWithoutRobustness() {
+    const holdingCount = workspace?.holding?.length ?? 0;
+    if (holdingCount === 0) return;
+    const confirmed = window.confirm(
+      `Graduate all ${holdingCount} Holding strategies into Databank without running calendar folds, walk-forward/CPCV, Monte Carlo or parameter-neighborhood tests?\n\nThey keep the basic and M1-fidelity checks already completed during Holding admission. This changes the archive and cannot be described as robustness-passed.`,
+    );
+    if (!confirmed) return;
+    setBatteryBusy(true);
+    setError(null);
+    try {
+      const result = await promoteHoldingWithoutRobustness();
+      setWorkspace(result.workspace);
+      setBatchSelection(new Set());
+      setBatchMessage(
+        `Graduated ${result.promoted + result.replaced} Holding strategies without the robustness battery. ${result.promoted} added and ${result.replaced} replaced matching Databank entries.`,
+      );
+      setDatabankTab("databank");
+      setQuery("");
+      setEntryFilter("all");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
+  function switchDatabankTab(tab: "holding" | "databank" | "certified") {
+    setDatabankTab(tab);
+    setQuery("");
+    setEntryFilter("all");
+    setBatchSelection(new Set());
   }
 
   async function stopBatteryJob() {
@@ -903,7 +990,7 @@ function App() {
                 role="tab"
                 aria-selected={databankTab === "holding"}
                 className={databankTab === "holding" ? "active" : ""}
-                onClick={() => setDatabankTab("holding")}
+                onClick={() => switchDatabankTab("holding")}
               >
                 Holding{workspace ? ` (${workspace.holding?.length ?? 0})` : ""}
               </button>
@@ -912,7 +999,7 @@ function App() {
                 role="tab"
                 aria-selected={databankTab === "databank"}
                 className={databankTab === "databank" ? "active" : ""}
-                onClick={() => setDatabankTab("databank")}
+                onClick={() => switchDatabankTab("databank")}
               >
                 Databank{workspace ? ` (${workspace.elites.length})` : ""}
               </button>
@@ -921,7 +1008,7 @@ function App() {
                 role="tab"
                 aria-selected={databankTab === "certified"}
                 className={databankTab === "certified" ? "active" : ""}
-                onClick={() => setDatabankTab("certified")}
+                onClick={() => switchDatabankTab("certified")}
               >
                 Certified
               </button>
@@ -1059,19 +1146,23 @@ function App() {
                 />
 
                 {(batteryJob && batteryJob.status !== "idle") && (
-                  <section className="panel" aria-label="Holding battery progress">
+                  <section className="panel" aria-label="Holding job progress">
                     <div className="panel-heading">
                       <div>
-                        <p className="eyebrow">Holding battery</p>
+                        <p className="eyebrow">
+                          {batteryJob.jobKind === "production_lane"
+                            ? "H4 Production Lane v1"
+                            : "Holding battery"}
+                        </p>
                         <h2>{batteryJob.phase}</h2>
                       </div>
                       <span className="read-only-badge">{batteryJob.status}</span>
                     </div>
                     <p>{batteryJob.message}</p>
-                    {(batteryJob.holdingBeforeShrink ?? 0) > 0 && (
+                    {(batteryJob.holdingBeforeShrink ?? 0) > 0 && batteryJob.jobKind !== "production_lane" && (
                       <p className="muted">
                         Funnel {formatNumber(batteryJob.holdingBeforeShrink ?? 0)} Holding
-                        → {formatNumber(batteryJob.holdingAfterShrink ?? batteryJob.holdingBeforeShrink ?? 0)} after shrink
+                        → {formatNumber(batteryJob.holdingAfterShrink ?? batteryJob.holdingBeforeShrink ?? 0)} ready
                         → {formatNumber(batteryJob.total)} queued
                         → {formatNumber(batteryJob.passed)} Databank
                         {batteryJob.targetDatabank
@@ -1086,7 +1177,7 @@ function App() {
                         note={`${formatNumber(batteryJob.queued)} queued · ${formatNumber(batteryJob.running)} running`}
                       />
                       <Kpi
-                        label="Passed → Databank"
+                        label={batteryJob.jobKind === "production_lane" ? "Selected → Databank" : "Passed → Databank"}
                         value={formatNumber(batteryJob.passed)}
                         note={`${formatNumber(batteryJob.databankElites)} databank elites`}
                       />
@@ -1096,7 +1187,7 @@ function App() {
                         note={`${formatNumber(batteryJob.holdingRemaining)} still in Holding`}
                       />
                       <Kpi
-                        label="Batteries / hour"
+                        label={batteryJob.jobKind === "production_lane" ? "Replays / hour" : "Batteries / hour"}
                         value={formatNumber(batteryJob.batteriesPerHour, 1)}
                         note={
                           batteryJob.etaSeconds != null && batteryJob.status === "running"
@@ -1105,7 +1196,7 @@ function App() {
                         }
                       />
                     </div>
-                    {batteryJob.killMix && batteryJob.rejected > 0 && (
+                    {batteryJob.jobKind !== "production_lane" && batteryJob.killMix && batteryJob.rejected > 0 && (
                       <div className="kpi-grid" aria-label="Battery kill mix">
                         <Kpi label="Neighborhood / RetDD" value={formatNumber(batteryJob.killMix.neighborhood)} note="0.85–1.25 of median" />
                         <Kpi label="Monte Carlo" value={formatNumber(batteryJob.killMix.monteCarlo)} note="P80 profit retention" />
@@ -1131,9 +1222,14 @@ function App() {
                           disabled={batteryBusy || batteryJob?.stopRequested}
                           onClick={() => void stopBatteryJob()}
                         >
-                          {batteryJob?.stopRequested ? "Stopping…" : "Stop battery"}
+                          {batteryJob?.stopRequested ? "Stopping…" : "Stop safely"}
                         </button>
                       </div>
+                    )}
+                    {batteryJob.reportPath && (
+                      <p className="muted" title={batteryJob.reportPath}>
+                        Immutable report: {batteryJob.reportPath}
+                      </p>
                     )}
                     {batteryActivity.rows.length > 0 && (
                       <div className="family-tester-results">
@@ -1179,70 +1275,38 @@ function App() {
                       <p className="eyebrow">
                         {databankTab === "holding"
                           ? "Untested M1 survivors"
-                          : "Battery-passed elites"}
+                          : "Selected research elites"}
                       </p>
                       <h2>
-                        {filtered.length}{" "}
+                        {filtered.length === archiveRows.length
+                          ? formatNumber(archiveRows.length)
+                          : `${formatNumber(filtered.length)} of ${formatNumber(archiveRows.length)}`}{" "}
                         {databankTab === "holding" ? "holding" : "elites"}
                       </h2>
                     </div>
                     <div className="table-controls">
                       {databankTab === "holding" && (
                         <>
-                          <label>
-                            Max daily P/L corr
-                            <select
-                              aria-label="Maximum daily P/L correlation"
-                              disabled={loading || holdingShrinkBusy || batteryBusy || batteryActive}
-                              onChange={(event) => setHoldingCorrCap(Number(event.target.value))}
-                              value={holdingCorrCap}
-                            >
-                              <option value={0.3}>0.3</option>
-                              <option value={0.4}>0.4</option>
-                              <option value={0.5}>0.5</option>
-                              <option value={0.6}>0.6</option>
-                            </select>
-                          </label>
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={
-                              loading
-                              || holdingShrinkBusy
-                              || batteryBusy
-                              || batteryActive
-                              || (workspace?.holding?.length ?? 0) === 0
-                            }
-                            onClick={() => void shrinkHoldingByCorr()}
-                            title="Drop correlated Holding clones using Development H1 daily P/L. Not a Discover start setting."
-                          >
-                            {holdingShrinkBusy ? "Shrinking…" : "Shrink Holding"}
-                          </button>
-                          <label>
-                            Queue
-                            <input
-                              aria-label="Factory queue limit"
-                              min={0}
-                              max={10000}
-                              onChange={(event) => setFactoryQueueLimit(Math.max(0, Number(event.target.value) || 0))}
-                              type="number"
-                              value={factoryQueueLimit}
-                            />
-                          </label>
-                          <label>
-                            Databank target
-                            <input
-                              aria-label="Factory Databank target"
-                              min={0}
-                              max={10000}
-                              onChange={(event) => setFactoryTargetDatabank(Math.max(0, Number(event.target.value) || 0))}
-                              type="number"
-                              value={factoryTargetDatabank}
-                            />
-                          </label>
                           <button
                             type="button"
                             className="primary"
+                            disabled={
+                              loading
+                              || batteryBusy
+                              || batteryActive
+                              || holdingShrinkBusy
+                              || (workspace?.holding?.length ?? 0) === 0
+                            }
+                            onClick={() => void runProductionLane()}
+                            title="Fixed H4 Development-only recipe: require 6/12-month stability, rank by expectancy × √trades, and promote the top 20% under diversity limits. Sealed final stays unopened."
+                          >
+                            {batteryActive && batteryJob?.jobKind === "production_lane"
+                              ? "Production Lane running…"
+                              : `Run Production Lane v1 (${workspace?.holding?.length ?? 0})`}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
                             disabled={
                               loading
                               || batteryBusy
@@ -1251,28 +1315,110 @@ function App() {
                               || (workspace?.holding?.length ?? 0) === 0
                             }
                             onClick={() => void startHoldingFactory()}
-                            title="Shrink correlated clones, rank by trades × R-expectancy, then battery the queue. Queue 0 = everyone after shrink. Databank target 0 = keep every passer."
+                            title="Keep the current Holding cohort, rank by trades × R-expectancy, then run the full battery. Each pass moves to Databank immediately; failed strategies remain in Holding."
                           >
-                            {batteryActive ? "Factory running…" : "Run factory"}
+                            {batteryActive && batteryJob?.jobKind !== "production_lane"
+                              ? "Factory running…"
+                              : "Run full robustness battery"}
                           </button>
                           <button
                             type="button"
-                            className="primary"
+                            className="secondary"
                             disabled={
                               loading
                               || batteryBusy
                               || batteryActive
                               || holdingShrinkBusy
-                              || batchSelection.size === 0
+                              || workspace?.legacyReadOnly
+                              || (workspace?.holding?.length ?? 0) === 0
                             }
-                            onClick={() => void startBatteryOnSelection()}
+                            onClick={() => void graduateAllHoldingWithoutRobustness()}
+                            title="Move every current Holding strategy to Databank without the deferred robustness battery."
                           >
-                            {batteryActive
-                              ? "Battery running…"
-                              : batteryBusy
-                                ? "Starting…"
-                                : `Run battery (${batchSelection.size})`}
+                            {batteryBusy
+                              ? "Working…"
+                              : `Graduate all · skip robustness (${workspace?.holding?.length ?? 0})`}
                           </button>
+                          <button
+                            type="button"
+                            className={holdingControlsOpen ? "secondary active" : "secondary"}
+                            onClick={() => setHoldingControlsOpen((current) => !current)}
+                          >
+                            {holdingControlsOpen ? "Hide advanced controls" : "Advanced controls"}
+                          </button>
+                          {holdingControlsOpen && (
+                            <div className="holding-advanced-controls">
+                              <label>
+                                Max daily P/L corr
+                                <select
+                                  aria-label="Maximum daily P/L correlation"
+                                  disabled={loading || holdingShrinkBusy || batteryBusy || batteryActive}
+                                  onChange={(event) => setHoldingCorrCap(Number(event.target.value))}
+                                  value={holdingCorrCap}
+                                >
+                                  <option value={0.3}>0.3</option>
+                                  <option value={0.4}>0.4</option>
+                                  <option value={0.5}>0.5</option>
+                                  <option value={0.6}>0.6</option>
+                                </select>
+                              </label>
+                              <button
+                                type="button"
+                                className="secondary"
+                                disabled={
+                                  loading
+                                  || holdingShrinkBusy
+                                  || batteryBusy
+                                  || batteryActive
+                                  || (workspace?.holding?.length ?? 0) === 0
+                                }
+                                onClick={() => void shrinkHoldingByCorr()}
+                                title="Drop correlated Holding clones using Development H1 daily P/L. Not a Discover start setting."
+                              >
+                                {holdingShrinkBusy ? "Shrinking…" : "Shrink Holding"}
+                              </button>
+                              <label>
+                                Queue
+                                <input
+                                  aria-label="Factory queue limit"
+                                  min={0}
+                                  max={10000}
+                                  onChange={(event) => setFactoryQueueLimit(Math.max(0, Number(event.target.value) || 0))}
+                                  type="number"
+                                  value={factoryQueueLimit}
+                                />
+                              </label>
+                              <label>
+                                Databank target
+                                <input
+                                  aria-label="Factory Databank target"
+                                  min={0}
+                                  max={10000}
+                                  onChange={(event) => setFactoryTargetDatabank(Math.max(0, Number(event.target.value) || 0))}
+                                  type="number"
+                                  value={factoryTargetDatabank}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="secondary"
+                                disabled={
+                                  loading
+                                  || batteryBusy
+                                  || batteryActive
+                                  || holdingShrinkBusy
+                                  || batchSelection.size === 0
+                                }
+                                onClick={() => void startBatteryOnSelection()}
+                              >
+                                {batteryActive
+                                  ? "Battery running…"
+                                  : batteryBusy
+                                    ? "Starting…"
+                                    : `Run battery (${batchSelection.size})`}
+                              </button>
+                            </div>
+                          )}
                         </>
                       )}
                       <input
@@ -1307,6 +1453,18 @@ function App() {
                         <option value="entryConditions">Entry conditions</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
+                      {filtered.length !== archiveRows.length && (
+                        <button
+                          type="button"
+                          className="text-action"
+                          onClick={() => {
+                            setQuery("");
+                            setEntryFilter("all");
+                          }}
+                        >
+                          Clear filters
+                        </button>
+                      )}
                     </div>
                     <div className="batch-controls">
                       <label>
@@ -1660,6 +1818,11 @@ function ResultsDetailPage({
   };
 
   useEffect(() => {
+    if (!detail || detail.fingerprint !== fingerprint || detail.sealedProtected) {
+      setPartition(null);
+      setPartitionBusy(false);
+      return;
+    }
     let cancelled = false;
     setPartition(null);
     setPartitionBusy(true);
@@ -1676,7 +1839,7 @@ function ResultsDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [fingerprint]);
+  }, [fingerprint, detail?.sealedProtected]);
 
   const initialBalance = partition?.initialBalance ?? workspace?.initialBalance ?? 100_000;
   const storedMetrics = detail?.metrics ?? {};
@@ -3512,7 +3675,7 @@ function DiscoverWorkspace({
     minimumNeighborhoodSurvivalFraction: 0.55,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
-    multiSymbolMinimumPass: null,
+    multiSymbolMinimumPass: 0,
     packDataDir: null,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
@@ -3541,6 +3704,9 @@ function DiscoverWorkspace({
   const [testerSeed, setTesterSeed] = useState(42);
   const [testerBusy, setTesterBusy] = useState(false);
   const [testerReport, setTesterReport] = useState<ConditionBakeoffReport | null>(null);
+  const [timeframeBakeoffDraws, setTimeframeBakeoffDraws] = useState(20);
+  const [timeframeBakeoffBusy, setTimeframeBakeoffBusy] = useState(false);
+  const [timeframeBakeoffReport, setTimeframeBakeoffReport] = useState<TimeframeBakeoffReport | null>(null);
   const [resultsViewFp, setResultsViewFp] = useState<string | null>(null);
   const [liveWorkspace, setLiveWorkspace] = useState<DatabankWorkspace | null>(null);
   const [liveSelected, setLiveSelected] = useState<string | null>(null);
@@ -3548,6 +3714,7 @@ function DiscoverWorkspace({
   const [liveDetailOpen, setLiveDetailOpen] = useState(false);
   const [liveDetailLoading, setLiveDetailLoading] = useState(false);
   const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
+  const [expertMode, setExpertMode] = useState(false);
   const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir" | "mq5">("overview");
   const lastDatabankCountRef = useRef(0);
   const lastLiveRevisionRef = useRef(0);
@@ -3871,6 +4038,50 @@ function DiscoverWorkspace({
     }
   }
 
+  async function runTimeframeComparison() {
+    if (!form.dataPath || !form.m1DataPath || !form.brokerPath) {
+      onError("Choose a symbol (H1 source, M1, broker) before running the timeframe bakeoff.");
+      return;
+    }
+    setTimeframeBakeoffBusy(true);
+    onError(null);
+    try {
+      const bound = bindDiscoverTimezone(form);
+      const grammar = form.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR;
+      const report = await runTimeframeBakeoff({
+        dataPath: bound.dataPath,
+        metadataPath: bound.metadataPath,
+        sourceTimezone: bound.sourceTimezone,
+        m1DataPath: bound.m1DataPath,
+        m1MetadataPath: bound.m1MetadataPath,
+        m1SourceTimezone: bound.m1SourceTimezone,
+        brokerPath: bound.brokerPath,
+        drawsPerCell: Math.max(1, timeframeBakeoffDraws),
+        seed: form.seed ?? 42,
+        minimumTrades: form.minimumTrades ?? 10,
+        minimumReturnPercent: form.minimumReturnPercent ?? 0,
+        minimumProfitFactor: form.minimumProfitFactor ?? 1,
+        maximumDrawdownPercent: form.maximumDrawdownPercent ?? 40,
+        oos1Retention: form.oos1ExpectancyRetention ?? 0.7,
+        commissionPerLotRoundTurn: form.commissionPerLotRoundTurn ?? 7,
+        slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
+        fallbackSpreadPoints: form.fallbackSpreadPoints,
+        validationFraction: (form.validationFraction ?? 0) > 0 ? form.validationFraction! : 0.2,
+        sealedFraction: form.sealedFraction ?? 1 / 3,
+        minimumEntryConditions: grammar.minimumEntryConditions,
+        maximumEntryConditions: grammar.maximumEntryConditions,
+        minimumExitConditions: grammar.minimumExitConditions,
+        maximumExitConditions: grammar.maximumExitConditions,
+        historyStartYear: form.historyStartYear ?? 2016,
+      });
+      setTimeframeBakeoffReport(report);
+    } catch (reason) {
+      onError(String(reason));
+    } finally {
+      setTimeframeBakeoffBusy(false);
+    }
+  }
+
   function applyRecommendedCount(count: number) {
     setForm((current) => ({
       ...current,
@@ -3964,10 +4175,19 @@ function DiscoverWorkspace({
 
       {discoverTab === "settings" && (
       <div className="discover-main discover-settings-pane">
-      <section className="panel discover-form">
+      <section className={`panel discover-form ${expertMode ? "expert-mode" : "simple-mode"}`}>
         <div className="panel-heading">
-          <div><p className="eyebrow">Discover</p><h2>Configure deterministic evolution</h2></div>
+          <div><p className="eyebrow">Discover</p><h2>{expertMode ? "Configure deterministic evolution" : "Choose a research recipe"}</h2></div>
           <div className="mode-toggle">
+            <button
+              type="button"
+              className={expertMode ? "active" : ""}
+              disabled={active || busy}
+              onClick={() => setExpertMode((current) => !current)}
+              title="Show worker, gate, robustness and search-range controls"
+            >
+              {expertMode ? "Hide expert settings" : "Expert settings"}
+            </button>
             <button type="button" className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
             <button type="button" className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
             <button
@@ -3999,20 +4219,21 @@ function DiscoverWorkspace({
               <div className="hypothesis-strip">
                 <div className="hypothesis-heading">
                   <p className="eyebrow">Hypothesis</p>
-                  <h3>Universal grammar + run mode</h3>
+                  <h3>{expertMode ? "Universal grammar + run mode" : "Research recipe"}</h3>
                 </div>
                 <p className="recipe-summary">
-                  Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts.
-                  Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3.
+                  {expertMode
+                    ? "Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts. Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3."
+                    : "Start with a bounded research path. QuantForge keeps the grammar, gates and validation firewall on safe defaults; choose how much of the pipeline to run below."}
                 </p>
-                <div className="form-grid universal-grammar-grid">
+                {expertMode && <div className="form-grid universal-grammar-grid">
                   <NumberField label="Entry conditions min" value={form.universalGrammar?.minimumEntryConditions ?? 2} onChange={(value) => updateGrammar("minimumEntryConditions", value ?? 2)} min={2} max={4} />
                   <NumberField label="Entry conditions max" value={form.universalGrammar?.maximumEntryConditions ?? 2} onChange={(value) => updateGrammar("maximumEntryConditions", value ?? 2)} min={2} max={4} />
                   <NumberField label="Exit conditions min" value={form.universalGrammar?.minimumExitConditions ?? 1} onChange={(value) => updateGrammar("minimumExitConditions", value ?? 1)} min={1} max={3} />
                   <NumberField label="Exit conditions max" value={form.universalGrammar?.maximumExitConditions ?? 3} onChange={(value) => updateGrammar("maximumExitConditions", value ?? 3)} min={1} max={3} />
                   <NumberField label="Closed-bar shift min" value={form.universalGrammar?.minimumShift ?? 1} onChange={(value) => updateGrammar("minimumShift", value ?? 1)} min={1} />
                   <NumberField label="Closed-bar shift max" value={form.universalGrammar?.maximumShift ?? 3} onChange={(value) => updateGrammar("maximumShift", value ?? 3)} min={1} />
-                </div>
+                </div>}
                 <div className="mode-toggle run-mode-toggle">
                   <button
                     type="button"
@@ -4080,7 +4301,7 @@ function DiscoverWorkspace({
                   >
                     Quota (grow Holding overnight)
                   </button>
-                  <button
+                  {expertMode && <button
                     type="button"
                     className={form.runMode === "high_performance_islands" ? "active" : ""}
                     onClick={() =>
@@ -4104,7 +4325,7 @@ function DiscoverWorkspace({
                     }
                   >
                     High-Performance Islands
-                  </button>
+                  </button>}
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <div className="form-stack compact">
@@ -4120,7 +4341,7 @@ function DiscoverWorkspace({
                         onChange={(event) => setForm((current) => ({ ...current, factoryAfterDiscover: event.target.checked }))}
                       />
                       <small>
-                        When Discover checkpoints, shrink Holding at daily P/L corr {form.factoryMaxCorrelation ?? 0.5}, rank by trades × R-expectancy, then battery {(form.factoryQueueLimit ?? 0) > 0 ? `the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "everyone left after shrink"}. {(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}
+                        When Discover checkpoints, rank the current Holding cohort by trades × R-expectancy, then run the battery {(form.factoryQueueLimit ?? 0) > 0 ? `on the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "on everyone in Holding"}. Each pass moves to Databank immediately; failures stay in Holding. Correlation shrinking remains a separate manual action. {(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}
                       </small>
                     </label>
                     <div className="form-grid universal-grammar-grid">
@@ -4193,6 +4414,7 @@ function DiscoverWorkspace({
               <div className="mode-toggle">
                 <button type="button" className={form.decisionTimeframe === "H1" ? "active" : ""} onClick={() => update("decisionTimeframe", "H1")}>H1</button>
                 <button type="button" className={form.decisionTimeframe === "M15" ? "active" : ""} onClick={() => update("decisionTimeframe", "M15")}>M15</button>
+                <button type="button" className={form.decisionTimeframe === "H4" ? "active" : ""} onClick={() => update("decisionTimeframe", "H4")}>H4</button>
               </div>
             </div>
             <div className="field-row">
@@ -4221,11 +4443,11 @@ function DiscoverWorkspace({
                 ? "Drops bars before 1 Jan 2020 broker time from the 2016 pack. IS and sealed OOS fractions are taken on the remaining history."
                 : "Uses the full ICMarkets 2016–present pack. Continue runs keep the year sealed in the databank."}
             </p>
-            <p className="immutable-note">M15 is built directly from the selected M1 export, keeping decision candles aligned with execution chronology.</p>
+            <p className="immutable-note">M15 and H4 are built directly from the selected M1 export, keeping decision candles aligned with execution chronology. Orders are still checked against M1 for fidelity.</p>
             <details className="advanced-settings">
               <summary>Bound paths (auto-filled from symbol)</summary>
               <div className="form-stack compact">
-                <label className="field-row"><span>Decision source ({form.decisionTimeframe})</span><code>{form.decisionTimeframe === "M15" ? "Built from the M1 path below" : form.dataPath || "—"}</code></label>
+                <label className="field-row"><span>Decision source ({form.decisionTimeframe})</span><code>{form.decisionTimeframe === "H1" ? form.dataPath || "—" : "Built from the M1 path below"}</code></label>
                 <label className="field-row"><span>Decision metadata</span><code>{form.metadataPath || "—"}</code></label>
                 <label className="field-row"><span>M1</span><code>{form.m1DataPath || "—"}</code></label>
                 <label className="field-row"><span>M1 metadata</span><code>{form.m1MetadataPath || "—"}</code></label>
@@ -4249,7 +4471,7 @@ function DiscoverWorkspace({
               onChange={(value) => update("generations", value ?? 0)}
               min={0}
             />
-            {form.mode === "new" && <>
+            {expertMode && form.mode === "new" && <>
               <NumberField label="Initial candidates" value={form.initialCandidates} onChange={(value) => update("initialCandidates", value)} min={1} />
               <NumberField label="Batch / generation" value={form.batchSize} onChange={(value) => update("batchSize", value)} min={1} />
               <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value)} min={0} />
@@ -4357,7 +4579,7 @@ function DiscoverWorkspace({
                     max={100}
                     step={1}
                   />
-                  <NumberField label="Multi-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
+                  <NumberField label="Optional cross-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
                 </div>
                 <p className="immutable-note">Monte Carlo settings seal into the databank with the rest of Discover config. Stop/limit search requires a bid/ask <code>.quotes.csv</code> sidecar beside M1.</p>
                 {perturbationError(form) && <p className="field-error">{perturbationError(form)}</p>}
@@ -4379,7 +4601,7 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note">Development alone drives search and breeding. Holding needs M1 80/130 fidelity only. Sealed holdout is never loaded by Discover.</p>
+            <p className="immutable-note simple-mode-note">Development drives search and breeding. Holding receives the cheap M1 fidelity screen; the full robustness battery runs later from the Holding tab. Sealed holdout is never loaded by Discover. Turn on Expert settings to tune gates, robustness, execution modules and search ranges.</p>
             <details className="advanced-settings" open>
               <summary>Execution modules — search genes (pot only until breeding)</summary>
               <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
@@ -4605,6 +4827,78 @@ function DiscoverWorkspace({
                   Run Discover until elites pass M1 robustness, or open a databank. Results appear here as promotions land.
                 </p>
               )}
+            </section>
+
+            <section className="panel family-tester-panel condition-bakeoff-panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">Timeframe comparison</p>
+                  <h2>H1 vs H4 bakeoff</h2>
+                </div>
+                <span className="read-only-badge">Paired candidates · OOS1 diagnostic</span>
+              </div>
+              <div className="family-tester-body">
+                <p className="immutable-note">
+                  Evaluates the same deterministic candidates on H1 and H4. Development gates select candidates;
+                  OOS1 measures survival. The sealed holdout is never loaded. If the current recipe has OOS1 off,
+                  this diagnostic uses a temporary 20% OOS1 reserve.
+                </p>
+                <div className="numeric-grid family-tester-numbers">
+                  <NumberField
+                    label="Draws / grammar cell"
+                    value={timeframeBakeoffDraws}
+                    onChange={(value) => setTimeframeBakeoffDraws(value ?? 20)}
+                    min={1}
+                  />
+                </div>
+                <div className="family-tester-actions">
+                  <button
+                    className="primary"
+                    disabled={active || timeframeBakeoffBusy || !form.dataPath || !form.m1DataPath || !form.brokerPath}
+                    onClick={() => void runTimeframeComparison()}
+                  >
+                    {timeframeBakeoffBusy ? "Running H1 vs H4…" : "Run H1 vs H4 bakeoff"}
+                  </button>
+                </div>
+                {timeframeBakeoffReport && (
+                  <>
+                    <div className="family-tester-results">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Lane</th>
+                            <th>IS screen</th>
+                            <th>OOS1 survival</th>
+                            <th>Retention</th>
+                            <th>Trades</th>
+                            <th>DD</th>
+                            <th>Selected future lift</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {timeframeBakeoffReport.rows.map((row) => (
+                            <tr key={row.timeframe}>
+                              <td>{row.timeframe}</td>
+                              <td>{formatNumber(row.screened)} / {formatNumber(row.draws)}</td>
+                              <td>{(row.oos1SurvivalRate * 100).toFixed(1)}%</td>
+                              <td>{row.medianRetention == null ? "—" : formatNumber(row.medianRetention, 3)}</td>
+                              <td>{row.medianTradeCount == null ? "—" : formatNumber(row.medianTradeCount, 0)}</td>
+                              <td>{row.medianDrawdownPercent == null ? "—" : `${formatNumber(row.medianDrawdownPercent, 1)}%`}</td>
+                              <td>{row.selectedFutureExpectancyLiftR == null ? "—" : `${formatNumber(row.selectedFutureExpectancyLiftR, 3)}R`}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="immutable-note">
+                      {timeframeBakeoffReport.pair.recommendation}
+                      {" "}
+                      H4 pass-rate lift: {(timeframeBakeoffReport.pair.h4PassRateLift * 100).toFixed(1)}pp;
+                      paired OOS1 wins H1/H4: {formatNumber(timeframeBakeoffReport.pair.h1Oos1Wins)}/{formatNumber(timeframeBakeoffReport.pair.h4Oos1Wins)}.
+                    </p>
+                  </>
+                )}
+              </div>
             </section>
 
             <section className="panel family-tester-panel condition-bakeoff-panel">
@@ -5618,8 +5912,9 @@ function EliteInspector({
   }
 
   useEffect(() => {
-    if (!detail || tab !== "overview") {
+    if (!detail || tab !== "overview" || detail.sealedProtected) {
       setPartitionView(null);
+      setPartitionBusy(false);
       return;
     }
     let cancelled = false;
@@ -5638,7 +5933,7 @@ function EliteInspector({
     return () => {
       cancelled = true;
     };
-  }, [detail?.fingerprint, tab, onError]);
+  }, [detail?.fingerprint, detail?.sealedProtected, tab, onError]);
 
   useEffect(() => {
     if (!detail || tab !== "mq5") {
@@ -5723,12 +6018,22 @@ function EliteInspector({
                   </p>
                 </section>
               )}
-              <PartitionEquityChart
-                view={partitionView}
-                busy={partitionBusy}
-                researchGrade={researchGrade}
-                m1FidelityVerified={m1FidelityVerified}
-              />
+              {detail.sealedProtected ? (
+                <section className="legacy-metrics-warning">
+                  <p className="eyebrow">Sealed final protected</p>
+                  <p>
+                    Production Lane used Development only. Future M1 equity and expectancy are hidden here;
+                    reveal them once through the explicit Sealed Final workflow after the shortlist is frozen.
+                  </p>
+                </section>
+              ) : (
+                <PartitionEquityChart
+                  view={partitionView}
+                  busy={partitionBusy}
+                  researchGrade={researchGrade}
+                  m1FidelityVerified={m1FidelityVerified}
+                />
+              )}
               <section className="metric-list">
                 <Metric label="Mean R" value={(Number(detail.metrics.expectancy_r) || 0).toFixed(3)} />
                 <Metric
@@ -6004,8 +6309,9 @@ function EliteDetailModal({
   const [partitionBusy, setPartitionBusy] = useState(false);
 
   useEffect(() => {
-    if (!detail || tab !== "overview") {
+    if (!detail || tab !== "overview" || detail.sealedProtected) {
       setPartitionView(null);
+      setPartitionBusy(false);
       return;
     }
     let cancelled = false;
@@ -6024,7 +6330,7 @@ function EliteDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [detail?.fingerprint, tab, onError]);
+  }, [detail?.fingerprint, detail?.sealedProtected, tab, onError]);
 
   return (
     <div

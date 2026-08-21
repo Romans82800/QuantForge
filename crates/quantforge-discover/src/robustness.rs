@@ -3,9 +3,7 @@
 use chrono::Datelike;
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::FloatPolicy;
-use quantforge_data::{
-    BarDataset, QuoteBarDataset, bar_content_hash, quote_bar_content_hash,
-};
+use quantforge_data::{BarDataset, QuoteBarDataset, bar_content_hash, quote_bar_content_hash};
 use quantforge_eval::{
     IndicatorBufferCache, SameBarPolicy, ScoutConfig, ScoutResult, ScoutTelemetry,
     evaluate_strategy_cached,
@@ -227,14 +225,8 @@ pub fn run_m1_predeposit_robustness(
     let retention_evidence = m1_retention_evidence(h1_metrics, &baseline.metrics, config);
     let h1_scout = neighborhood_scout_config(config);
     let h1_cache = IndicatorBufferCache::new(is_decision.bars.len());
-    let h1_run = evaluate_strategy_cached(
-        strategy,
-        is_decision,
-        broker,
-        &h1_scout,
-        &h1_cache,
-    )
-    .map_err(|_| RobustnessReject::ParamNeighborhood)?;
+    let h1_run = evaluate_strategy_cached(strategy, is_decision, broker, &h1_scout, &h1_cache)
+        .map_err(|_| RobustnessReject::ParamNeighborhood)?;
     if !crate::fold_r::calendar_year_fold_r(&h1_run.trades).passes_stability() {
         return Err(RobustnessReject::FoldStability);
     }
@@ -328,11 +320,7 @@ pub fn run_m1_predeposit_robustness(
         folds: sequential_rows,
     };
 
-    let profits: Vec<_> = h1_run
-        .trades
-        .iter()
-        .map(|trade| trade.net_profit)
-        .collect();
+    let profits: Vec<_> = h1_run.trades.iter().map(|trade| trade.net_profit).collect();
     let maximum_p95_drawdown_percent =
         h1_run.metrics.max_drawdown_percent * config.monte_carlo_max_drawdown_ratio;
     let mut mc = monte_carlo_trade_resampling_with_skip(
@@ -486,7 +474,10 @@ fn evaluate_h1_neighborhood(
         })
         .collect();
     let evaluated_samples = neighborhood_samples.len();
-    let surviving = neighborhood_samples.iter().filter(|row| row.survived).count();
+    let surviving = neighborhood_samples
+        .iter()
+        .filter(|row| row.survived)
+        .count();
     if evaluated_samples * 2 < config.neighborhood_samples {
         return Err(RobustnessReject::ParamNeighborhood);
     }

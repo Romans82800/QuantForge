@@ -1,6 +1,6 @@
 use crate::archive::{
     CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank, deposit_to_holding,
-    deposit_to_specialist_pool, remove_holding_by_fingerprint,
+    deposit_to_specialist_pool, refresh_fingerprint_coverage_map, remove_holding_by_fingerprint,
 };
 use crate::grammar::{
     apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
@@ -26,7 +26,7 @@ use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_wi
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -478,11 +478,10 @@ impl PromotionPipeline {
         pot_evaluation: CandidateEvaluation,
         bank: &mut Databank,
     ) -> Result<(), DiscoverError> {
-        let mut overflow = self
-            .shared
-            .overflow
-            .lock()
-            .map_err(|_| DiscoverError::InvalidConfig("promotion overflow lock poisoned".into()))?;
+        let mut overflow =
+            self.shared.overflow.lock().map_err(|_| {
+                DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
+            })?;
         if overflow.len() >= PROMOTION_OVERFLOW_CAPACITY {
             overflow.pop_front();
             bank.telemetry.promotion_overflow_dropped += 1;
@@ -502,13 +501,9 @@ impl PromotionPipeline {
                 break;
             }
             let next = {
-                let mut overflow = self
-                    .shared
-                    .overflow
-                    .lock()
-                    .map_err(|_| {
-                        DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
-                    })?;
+                let mut overflow = self.shared.overflow.lock().map_err(|_| {
+                    DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
+                })?;
                 overflow.pop_front()
             };
             match next {
@@ -915,6 +910,78 @@ pub fn holding_factory_score(trade_count: usize, expectancy_r: f64) -> f64 {
     trade_count as f64 * expectancy_r.max(0.0)
 }
 
+/// Move every current Holding entry into the Databank without running the
+/// deferred robustness battery. This is an explicit research override used by
+/// the desktop Holding page; Discover's normal promotion path is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoldingBypassResult {
+    pub promoted: usize,
+    pub replaced: usize,
+}
+
+pub fn promote_all_holding_without_robustness(bank: &mut Databank) -> HoldingBypassResult {
+    let selected = bank
+        .holding
+        .iter()
+        .map(|elite| elite.structural_fingerprint.to_string())
+        .collect::<BTreeSet<_>>();
+    promote_selected_holding_without_robustness(bank, &selected, None)
+}
+
+/// Promote only the named Holding entries while leaving every non-selected
+/// candidate in Holding. `selection_gate` records the Development-only recipe
+/// that chose the cohort; it must not contain future/holdout evidence.
+pub fn promote_selected_holding_without_robustness(
+    bank: &mut Databank,
+    selected: &BTreeSet<String>,
+    selection_gate: Option<GateResult>,
+) -> HoldingBypassResult {
+    let holding = std::mem::take(&mut bank.holding);
+    let mut remaining = Vec::with_capacity(holding.len());
+    let mut promoted = 0;
+    let mut replaced = 0;
+
+    for mut elite in holding {
+        if !selected.contains(elite.structural_fingerprint.as_str()) {
+            remaining.push(elite);
+            continue;
+        }
+        elite
+            .gate_results
+            .retain(|gate| gate.name != "robustness_bypass");
+        elite.gate_results.push(GateResult {
+            name: "robustness_bypass".into(),
+            passed: false,
+            detail: "Manually graduated from Holding; deferred robustness battery was not run."
+                .into(),
+        });
+        if let Some(gate) = selection_gate.as_ref() {
+            elite
+                .gate_results
+                .retain(|existing| existing.name != gate.name);
+            elite.gate_results.push(gate.clone());
+        }
+        if let Some(index) = bank
+            .elites
+            .iter()
+            .position(|existing| existing.structural_fingerprint == elite.structural_fingerprint)
+        {
+            bank.elites[index] = elite;
+            replaced += 1;
+            bank.telemetry.record(DepositDecision::ReplacedInDatabank);
+        } else {
+            bank.elites.push(elite);
+            promoted += 1;
+            bank.telemetry.record(DepositDecision::AcceptedToDatabank);
+        }
+    }
+
+    bank.holding = remaining;
+    refresh_fingerprint_coverage_map(&bank.holding, &mut bank.holding_coverage_map);
+    refresh_fingerprint_coverage_map(&bank.elites, &mut bank.coverage_map);
+    HoldingBypassResult { promoted, replaced }
+}
+
 /// Successful Holding battery: strategy removed from Holding and deposited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldingBatteryResult {
@@ -1002,9 +1069,7 @@ pub fn run_holding_battery_and_promote(
                 .find(|entry| &entry.structural_fingerprint == fingerprint)
                 .cloned()
                 .ok_or_else(|| {
-                    HoldingBatteryReject::Evaluation(
-                        "promoted elite missing after deposit".into(),
-                    )
+                    HoldingBatteryReject::Evaluation("promoted elite missing after deposit".into())
                 })?;
             Ok(HoldingBatteryResult {
                 fingerprint: fingerprint.clone(),
@@ -2595,6 +2660,85 @@ mod tests {
     fn factory_score_ranks_busy_positive_expectancy_ahead_of_heroes() {
         assert!(super::holding_factory_score(200, 0.12) > super::holding_factory_score(40, 0.40));
         assert_eq!(super::holding_factory_score(500, -0.10), 0.0);
+    }
+
+    #[test]
+    fn explicit_robustness_bypass_moves_the_complete_holding_cohort() {
+        let dataset = dataset();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
+        bank.holding = bank.accepted_pool.iter().take(3).cloned().collect();
+        assert!(!bank.holding.is_empty());
+        let expected: Vec<_> = bank
+            .holding
+            .iter()
+            .map(|elite| elite.structural_fingerprint.clone())
+            .collect();
+
+        let result = super::promote_all_holding_without_robustness(&mut bank);
+
+        assert_eq!(result.promoted, expected.len());
+        assert_eq!(result.replaced, 0);
+        assert!(bank.holding.is_empty());
+        assert!(bank.holding_coverage_map.is_empty());
+        assert_eq!(bank.elites.len(), expected.len());
+        assert_eq!(bank.coverage_map.len(), expected.len());
+        assert!(bank.elites.iter().all(|elite| {
+            elite
+                .gate_results
+                .iter()
+                .any(|gate| gate.name == "robustness_bypass" && !gate.passed)
+        }));
+        assert!(expected.iter().all(|fingerprint| {
+            bank.elites
+                .iter()
+                .any(|elite| &elite.structural_fingerprint == fingerprint)
+        }));
+    }
+
+    #[test]
+    fn production_lane_promotion_moves_only_selected_holding_names() {
+        let dataset = dataset();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
+        bank.holding = bank.accepted_pool.iter().take(3).cloned().collect();
+        assert!(bank.holding.len() >= 2);
+        let selected_fingerprint = bank.holding[0].structural_fingerprint.to_string();
+        let untouched_fingerprint = bank.holding[1].structural_fingerprint.clone();
+        let selected = BTreeSet::from([selected_fingerprint]);
+
+        let result = super::promote_selected_holding_without_robustness(
+            &mut bank,
+            &selected,
+            Some(GateResult {
+                name: "production_lane_v1".into(),
+                passed: true,
+                detail: "Selected using Development evidence only.".into(),
+            }),
+        );
+
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.replaced, 0);
+        assert!(
+            bank.holding
+                .iter()
+                .any(|elite| elite.structural_fingerprint == untouched_fingerprint)
+        );
+        let promoted = bank
+            .elites
+            .iter()
+            .find(|elite| selected.contains(elite.structural_fingerprint.as_str()))
+            .unwrap();
+        assert!(
+            promoted
+                .gate_results
+                .iter()
+                .any(|gate| { gate.name == "production_lane_v1" && gate.passed })
+        );
+        assert!(
+            promoted
+                .gate_results
+                .iter()
+                .any(|gate| { gate.name == "robustness_bypass" && !gate.passed })
+        );
     }
 
     #[test]

@@ -370,6 +370,8 @@ export interface EliteDetail {
   foldUsable: boolean;
   strategyIr: unknown;
   equitySignature: number[];
+  /** True when only the explicit one-shot Sealed Final workflow may reveal future rows. */
+  sealedProtected: boolean;
   /** Present when Discover persisted robustness gate detail; otherwise UI shows "not recorded". */
   robustness?: EliteRobustnessView | null;
 }
@@ -531,12 +533,73 @@ export interface ConditionBakeoffRequest {
   historyStartYear?: number | null;
 }
 
+export interface TimeframeBakeoffLaneRow {
+  timeframe: "H1" | "H4";
+  draws: number;
+  screened: number;
+  oos1Survivors: number;
+  oos1SurvivalRate: number;
+  medianIsExpectancyR: number | null;
+  medianOos1ExpectancyR: number | null;
+  medianRetention: number | null;
+  medianTradeCount: number | null;
+  medianDrawdownPercent: number | null;
+  medianRecoveryFactor: number | null;
+  medianSharpe: number | null;
+  selectedOos1ExpectancyR: number | null;
+  unselectedOos1ExpectancyR: number | null;
+  selectedFutureExpectancyLiftR: number | null;
+}
+
+export interface TimeframeBakeoffPair {
+  pairedComparisons: number;
+  h1Oos1Wins: number;
+  h4Oos1Wins: number;
+  h4RetentionLift: number | null;
+  h4PassRateLift: number;
+  h4SelectedFutureExpectancyLiftR: number | null;
+  recommendation: string;
+}
+
+export interface TimeframeBakeoffReport {
+  evaluations: number;
+  rows: TimeframeBakeoffLaneRow[];
+  pair: TimeframeBakeoffPair;
+}
+
+export interface TimeframeBakeoffRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+  drawsPerCell: number;
+  seed: number;
+  minimumTrades: number;
+  minimumReturnPercent: number;
+  minimumProfitFactor: number;
+  maximumDrawdownPercent: number;
+  oos1Retention: number;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  fallbackSpreadPoints: number | null;
+  validationFraction: number;
+  sealedFraction: number;
+  minimumEntryConditions: number;
+  maximumEntryConditions: number;
+  minimumExitConditions: number;
+  maximumExitConditions: number;
+  historyStartYear?: number | null;
+}
+
 export interface DiscoverRequest {
   mode: DiscoverMode;
   /** Explicit UI selection. The backend refuses data/broker bindings for another symbol. */
   selectedSymbol: string | null;
   dataPath: string;
-  decisionTimeframe: "H1" | "M15" | null;
+  decisionTimeframe: "H1" | "M15" | "H4" | null;
   metadataPath: string | null;
   sourceTimezone: string | null;
   m1DataPath: string;
@@ -787,6 +850,7 @@ export interface BatteryItemView {
 
 export interface BatteryJobView {
   jobId: string | null;
+  jobKind: "battery" | "production_lane" | string;
   status: "idle" | "running" | "completed" | "stopped" | "failed" | string;
   phase: string;
   message: string;
@@ -820,6 +884,8 @@ export interface BatteryJobView {
   holdingBeforeShrink?: number;
   holdingAfterShrink?: number;
   targetDatabank?: number | null;
+  reportPath?: string | null;
+  workspace?: DatabankWorkspace | null;
 }
 
 export interface ChallengeRequest {

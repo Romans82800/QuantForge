@@ -1,4 +1,4 @@
-//! Offline methodology factor grid: what keeps OOS1 expectancy across grammar sizes.
+//! Offline methodology factor grid: what keeps OOS1 per-trade R across grammar sizes.
 
 use crate::grammar::{build_seed, rng_for};
 use crate::model::{DiscoverError, SearchFamily, UniversalGrammarConfig};
@@ -97,7 +97,9 @@ pub struct FactorDraw {
     pub recipe: FactorRecipe,
     pub entry_kind: String,
     pub complexity: usize,
+    /// Mean per-trade R on the development partition.
     pub is_expectancy: f64,
+    /// Mean per-trade R on the chronological OOS1 partition.
     pub oos1_expectancy: f64,
     pub retention: Option<f64>,
     pub is_trades: usize,
@@ -220,8 +222,11 @@ pub fn run_methodology_grid(
                         config.minimum_profit_factor,
                         config.maximum_drawdown_percent,
                     );
-                    let is_e = is_run.metrics.expectancy;
-                    let oos_e = oos_run.metrics.expectancy;
+                    // Dollar expectancy changes with position sizing and is not
+                    // comparable across strategies. Use the per-trade R measure
+                    // everywhere the methodology compares expectancy or retention.
+                    let is_e = risk_normalized_expectancy(&is_run.metrics);
+                    let oos_e = risk_normalized_expectancy(&oos_run.metrics);
                     let retention = (is_e > 0.0 && is_e.is_finite() && oos_e.is_finite())
                         .then_some(oos_e / is_e);
                     let passed_oos1 = passed_is
@@ -293,7 +298,7 @@ fn mix_sequence(
         .wrapping_add(draw)
 }
 
-fn build_factor_strategy(
+pub(crate) fn build_factor_strategy(
     seed: u64,
     sequence: u64,
     entry_conditions: usize,
@@ -412,7 +417,7 @@ fn build_factor_strategy(
     strategy
 }
 
-fn passes_screen(
+pub(crate) fn passes_screen(
     metrics: &BacktestMetrics,
     minimum_trades: usize,
     minimum_return_percent: f64,
@@ -430,6 +435,10 @@ fn passes_screen(
         && metrics.return_percent > minimum_return_percent
         && pf >= minimum_profit_factor
         && metrics.max_drawdown_percent <= maximum_drawdown_percent
+}
+
+fn risk_normalized_expectancy(metrics: &BacktestMetrics) -> f64 {
+    metrics.expectancy_r
 }
 
 fn summarize_cells(draws: &[FactorDraw], config: &MethodologyGridConfig) -> Vec<FactorCellSummary> {
@@ -819,5 +828,34 @@ fn apply_benjamini_hochberg(contrasts: &mut [FactorContrast], q: f64) {
         prev = bh;
         contrasts[index].q_value = bh;
         contrasts[index].significant_fdr_10 = bh <= q;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::risk_normalized_expectancy;
+    use quantforge_eval::BacktestMetrics;
+
+    #[test]
+    fn methodology_expectancy_is_per_trade_r_not_account_currency() {
+        let metrics = BacktestMetrics {
+            initial_balance: 100_000.0,
+            ending_balance: 100_250.0,
+            net_profit: 250.0,
+            return_percent: 0.25,
+            trade_count: 10,
+            winning_trades: 6,
+            losing_trades: 4,
+            win_rate: 60.0,
+            profit_factor: Some(1.5),
+            max_drawdown: 100.0,
+            max_drawdown_percent: 0.1,
+            sharpe_ratio: None,
+            expectancy: 25.0,
+            expectancy_r: 0.125,
+            median_r: 0.1,
+        };
+
+        assert_eq!(risk_normalized_expectancy(&metrics), 0.125);
     }
 }

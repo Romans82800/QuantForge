@@ -6,12 +6,18 @@ use crate::databank::{
     DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
 };
 use quantforge_data::{
-    BarDataset, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
+    BarDataset, bar_content_hash, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes,
+    infer_median_interval_ms,
 };
 use quantforge_discover::{
     ConditionBakeoffConfig, ConditionBakeoffReport, DEFAULT_FX_PACK, Databank, DiscoverConfig,
-    DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, UniversalGrammarConfig,
-    new_databank, run_condition_bakeoff as evolve_condition_bakeoff,
+    DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, TimeframeAblationConfig,
+    TimeframeAblationReport, TimeframeBakeoffConfig, TimeframeBakeoffReport, TimeframeGateConfig,
+    TimeframeRollingWindow, UniversalGrammarConfig, new_databank,
+    run_condition_bakeoff as evolve_condition_bakeoff,
+    run_timeframe_ablation as evolve_timeframe_ablation,
+    run_timeframe_bakeoff as evolve_timeframe_bakeoff,
+    run_timeframe_rolling_ablation as evolve_timeframe_rolling_ablation,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_replacing};
@@ -41,6 +47,7 @@ pub enum DiscoverMode {
 enum DecisionTimeframe {
     H1,
     M15,
+    H4,
 }
 
 impl DecisionTimeframe {
@@ -48,6 +55,7 @@ impl DecisionTimeframe {
         match self {
             Self::H1 => 3_600_000,
             Self::M15 => 900_000,
+            Self::H4 => 14_400_000,
         }
     }
 }
@@ -393,6 +401,158 @@ pub struct ConditionBakeoffRequest {
     history_start_year: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeframeBakeoffRequest {
+    data_path: String,
+    metadata_path: Option<String>,
+    source_timezone: Option<String>,
+    m1_data_path: String,
+    m1_metadata_path: Option<String>,
+    m1_source_timezone: Option<String>,
+    broker_path: String,
+    draws_per_cell: usize,
+    seed: u64,
+    minimum_trades: usize,
+    minimum_return_percent: f64,
+    minimum_profit_factor: f64,
+    maximum_drawdown_percent: f64,
+    oos1_retention: f64,
+    commission_per_lot_round_turn: f64,
+    slippage_points_per_side: f64,
+    fallback_spread_points: Option<f64>,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+    minimum_entry_conditions: usize,
+    maximum_entry_conditions: usize,
+    minimum_exit_conditions: usize,
+    maximum_exit_conditions: usize,
+    #[serde(default)]
+    history_start_year: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeframeAblationRequest {
+    #[serde(flatten)]
+    base: TimeframeBakeoffRequest,
+    #[serde(default)]
+    h1_gates: Option<TimeframeGateConfig>,
+    #[serde(default)]
+    h4_gates: Option<TimeframeGateConfig>,
+}
+
+struct TimeframeComparisonData {
+    h1_is: BarDataset,
+    h1_oos1: BarDataset,
+    h1_sealed: BarDataset,
+    h4_is: BarDataset,
+    h4_oos1: BarDataset,
+    h4_sealed: BarDataset,
+    broker: quantforge_broker::SymbolSpecification,
+}
+
+fn load_timeframe_comparison_data(
+    request: &TimeframeBakeoffRequest,
+) -> Result<TimeframeComparisonData, String> {
+    if request.minimum_entry_conditions > request.maximum_entry_conditions
+        || request.minimum_exit_conditions > request.maximum_exit_conditions
+    {
+        return Err(
+            "timeframe bakeoff minimum grammar bounds must not exceed maximum bounds".into(),
+        );
+    }
+    if request.validation_fraction <= 0.0 {
+        return Err("timeframe bakeoff requires a non-zero OOS1 reserve".into());
+    }
+    let mut loaded = load_data_source(
+        &request.data_path,
+        request.metadata_path.as_deref(),
+        request.source_timezone.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut m1_loaded = load_data_source(
+        &request.m1_data_path,
+        request.m1_metadata_path.as_deref(),
+        request.m1_source_timezone.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let history_start_year = request
+        .history_start_year
+        .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR);
+    let quote_path = infer_quote_path(&request.m1_data_path);
+    let mut quote_dataset = quote_path
+        .as_ref()
+        .map(|path| load_quote_sidecar(path, m1_loaded.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut loaded.dataset,
+        &mut m1_loaded.dataset,
+        quote_dataset.as_mut(),
+        history_start_year,
+    )?;
+    let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
+    load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
+    let (validation_fraction, sealed_fraction) =
+        normalize_split_fractions(request.validation_fraction, request.sealed_fraction)?;
+    let h1_decision = match quote_dataset.as_ref() {
+        Some(quotes) => build_decision_from_m1_quotes(
+            &m1_loaded.dataset,
+            Some(&loaded.dataset),
+            quotes,
+            broker.point,
+        )?,
+        None => build_decision_from_m1(&m1_loaded.dataset, Some(&loaded.dataset))?,
+    };
+    let h4_decision = match quote_dataset.as_ref() {
+        Some(quotes) => build_timeframe_from_m1_with_quotes(
+            &m1_loaded.dataset,
+            quotes,
+            broker.point,
+            DecisionTimeframe::H4.interval_ms(),
+            None,
+        )
+        .map_err(|error| error.to_string())?,
+        None => build_timeframe_from_m1(
+            &m1_loaded.dataset,
+            DecisionTimeframe::H4.interval_ms(),
+            None,
+        )
+        .map_err(|error| error.to_string())?,
+    };
+    Ok(TimeframeComparisonData {
+        h1_is: development_partition(&h1_decision, validation_fraction, sealed_fraction)?,
+        h1_oos1: oos1_partition(&h1_decision, validation_fraction, sealed_fraction)?,
+        h1_sealed: sealed_partition(&h1_decision, validation_fraction, sealed_fraction)?,
+        h4_is: development_partition(&h4_decision, validation_fraction, sealed_fraction)?,
+        h4_oos1: oos1_partition(&h4_decision, validation_fraction, sealed_fraction)?,
+        h4_sealed: sealed_partition(&h4_decision, validation_fraction, sealed_fraction)?,
+        broker,
+    })
+}
+
+fn timeframe_scout(request: &TimeframeBakeoffRequest) -> ScoutConfig {
+    let mut scout = ScoutConfig::default();
+    scout.costs = CostModel {
+        commission_per_lot_round_turn: request.commission_per_lot_round_turn,
+        adverse_slippage_points_per_side: request.slippage_points_per_side,
+        fallback_spread_points: request.fallback_spread_points,
+        ..scout.costs
+    };
+    scout
+}
+
+fn timeframe_gate_from_request(request: &TimeframeBakeoffRequest) -> TimeframeGateConfig {
+    TimeframeGateConfig {
+        minimum_trades: request.minimum_trades,
+        minimum_return_percent: request.minimum_return_percent,
+        minimum_profit_factor: request.minimum_profit_factor,
+        maximum_drawdown_percent: request.maximum_drawdown_percent,
+        oos1_retention: request.oos1_retention,
+    }
+}
+
 #[tauri::command]
 pub fn run_condition_bakeoff(
     request: ConditionBakeoffRequest,
@@ -461,6 +621,74 @@ pub fn run_condition_bakeoff(
 }
 
 #[tauri::command]
+pub fn run_timeframe_bakeoff(
+    request: TimeframeBakeoffRequest,
+) -> Result<TimeframeBakeoffReport, String> {
+    let data = load_timeframe_comparison_data(&request)?;
+    let config = TimeframeBakeoffConfig {
+        seed: request.seed,
+        draws_per_cell: request.draws_per_cell.max(1),
+        entry_condition_counts: (request.minimum_entry_conditions
+            ..=request.maximum_entry_conditions)
+            .collect(),
+        exit_condition_counts: (request.minimum_exit_conditions..=request.maximum_exit_conditions)
+            .collect(),
+        scout: timeframe_scout(&request),
+        minimum_trades: request.minimum_trades,
+        minimum_return_percent: request.minimum_return_percent,
+        minimum_profit_factor: request.minimum_profit_factor,
+        maximum_drawdown_percent: request.maximum_drawdown_percent,
+        oos1_retention: request.oos1_retention,
+    };
+    evolve_timeframe_bakeoff(
+        &data.h1_is,
+        &data.h1_oos1,
+        &data.h4_is,
+        &data.h4_oos1,
+        &data.broker,
+        config,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn run_timeframe_ablation(
+    request: TimeframeAblationRequest,
+) -> Result<TimeframeAblationReport, String> {
+    let data = load_timeframe_comparison_data(&request.base)?;
+    let shared_gates = timeframe_gate_from_request(&request.base);
+    let config = TimeframeAblationConfig {
+        seed: request.base.seed,
+        draws_per_cell: request.base.draws_per_cell.max(1),
+        entry_condition_counts: (request.base.minimum_entry_conditions
+            ..=request.base.maximum_entry_conditions)
+            .collect(),
+        exit_condition_counts: (request.base.minimum_exit_conditions
+            ..=request.base.maximum_exit_conditions)
+            .collect(),
+        scout: timeframe_scout(&request.base),
+        h1_gates: request
+            .h1_gates
+            .clone()
+            .unwrap_or_else(|| shared_gates.clone()),
+        h4_gates: request
+            .h4_gates
+            .clone()
+            .unwrap_or_else(|| shared_gates.clone()),
+        shared_gates,
+    };
+    evolve_timeframe_ablation(
+        &data.h1_is,
+        &data.h1_oos1,
+        &data.h4_is,
+        &data.h4_oos1,
+        &data.broker,
+        config,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn start_discover(
     mut request: DiscoverRequest,
     state: State<'_, DiscoverState>,
@@ -470,14 +698,15 @@ pub fn start_discover(
         request.databank_path = automatic_databank_path(&request)?;
     }
     validate_request(&request)?;
-    if request
-        .run_mode
-        .as_deref()
-        .and_then(parse_run_mode)
+    if request.run_mode.as_deref().and_then(parse_run_mode)
         == Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
     {
-        request.target_databank_elites =
-            Some(request.target_databank_elites.unwrap_or(400).clamp(40, 10_000));
+        request.target_databank_elites = Some(
+            request
+                .target_databank_elites
+                .unwrap_or(400)
+                .clamp(40, 10_000),
+        );
     }
     {
         let current = state
@@ -593,8 +822,11 @@ pub fn start_discover(
                     let factory = crate::databank::HoldingBatteryRequest {
                         fingerprints: Vec::new(),
                         ranked: true,
-                        shrink_first: true,
-                        max_correlation: request.factory_max_correlation,
+                        // Correlation shrinking is a separate, explicit
+                        // Holding action. An automatic full battery must not
+                        // silently reduce the cohort before testing it.
+                        shrink_first: false,
+                        max_correlation: None,
                         queue_limit: factory_queue,
                         target_databank: factory_target,
                     };
@@ -607,10 +839,10 @@ pub fn start_discover(
                             if let Ok(mut view) = job.write() {
                                 let factory_note = match factory_target {
                                     Some(n) => format!(
-                                        "Factory started: shrink Holding, then battery until {n} Databank names."
+                                        "Factory started: battery the Holding queue until {n} Databank names."
                                     ),
                                     None => {
-                                        "Factory started: shrink Holding, then battery everyone left after shrink."
+                                        "Factory started: battery everyone in the current Holding queue."
                                             .to_owned()
                                     }
                                 };
@@ -619,10 +851,8 @@ pub fn start_discover(
                         }
                         Err(error) => {
                             if let Ok(mut view) = job.write() {
-                                view.message = format!(
-                                    "{}. Factory did not start: {error}",
-                                    view.message
-                                );
+                                view.message =
+                                    format!("{}. Factory did not start: {error}", view.message);
                             }
                         }
                     }
@@ -682,6 +912,7 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
     let timeframe = match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
         DecisionTimeframe::H1 => "H1",
         DecisionTimeframe::M15 => "M15",
+        DecisionTimeframe::H4 => "H4",
     };
     let history_year = request
         .history_start_year
@@ -784,7 +1015,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         let broker = load_bound_broker(&request.broker_path, None)?;
         validate_selected_symbol(request.selected_symbol.as_deref(), &broker.symbol)?;
     }
-        if request.mode == DiscoverMode::New {
+    if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
             validate_universal_grammar(grammar)?;
         }
@@ -796,7 +1027,8 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             }
         }
         if let Some(year) = request.history_start_year {
-            quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
+            quantforge_data::normalize_history_start_year(year)
+                .map_err(|error| error.to_string())?;
         }
         let validation = request
             .validation_fraction
@@ -894,7 +1126,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
 }
 
 /// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
-/// pack. Decision-timeframe paths are allowed here because H1/M15 packs are
+/// pack. Decision-timeframe paths are allowed here because H1/M15/H4 packs are
 /// derived from the same M1 stream and therefore share its sibling sidecar.
 pub fn infer_quote_path_public(m1_path: &str) -> Option<PathBuf> {
     infer_quote_path(m1_path)
@@ -904,7 +1136,7 @@ fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
     let path = Path::new(m1_path);
     let stem = path.file_stem()?.to_str()?;
     let mut candidates = vec![path.with_file_name(format!("{stem}.quotes.csv"))];
-    for suffix in ["_H1", "_M15"] {
+    for suffix in ["_H1", "_M15", "_H4"] {
         if let Some(base) = stem.strip_suffix(suffix) {
             candidates.push(path.with_file_name(format!("{base}_M1.quotes.csv")));
         }
@@ -914,6 +1146,18 @@ fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
         candidates.push(path.with_file_name(format!("{symbol}_M1.quotes.csv")));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn requested_multi_symbol_minimum_pass(
+    request: &DiscoverRequest,
+    continued_artifact: Option<&EvolveArtifact>,
+) -> usize {
+    match (&request.mode, continued_artifact) {
+        (DiscoverMode::Continue, Some(artifact)) => {
+            artifact.databank.config.multi_symbol_minimum_pass
+        }
+        _ => request.multi_symbol_minimum_pass.unwrap_or(0),
+    }
 }
 
 fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMetadata>) -> bool {
@@ -1030,17 +1274,17 @@ fn run_discovery(
                 )?,
                 None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
             },
-            DecisionTimeframe::M15 => match quote_dataset.as_ref() {
+            DecisionTimeframe::M15 | DecisionTimeframe::H4 => match quote_dataset.as_ref() {
                 Some(quotes) => quantforge_data::build_timeframe_from_m1_with_quotes(
                     &m1.dataset,
                     quotes,
                     broker.point,
-                    DecisionTimeframe::M15.interval_ms(),
+                    decision_timeframe.interval_ms(),
                     None,
                 )
                 .map_err(|error| error.to_string())?,
                 None => {
-                    build_timeframe_from_m1(&m1.dataset, DecisionTimeframe::M15.interval_ms(), None)
+                    build_timeframe_from_m1(&m1.dataset, decision_timeframe.interval_ms(), None)
                         .map_err(|error| error.to_string())?
                 }
             },
@@ -1094,15 +1338,24 @@ fn run_discovery(
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
     // Search uses every bar except the sealed holdout. OOS1 is not a pick gate.
     let m1_eval = &m1.dataset;
-    let pack = load_fx_pack(
-        request.pack_data_dir.as_deref(),
-        &broker.symbol,
-        validation_fraction,
-        sealed_fraction,
-        promotion_split || request.mode == DiscoverMode::Continue,
-        &decision_timeframe,
-        history_start_year,
-    )?;
+    // A pack is deliberately opt-in. Merely selecting a pack directory must
+    // not add several extra full strategy replays to every scout candidate.
+    // Continuations retain the immutable gate stored in the databank.
+    let multi_symbol_minimum_pass =
+        requested_multi_symbol_minimum_pass(&request, continued_artifact.as_ref());
+    let pack = if multi_symbol_minimum_pass > 0 {
+        load_fx_pack(
+            request.pack_data_dir.as_deref(),
+            &broker.symbol,
+            validation_fraction,
+            sealed_fraction,
+            promotion_split || request.mode == DiscoverMode::Continue,
+            &decision_timeframe,
+            history_start_year,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let (mut bank, continuation_recipe_hash, starting_generation) = match request.mode {
         DiscoverMode::New => {
@@ -1117,15 +1370,6 @@ fn run_discovery(
             if !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
                 // Indices, oil, crypto and metals cannot pass the FX identical-parameter screen.
                 config.multi_symbol_minimum_pass = 0;
-            } else if !pack.is_empty()
-                && config.multi_symbol_minimum_pass == 0
-                && request.multi_symbol_minimum_pass.is_none()
-                && config.run_mode != quantforge_discover::DiscoverRunMode::QuotaHarvest
-            {
-                // Default to 6-of-N when a pack is supplied and the UI left the gate unset.
-                // Quota Harvest skips this: six extra H1 replays per candidate is why
-                // Looked-at crawls versus a single-symbol scout.
-                config.multi_symbol_minimum_pass = 6.min(pack.len() + 1);
             }
             let bank = new_databank(new_dataset, m1_eval, &broker, config)
                 .map_err(|error| error.to_string())?;
@@ -1207,11 +1451,12 @@ fn run_discovery(
             .map_err(|error| error.to_string())?;
 
     if request.mode == DiscoverMode::New && bank.evaluation_count == 0 {
-        let mut on_progress = |evaluated: &Databank| -> Result<bool, quantforge_discover::DiscoverError> {
-            update_bank(job, evaluated, 0, soft_budget, run_until_stopped, &clock)
-                .map_err(quantforge_discover::DiscoverError::InvalidConfig)?;
-            Ok(!stop.load(Ordering::SeqCst))
-        };
+        let mut on_progress =
+            |evaluated: &Databank| -> Result<bool, quantforge_discover::DiscoverError> {
+                update_bank(job, evaluated, 0, soft_budget, run_until_stopped, &clock)
+                    .map_err(quantforge_discover::DiscoverError::InvalidConfig)?;
+                Ok(!stop.load(Ordering::SeqCst))
+            };
         session
             .seed_initial_population(
                 &mut bank,
@@ -2165,9 +2410,7 @@ fn normalize_split_fractions(
         || !(0.0..=0.4).contains(&validation_fraction)
         || !(0.05..=0.4).contains(&sealed_fraction)
     {
-        return Err(
-            "OOS1 reserve must be 0–40% and sealed holdout must be 5–40%".into(),
-        );
+        return Err("OOS1 reserve must be 0–40% and sealed holdout must be 5–40%".into());
     }
     let validation = validation_fraction;
     let sealed = sealed_fraction;
@@ -2223,6 +2466,21 @@ fn oos1_partition(
     let start = plan.development.bar_count;
     let end = start + plan.validation.bar_count;
     slice_partition(dataset, start, end)
+}
+
+fn sealed_partition(
+    dataset: &BarDataset,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<BarDataset, String> {
+    let plan = quantforge_quality::DataSplitPlan::chronological(
+        dataset,
+        validation_fraction,
+        sealed_fraction,
+    )
+    .map_err(|error| error.to_string())?;
+    let start = plan.development.bar_count + plan.validation.bar_count;
+    slice_partition(dataset, start, dataset.bars.len())
 }
 
 fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<BarDataset, String> {
@@ -2397,9 +2655,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
-        minimum_development_expectancy_r: request
-            .minimum_development_expectancy_r
-            .unwrap_or(0.25),
+        minimum_development_expectancy_r: request.minimum_development_expectancy_r.unwrap_or(0.25),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
         allow_break_even: request.allow_break_even.unwrap_or(false),
@@ -2893,6 +3149,18 @@ mod tests {
     }
 
     #[test]
+    fn cross_symbol_screen_is_opt_in_for_new_jobs() {
+        let directory = tempdir().expect("temp directory");
+        let mut request = request(directory.path().join("bank.json").display().to_string());
+        request.pack_data_dir = Some("/unused-pack-directory".into());
+        request.multi_symbol_minimum_pass = None;
+        assert_eq!(requested_multi_symbol_minimum_pass(&request, None), 0);
+
+        request.multi_symbol_minimum_pass = Some(6);
+        assert_eq!(requested_multi_symbol_minimum_pass(&request, None), 6);
+    }
+
+    #[test]
     fn continuation_rejects_new_search_overrides() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("bank.json");
@@ -3017,10 +3285,9 @@ mod tests {
             None,
         )
         .expect("fixture should load");
-        let unsealed = unsealed_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
-            .expect("unsealed");
-        let development = development_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
-            .expect("development");
+        let unsealed = unsealed_partition(&loaded.dataset, 0.0, 1.0 / 3.0).expect("unsealed");
+        let development =
+            development_partition(&loaded.dataset, 0.0, 1.0 / 3.0).expect("development");
         assert_eq!(unsealed.data_hash, development.data_hash);
         assert_eq!(unsealed.bars.len(), development.bars.len());
     }
@@ -3185,5 +3452,737 @@ mod tests {
         assert_eq!(built.bars.len(), 1);
         assert!((built.bars[0].high - 1.2).abs() < 1e-9);
         assert_eq!(built.bars[0].tick_volume, 59);
+    }
+
+    #[test]
+    fn h4_is_a_four_hour_decision_lane() {
+        use quantforge_data::Bar;
+        let bars = vec![
+            Bar {
+                timestamp_ms: 0,
+                open: 1.0,
+                high: 1.1,
+                low: 0.9,
+                close: 1.05,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: None,
+            },
+            Bar {
+                timestamp_ms: DecisionTimeframe::H4.interval_ms(),
+                open: 1.05,
+                high: 1.15,
+                low: 1.0,
+                close: 1.1,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: None,
+            },
+        ];
+        let dataset = BarDataset {
+            data_hash: bar_content_hash(&bars),
+            source_rows: bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars,
+        };
+
+        assert_eq!(DecisionTimeframe::H4.interval_ms(), 14_400_000);
+        assert_eq!(decision_timeframe_label(&dataset).unwrap(), "H4");
+    }
+
+    #[test]
+    fn real_pack_timeframe_bakeoff_smoke_when_requested() {
+        let Ok(root) = std::env::var("QF_TIMEFRAME_BAKEOFF_PACK") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let request = TimeframeBakeoffRequest {
+            data_path: root
+                .join("ICMarketsSC-Demo_EURUSD_H1_2016_present.tsv")
+                .display()
+                .to_string(),
+            metadata_path: Some(
+                root.join("ICMarketsSC-Demo_EURUSD_H1_2016_present.metadata.csv")
+                    .display()
+                    .to_string(),
+            ),
+            source_timezone: None,
+            m1_data_path: root
+                .join("ICMarketsSC-Demo_EURUSD_M1_2016_present.tsv")
+                .display()
+                .to_string(),
+            m1_metadata_path: Some(
+                root.join("ICMarketsSC-Demo_EURUSD_M1_2016_present.metadata.csv")
+                    .display()
+                    .to_string(),
+            ),
+            m1_source_timezone: None,
+            broker_path: root.join("EURUSD.broker.json").display().to_string(),
+            draws_per_cell: 20,
+            seed: 42,
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+            commission_per_lot_round_turn: 7.0,
+            slippage_points_per_side: 0.0,
+            fallback_spread_points: None,
+            validation_fraction: 0.2,
+            sealed_fraction: 1.0 / 3.0,
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 2,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 1,
+            history_start_year: Some(2016),
+        };
+        let report = run_timeframe_bakeoff(request).expect("real pack bakeoff should run");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.pair.paired_comparisons, 20);
+    }
+
+    #[test]
+    fn real_pack_timeframe_ablation_smoke_when_requested() {
+        let Ok(root) = std::env::var("QF_TIMEFRAME_ABLATION_PACK") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let request = TimeframeBakeoffRequest {
+            data_path: root
+                .join("ICMarketsSC-Demo_EURUSD_H1_2016_present.tsv")
+                .display()
+                .to_string(),
+            metadata_path: Some(
+                root.join("ICMarketsSC-Demo_EURUSD_H1_2016_present.metadata.csv")
+                    .display()
+                    .to_string(),
+            ),
+            source_timezone: None,
+            m1_data_path: root
+                .join("ICMarketsSC-Demo_EURUSD_M1_2016_present.tsv")
+                .display()
+                .to_string(),
+            m1_metadata_path: Some(
+                root.join("ICMarketsSC-Demo_EURUSD_M1_2016_present.metadata.csv")
+                    .display()
+                    .to_string(),
+            ),
+            m1_source_timezone: None,
+            broker_path: root.join("EURUSD.broker.json").display().to_string(),
+            draws_per_cell: 100,
+            seed: 42,
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+            commission_per_lot_round_turn: 7.0,
+            slippage_points_per_side: 0.0,
+            fallback_spread_points: None,
+            validation_fraction: 0.2,
+            sealed_fraction: 1.0 / 3.0,
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 2,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 1,
+            history_start_year: Some(2016),
+        };
+        let report = run_timeframe_ablation(TimeframeAblationRequest {
+            base: request,
+            h1_gates: None,
+            h4_gates: Some(TimeframeGateConfig {
+                minimum_trades: 20,
+                minimum_return_percent: 0.0,
+                minimum_profit_factor: 1.0,
+                maximum_drawdown_percent: 25.0,
+                oos1_retention: 0.7,
+            }),
+        })
+        .expect("real pack timeframe ablation should run");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        assert_eq!(report.rows.len(), 26);
+        assert_eq!(report.comparisons.len(), 13);
+        assert!(
+            report
+                .comparisons
+                .iter()
+                .all(|comparison| comparison.paired_comparisons == 100)
+        );
+    }
+
+    #[test]
+    fn real_pack_timeframe_walk_forward_selection_smoke_when_requested() {
+        let Ok(root) = std::env::var("QF_TIMEFRAME_WALK_FORWARD_PACK") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let symbol = std::env::var("QF_TIMEFRAME_WALK_FORWARD_SYMBOL")
+            .unwrap_or_else(|_| "EURUSD".into())
+            .to_ascii_uppercase();
+        let seed = std::env::var("QF_TIMEFRAME_WALK_FORWARD_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(42);
+        let request = TimeframeBakeoffRequest {
+            data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            source_timezone: None,
+            m1_data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            m1_metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            m1_source_timezone: None,
+            broker_path: root
+                .join(format!("{symbol}.broker.json"))
+                .display()
+                .to_string(),
+            draws_per_cell: 100,
+            seed,
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+            commission_per_lot_round_turn: 7.0,
+            slippage_points_per_side: 0.0,
+            fallback_spread_points: None,
+            validation_fraction: 0.2,
+            sealed_fraction: 1.0 / 3.0,
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 2,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 1,
+            history_start_year: Some(2016),
+        };
+        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
+        let shared_gates = timeframe_gate_from_request(&request);
+        let h4_gates = TimeframeGateConfig {
+            minimum_trades: 20,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 25.0,
+            oos1_retention: 0.7,
+        };
+        let config = TimeframeAblationConfig {
+            seed: request.seed,
+            draws_per_cell: request.draws_per_cell,
+            entry_condition_counts: vec![2],
+            exit_condition_counts: vec![1],
+            scout: timeframe_scout(&request),
+            h1_gates: shared_gates.clone(),
+            h4_gates: h4_gates.clone(),
+            shared_gates,
+        };
+        let h1_start = data
+            .h1_is
+            .bars
+            .first()
+            .expect("H1 development bars")
+            .timestamp_ms;
+        let h1_len = data.h1_is.bars.len();
+        let origins = [
+            ("origin_1", 0.45_f64, 0.60_f64),
+            ("origin_2", 0.55_f64, 0.70_f64),
+            ("origin_3", 0.65_f64, 0.80_f64),
+        ];
+        let mut summary = Vec::new();
+        for (label, train_fraction, validation_end_fraction) in origins {
+            let train_end_index = (h1_len as f64 * train_fraction).round() as usize;
+            let validation_end_index = (h1_len as f64 * validation_end_fraction).round() as usize;
+            let validation_start = data.h1_is.bars[train_end_index].timestamp_ms;
+            let validation_end = data.h1_is.bars[validation_end_index].timestamp_ms;
+            let h1_train = slice_timestamp_window(&data.h1_is, h1_start, validation_start);
+            let h1_validation =
+                slice_timestamp_window(&data.h1_is, validation_start, validation_end);
+            let h4_train = slice_timestamp_window(&data.h4_is, h1_start, validation_start);
+            let h4_validation =
+                slice_timestamp_window(&data.h4_is, validation_start, validation_end);
+            let report = evolve_timeframe_ablation(
+                &h1_train,
+                &h1_validation,
+                &h4_train,
+                &h4_validation,
+                &data.broker,
+                config.clone(),
+            )
+            .expect("inner walk-forward ablation should run");
+            let row = |mode: quantforge_discover::TimeframeSelectionMode, timeframe: &str| {
+                report
+                    .rows
+                    .iter()
+                    .find(|row| row.selection_mode == mode && row.timeframe == timeframe)
+                    .expect("walk-forward row exists")
+            };
+            let h4_drawdown = row(
+                quantforge_discover::TimeframeSelectionMode::DrawdownOnly,
+                "H4",
+            );
+            let h4_drawdown_top_k = row(
+                quantforge_discover::TimeframeSelectionMode::DrawdownTopK,
+                "H4",
+            );
+            let h4_fold = row(
+                quantforge_discover::TimeframeSelectionMode::MedianFoldExpectancyTopK,
+                "H4",
+            );
+            let h4_expectancy = row(
+                quantforge_discover::TimeframeSelectionMode::ExpectancyTopK,
+                "H4",
+            );
+            let h4_shared = row(
+                quantforge_discover::TimeframeSelectionMode::SharedGates,
+                "H4",
+            );
+            let h4_random = row(
+                quantforge_discover::TimeframeSelectionMode::RandomTopK,
+                "H4",
+            );
+            summary.push(json!({
+                "seed": request.seed,
+                "origin": label,
+                "trainBarsH1": h1_train.bars.len(),
+                "validationBarsH1": h1_validation.bars.len(),
+                "h4SharedLiftR": h4_shared.selected_future_expectancy_lift_r,
+                "h4DrawdownLiftR": h4_drawdown.selected_future_expectancy_lift_r,
+                "h4DrawdownTopKLiftR": h4_drawdown_top_k.selected_future_expectancy_lift_r,
+                "h4FoldExpectancyTopKLiftR": h4_fold.selected_future_expectancy_lift_r,
+                "h4ExpectancyTopKLiftR": h4_expectancy.selected_future_expectancy_lift_r,
+                "h4RandomTopKLiftR": h4_random.selected_future_expectancy_lift_r,
+                "h4DrawdownSelected": h4_drawdown.selected,
+                "h4DrawdownTopKSelected": h4_drawdown_top_k.selected,
+                "h4FoldSelected": h4_fold.selected,
+                "h4RandomTopKSelected": h4_random.selected,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+        assert_eq!(summary.len(), 3);
+    }
+
+    #[test]
+    fn real_pack_timeframe_sealed_evaluation_smoke_when_requested() {
+        let Ok(root) = std::env::var("QF_TIMEFRAME_SEALED_EVAL_PACK") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let symbol = std::env::var("QF_TIMEFRAME_SEALED_EVAL_SYMBOL")
+            .unwrap_or_else(|_| "EURUSD".into())
+            .to_ascii_uppercase();
+        let seed = std::env::var("QF_TIMEFRAME_SEALED_EVAL_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(42);
+        let request = TimeframeBakeoffRequest {
+            data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            source_timezone: None,
+            m1_data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            m1_metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            m1_source_timezone: None,
+            broker_path: root
+                .join(format!("{symbol}.broker.json"))
+                .display()
+                .to_string(),
+            draws_per_cell: 100,
+            seed,
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+            commission_per_lot_round_turn: 7.0,
+            slippage_points_per_side: 0.0,
+            fallback_spread_points: None,
+            validation_fraction: 0.2,
+            sealed_fraction: 1.0 / 3.0,
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 2,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 1,
+            history_start_year: Some(2016),
+        };
+        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
+        let shared_gates = timeframe_gate_from_request(&request);
+        let h4_gates = TimeframeGateConfig {
+            minimum_trades: 20,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 25.0,
+            oos1_retention: 0.7,
+        };
+        let config = TimeframeAblationConfig {
+            seed: request.seed,
+            draws_per_cell: request.draws_per_cell,
+            entry_condition_counts: vec![2],
+            exit_condition_counts: vec![1],
+            scout: timeframe_scout(&request),
+            h1_gates: shared_gates.clone(),
+            h4_gates,
+            shared_gates,
+        };
+        let report = evolve_timeframe_ablation(
+            &data.h1_is,
+            &data.h1_sealed,
+            &data.h4_is,
+            &data.h4_sealed,
+            &data.broker,
+            config,
+        )
+        .expect("sealed evaluation should run");
+        let row = |mode: quantforge_discover::TimeframeSelectionMode| {
+            report
+                .rows
+                .iter()
+                .find(|row| row.selection_mode == mode && row.timeframe == "H4")
+                .expect("sealed H4 row exists")
+        };
+        let shared = row(quantforge_discover::TimeframeSelectionMode::SharedGates);
+        let drawdown = row(quantforge_discover::TimeframeSelectionMode::DrawdownTopK);
+        let random = row(quantforge_discover::TimeframeSelectionMode::RandomTopK);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "symbol": symbol,
+                "seed": request.seed,
+                "sealedBarsH1": data.h1_sealed.bars.len(),
+                "sealedBarsH4": data.h4_sealed.bars.len(),
+                "sharedSelected": shared.selected,
+                "sharedSelectedSealedExpectancyR": shared.selected_oos1_expectancy_r,
+                "sharedUnselectedSealedExpectancyR": shared.unselected_oos1_expectancy_r,
+                "sharedSealedLiftR": shared.selected_future_expectancy_lift_r,
+                "drawdownTopKSelected": drawdown.selected,
+                "drawdownTopKSelectedSealedExpectancyR": drawdown.selected_oos1_expectancy_r,
+                "drawdownTopKUnselectedSealedExpectancyR": drawdown.unselected_oos1_expectancy_r,
+                "drawdownTopKSealedLiftR": drawdown.selected_future_expectancy_lift_r,
+                "randomTopKSelected": random.selected,
+                "randomTopKSelectedSealedExpectancyR": random.selected_oos1_expectancy_r,
+                "randomTopKUnselectedSealedExpectancyR": random.unselected_oos1_expectancy_r,
+                "randomTopKSealedLiftR": random.selected_future_expectancy_lift_r,
+            }))
+            .unwrap()
+        );
+        assert!(drawdown.selected <= shared.selected);
+        assert!(random.selected <= shared.selected);
+    }
+
+    #[test]
+    fn real_pack_timeframe_rolling_benchmark_smoke_when_requested() {
+        let Ok(root) = std::env::var("QF_TIMEFRAME_ROLLING_PACK") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let symbol = std::env::var("QF_TIMEFRAME_ROLLING_SYMBOL")
+            .unwrap_or_else(|_| "EURUSD".into())
+            .to_ascii_uppercase();
+        let seed = std::env::var("QF_TIMEFRAME_ROLLING_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(7);
+        let draws_per_cell = std::env::var("QF_TIMEFRAME_ROLLING_DRAWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50);
+        let request = TimeframeBakeoffRequest {
+            data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            source_timezone: None,
+            m1_data_path: root
+                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
+                .display()
+                .to_string(),
+            m1_metadata_path: Some(
+                root.join(format!(
+                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
+                ))
+                .display()
+                .to_string(),
+            ),
+            m1_source_timezone: None,
+            broker_path: root
+                .join(format!("{symbol}.broker.json"))
+                .display()
+                .to_string(),
+            draws_per_cell,
+            seed,
+            minimum_trades: 10,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 40.0,
+            oos1_retention: 0.7,
+            commission_per_lot_round_turn: 7.0,
+            slippage_points_per_side: 0.0,
+            fallback_spread_points: None,
+            validation_fraction: 0.2,
+            sealed_fraction: 1.0 / 3.0,
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 2,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 1,
+            history_start_year: Some(2016),
+        };
+        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
+        let shared_gates = timeframe_gate_from_request(&request);
+        let config = TimeframeAblationConfig {
+            seed: request.seed,
+            draws_per_cell: request.draws_per_cell,
+            entry_condition_counts: vec![2],
+            exit_condition_counts: vec![1],
+            scout: timeframe_scout(&request),
+            h1_gates: shared_gates.clone(),
+            h4_gates: TimeframeGateConfig {
+                minimum_trades: 20,
+                minimum_return_percent: 0.0,
+                minimum_profit_factor: 1.0,
+                maximum_drawdown_percent: 25.0,
+                oos1_retention: 0.7,
+            },
+            shared_gates,
+        };
+        let h1_start = data
+            .h1_is
+            .bars
+            .first()
+            .expect("development bars")
+            .timestamp_ms;
+        let h1_len = data.h1_is.bars.len();
+        let origins = [
+            ("origin_1", 0.25_f64),
+            ("origin_2", 0.35_f64),
+            ("origin_3", 0.45_f64),
+            ("origin_4", 0.55_f64),
+            ("origin_5", 0.65_f64),
+        ];
+        let horizons = [("3m", 3_u32), ("6m", 6_u32), ("12m", 12_u32)];
+        let mut all_rows = Vec::new();
+        for (origin, train_fraction) in origins {
+            let train_end_index = (h1_len as f64 * train_fraction).round() as usize;
+            let validation_start = data.h1_is.bars[train_end_index].timestamp_ms;
+            let h4_train = slice_timestamp_window(&data.h4_is, h1_start, validation_start);
+            let mut validation_sets = Vec::new();
+            for (horizon, horizon_months) in horizons {
+                let validation_end_timestamp =
+                    add_calendar_months(validation_start, horizon_months);
+                let validation_end_index = data
+                    .h1_is
+                    .bars
+                    .partition_point(|bar| bar.timestamp_ms < validation_end_timestamp);
+                assert!(
+                    validation_end_index > train_end_index,
+                    "rolling validation window must contain bars"
+                );
+                let validation_end = if validation_end_index < h1_len {
+                    data.h1_is.bars[validation_end_index].timestamp_ms
+                } else {
+                    data.h1_is.bars.last().unwrap().timestamp_ms + 1
+                };
+                let h1_validation =
+                    slice_timestamp_window(&data.h1_is, validation_start, validation_end);
+                let h4_validation =
+                    slice_timestamp_window(&data.h4_is, validation_start, validation_end);
+                validation_sets.push((format!("{origin}_{horizon}"), h1_validation, h4_validation));
+            }
+            let windows = validation_sets
+                .iter()
+                .map(|(label, h1, h4)| TimeframeRollingWindow {
+                    label: label.clone(),
+                    h1,
+                    h4,
+                })
+                .collect::<Vec<_>>();
+            let report = evolve_timeframe_rolling_ablation(
+                &h4_train,
+                &windows,
+                &data.broker,
+                config.clone(),
+            )
+            .expect("rolling benchmark should run");
+            all_rows.extend(report.rows);
+        }
+
+        let modes = [
+            quantforge_discover::TimeframeSelectionMode::SharedGates,
+            quantforge_discover::TimeframeSelectionMode::RandomTopK,
+            quantforge_discover::TimeframeSelectionMode::DrawdownTopK,
+            quantforge_discover::TimeframeSelectionMode::RecoveryFactorTopK,
+            quantforge_discover::TimeframeSelectionMode::TradesTopK,
+            quantforge_discover::TimeframeSelectionMode::ReturnTopK,
+            quantforge_discover::TimeframeSelectionMode::ProfitFactorTopK,
+            quantforge_discover::TimeframeSelectionMode::SharpeTopK,
+            quantforge_discover::TimeframeSelectionMode::ExpectancyTopK,
+            quantforge_discover::TimeframeSelectionMode::MedianFoldExpectancyTopK,
+            quantforge_discover::TimeframeSelectionMode::ExpectancyTimesTradesTopK,
+            quantforge_discover::TimeframeSelectionMode::ExpectancyTimesSqrtTradesTopK,
+        ];
+        let mean = |values: Vec<f64>| {
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        };
+        let mut horizon_summary = Vec::new();
+        for (horizon, _) in horizons {
+            let mut mode_summary = Vec::new();
+            for mode in modes {
+                let rows = all_rows
+                    .iter()
+                    .filter(|row| row.window.ends_with(horizon) && row.selection_mode == mode)
+                    .collect::<Vec<_>>();
+                let lifts = rows
+                    .iter()
+                    .filter_map(|row| row.selected_future_expectancy_lift_r)
+                    .collect::<Vec<_>>();
+                let selected_future = rows
+                    .iter()
+                    .filter_map(|row| row.selected_future_expectancy_r)
+                    .collect::<Vec<_>>();
+                mode_summary.push(json!({
+                    "mode": format!("{mode:?}"),
+                    "windows": rows.len(),
+                    "meanEligible": mean(rows.iter().map(|row| row.eligible as f64).collect()),
+                    "meanLiftR": mean(lifts.clone()),
+                    "positiveLiftWindows": lifts.iter().filter(|value| **value > 0.0).count(),
+                    "minimumLiftR": lifts.iter().copied().reduce(f64::min),
+                    "meanSelectedFutureExpectancyR": mean(selected_future),
+                    "meanSelectedFutureTrades": mean(rows.iter().filter_map(|row| row.selected_future_trade_count).collect()),
+                }));
+            }
+            let dd_rows = all_rows
+                .iter()
+                .filter(|row| {
+                    row.window.ends_with(horizon)
+                        && row.selection_mode
+                            == quantforge_discover::TimeframeSelectionMode::DrawdownTopK
+                })
+                .collect::<Vec<_>>();
+            let random_rows = all_rows
+                .iter()
+                .filter(|row| {
+                    row.window.ends_with(horizon)
+                        && row.selection_mode
+                            == quantforge_discover::TimeframeSelectionMode::RandomTopK
+                })
+                .collect::<Vec<_>>();
+            let dd_beats_random = dd_rows
+                .iter()
+                .zip(random_rows.iter())
+                .filter(|(dd, random)| {
+                    dd.selected_future_expectancy_lift_r
+                        .unwrap_or(f64::NEG_INFINITY)
+                        > random
+                            .selected_future_expectancy_lift_r
+                            .unwrap_or(f64::NEG_INFINITY)
+                })
+                .count();
+            horizon_summary.push(json!({
+                "horizon": horizon,
+                "ddBeatsRandomWindows": dd_beats_random,
+                "totalWindows": dd_rows.len(),
+                "modes": mode_summary,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "symbol": symbol,
+                "seed": request.seed,
+                "drawsPerCell": request.draws_per_cell,
+                "origins": origins.len(),
+                "horizons": horizons.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+                "summary": horizon_summary,
+            }))
+            .unwrap()
+        );
+        assert_eq!(all_rows.len(), origins.len() * horizons.len() * modes.len());
+    }
+
+    fn add_calendar_months(timestamp_ms: i64, months: u32) -> i64 {
+        use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid rolling timestamp");
+        let total_month = timestamp.year() * 12 + timestamp.month0() as i32 + months as i32;
+        let year = total_month.div_euclid(12);
+        let month = total_month.rem_euclid(12) as u32 + 1;
+        let next_month = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+        };
+        let day = timestamp.day().min(next_month.pred_opt().unwrap().day());
+        let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        Utc.from_utc_datetime(
+            &date
+                .and_hms_milli_opt(
+                    timestamp.hour(),
+                    timestamp.minute(),
+                    timestamp.second(),
+                    timestamp.timestamp_subsec_millis(),
+                )
+                .unwrap(),
+        )
+        .timestamp_millis()
+    }
+
+    fn slice_timestamp_window(dataset: &BarDataset, start_ms: i64, end_ms: i64) -> BarDataset {
+        let bars = dataset
+            .bars
+            .iter()
+            .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms < end_ms)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(bars.len() >= 2, "walk-forward window must contain bars");
+        BarDataset {
+            data_hash: bar_content_hash(&bars),
+            source_rows: bars.len(),
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: dataset.delimiter,
+            source_timezone: dataset.source_timezone.clone(),
+            bars,
+        }
     }
 }

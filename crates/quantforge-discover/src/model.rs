@@ -1797,8 +1797,9 @@ pub struct Databank {
     pub holding: Vec<Elite>,
     #[serde(default)]
     pub holding_coverage_map: BTreeMap<String, ContentHash>,
-    /// Promotion databank: elites that passed Development M1/CPCV/MC/parameter
-    /// robustness and the subsequent OOS1 validation gate. OOS2 is absent.
+    /// Promotion databank. Normal entries passed Development M1/CPCV/MC/parameter
+    /// robustness; explicit desktop bypass entries carry a failed
+    /// `robustness_bypass` gate marker. OOS2 is absent.
     pub elites: Vec<Elite>,
     /// Stable niche string to elite fingerprint, convenient for UI coverage maps.
     pub coverage_map: BTreeMap<String, ContentHash>,

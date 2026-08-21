@@ -1193,7 +1193,8 @@ pub(crate) fn apply_history_start_year(
     dataset: &mut BarDataset,
     year: u16,
 ) -> Result<usize, String> {
-    let year = quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
+    let year =
+        quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
     dataset
         .trim_before_calendar_year(year)
         .map_err(|error| error.to_string())
@@ -1207,7 +1208,8 @@ pub(crate) fn trim_market_history_to_year(
     quotes: Option<&mut QuoteBarDataset>,
     year: u16,
 ) -> Result<usize, String> {
-    let year = quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
+    let year =
+        quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
     let cutoff = quantforge_data::history_start_cutoff_ms(&m1.source_timezone, year)
         .or_else(|_| quantforge_data::history_start_cutoff_ms(&decision.source_timezone, year))
         .map_err(|error| error.to_string())?;
