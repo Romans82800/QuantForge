@@ -32,6 +32,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
+/// Called after a factory promotion has been durably checkpointed.  Discover
+/// uses this to replace its otherwise-finished live snapshot, so its dashboard
+/// cannot keep reporting the pre-battery Holding/Databank counts.
+pub(crate) type FactoryCheckpoint = Arc<dyn Fn(&EvolveArtifact) + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatteryItemView {
@@ -321,7 +326,14 @@ pub fn start_holding_battery_job(
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request, Some(desktop)) {
+        if let Err(error) = run_factory_or_battery(
+            job,
+            stop,
+            snapshot,
+            request,
+            Some(desktop),
+            None,
+        ) {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -445,6 +457,7 @@ pub(crate) fn spawn_factory_from_archive(
     databank_path: String,
     request: HoldingBatteryRequest,
     state: &BatteryJobState,
+    factory_checkpoint: Option<FactoryCheckpoint>,
 ) -> Result<BatteryJobView, String> {
     if state.is_busy()? {
         return Err("a Holding battery job is already running".into());
@@ -491,7 +504,14 @@ pub(crate) fn spawn_factory_from_archive(
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request, None) {
+        if let Err(error) = run_factory_or_battery(
+            job,
+            stop,
+            snapshot,
+            request,
+            None,
+            factory_checkpoint,
+        ) {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -975,8 +995,12 @@ fn checkpoint_battery_promotion(
     snapshot: &mut ArchiveSnapshot,
     desktop: Option<&DesktopState>,
     job: &Arc<RwLock<BatteryJobView>>,
+    factory_checkpoint: Option<&FactoryCheckpoint>,
 ) -> Result<(), String> {
     persist_snapshot(snapshot)?;
+    if let Some(publish) = factory_checkpoint {
+        publish(&snapshot.artifact);
+    }
     let workspace = desktop
         .map(|desktop| reload_workspace_from_path(Path::new(&snapshot.databank_path), desktop))
         .transpose()?;
@@ -996,6 +1020,7 @@ fn run_factory_or_battery(
     mut snapshot: ArchiveSnapshot,
     request: HoldingBatteryRequest,
     desktop: Option<DesktopState>,
+    factory_checkpoint: Option<FactoryCheckpoint>,
 ) -> Result<(), String> {
     let holding_before = snapshot.artifact.databank.holding.len();
     if request.shrink_first {
@@ -1071,7 +1096,15 @@ fn run_factory_or_battery(
         );
     }
 
-    run_battery_job(job, stop, snapshot, fingerprints, target_databank, desktop)
+    run_battery_job(
+        job,
+        stop,
+        snapshot,
+        fingerprints,
+        target_databank,
+        desktop,
+        factory_checkpoint,
+    )
 }
 
 fn shrink_holding_snapshot(
@@ -1128,6 +1161,7 @@ fn run_battery_job(
     fingerprints: Vec<String>,
     target_databank: Option<usize>,
     desktop: Option<DesktopState>,
+    factory_checkpoint: Option<FactoryCheckpoint>,
 ) -> Result<(), String> {
     let started = Instant::now();
     update_phase(
@@ -1391,7 +1425,12 @@ fn run_battery_job(
                 let phase = format!("Promoted {passed}; syncing Databank");
                 update_phase(&job, &phase, "Saved the accepted strategy; starting the next one.");
             }
-            checkpoint_battery_promotion(&mut snapshot, desktop.as_ref(), &job)?;
+            checkpoint_battery_promotion(
+                &mut snapshot,
+                desktop.as_ref(),
+                &job,
+                factory_checkpoint.as_ref(),
+            )?;
             dirty = false;
         }
 
@@ -1401,7 +1440,12 @@ fn run_battery_job(
     }
 
     if dirty {
-        let _ = checkpoint_battery_promotion(&mut snapshot, desktop.as_ref(), &job);
+        let _ = checkpoint_battery_promotion(
+            &mut snapshot,
+            desktop.as_ref(),
+            &job,
+            factory_checkpoint.as_ref(),
+        );
     }
     if let Ok(mut view) = job.write() {
         if view.status == "running" {

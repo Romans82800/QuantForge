@@ -830,10 +830,37 @@ pub fn start_discover(
                         queue_limit: factory_queue,
                         target_databank: factory_target,
                     };
+                    // Discover has already completed by this point, but the
+                    // factory can promote a Holding candidate seconds later.
+                    // Keep the finished dashboard's live snapshot in lockstep
+                    // with each durable factory checkpoint; otherwise it can
+                    // misleadingly keep showing zero Databank strategies.
+                    let factory_live_artifact = Arc::clone(&live_artifact);
+                    let factory_discover_job = Arc::clone(&job);
+                    let factory_checkpoint: crate::holding_battery::FactoryCheckpoint =
+                        Arc::new(move |artifact| {
+                            if let Ok(mut live) = factory_live_artifact.write() {
+                                *live = Some(artifact.clone());
+                            }
+                            if let Ok(mut view) = factory_discover_job.write() {
+                                view.holding_elites = artifact.databank.holding.len();
+                                view.databank_elites = artifact.databank.elites.len();
+                                view.coverage = artifact.databank.coverage();
+                                view.qd_score = artifact.databank.qd_score();
+                                view.live_databank_revision = view
+                                    .live_databank_revision
+                                    .saturating_add(1);
+                                view.message = format!(
+                                    "Factory checkpoint: {} Holding · {} Databank. {}",
+                                    view.holding_elites, view.databank_elites, view.message
+                                );
+                            }
+                        });
                     match crate::holding_battery::spawn_factory_from_archive(
                         request.databank_path.clone(),
                         factory,
                         &battery_state,
+                        Some(factory_checkpoint),
                     ) {
                         Ok(_) => {
                             if let Ok(mut view) = job.write() {
