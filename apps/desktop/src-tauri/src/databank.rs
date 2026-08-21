@@ -1642,6 +1642,10 @@ pub struct HoldingBatteryRequest {
     /// Stop the battery once Databank reaches this many elites. `None` or `0` keeps every passer.
     #[serde(default)]
     pub target_databank: Option<usize>,
+    /// Run the full battery for evidence, then graduate every tested Holding
+    /// candidate whether it passed or failed. Never used by Discover itself.
+    #[serde(default)]
+    pub audit_and_graduate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

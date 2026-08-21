@@ -731,6 +731,30 @@ function App() {
     }
   }
 
+  async function auditAndGraduateHolding() {
+    const holdingCount = workspace?.holding?.length ?? 0;
+    if (holdingCount === 0) return;
+    const confirmed = window.confirm(
+      `Run the full Development/M1 battery on all ${holdingCount} Holding strategies, then move every one to Databank?\n\nPasses and failures will both be retained with their recorded battery result. This does not use OOS2 and does not change Discover search or ranking.`,
+    );
+    if (!confirmed) return;
+    setBatteryBusy(true);
+    setError(null);
+    try {
+      const started = await startHoldingBatteryJob([], {
+        ranked: true,
+        shrinkFirst: false,
+        auditAndGraduate: true,
+      });
+      lastBatteryRevision.current = started.revision;
+      setBatteryJob(started);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBatteryBusy(false);
+    }
+  }
+
   async function runProductionLane() {
     const holdingCount = workspace?.holding?.length ?? 0;
     if (holdingCount === 0) return;
@@ -1152,6 +1176,8 @@ function App() {
                         <p className="eyebrow">
                           {batteryJob.jobKind === "production_lane"
                             ? "H4 Production Lane v1"
+                            : batteryJob.auditAndGraduate
+                              ? "Full robustness audit"
                             : "Holding battery"}
                         </p>
                         <h2>{batteryJob.phase}</h2>
@@ -1164,7 +1190,7 @@ function App() {
                         Funnel {formatNumber(batteryJob.holdingBeforeShrink ?? 0)} Holding
                         → {formatNumber(batteryJob.holdingAfterShrink ?? batteryJob.holdingBeforeShrink ?? 0)} ready
                         → {formatNumber(batteryJob.total)} queued
-                        → {formatNumber(batteryJob.passed)} Databank
+                        → {formatNumber(batteryJob.passed)} {batteryJob.auditAndGraduate ? "passed tests" : "Databank"}
                         {batteryJob.targetDatabank
                           ? ` (stop at ${formatNumber(batteryJob.targetDatabank)})`
                           : ""}
@@ -1177,14 +1203,14 @@ function App() {
                         note={`${formatNumber(batteryJob.queued)} queued · ${formatNumber(batteryJob.running)} running`}
                       />
                       <Kpi
-                        label={batteryJob.jobKind === "production_lane" ? "Selected → Databank" : "Passed → Databank"}
+                        label={batteryJob.jobKind === "production_lane" ? "Selected → Databank" : batteryJob.auditAndGraduate ? "Passed tests" : "Passed → Databank"}
                         value={formatNumber(batteryJob.passed)}
                         note={`${formatNumber(batteryJob.databankElites)} databank elites`}
                       />
                       <Kpi
-                        label="Rejected"
+                        label={batteryJob.auditAndGraduate ? "Failed tests" : "Rejected"}
                         value={formatNumber(batteryJob.rejected)}
-                        note={`${formatNumber(batteryJob.holdingRemaining)} still in Holding`}
+                        note={batteryJob.auditAndGraduate ? "All tested strategies graduate" : `${formatNumber(batteryJob.holdingRemaining)} still in Holding`}
                       />
                       <Kpi
                         label={batteryJob.jobKind === "production_lane" ? "Replays / hour" : "Batteries / hour"}
@@ -1320,6 +1346,23 @@ function App() {
                             {batteryActive && batteryJob?.jobKind !== "production_lane"
                               ? "Factory running…"
                               : "Run full robustness battery"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={
+                              loading
+                              || batteryBusy
+                              || batteryActive
+                              || holdingShrinkBusy
+                              || (workspace?.holding?.length ?? 0) === 0
+                            }
+                            onClick={() => void auditAndGraduateHolding()}
+                            title="Run the complete Development/M1 battery and save its pass or fail result, then graduate every tested strategy to Databank."
+                          >
+                            {batteryActive && batteryJob?.auditAndGraduate
+                              ? "Auditing and graduating…"
+                              : `Run battery · keep all (${workspace?.holding?.length ?? 0})`}
                           </button>
                           <button
                             type="button"

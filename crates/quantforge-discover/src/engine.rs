@@ -949,12 +949,18 @@ pub fn promote_selected_holding_without_robustness(
         elite
             .gate_results
             .retain(|gate| gate.name != "robustness_bypass");
-        elite.gate_results.push(GateResult {
-            name: "robustness_bypass".into(),
-            passed: false,
-            detail: "Manually graduated from Holding; deferred robustness battery was not run."
-                .into(),
-        });
+        if !elite
+            .gate_results
+            .iter()
+            .any(|gate| gate.name == "robustness_audit")
+        {
+            elite.gate_results.push(GateResult {
+                name: "robustness_bypass".into(),
+                passed: false,
+                detail: "Manually graduated from Holding; deferred robustness battery was not run."
+                    .into(),
+            });
+        }
         if let Some(gate) = selection_gate.as_ref() {
             elite
                 .gate_results
@@ -988,6 +994,98 @@ pub struct HoldingBatteryResult {
     pub fingerprint: quantforge_core::ContentHash,
     pub decision: DepositDecision,
     pub elite: Elite,
+}
+
+/// Outcome of the non-gating full-battery audit. The candidate remains in
+/// Holding until the caller explicitly graduates it; this result never feeds
+/// breeding, ranking, or OOS selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoldingBatteryAuditResult {
+    pub fingerprint: quantforge_core::ContentHash,
+    pub passed: bool,
+    pub reason: Option<String>,
+}
+
+/// Run the same Development/M1 battery as the strict Holding gate, but only
+/// record the result on the Holding candidate. It does not remove, promote, or
+/// reject the candidate.
+pub fn audit_holding_battery(
+    bank: &mut Databank,
+    fingerprint: &quantforge_core::ContentHash,
+    dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+) -> Result<HoldingBatteryAuditResult, HoldingBatteryReject> {
+    let elite = bank
+        .holding
+        .iter()
+        .find(|entry| &entry.structural_fingerprint == fingerprint)
+        .cloned()
+        .ok_or(HoldingBatteryReject::NotInHolding)?;
+    let robustness = robustness_config_from_discover(&bank.config);
+    let prior_h1 = elite
+        .robustness
+        .as_ref()
+        .map(|evidence| evidence.m1_retention.selected_timeframe_metrics.clone())
+        .unwrap_or_else(|| elite.metrics.clone());
+    let outcome = crate::robustness::run_m1_predeposit_robustness(
+        &elite.strategy,
+        dataset,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &robustness,
+        &prior_h1,
+        false,
+    );
+    let (passed, reason, evidence) = match outcome {
+        Err(reject) => (false, Some(reject.to_string()), None),
+        Ok(outcome)
+            if !crate::archive::passes_gate_config(&outcome.result, &bank.config.deposit_gates) =>
+        {
+            (false, Some("deposit gates".into()), outcome.evidence)
+        }
+        Ok(outcome)
+            if !passes_development_expectancy(
+                outcome.result.metrics.expectancy,
+                bank.config.minimum_development_expectancy_r,
+            ) =>
+        {
+            (
+                false,
+                Some("Development expectancy floor".into()),
+                outcome.evidence,
+            )
+        }
+        Ok(outcome) => (true, None, outcome.evidence),
+    };
+    let audited = bank
+        .holding
+        .iter_mut()
+        .find(|entry| &entry.structural_fingerprint == fingerprint)
+        .ok_or(HoldingBatteryReject::NotInHolding)?;
+    if evidence.is_some() {
+        audited.robustness = evidence;
+    }
+    audited
+        .gate_results
+        .retain(|gate| gate.name != "robustness_audit");
+    audited.gate_results.push(GateResult {
+        name: "robustness_audit".into(),
+        passed,
+        detail: match &reason {
+            Some(reason) => format!(
+                "Full Development/M1 battery audit failed: {reason}. This was recorded only; the strategy can still be graduated."
+            ),
+            None => "Full Development/M1 battery audit passed. This was recorded only; it was not used as a selection gate.".into(),
+        },
+    });
+    Ok(HoldingBatteryAuditResult {
+        fingerprint: fingerprint.clone(),
+        passed,
+        reason,
+    })
 }
 
 /// Run the full M1 robustness battery on one Holding candidate and,
@@ -2693,6 +2791,61 @@ mod tests {
                 .iter()
                 .any(|elite| &elite.structural_fingerprint == fingerprint)
         }));
+    }
+
+    #[test]
+    fn audited_graduation_preserves_the_audit_instead_of_marking_a_bypass() {
+        let dataset = dataset();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
+        bank.holding = bank.accepted_pool.iter().take(1).cloned().collect();
+        let fingerprint = bank.holding[0].structural_fingerprint.to_string();
+        bank.holding[0].gate_results.push(GateResult {
+            name: "robustness_audit".into(),
+            passed: false,
+            detail: "Recorded failure.".into(),
+        });
+
+        let result = super::promote_selected_holding_without_robustness(
+            &mut bank,
+            &BTreeSet::from([fingerprint]),
+            None,
+        );
+
+        assert_eq!(result.promoted, 1);
+        assert!(bank.elites[0]
+            .gate_results
+            .iter()
+            .any(|gate| gate.name == "robustness_audit" && !gate.passed));
+        assert!(!bank.elites[0]
+            .gate_results
+            .iter()
+            .any(|gate| gate.name == "robustness_bypass"));
+    }
+
+    #[test]
+    fn battery_audit_records_its_result_without_moving_the_holding_candidate() {
+        let dataset = dataset();
+        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
+        bank.holding = bank.accepted_pool.iter().take(1).cloned().collect();
+        let fingerprint = bank.holding[0].structural_fingerprint.clone();
+
+        let result = super::audit_holding_battery(
+            &mut bank,
+            &fingerprint,
+            &dataset,
+            &dataset,
+            None,
+            &broker(),
+        )
+        .unwrap();
+
+        assert_eq!(result.fingerprint, fingerprint);
+        assert_eq!(bank.holding.len(), 1);
+        assert!(bank.elites.is_empty());
+        assert!(bank.holding[0]
+            .gate_results
+            .iter()
+            .any(|gate| gate.name == "robustness_audit" && gate.passed == result.passed));
     }
 
     #[test]

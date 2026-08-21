@@ -885,6 +885,7 @@ export interface BatteryJobView {
   holdingBeforeShrink?: number;
   holdingAfterShrink?: number;
   targetDatabank?: number | null;
+  auditAndGraduate?: boolean;
   reportPath?: string | null;
   workspace?: DatabankWorkspace | null;
 }

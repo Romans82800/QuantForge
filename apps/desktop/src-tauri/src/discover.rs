@@ -838,6 +838,7 @@ pub fn start_discover(
                         max_correlation: None,
                         queue_limit: factory_queue,
                         target_databank: factory_target,
+                        audit_and_graduate: false,
                     };
                     // Discover has already completed by this point, but the
                     // factory can promote a Holding candidate seconds later.

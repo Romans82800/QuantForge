@@ -93,6 +93,7 @@ export function startHoldingBatteryJob(
     maxCorrelation?: number;
     queueLimit?: number;
     targetDatabank?: number;
+    auditAndGraduate?: boolean;
   },
 ): Promise<BatteryJobView> {
   return invoke<BatteryJobView>("start_holding_battery_job", {
@@ -103,6 +104,7 @@ export function startHoldingBatteryJob(
       maxCorrelation: options?.maxCorrelation ?? null,
       queueLimit: options?.queueLimit ?? null,
       targetDatabank: options?.targetDatabank ?? null,
+      auditAndGraduate: options?.auditAndGraduate ?? false,
     },
   });
 }

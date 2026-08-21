@@ -100,6 +100,7 @@ pub struct BatteryJobView {
     holding_before_shrink: usize,
     holding_after_shrink: usize,
     target_databank: Option<usize>,
+    audit_and_graduate: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     report_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +134,7 @@ impl BatteryJobView {
             holding_before_shrink: 0,
             holding_after_shrink: 0,
             target_databank: None,
+            audit_and_graduate: false,
             report_path: None,
             workspace: None,
         }
@@ -277,7 +279,11 @@ pub fn start_holding_battery_job(
         .as_millis() as u64;
     let started = BatteryJobView {
         job_id: Some(format!("battery-{now_ms}")),
-        job_kind: "battery",
+        job_kind: if request.audit_and_graduate {
+            "audit_graduate"
+        } else {
+            "battery"
+        },
         status: "running",
         phase: if request.shrink_first {
             "Preparing factory".into()
@@ -286,7 +292,9 @@ pub fn start_holding_battery_job(
         } else {
             "Loading market data".into()
         },
-        message: if request.ranked {
+        message: if request.audit_and_graduate {
+            "Running the full battery as an audit, then graduating every Holding strategy regardless of result.".into()
+        } else if request.ranked {
             "Ranking the current Holding cohort, then running the robustness battery one strategy at a time.".into()
         } else {
             format!(
@@ -313,6 +321,7 @@ pub fn start_holding_battery_job(
         holding_before_shrink: snapshot.artifact.databank.holding.len(),
         holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
+        audit_and_graduate: request.audit_and_graduate,
         report_path: None,
         workspace: None,
     };
@@ -421,6 +430,7 @@ pub fn start_production_lane_job(
         holding_before_shrink: total,
         holding_after_shrink: total,
         target_databank: None,
+        audit_and_graduate: false,
         report_path: None,
         workspace: None,
     };
@@ -489,6 +499,7 @@ pub(crate) fn spawn_factory_from_archive(
         holding_before_shrink: snapshot.artifact.databank.holding.len(),
         holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
+        audit_and_graduate: false,
         report_path: None,
         workspace: None,
     };
@@ -1028,7 +1039,9 @@ fn run_factory_or_battery(
     }
     let holding_after = snapshot.artifact.databank.holding.len();
     let queue_take = optional_positive(request.queue_limit);
-    let target_databank = optional_positive(request.target_databank);
+    let target_databank = (!request.audit_and_graduate)
+        .then(|| optional_positive(request.target_databank))
+        .flatten();
     let fingerprints = if request.ranked || request.fingerprints.is_empty() {
         ranked_holding_fingerprints(&snapshot.artifact.databank, queue_take)
     } else {
@@ -1095,6 +1108,7 @@ fn run_factory_or_battery(
         target_databank,
         desktop,
         factory_checkpoint,
+        request.audit_and_graduate,
     )
 }
 
@@ -1153,6 +1167,7 @@ fn run_battery_job(
     target_databank: Option<usize>,
     desktop: Option<DesktopState>,
     factory_checkpoint: Option<FactoryCheckpoint>,
+    audit_and_graduate: bool,
 ) -> Result<(), String> {
     let started = Instant::now();
     update_phase(
@@ -1279,10 +1294,20 @@ fn run_battery_job(
 
     update_phase(
         &job,
-        "Running battery",
-        &format!(
-            "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."
-        ),
+        if audit_and_graduate {
+            "Running full battery audit"
+        } else {
+            "Running battery"
+        },
+        &if audit_and_graduate {
+            format!(
+                "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Every result is recorded; every tested strategy will move to Databank."
+            )
+        } else {
+            format!(
+                "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."
+            )
+        },
     );
 
     let mut passed = 0usize;
@@ -1317,8 +1342,36 @@ fn run_battery_job(
             .as_ref()
             .map(|elite| elite.structural_fingerprint.clone());
 
-        let outcome = match target {
+        let outcome: Result<(bool, Option<String>), (String, String)> = match target {
             None => Err(("other".to_owned(), "not in Holding".to_owned())),
+            Some(hash) if audit_and_graduate => {
+                let audit = quantforge_discover::audit_holding_battery(
+                    &mut snapshot.artifact.databank,
+                    &hash,
+                    &development,
+                    &m1_owned,
+                    quote_for_battery.as_ref(),
+                    &broker,
+                );
+                let (audit_passed, audit_reason) = match audit {
+                    Ok(result) => (result.passed, result.reason),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                let selected = BTreeSet::from([hash.to_string()]);
+                let graduated = quantforge_discover::promote_selected_holding_without_robustness(
+                    &mut snapshot.artifact.databank,
+                    &selected,
+                    None,
+                );
+                if graduated.promoted + graduated.replaced != 1 {
+                    Err((
+                        "other".to_owned(),
+                        "could not graduate audited Holding strategy".to_owned(),
+                    ))
+                } else {
+                    Ok((audit_passed, audit_reason))
+                }
+            }
             Some(hash) => quantforge_discover::run_holding_battery_and_promote(
                 &mut snapshot.artifact.databank,
                 &hash,
@@ -1328,7 +1381,7 @@ fn run_battery_job(
                 quote_for_battery.as_ref(),
                 &broker,
             )
-            .map(|_| ())
+            .map(|_| (true, None))
             .map_err(|error| (error.kill_bucket().to_string(), error.to_string())),
         };
 
@@ -1336,11 +1389,23 @@ fn run_battery_job(
         let mut status = "rejected";
         let mut reason: Option<String> = None;
         match outcome {
-            Ok(()) => {
-                passed += 1;
+            Ok((audit_passed, audit_reason)) => {
                 dirty = true;
-                status = "passed";
-                mark_item(&job, fingerprint, "passed", None);
+                if audit_passed {
+                    passed += 1;
+                    status = "passed";
+                    mark_item(&job, fingerprint, "passed", None);
+                } else {
+                    rejected += 1;
+                    status = "audited_failed";
+                    reason = audit_reason.clone();
+                    mark_item(
+                        &job,
+                        fingerprint,
+                        "audited_failed",
+                        audit_reason,
+                    );
+                }
             }
             Err((bucket, reject_reason)) => {
                 rejected += 1;
@@ -1405,17 +1470,34 @@ fn run_battery_job(
                 } else {
                     "Battery complete".into()
                 };
-                view.message = funnel_message(&view, passed, rejected, completed, target_hit);
+                view.message = funnel_message(
+                    &view,
+                    passed,
+                    rejected,
+                    completed,
+                    target_hit,
+                    audit_and_graduate,
+                );
                 view.stop_requested = false;
                 view.eta_seconds = Some(0.0);
                 view.running = 0;
                 view.queued = 0;
             } else {
-                view.phase = format!("Battery {completed}/{total}");
-                view.message = format!(
-                    "{} Holding → {completed} tested → {passed} moved to Databank / {rejected} remain in Holding · {rate:.1}/hr",
-                    view.holding_before_shrink
+                view.phase = format!(
+                    "{} {completed}/{total}",
+                    if audit_and_graduate { "Audit" } else { "Battery" }
                 );
+                view.message = if audit_and_graduate {
+                    format!(
+                        "{} Holding → {completed} audited → {passed} passed / {rejected} failed tests → all {completed} moved to Databank · {rate:.1}/hr",
+                        view.holding_before_shrink
+                    )
+                } else {
+                    format!(
+                        "{} Holding → {completed} tested → {passed} moved to Databank / {rejected} remain in Holding · {rate:.1}/hr",
+                        view.holding_before_shrink
+                    )
+                };
             }
         }
 
@@ -1469,7 +1551,14 @@ fn run_battery_job(
             } else {
                 "Battery complete".into()
             };
-            view.message = funnel_message(&view, view.passed, view.rejected, view.completed, false);
+            view.message = funnel_message(
+                &view,
+                view.passed,
+                view.rejected,
+                view.completed,
+                false,
+                audit_and_graduate,
+            );
             view.stop_requested = false;
         }
     }
@@ -1482,7 +1571,14 @@ fn funnel_message(
     rejected: usize,
     completed: usize,
     target_hit: bool,
+    audit_and_graduate: bool,
 ) -> String {
+    if audit_and_graduate {
+        return format!(
+            "{} Holding → {completed} audited → {passed} passed / {rejected} failed tests → all {completed} graduated to Databank. Battery evidence is recorded, not used as a gate.",
+            view.holding_before_shrink,
+        );
+    }
     let mix = &view.kill_mix;
     let target = if target_hit {
         " Databank target reached."

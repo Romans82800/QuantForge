@@ -22,7 +22,9 @@ pub use bakeoff::{
     ConditionBakeoffConfig, ConditionBakeoffReport, ConditionBakeoffRow, run_condition_bakeoff,
 };
 pub use engine::{
-    EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, HoldingBypassResult,
+    EvolutionSession, HoldingBatteryAuditResult, HoldingBatteryReject, HoldingBatteryResult,
+    HoldingBypassResult,
+    audit_holding_battery,
     continue_evolution, continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
     evolve_new_with_pack_and_quotes, holding_factory_score, new_databank,
     promote_all_holding_without_robustness, promote_selected_holding_without_robustness,
