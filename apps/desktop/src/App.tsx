@@ -3898,6 +3898,9 @@ function DiscoverWorkspace({
         promotionSplit: true,
         // Generations 0 means SQX-style run-until-stopped, never a hard start block.
         runUntilStopped: (form.runUntilStopped ?? true) || form.generations < 1,
+        // Open-ended Discover never inherits a factory cap. When you press
+        // Stop, its battery examines every frozen Holding strategy.
+        factoryTargetDatabank: (form.runUntilStopped ?? true) ? 0 : form.factoryTargetDatabank,
       });
       const request = form.mode === "continue"
           ? {
@@ -4341,13 +4344,15 @@ function DiscoverWorkspace({
                         onChange={(event) => setForm((current) => ({ ...current, factoryAfterDiscover: event.target.checked }))}
                       />
                       <small>
-                        When Discover checkpoints, rank the current Holding cohort by trades × R-expectancy, then run the battery {(form.factoryQueueLimit ?? 0) > 0 ? `on the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "on everyone in Holding"}. Each pass moves to Databank immediately; failures stay in Holding. Correlation shrinking remains a separate manual action. {(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}
+                        {form.runUntilStopped ?? true
+                          ? "Open-ended mode keeps Discover running until you press Stop. Then it ranks and tests every frozen Holding strategy; it has no Databank cap."
+                          : `When Discover completes, rank the current Holding cohort by trades × R-expectancy, then run the battery ${(form.factoryQueueLimit ?? 0) > 0 ? `on the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "on everyone in Holding"}. Each pass moves to Databank immediately; failures stay in Holding. Correlation shrinking remains a separate manual action. ${(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}`}
                       </small>
                     </label>
                     <div className="form-grid universal-grammar-grid">
                       <NumberField label="Holding quota" value={form.targetDatabankElites ?? 400} onChange={(value) => setForm((current) => ({ ...current, targetDatabankElites: value ?? 400 }))} min={40} max={10000} />
                       <NumberField label="Factory queue (0 = all)" value={form.factoryQueueLimit ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryQueueLimit: value ?? 0 }))} min={0} max={10000} />
-                      <NumberField label="Databank target (0 = all passers)" value={form.factoryTargetDatabank ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryTargetDatabank: value ?? 0 }))} min={0} max={10000} />
+                      {!(form.runUntilStopped ?? true) && <NumberField label="Databank target (0 = all passers)" value={form.factoryTargetDatabank ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryTargetDatabank: value ?? 0 }))} min={0} max={10000} />}
                     </div>
                   </div>
                 )}
@@ -4461,7 +4466,11 @@ function DiscoverWorkspace({
               <input
                 type="checkbox"
                 checked={form.runUntilStopped ?? true}
-                onChange={(event) => update("runUntilStopped", event.target.checked)}
+                onChange={(event) => setForm((current) => ({
+                  ...current,
+                  runUntilStopped: event.target.checked,
+                  factoryTargetDatabank: event.target.checked ? 0 : current.factoryTargetDatabank,
+                }))}
               />
               <span>Run until stopped (SQX-style continuous bank growth)</span>
             </label>

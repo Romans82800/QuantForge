@@ -326,14 +326,9 @@ pub fn start_holding_battery_job(
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(
-            job,
-            stop,
-            snapshot,
-            request,
-            Some(desktop),
-            None,
-        ) {
+        if let Err(error) =
+            run_factory_or_battery(job, stop, snapshot, request, Some(desktop), None)
+        {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -473,7 +468,8 @@ pub(crate) fn spawn_factory_from_archive(
         job_kind: "battery",
         status: "running",
         phase: "Preparing factory".into(),
-        message: "Discover finished — ranking the current Holding cohort for the battery queue.".into(),
+        message: "Discover finished — ranking the current Holding cohort for the battery queue."
+            .into(),
         databank_path: Some(databank_path),
         total: 0,
         queued: 0,
@@ -504,14 +500,9 @@ pub(crate) fn spawn_factory_from_archive(
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(
-            job,
-            stop,
-            snapshot,
-            request,
-            None,
-            factory_checkpoint,
-        ) {
+        if let Err(error) =
+            run_factory_or_battery(job, stop, snapshot, request, None, factory_checkpoint)
+        {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -1206,8 +1197,9 @@ fn run_battery_job(
         None => build_decision_from_m1(&m1.dataset, Some(&decision_source.dataset)),
     }
     .map_err(|error| format!("cannot reconstruct H1 from M1: {error}"))?;
-    let h1_plan = DataSplitPlan::chronological(&h1, snapshot.validation_fraction, snapshot.sealed_fraction)
-        .map_err(|error| error.to_string())?;
+    let h1_plan =
+        DataSplitPlan::chronological(&h1, snapshot.validation_fraction, snapshot.sealed_fraction)
+            .map_err(|error| error.to_string())?;
     let h1_development = slice_bars(&h1, 0, h1_plan.development.bar_count)?;
     let (decision_timeframe, development, development_end) = if h1_development.data_hash
         == snapshot.artifact.databank.data_hash
@@ -1247,7 +1239,9 @@ fn run_battery_job(
         } else {
             return Err(format!(
                 "This Holding archive is not bound to the reconstructed H1 or H4 Development data (archive {}, H1 {}, H4 {}). Nothing was evaluated or promoted.",
-                snapshot.artifact.databank.data_hash, h1_development.data_hash, h4_development.data_hash,
+                snapshot.artifact.databank.data_hash,
+                h1_development.data_hash,
+                h4_development.data_hash,
             ));
         }
     };
@@ -1265,22 +1259,30 @@ fn run_battery_job(
     // M1 cursor only through those decision-bar intervals. Newer archives may
     // instead bind the time-clipped Development M1 stream. Accept either exact
     // binding; never substitute a third dataset.
-    let (m1_owned, quote_for_battery, execution_binding) =
-        if snapshot.artifact.databank.execution_data_hash == m1.dataset.data_hash {
-            (m1.dataset.clone(), quote_dataset.clone(), "full M1")
-        } else if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
-            (m1_development, quote_development, "Development M1")
-        } else {
+    let (m1_owned, quote_for_battery, execution_binding) = if snapshot
+        .artifact
+        .databank
+        .execution_data_hash
+        == m1.dataset.data_hash
+    {
+        (m1.dataset.clone(), quote_dataset.clone(), "full M1")
+    } else if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
+        (m1_development, quote_development, "Development M1")
+    } else {
         return Err(format!(
             "This Holding archive is not bound to either approved {decision_timeframe} M1 execution dataset (archive {}, full {}, Development {}). Nothing was evaluated or promoted.",
-            snapshot.artifact.databank.execution_data_hash, m1.dataset.data_hash, m1_development.data_hash,
+            snapshot.artifact.databank.execution_data_hash,
+            m1.dataset.data_hash,
+            m1_development.data_hash,
         ));
-        };
+    };
 
     update_phase(
         &job,
         "Running battery",
-        &format!("Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."),
+        &format!(
+            "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."
+        ),
     );
 
     let mut passed = 0usize;
@@ -1423,7 +1425,11 @@ fn run_battery_job(
         if dirty {
             if !finished {
                 let phase = format!("Promoted {passed}; syncing Databank");
-                update_phase(&job, &phase, "Saved the accepted strategy; starting the next one.");
+                update_phase(
+                    &job,
+                    &phase,
+                    "Saved the accepted strategy; starting the next one.",
+                );
             }
             checkpoint_battery_promotion(
                 &mut snapshot,

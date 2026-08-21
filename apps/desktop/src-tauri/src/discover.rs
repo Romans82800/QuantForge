@@ -34,6 +34,8 @@ use tauri::State;
 
 const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const ROLLING_THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const HOLDING_STALL_GENERATIONS: u64 = 25;
+const HOLDING_STALL_MIN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -818,7 +820,14 @@ pub fn start_discover(
             Ok(()) => {
                 if request.factory_after_discover.unwrap_or(false) {
                     let factory_queue = request.factory_queue_limit.filter(|&n| n > 0);
-                    let factory_target = request.factory_target_databank.filter(|&n| n > 0);
+                    // An open-ended Discover is allowed to hand off only
+                    // after the user explicitly stops it. When it does, the
+                    // factory must examine the whole frozen Holding cohort,
+                    // not silently stop after an old target such as `1`.
+                    let factory_target = automatic_factory_target(
+                        request.run_until_stopped.unwrap_or(true),
+                        request.factory_target_databank,
+                    );
                     let factory = crate::databank::HoldingBatteryRequest {
                         fingerprints: Vec::new(),
                         ranked: true,
@@ -847,9 +856,8 @@ pub fn start_discover(
                                 view.databank_elites = artifact.databank.elites.len();
                                 view.coverage = artifact.databank.coverage();
                                 view.qd_score = artifact.databank.qd_score();
-                                view.live_databank_revision = view
-                                    .live_databank_revision
-                                    .saturating_add(1);
+                                view.live_databank_revision =
+                                    view.live_databank_revision.saturating_add(1);
                                 view.message = format!(
                                     "Factory checkpoint: {} Holding · {} Databank. {}",
                                     view.holding_elites, view.databank_elites, view.message
@@ -1442,8 +1450,6 @@ fn run_discovery(
     let mut last_checkpoint_active_seconds = clock.active_seconds();
     let mut last_holding_count = bank.holding.len();
     let mut holding_stall_generations = 0u64;
-    const HOLDING_STALL_GENERATIONS: u64 = 25;
-    const HOLDING_STALL_MIN: usize = 40;
 
     let quota_met = |bank: &Databank| -> bool {
         bank.config
@@ -1451,9 +1457,12 @@ fn run_discovery(
             .is_some_and(|target| bank.quota_progress_count() >= target)
     };
     let holding_plateaued = |bank: &Databank, stall: u64| -> bool {
-        bank.config.build_to_holding
-            && stall >= HOLDING_STALL_GENERATIONS
-            && bank.holding.len() >= HOLDING_STALL_MIN
+        holding_plateau_should_stop(
+            run_until_stopped,
+            bank.config.build_to_holding,
+            bank.holding.len(),
+            stall,
+        )
     };
 
     // Dataset selection is fixed for the run: `validate_resume` requires the
@@ -1620,6 +1629,10 @@ fn run_discovery(
         if quota_met(&bank) {
             break;
         }
+        // A Holding plateau is useful evidence for a finite quota recipe, but
+        // it is not a valid reason to stop an explicitly open-ended Discover
+        // run. The old behaviour silently handed open-ended runs to the
+        // factory after 25 flat generations.
         if holding_plateaued(&bank, holding_stall_generations) {
             if let Ok(mut view) = job.write() {
                 view.message = format!(
@@ -1992,6 +2005,27 @@ fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool)
     }
 }
 
+fn automatic_factory_target(
+    run_until_stopped: bool,
+    configured_target: Option<usize>,
+) -> Option<usize> {
+    (!run_until_stopped)
+        .then_some(configured_target.filter(|&target| target > 0))
+        .flatten()
+}
+
+fn holding_plateau_should_stop(
+    run_until_stopped: bool,
+    build_to_holding: bool,
+    holding_count: usize,
+    stall_generations: u64,
+) -> bool {
+    !run_until_stopped
+        && build_to_holding
+        && stall_generations >= HOLDING_STALL_GENERATIONS
+        && holding_count >= HOLDING_STALL_MIN
+}
+
 fn funnel_summary(bank: &Databank) -> String {
     let telemetry = &bank.telemetry;
     format!(
@@ -2096,11 +2130,13 @@ fn build_discover_artifact(
         ),
         (
             "decision_timeframe".into(),
-            json!(match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
-                DecisionTimeframe::H1 => "H1",
-                DecisionTimeframe::M15 => "M15",
-                DecisionTimeframe::H4 => "H4",
-            }),
+            json!(
+                match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
+                    DecisionTimeframe::H1 => "H1",
+                    DecisionTimeframe::M15 => "M15",
+                    DecisionTimeframe::H4 => "H4",
+                }
+            ),
         ),
         ("databank".into(), json!(display_path(output_path))),
         ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
@@ -3080,6 +3116,19 @@ fn update_bank(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn open_ended_discover_never_stops_for_a_holding_plateau_or_factory_target() {
+        assert!(!holding_plateau_should_stop(true, true, 111, 25));
+        assert_eq!(automatic_factory_target(true, Some(1)), None);
+    }
+
+    #[test]
+    fn finite_discover_can_use_an_explicit_plateau_or_factory_target() {
+        assert!(holding_plateau_should_stop(false, true, 40, 25));
+        assert_eq!(automatic_factory_target(false, Some(1)), Some(1));
+        assert_eq!(automatic_factory_target(false, Some(0)), None);
+    }
 
     fn fixture(name: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
