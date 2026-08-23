@@ -4553,7 +4553,7 @@ function DiscoverWorkspace({
               <NumberField label="Maximum RAM (MB)" value={form.maxMemoryMb} onChange={(value) => update("maxMemoryMb", value)} min={1024} step={1024} />
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
-              <NumberField label="OOS1 reserve (0 = off)" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} min={0} />
+              <NumberField label="OOS1 validation reserve (0 = off)" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} min={0} max={0.5} />
               <NumberField label="Sealed holdout" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
               <label className="field-row pack-directory-field">
                 <span>FX pack directory (matching-timeframe screen)</span>
@@ -4662,7 +4662,7 @@ function DiscoverWorkspace({
                   <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
                   <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
                   <NumberField label="M1 fidelity min return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
-                  <NumberField label="OOS1 certification retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
+                  <NumberField label="OOS1 retention vs Development (0–2×)" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} min={0} max={2} />
                   <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                   <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
                   <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
@@ -4807,7 +4807,7 @@ function DiscoverWorkspace({
             </ul>
             <p className="funnel-group-label">Post-breed Holding pipeline — after breeding unlocks</p>
             <ul>
-              <li><span>OOS1 leakage guard (must remain 0)</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>{(form.validationFraction ?? 0) > 0 ? "OOS1 validation rejects" : "OOS1 validation (off)"}</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
               <li><span>Development expectancy floor</span><strong>{formatNumber(job?.rejectedDevelopmentExpectancy ?? 0)}</strong></li>
               <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
               <li><span>Development CPCV</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
@@ -5237,7 +5237,7 @@ function DiscoverContractSummary({
         <SummaryLine label="Development / Holdout" value={splitCaption(form.validationFraction ?? 0, form.sealedFraction ?? 1 / 3)} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
         <SummaryLine label="Minimum Development expectancy" value={`≥ ${formatNumber(form.minimumDevelopmentExpectancyR ?? 0, 2)}R`} />
-        <SummaryLine label="OOS1 pick" value="Off · fold-stable Development R replaces it" />
+        <SummaryLine label="OOS1 validation" value={(form.validationFraction ?? 0) > 0 ? `${formatNumber((form.validationFraction ?? 0) * 100, 0)}% reserve · ≥${formatNumber(form.oos1ExpectancyRetention ?? 0.7, 2)}× Development` : "Off · 0% reserve"} />
         <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
         <SummaryLine label="Sealed holdout" value="Display only · not a Discover gate" accent />
       </div>

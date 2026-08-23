@@ -597,7 +597,9 @@ fn promote_one(
     let broker = context.broker.as_ref();
     let robustness = &context.robustness;
 
-    // Holding path: M1 80/130 retention only. Battery + OOS1 wait.
+    // Holding path: M1 80/130 retention only. The full Development battery
+    // and optional OOS1 validation run later, after a user starts it from
+    // Holding.
     if context.build_to_holding {
         let m1_outcome = match crate::robustness::run_m1_holding_admission(
             strategy,
@@ -640,7 +642,7 @@ fn promote_one(
         };
     }
 
-    // Legacy direct-to-databank path: optional full battery, then OOS1.
+    // Direct-to-databank path: optional full battery, then optional OOS1.
     let m1_outcome = if context.require_m1_robustness {
         match crate::robustness::run_m1_predeposit_robustness(
             strategy,
@@ -713,13 +715,65 @@ fn promote_one(
         robustness: m1_outcome.1.clone(),
     };
 
-    // Fold-stable Development R is the promotion objective. OOS1 is not a pick
-    // gate — a single chronological slice manufactures a clean databank.
+    // OOS1 is a post-Development validation gate. It never participates in
+    // scouting, breeding, or ranking. A zero OOS1 reserve is represented by
+    // `None`, which leaves the two-way Development/OOS2 protocol intact.
+    let Some(oos1) = context.oos1.as_deref() else {
+        return PromotionOutcome::DevelopmentApproved {
+            candidate: development_candidate,
+            oos1_passed: true,
+            oos1_expectancy: None,
+            oos1_expectancy_ratio: None,
+        };
+    };
+    let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
+        return PromotionOutcome::EvaluationError {
+            message: "OOS1 validation partition is empty".into(),
+        };
+    };
+    // Replay Development + OOS1 together only to preserve indicator warm-up,
+    // open positions, and execution continuity at the boundary. The admitted
+    // Development metrics above remain the fitness reference.
+    let validation_decision = join_datasets(context.dataset.as_ref(), oos1);
+    let validation = match evaluate_strategy_m1_with_optional_quotes(
+        strategy,
+        &validation_decision,
+        context.m1.as_ref(),
+        context.quotes.as_deref(),
+        broker,
+        &JudgeConfig {
+            initial_balance: robustness.initial_balance,
+            costs: robustness.costs.clone(),
+            allow_execution_gaps: false,
+            indicator_engine: robustness.indicator_engine,
+            entry_window: robustness.entry_window,
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return PromotionOutcome::EvaluationError {
+                message: format!("M1 OOS1 validation replay failed: {error}"),
+            };
+        }
+    };
+    let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
+    if !passes_oos1_pick(
+        development_expectancy,
+        oos1_expectancy,
+        context.oos1_expectancy_retention,
+    ) {
+        return PromotionOutcome::DevelopmentApproved {
+            candidate: development_candidate,
+            oos1_passed: false,
+            oos1_expectancy: Some(oos1_expectancy),
+            oos1_expectancy_ratio: Some(oos1_expectancy / development_expectancy),
+        };
+    }
     PromotionOutcome::DevelopmentApproved {
         candidate: development_candidate,
         oos1_passed: true,
-        oos1_expectancy: None,
-        oos1_expectancy_ratio: None,
+        oos1_expectancy: Some(oos1_expectancy),
+        oos1_expectancy_ratio: Some(oos1_expectancy / development_expectancy),
     }
 }
 
@@ -842,10 +896,8 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     }
 }
 
-/// OOS1 validation used to require positive expectancy and retention relative
-/// to the M1 Development replay. Kept for tests and old artifacts; Discover no
-/// longer picks on OOS1.
-#[cfg_attr(not(test), allow(dead_code))]
+/// OOS1 validation requires positive expectancy and configurable retention
+/// relative to the M1 Development replay. It must never feed breeding or rank.
 pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
     is_expectancy.is_finite()
         && oos1_expectancy.is_finite()
@@ -1108,13 +1160,14 @@ pub fn audit_holding_battery(
     })
 }
 
-/// Run the full M1 robustness battery on one Holding candidate and,
-/// on pass, promote it into the Databank elites archive. OOS1 is not a pick.
+/// Run the full M1 robustness battery on one Holding candidate and, on pass,
+/// promote it into the Databank elites archive. When the immutable run split
+/// contains OOS1, validate there only after the Development battery passes.
 pub fn run_holding_battery_and_promote(
     bank: &mut Databank,
     fingerprint: &quantforge_core::ContentHash,
     dataset: &BarDataset,
-    _oos1_dataset: Option<&BarDataset>,
+    oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
@@ -1158,7 +1211,7 @@ pub fn run_holding_battery_and_promote(
         return Err(HoldingBatteryReject::DevelopmentExpectancy);
     }
 
-    let candidate = CandidateEvaluation {
+    let mut candidate = CandidateEvaluation {
         strategy: elite.strategy.clone(),
         result: outcome.result,
         generation: elite.discovered_generation,
@@ -1173,6 +1226,53 @@ pub fn run_holding_battery_and_promote(
         gate_results: elite.gate_results.clone(),
         robustness: outcome.evidence,
     };
+
+    if let Some(oos1) = oos1_dataset {
+        let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
+            return Err(HoldingBatteryReject::Evaluation(
+                "OOS1 validation partition is empty".into(),
+            ));
+        };
+        let validation_decision = join_datasets(dataset, oos1);
+        let validation = evaluate_strategy_m1_with_optional_quotes(
+            &elite.strategy,
+            &validation_decision,
+            m1_dataset,
+            quote_dataset,
+            broker,
+            &JudgeConfig {
+                initial_balance: robustness.initial_balance,
+                costs: robustness.costs.clone(),
+                allow_execution_gaps: false,
+                indicator_engine: robustness.indicator_engine,
+                entry_window: robustness.entry_window,
+            },
+        )
+        .map_err(|error| {
+            HoldingBatteryReject::Evaluation(format!("M1 OOS1 validation replay failed: {error}"))
+        })?;
+        let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
+        if !passes_oos1_pick(
+            development_expectancy,
+            oos1_expectancy,
+            bank.config.oos1_expectancy_retention,
+        ) {
+            return Err(HoldingBatteryReject::Oos1);
+        }
+        candidate.oos1_expectancy = Some(oos1_expectancy);
+        candidate.oos1_expectancy_ratio = Some(oos1_expectancy / development_expectancy);
+        candidate.gate_results = build_gate_results(
+            development_expectancy,
+            candidate.oos1_expectancy,
+            candidate.oos1_expectancy_ratio,
+            true,
+            None,
+            &candidate.multi_symbol_results,
+            bank.config.multi_symbol_minimum_pass,
+            candidate.deflated_trade_sharpe,
+            bank.config.minimum_deflated_trade_sharpe,
+        );
+    }
 
     let decision = deposit_to_databank(bank, candidate)
         .map_err(|error| HoldingBatteryReject::Evaluation(error.to_string()))?;
@@ -2648,7 +2748,9 @@ mod tests {
     #[test]
     fn oos1_pick_requires_positive_retention_of_is_expectancy() {
         assert!(passes_oos1_pick(10.0, 7.0, 0.7));
+        assert!(passes_oos1_pick(10.0, 12.0, 1.2));
         assert!(!passes_oos1_pick(10.0, 6.9, 0.7));
+        assert!(!passes_oos1_pick(10.0, 11.9, 1.2));
         assert!(!passes_oos1_pick(10.0, -1.0, 0.7));
         assert!(!passes_oos1_pick(-2.0, 5.0, 0.7));
         assert!(!passes_oos1_pick(f64::NAN, 5.0, 0.7));
@@ -3134,14 +3236,14 @@ mod tests {
     }
 
     #[test]
-    fn oos1_is_not_a_promotion_pick() {
+    fn oos1_is_kept_out_of_breeding_archives() {
         let dataset = dataset();
         let mut cfg = config();
         cfg.mutate_after_elites = 1;
         cfg.require_m1_robustness = false;
         let oos1 = dataset.clone();
         let bank = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
-            .expect("OOS1 may be supplied but must not be used to pick");
+            .expect("OOS1 is deferred until after the Development battery");
         assert!(
             bank.accepted_pool
                 .iter()

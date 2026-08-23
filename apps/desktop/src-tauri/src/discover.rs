@@ -590,11 +590,11 @@ pub fn run_condition_bakeoff(
     )?;
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
-    let validation_fraction = request.validation_fraction.clamp(0.0, 0.4);
+    let validation_fraction = request.validation_fraction.clamp(0.0, 0.5);
     let sealed_fraction = request.sealed_fraction.clamp(0.05, 0.4);
     if validation_fraction + sealed_fraction >= 0.9 {
         return Err(format!(
-            "validation ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for IS"
+            "OOS1 ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for Development"
         ));
     }
     let search_h1 = development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
@@ -1386,12 +1386,46 @@ fn run_discovery(
     };
     let (validation_fraction, sealed_fraction) =
         normalize_split_fractions(validation_fraction, sealed_fraction)?;
+    if validation_fraction > 0.0 && !promotion_split {
+        return Err(
+            "OOS1 validation requires promotion split so Development, OOS1 and sealed OOS2 remain separate"
+                .into(),
+        );
+    }
+    let oos1_enabled = validation_fraction > 0.0;
+    if request.mode == DiscoverMode::Continue
+        && oos1_enabled
+        && continued_artifact.as_ref().is_some_and(|artifact| {
+            artifact
+                .manifest
+                .recipe
+                .config
+                .get("oos1_pick_enabled")
+                .and_then(Value::as_bool)
+                != Some(true)
+        })
+    {
+        return Err(
+            "this archive was created while OOS1 validation was disabled; start a new run to reserve and validate OOS1 without changing the historical experiment".into(),
+        );
+    }
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| unsealed_partition(&search_decision, validation_fraction, sealed_fraction))
+        .then(|| {
+            if oos1_enabled {
+                development_partition(&search_decision, validation_fraction, sealed_fraction)
+            } else {
+                unsealed_partition(&search_decision, validation_fraction, sealed_fraction)
+            }
+        })
         .transpose()?;
-    let oos1_dataset = None;
+    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
+        .then_some(())
+        .filter(|_| oos1_enabled)
+        .map(|_| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
+        .transpose()?;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
-    // Search uses every bar except the sealed holdout. OOS1 is not a pick gate.
+    // Development alone drives search and breeding. When reserved, OOS1 is
+    // opened only after the full Development battery; OOS2 is never materialized.
     let m1_eval = &m1.dataset;
     // A pack is deliberately opt-in. Merely selecting a pack directory must
     // not add several extra full strategy replays to every scout candidate.
@@ -1405,6 +1439,7 @@ fn run_discovery(
             validation_fraction,
             sealed_fraction,
             promotion_split || request.mode == DiscoverMode::Continue,
+            oos1_enabled,
             &decision_timeframe,
             history_start_year,
         )?
@@ -1417,9 +1452,11 @@ fn run_discovery(
             update_phase(
                 job,
                 "Evaluating initial grammar population",
-                &format!(
+                if oos1_enabled {
+                    "Development fills Holding. The full battery then validates OOS1; sealed OOS2 is never loaded."
+                } else {
                     "Fold-stable Development R fills Holding. Sealed holdout is never loaded."
-                ),
+                },
             )?;
             let mut config = new_config(&request)?;
             if !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
@@ -2178,6 +2215,10 @@ fn build_discover_artifact(
         ("desktop_job".into(), json!(true)),
         ("promotion_split".into(), json!(true)),
         ("validation_fraction".into(), json!(validation_fraction)),
+        (
+            "oos1_pick_enabled".into(),
+            json!(validation_fraction > 0.0),
+        ),
         ("sealed_fraction".into(), json!(sealed_fraction)),
         (
             "stopped_early".into(),
@@ -2358,6 +2399,7 @@ fn load_fx_pack(
     validation_fraction: f64,
     sealed_fraction: f64,
     apply_promotion_split: bool,
+    reserve_oos1: bool,
     decision_timeframe: &str,
     history_start_year: u16,
 ) -> Result<Vec<PackSymbol>, String> {
@@ -2406,7 +2448,11 @@ fn load_fx_pack(
             load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
         apply_history_start_year(&mut loaded.dataset, history_start_year)?;
         let dataset = if apply_promotion_split {
-            unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
+            if reserve_oos1 {
+                development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
+            } else {
+                unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
+            }
         } else {
             loaded.dataset
         };
@@ -2498,16 +2544,16 @@ fn normalize_split_fractions(
     // sample.  Reject invalid input explicitly instead.
     if !validation_fraction.is_finite()
         || !sealed_fraction.is_finite()
-        || !(0.0..=0.4).contains(&validation_fraction)
+        || !(0.0..=0.5).contains(&validation_fraction)
         || !(0.05..=0.4).contains(&sealed_fraction)
     {
-        return Err("OOS1 reserve must be 0–40% and sealed holdout must be 5–40%".into());
+        return Err("OOS1 reserve must be 0–50% and sealed holdout must be 5–40%".into());
     }
     let validation = validation_fraction;
     let sealed = sealed_fraction;
     if validation + sealed >= 0.9 {
         return Err(format!(
-            "validation ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for IS"
+            "OOS1 ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for Development"
         ));
     }
     Ok((validation, sealed))
@@ -3416,6 +3462,8 @@ mod tests {
         assert!(normalize_split_fractions(0.2, 0.2).is_ok());
         assert!(normalize_split_fractions(0.0, 1.0 / 3.0).is_ok());
         assert!(normalize_split_fractions(0.2, 0.1).is_ok());
+        assert!(normalize_split_fractions(0.5, 0.33).is_ok());
+        assert!(normalize_split_fractions(0.51, 0.2).is_err());
         let error = normalize_split_fractions(0.5, 0.45).expect_err("IS must remain");
         assert!(error.contains("less than 10%"));
     }

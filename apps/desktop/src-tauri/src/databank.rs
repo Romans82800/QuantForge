@@ -1827,12 +1827,25 @@ fn run_holding_battery_sync(
     let m1_plan = DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
         .map_err(|error| error.to_string())?;
     let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
+    let m1_unsealed = slice_bars(
+        &m1.dataset,
+        0,
+        m1_plan.development.bar_count + m1_plan.validation.bar_count,
+    )?;
     let m1_eval = if bank.execution_data_hash == m1_development.data_hash {
         &m1_development
     } else if bank.execution_data_hash == m1.dataset.data_hash {
         &m1.dataset
     } else {
         &m1_development
+    };
+
+    // OOS1 replay needs M1 continuity through the end of the validation slice,
+    // but never receives any OOS2 M1 bars.
+    let m1_battery = if oos1.is_some() {
+        &m1_unsealed
+    } else {
+        m1_eval
     };
 
     let mut promoted = 0usize;
@@ -1855,7 +1868,7 @@ fn run_holding_battery_sync(
             &target,
             &development,
             oos1.as_ref(),
-            m1_eval,
+            m1_battery,
             quote_dataset.as_ref(),
             &broker,
         ) {

@@ -540,11 +540,15 @@ struct EvolveArgs {
     /// Allow a data-quality Fail and record the override in the manifest.
     #[arg(long)]
     allow_failed_data: bool,
-    /// Search unsealed history (everything except the sealed holdout). OOS1 is not a pick.
+    /// Search Development history and reserve OOS1/OOS2 from strategy construction.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     promotion_split: bool,
+    /// Optional OOS1 reserve. Set 0 to disable OOS1; values up to 0.5 are allowed.
     #[arg(long, default_value_t = quantforge_quality::DEFAULT_VALIDATION_FRACTION)]
     validation_fraction: f64,
+    /// OOS1 expectancy as a multiple of Development expectancy (0–2; above 1 requires improvement).
+    #[arg(long)]
+    oos1_expectancy_retention: Option<f64>,
     #[arg(long, default_value_t = quantforge_quality::DEFAULT_SEALED_FRACTION)]
     sealed_fraction: f64,
 }
@@ -4913,6 +4917,13 @@ fn join_windows_relative(base: &Path, relative: &str) -> PathBuf {
 }
 
 fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
+    validate_evolve_split(args.validation_fraction, args.sealed_fraction)?;
+    if args.validation_fraction > 0.0 && !args.promotion_split {
+        return Err(
+            "OOS1 validation requires --promotion-split so Development, OOS1 and sealed OOS2 remain separate"
+                .into(),
+        );
+    }
     let (mut dataset, metadata) = load_source(&args.source)?;
     let m1_source = DataSourceArgs {
         path: args.m1.clone(),
@@ -4967,15 +4978,29 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         interval_ms
     );
 
+    let oos1_enabled = args.promotion_split && args.validation_fraction > 0.0;
     let development = args
         .promotion_split
-        .then(|| unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .then(|| {
+            if oos1_enabled {
+                development_partition(&dataset, args.validation_fraction, args.sealed_fraction)
+            } else {
+                unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction)
+            }
+        })
         .transpose()?;
-    let oos1 = None;
+    let oos1 = oos1_enabled
+        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .transpose()?;
     let search_dataset = development.as_ref().unwrap_or(&dataset);
+    let m1_validation_window = if oos1_enabled {
+        unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction)?
+    } else {
+        search_dataset.clone()
+    };
     let m1_is = args
         .promotion_split
-        .then(|| clip_dataset_to_window(&m1_dataset, search_dataset))
+        .then(|| clip_dataset_to_window(&m1_dataset, &m1_validation_window))
         .transpose()?;
     let m1_eval = m1_is.as_ref().unwrap_or(&m1_dataset);
 
@@ -5056,6 +5081,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
             "validation_fraction".into(),
             json!(args.validation_fraction),
         ),
+        ("oos1_pick_enabled".into(), json!(oos1_enabled)),
         ("sealed_fraction".into(), json!(args.sealed_fraction)),
         ("is_label".into(), json!("in_sample")),
         ("oos1_label".into(), json!("out_of_sample_1_pick")),
@@ -5660,7 +5686,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: quantforge_discover::SearchRangeProfile::default(),
-        oos1_expectancy_retention: 0.7,
+        oos1_expectancy_retention: args.oos1_expectancy_retention.unwrap_or(0.7),
         minimum_development_expectancy_r: 0.25,
         require_m1_precision: false,
         simple_exits: true,
@@ -5744,6 +5770,24 @@ fn development_partition(
 ) -> Result<BarDataset, Box<dyn Error>> {
     let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
     slice_partition(dataset, 0, plan.development.bar_count)
+}
+
+fn validate_evolve_split(
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<(), Box<dyn Error>> {
+    if !validation_fraction.is_finite()
+        || !sealed_fraction.is_finite()
+        || !(0.0..=0.5).contains(&validation_fraction)
+        || !(0.05..=0.4).contains(&sealed_fraction)
+        || validation_fraction + sealed_fraction >= 0.9
+    {
+        return Err(
+            "OOS1 reserve must be 0–50%, sealed holdout must be 5–40%, and at least 10% must remain for Development"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn unsealed_partition(
@@ -5864,6 +5908,7 @@ fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>
         || args.minimum_profit_factor.is_some()
         || args.minimum_return_drawdown.is_some()
         || args.minimum_m1_return_retention.is_some()
+        || args.oos1_expectancy_retention.is_some()
         || args.flatten_at_22
         || args.commission_per_lot_round_turn.is_some()
         || args.slippage_points_per_side.is_some()
