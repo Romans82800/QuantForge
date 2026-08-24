@@ -40,6 +40,8 @@ import type {
   ParityRequest,
   ParityView,
   PortfolioRequest,
+  PortfolioDiscoverRequest,
+  PortfolioDiscoverJobView,
   PortfolioView,
   SealedRequest,
   SealedView,
@@ -267,6 +269,24 @@ export function importMarketFolder(request: MarketFolderImportRequest): Promise<
 
 export function startDiscover(request: DiscoverRequest): Promise<DiscoverJobView> {
   return invoke<DiscoverJobView>("start_discover", { request });
+}
+
+export function startPortfolioDiscover(
+  request: PortfolioDiscoverRequest,
+): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("start_portfolio_discover", { request });
+}
+
+export function getPortfolioDiscoverJob(): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("get_portfolio_discover_job");
+}
+
+export function getPortfolioLiveDatabank(symbol: string): Promise<DatabankWorkspace> {
+  return invoke<DatabankWorkspace>("get_portfolio_live_databank", { symbol });
+}
+
+export function stopPortfolioDiscover(): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("stop_portfolio_discover");
 }
 
 export function runConditionBakeoff(

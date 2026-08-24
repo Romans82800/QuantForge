@@ -305,6 +305,84 @@ pub struct DiscoverState {
     stop: Arc<AtomicBool>,
 }
 
+/// One independently-bound market lane inside a shared Portfolio Discover
+/// campaign. A lane has its own data, broker, split, seed and Databank; the
+/// campaign only shares the bounded CPU budget and user-facing status.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioDiscoverAsset {
+    symbol: String,
+    data_path: String,
+    metadata_path: Option<String>,
+    source_timezone: Option<String>,
+    m1_data_path: String,
+    m1_metadata_path: Option<String>,
+    m1_source_timezone: Option<String>,
+    broker_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioDiscoverRequest {
+    /// The shared search recipe. Asset paths are replaced by each selected lane.
+    recipe: DiscoverRequest,
+    assets: Vec<PortfolioDiscoverAsset>,
+    /// Total Scout workers for the whole campaign, not per asset. Zero uses
+    /// available logical CPUs and is divided fairly between lanes.
+    global_worker_threads: usize,
+    /// Full M1 imports are memory-heavy. Limit how many lanes load and evolve
+    /// concurrently; queued lanes retain the same frozen recipe and start as
+    /// an earlier lane finishes. Two is the safe desktop default.
+    concurrent_lanes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioDiscoverLaneView {
+    symbol: String,
+    output_path: String,
+    status: String,
+    phase: String,
+    evaluation_count: u64,
+    holding_elites: usize,
+    databank_elites: usize,
+    evaluations_per_hour: f64,
+    worker_threads: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioDiscoverJobView {
+    job_id: Option<String>,
+    status: String,
+    phase: String,
+    global_worker_threads: usize,
+    concurrent_lanes: usize,
+    active_lanes: usize,
+    completed_lanes: usize,
+    total_lanes: usize,
+    total_evaluation_count: u64,
+    total_holding_elites: usize,
+    total_databank_elites: usize,
+    started_at_ms: Option<u64>,
+    stop_requested: bool,
+    message: String,
+    lanes: Vec<PortfolioDiscoverLaneView>,
+}
+
+#[derive(Clone)]
+struct PortfolioLiveLane {
+    output_path: String,
+    artifact: Arc<RwLock<Option<EvolveArtifact>>>,
+}
+
+pub struct PortfolioDiscoverState {
+    job: Arc<RwLock<PortfolioDiscoverJobView>>,
+    stop: Arc<AtomicBool>,
+    live_lanes: Arc<RwLock<BTreeMap<String, PortfolioLiveLane>>>,
+}
+
 impl Default for DiscoverState {
     fn default() -> Self {
         Self {
@@ -312,6 +390,38 @@ impl Default for DiscoverState {
             live_artifact: Arc::new(RwLock::new(None)),
             paused: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Default for PortfolioDiscoverState {
+    fn default() -> Self {
+        Self {
+            job: Arc::new(RwLock::new(PortfolioDiscoverJobView::idle())),
+            stop: Arc::new(AtomicBool::new(false)),
+            live_lanes: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl PortfolioDiscoverJobView {
+    fn idle() -> Self {
+        Self {
+            job_id: None,
+            status: "idle".into(),
+            phase: "Ready".into(),
+            global_worker_threads: 0,
+            concurrent_lanes: 0,
+            active_lanes: 0,
+            completed_lanes: 0,
+            total_lanes: 0,
+            total_evaluation_count: 0,
+            total_holding_elites: 0,
+            total_databank_elites: 0,
+            started_at_ms: None,
+            stop_requested: false,
+            message: "Choose 2–7 complete symbols and start a shared recipe.".into(),
+            lanes: Vec::new(),
         }
     }
 }
@@ -702,6 +812,7 @@ pub fn start_discover(
     mut request: DiscoverRequest,
     state: State<'_, DiscoverState>,
     battery: State<'_, crate::holding_battery::BatteryJobState>,
+    portfolio: State<'_, PortfolioDiscoverState>,
 ) -> Result<DiscoverJobView, String> {
     if request.mode == DiscoverMode::New && request.databank_path.trim().is_empty() {
         request.databank_path = automatic_databank_path(&request)?;
@@ -725,6 +836,18 @@ pub fn start_discover(
         if matches!(current.status, "running" | "paused") {
             return Err("a discovery job is already active".into());
         }
+    }
+    if portfolio
+        .job
+        .read()
+        .map_err(|_| "multi-asset campaign state is unavailable")?
+        .status
+        == "running"
+    {
+        return Err(
+            "a multi-asset Discover campaign is active; stop it before starting a single-asset job"
+                .into(),
+        );
     }
 
     state.paused.store(false, Ordering::SeqCst);
@@ -906,6 +1029,399 @@ pub fn start_discover(
     Ok(started)
 }
 
+/// Start independent Discover lanes under one shared CPU budget. Assets never
+/// share bars, candidates, Databanks, OOS1 results or sealed OOS2 data.
+#[tauri::command]
+pub fn start_portfolio_discover(
+    request: PortfolioDiscoverRequest,
+    state: State<'_, PortfolioDiscoverState>,
+    single_discover: State<'_, DiscoverState>,
+) -> Result<PortfolioDiscoverJobView, String> {
+    if request.assets.len() < 2 || request.assets.len() > 7 {
+        return Err("Portfolio Discover requires between 2 and 7 assets".into());
+    }
+    if request.recipe.mode != DiscoverMode::New {
+        return Err(
+            "Portfolio Discover starts new isolated Databanks; continue each lane separately"
+                .into(),
+        );
+    }
+    if single_discover
+        .job
+        .read()
+        .map_err(|_| "discover job state is unavailable")?
+        .status
+        == "running"
+    {
+        return Err(
+            "stop the single-asset Discover job before starting a portfolio campaign".into(),
+        );
+    }
+    {
+        let current = state
+            .job
+            .read()
+            .map_err(|_| "portfolio campaign state is unavailable")?;
+        if current.status == "running" {
+            return Err("a Portfolio Discover campaign is already active".into());
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for asset in &request.assets {
+        let symbol = asset.symbol.trim().to_ascii_uppercase();
+        if symbol.is_empty() || !seen.insert(symbol) {
+            return Err("select each Portfolio Discover symbol once".into());
+        }
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let lane_count = request.assets.len();
+    let global_workers = if request.global_worker_threads == 0 {
+        available.max(lane_count)
+    } else {
+        request
+            .global_worker_threads
+            .max(lane_count)
+            .min(available.max(lane_count))
+    };
+    // Starting seven full H1/M1 loads at once can exhaust file handles and
+    // memory long before Scout CPU becomes the constraint. Keep the CPU budget
+    // fully used, but stage the high-memory lanes. Users can raise this when
+    // they have ample RAM; two is deliberately the default.
+    let concurrent_lanes = request.concurrent_lanes.clamp(1, lane_count);
+    let lane_workers = (global_workers / concurrent_lanes).max(1);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as u64;
+
+    let mut lanes = Vec::with_capacity(lane_count);
+    for (index, asset) in request.assets.iter().enumerate() {
+        let mut lane_request = request.recipe.clone();
+        lane_request.mode = DiscoverMode::New;
+        lane_request.selected_symbol = Some(asset.symbol.trim().to_ascii_uppercase());
+        lane_request.data_path = asset.data_path.clone();
+        lane_request.metadata_path = asset.metadata_path.clone();
+        lane_request.source_timezone = asset.source_timezone.clone();
+        lane_request.m1_data_path = asset.m1_data_path.clone();
+        lane_request.m1_metadata_path = asset.m1_metadata_path.clone();
+        lane_request.m1_source_timezone = asset.m1_source_timezone.clone();
+        lane_request.broker_path = asset.broker_path.clone();
+        lane_request.databank_path = automatic_databank_path(&lane_request)?;
+        lane_request.seed = Some(lane_request.seed.unwrap_or(42).wrapping_add(index as u64));
+        lane_request.worker_threads = Some(lane_workers);
+        // Holding work is deliberately not allowed to monopolise all cores on
+        // each lane. The user can later run batteries per asset.
+        lane_request.promotion_worker_threads = Some(1);
+        lane_request.pack_data_dir = None;
+        lane_request.multi_symbol_minimum_pass = Some(0);
+        lane_request.factory_after_discover = Some(false);
+        validate_request(&lane_request)?;
+        lanes.push((
+            asset.symbol.trim().to_ascii_uppercase(),
+            lane_request,
+            lane_workers,
+            Arc::new(RwLock::new(None)),
+        ));
+    }
+
+    state.stop.store(false, Ordering::SeqCst);
+    {
+        let mut live_lanes = state
+            .live_lanes
+            .write()
+            .map_err(|_| "portfolio live Databank state is unavailable")?;
+        live_lanes.clear();
+        for (symbol, request, _, artifact) in &lanes {
+            live_lanes.insert(
+                symbol.clone(),
+                PortfolioLiveLane {
+                    output_path: request.databank_path.clone(),
+                    artifact: Arc::clone(artifact),
+                },
+            );
+        }
+    }
+    let initial_lanes = lanes
+        .iter()
+        .map(|(symbol, request, workers, _)| {
+            portfolio_lane_view(symbol, &portfolio_lane_job(request, *workers))
+        })
+        .collect::<Vec<_>>();
+    let started = PortfolioDiscoverJobView {
+        job_id: Some(format!("portfolio-{now_ms}")),
+        status: "running".into(),
+        phase: "Preparing isolated asset lanes".into(),
+        global_worker_threads: global_workers,
+        concurrent_lanes,
+        active_lanes: 0,
+        completed_lanes: 0,
+        total_lanes: lane_count,
+        total_evaluation_count: 0,
+        total_holding_elites: 0,
+        total_databank_elites: 0,
+        started_at_ms: Some(now_ms),
+        stop_requested: false,
+        message: format!(
+            "{lane_count} isolated lanes share {global_workers} Scout worker{}; up to {concurrent_lanes} high-memory lane{} run at once. Each asset keeps its own Development, OOS1 and sealed OOS2 partitions.",
+            if global_workers == 1 { "" } else { "s" },
+            if concurrent_lanes == 1 { "" } else { "s" },
+        ),
+        lanes: initial_lanes,
+    };
+    *state
+        .job
+        .write()
+        .map_err(|_| "portfolio campaign state is unavailable")? = started.clone();
+
+    let campaign_job = Arc::clone(&state.job);
+    let campaign_stop = Arc::clone(&state.stop);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut pending = lanes
+            .into_iter()
+            .map(|(symbol, request, workers, artifact)| {
+                let job = Arc::new(RwLock::new(portfolio_lane_job(&request, workers)));
+                (symbol, request, workers, job, artifact)
+            })
+            .collect::<VecDeque<_>>();
+        let all_lanes = pending
+            .iter()
+            .map(|(symbol, _, _, job, _)| (symbol.clone(), Arc::clone(job)))
+            .collect::<Vec<_>>();
+        let mut running: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
+
+        loop {
+            if campaign_stop.load(Ordering::SeqCst) && !pending.is_empty() {
+                for (_, _, _, job, _) in pending.drain(..) {
+                    if let Ok(mut view) = job.write() {
+                        view.status = "stopped";
+                        view.phase = "Not started".into();
+                        view.message =
+                            "The campaign was stopped before this queued lane began.".into();
+                    }
+                }
+            }
+
+            while !campaign_stop.load(Ordering::SeqCst) && running.len() < concurrent_lanes {
+                let Some((symbol, lane_request, _, lane_job, lane_live_artifact)) =
+                    pending.pop_front()
+                else {
+                    break;
+                };
+                if let Ok(mut view) = lane_job.write() {
+                    view.status = "running";
+                    view.phase = "Loading and validating inputs".into();
+                    view.message = "This isolated lane is starting.".into();
+                }
+                let lane_paused = Arc::new(AtomicBool::new(false));
+                let lane_stop = Arc::clone(&campaign_stop);
+                let lane_job_for_thread = Arc::clone(&lane_job);
+                let handle = thread::spawn(move || {
+                    if let Err(error) = run_discovery(
+                        lane_request,
+                        &lane_job_for_thread,
+                        &lane_live_artifact,
+                        &lane_paused,
+                        &lane_stop,
+                    ) {
+                        if let Ok(mut view) = lane_job_for_thread.write() {
+                            view.status = "failed";
+                            view.phase = "Stopped with an error".into();
+                            view.message = error;
+                        }
+                    } else if let Ok(mut view) = lane_job_for_thread.write() {
+                        if view.status != "failed" {
+                            view.status = if lane_stop.load(Ordering::SeqCst) {
+                                "stopped"
+                            } else {
+                                "completed"
+                            };
+                            view.phase = "Discover finished".into();
+                        }
+                    }
+                });
+                running.push((symbol, handle));
+            }
+
+            let lanes = all_lanes
+                .iter()
+                .filter_map(|(symbol, job)| {
+                    job.read()
+                        .ok()
+                        .map(|view| portfolio_lane_view(symbol, &view))
+                })
+                .collect::<Vec<_>>();
+            let active_lanes = lanes.iter().filter(|lane| lane.status == "running").count();
+            let completed_lanes = lanes
+                .iter()
+                .filter(|lane| matches!(lane.status.as_str(), "completed" | "stopped" | "failed"))
+                .count();
+            let any_failed = lanes.iter().any(|lane| lane.status == "failed");
+            let all_finished = pending.is_empty() && running.is_empty();
+            if let Ok(mut view) = campaign_job.write() {
+                view.active_lanes = active_lanes;
+                view.completed_lanes = completed_lanes;
+                view.total_evaluation_count = lanes.iter().map(|lane| lane.evaluation_count).sum();
+                view.total_holding_elites = lanes.iter().map(|lane| lane.holding_elites).sum();
+                view.total_databank_elites = lanes.iter().map(|lane| lane.databank_elites).sum();
+                view.stop_requested = campaign_stop.load(Ordering::SeqCst);
+                view.lanes = lanes;
+                view.phase = if all_finished {
+                    if any_failed {
+                        "Campaign finished with lane errors"
+                    } else if view.stop_requested {
+                        "Campaign stopped"
+                    } else {
+                        "Campaign complete"
+                    }
+                    .into()
+                } else if view.stop_requested {
+                    "Stopping after each lane's current generation".into()
+                } else {
+                    format!(
+                        "{active_lanes}/{} lanes active · {} queued",
+                        view.total_lanes,
+                        pending.len()
+                    )
+                };
+                if all_finished {
+                    view.status = if any_failed {
+                        "failed"
+                    } else if view.stop_requested {
+                        "stopped"
+                    } else {
+                        "completed"
+                    }
+                    .into();
+                    view.message = format!(
+                        "{} lanes finished: {} Holding, {} Databank, {} candidates evaluated.",
+                        view.total_lanes,
+                        view.total_holding_elites,
+                        view.total_databank_elites,
+                        view.total_evaluation_count,
+                    );
+                }
+            }
+            if all_finished {
+                break;
+            }
+            let mut finished = Vec::new();
+            for (index, (_, handle)) in running.iter().enumerate() {
+                if handle.is_finished() {
+                    finished.push(index);
+                }
+            }
+            for index in finished.into_iter().rev() {
+                let (_, handle) = running.remove(index);
+                let _ = handle.join();
+            }
+            thread::sleep(Duration::from_millis(350));
+        }
+        for (_, handle) in running {
+            let _ = handle.join();
+        }
+    });
+    Ok(started)
+}
+
+#[tauri::command]
+pub fn get_portfolio_discover_job(
+    state: State<'_, PortfolioDiscoverState>,
+) -> Result<PortfolioDiscoverJobView, String> {
+    state
+        .job
+        .read()
+        .map(|view| view.clone())
+        .map_err(|_| "portfolio campaign state is unavailable".into())
+}
+
+/// Opens the selected campaign lane's in-memory Holding/Databank snapshot.
+/// Unlike the on-disk final archive, this updates while Discover is running.
+#[tauri::command]
+pub fn get_portfolio_live_databank(
+    symbol: String,
+    state: State<'_, PortfolioDiscoverState>,
+    databank_state: State<'_, DesktopState>,
+) -> Result<crate::databank::DatabankWorkspace, String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    let lane = state
+        .live_lanes
+        .read()
+        .map_err(|_| "portfolio live Databank state is unavailable")?
+        .get(&symbol)
+        .cloned()
+        .ok_or_else(|| format!("{symbol} is not part of the current multi-asset campaign"))?;
+    let artifact = lane
+        .artifact
+        .read()
+        .map_err(|_| "portfolio live lane state is unavailable")?
+        .clone()
+        .ok_or_else(|| format!("{symbol} has no Holding or Databank strategies yet"))?;
+    install_live_databank_artifact(artifact, PathBuf::from(lane.output_path), &databank_state)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn stop_portfolio_discover(
+    state: State<'_, PortfolioDiscoverState>,
+) -> Result<PortfolioDiscoverJobView, String> {
+    let mut view = state
+        .job
+        .write()
+        .map_err(|_| "portfolio campaign state is unavailable")?;
+    if view.status != "running" {
+        return Err("no active Portfolio Discover campaign can be stopped".into());
+    }
+    state.stop.store(true, Ordering::SeqCst);
+    view.stop_requested = true;
+    view.phase = "Stopping after each lane's current generation".into();
+    view.message = "Every lane will checkpoint its own immutable Databank before it exits.".into();
+    Ok(view.clone())
+}
+
+fn portfolio_lane_job(request: &DiscoverRequest, worker_threads: usize) -> DiscoverJobView {
+    let mut job = DiscoverJobView::idle();
+    job.job_id = Some(format!(
+        "portfolio-{}",
+        request.selected_symbol.as_deref().unwrap_or("lane")
+    ));
+    job.status = "queued";
+    job.mode = Some(DiscoverModeView::New);
+    job.phase = "Waiting for campaign worker".into();
+    job.output_path = Some(request.databank_path.clone());
+    job.requested_generations = request.generations;
+    job.run_until_stopped = request.run_until_stopped.unwrap_or(true);
+    job.worker_threads = worker_threads;
+    job.promotion_worker_threads = 1;
+    job.message = "Isolated Development search is starting.".into();
+    job
+}
+
+fn portfolio_lane_view(symbol: &str, job: &DiscoverJobView) -> PortfolioDiscoverLaneView {
+    PortfolioDiscoverLaneView {
+        symbol: symbol.into(),
+        // A stopped or completed open-ended Discover writes an immutable
+        // snapshot beside the working archive. The campaign UI must reopen
+        // that snapshot, not the transient working path which may not exist.
+        output_path: job
+            .latest_immutable_snapshot_path
+            .clone()
+            .or_else(|| job.output_path.clone())
+            .unwrap_or_default(),
+        status: job.status.into(),
+        phase: job.phase.clone(),
+        evaluation_count: job.evaluation_count,
+        holding_elites: job.holding_elites,
+        databank_elites: job.databank_elites,
+        evaluations_per_hour: job.rolling_evaluations_per_hour,
+        worker_threads: job.worker_threads,
+        message: job.message.clone(),
+    }
+}
+
 #[tauri::command]
 pub fn get_discover_live_databank(
     state: State<'_, DiscoverState>,
@@ -1061,9 +1577,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
             validate_universal_grammar(grammar)?;
-            if request.sl_tp_only_exits.unwrap_or(true)
-                && grammar.minimum_entry_conditions > 3
-            {
+            if request.sl_tp_only_exits.unwrap_or(true) && grammar.minimum_entry_conditions > 3 {
                 return Err(
                     "SL/TP-only exits allow 2–3 entry conditions; lower the minimum entry conditions or switch that profile off"
                         .into(),
@@ -2215,10 +2729,7 @@ fn build_discover_artifact(
         ("desktop_job".into(), json!(true)),
         ("promotion_split".into(), json!(true)),
         ("validation_fraction".into(), json!(validation_fraction)),
-        (
-            "oos1_pick_enabled".into(),
-            json!(validation_fraction > 0.0),
-        ),
+        ("oos1_pick_enabled".into(), json!(validation_fraction > 0.0)),
         ("sealed_fraction".into(), json!(sealed_fraction)),
         (
             "stopped_early".into(),
@@ -2765,8 +3276,10 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         // The constrained production lane intentionally leaves at most three
         // entry conditions. Exit bounds remain part of the legacy grammar
         // contract but are erased before evaluation.
-        universal_grammar.maximum_entry_conditions = universal_grammar.maximum_entry_conditions.min(3);
-        universal_grammar.maximum_exit_conditions = universal_grammar.maximum_exit_conditions.min(2);
+        universal_grammar.maximum_entry_conditions =
+            universal_grammar.maximum_entry_conditions.min(3);
+        universal_grammar.maximum_exit_conditions =
+            universal_grammar.maximum_exit_conditions.min(2);
     }
     let mut commission = request
         .commission_per_lot_round_turn
@@ -3214,6 +3727,33 @@ mod tests {
     fn open_ended_discover_never_stops_for_a_holding_plateau_or_factory_target() {
         assert!(!holding_plateau_should_stop(true, true, 111, 25));
         assert_eq!(automatic_factory_target(true, Some(1)), None);
+    }
+
+    #[test]
+    fn portfolio_lane_is_always_a_new_isolated_discover_job() {
+        let mut lane = request("/tmp/portfolio-lane.json".into());
+        lane.selected_symbol = Some("EURUSD".into());
+        lane.worker_threads = Some(2);
+        let view = portfolio_lane_job(&lane, 2);
+
+        assert_eq!(view.mode, Some(DiscoverModeView::New));
+        assert_eq!(view.status, "queued");
+        assert_eq!(view.worker_threads, 2);
+        assert_eq!(
+            view.output_path.as_deref(),
+            Some("/tmp/portfolio-lane.json")
+        );
+    }
+
+    #[test]
+    fn portfolio_lane_prefers_its_immutable_checkpoint_for_reopening() {
+        let lane = request("/tmp/portfolio-working.json".into());
+        let mut job = portfolio_lane_job(&lane, 2);
+        job.latest_immutable_snapshot_path = Some("/tmp/portfolio-stopped.json".into());
+
+        let view = portfolio_lane_view("EURUSD", &job);
+
+        assert_eq!(view.output_path, "/tmp/portfolio-stopped.json");
     }
 
     #[test]

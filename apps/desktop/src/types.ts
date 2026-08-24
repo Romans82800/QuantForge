@@ -850,6 +850,58 @@ export interface DiscoverJobView {
   message: string;
 }
 
+/** One complete market binding used by an isolated Portfolio Discover lane. */
+export interface PortfolioDiscoverAsset {
+  symbol: string;
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+}
+
+export interface PortfolioDiscoverRequest {
+  recipe: DiscoverRequest;
+  assets: PortfolioDiscoverAsset[];
+  /** Shared Scout CPU budget; 0 lets QuantForge divide available CPUs. */
+  globalWorkerThreads: number;
+  /** Full-market data loads are staged to avoid memory and I/O contention. */
+  concurrentLanes: number;
+}
+
+export interface PortfolioDiscoverLaneView {
+  symbol: string;
+  outputPath: string;
+  status: string;
+  phase: string;
+  evaluationCount: number;
+  holdingElites: number;
+  databankElites: number;
+  evaluationsPerHour: number;
+  workerThreads: number;
+  message: string;
+}
+
+export interface PortfolioDiscoverJobView {
+  jobId: string | null;
+  status: "idle" | "running" | "completed" | "stopped" | "failed" | string;
+  phase: string;
+  globalWorkerThreads: number;
+  concurrentLanes: number;
+  activeLanes: number;
+  completedLanes: number;
+  totalLanes: number;
+  totalEvaluationCount: number;
+  totalHoldingElites: number;
+  totalDatabankElites: number;
+  startedAtMs: number | null;
+  stopRequested: boolean;
+  message: string;
+  lanes: PortfolioDiscoverLaneView[];
+}
+
 export interface BatteryItemView {
   fingerprint: string;
   strategyId: string;

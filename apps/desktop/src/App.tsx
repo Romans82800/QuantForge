@@ -24,6 +24,8 @@ import {
   exportEliteEas,
   exportEliteTradeCsvs,
   getDiscoverJob,
+  getPortfolioDiscoverJob,
+  getPortfolioLiveDatabank,
   getDiscoverLiveDatabank,
   getElitePartitionEquity,
   getEliteMql5Source,
@@ -58,7 +60,9 @@ import {
   startIncubation,
   finalizeIncubation,
   startDiscover,
+  startPortfolioDiscover,
   stopDiscover,
+  stopPortfolioDiscover,
 } from "./api";
 import type {
   AssembleEvidenceRequest,
@@ -96,6 +100,9 @@ import type {
   ResultsRobustnessView,
   TradeRowView,
   PortfolioRequest,
+  PortfolioDiscoverAsset,
+  PortfolioDiscoverJobView,
+  PortfolioDiscoverRequest,
   PortfolioView,
   SearchRange,
   SearchRangeProfile,
@@ -3763,6 +3770,7 @@ function DiscoverWorkspace({
   const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
   const [expertMode, setExpertMode] = useState(false);
   const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir" | "mq5">("overview");
+  const [discoverScope, setDiscoverScope] = useState<"single" | "campaign">("single");
   const lastDatabankCountRef = useRef(0);
   const lastLiveRevisionRef = useRef(0);
   const liveReloadBusyRef = useRef(false);
@@ -4195,6 +4203,14 @@ function DiscoverWorkspace({
   const canStart = !startBlocker;
 
   return (
+    <div className="discover-workspace">
+      <div className="workspace-tabs" role="tablist" aria-label="Discover mode">
+        <button type="button" role="tab" aria-selected={discoverScope === "single"} className={discoverScope === "single" ? "active" : ""} onClick={() => setDiscoverScope("single")}>Single asset</button>
+        <button type="button" role="tab" aria-selected={discoverScope === "campaign"} className={discoverScope === "campaign" ? "active" : ""} onClick={() => setDiscoverScope("campaign")}>Multi-asset campaign</button>
+      </div>
+      {discoverScope === "campaign" ? (
+        <MultiAssetDiscoverCampaign onError={onError} onOpenDatabank={onOpenDatabank} />
+      ) : (
     <div className="discover-layout">
       <div className="discover-dashboard">
         <div className="discover-tabs" role="tablist" aria-label="Discover dashboard">
@@ -5156,6 +5172,8 @@ function DiscoverWorkspace({
         />
       )}
     </div>
+      )}
+    </div>
   );
 }
 
@@ -5421,12 +5439,239 @@ function IndicatorParityPanel({ onError }: { onError: (message: string | null) =
   return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Buffer-level reconciliation</p><h2>Compare Rust indicators with MT5</h2></div></div><div className="form-stack"><PathField label="Indicator probe CSV" path={form.referencePath} choose={() => chooseTesterCsv("Choose MT5 indicator probe export")} onChange={(value) => setForm((current) => ({ ...current, referencePath: value }))} required /><PathField label="New indicator parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save indicator parity artifact", "indicator-parity.json")} onChange={(value) => setForm((current) => ({ ...current, outputPath: value }))} required /></div><div className="numeric-grid"><NumberField label="Warmup rows" value={form.warmupRows} onChange={(value) => setForm((current) => ({ ...current, warmupRows: value ?? 1000 }))} min={0} /><NumberField label="Absolute epsilon" value={form.absoluteEpsilon} onChange={(value) => setForm((current) => ({ ...current, absoluteEpsilon: value ?? 1e-10 }))} step={1e-10} /><NumberField label="Relative epsilon" value={form.relativeEpsilon} onChange={(value) => setForm((current) => ({ ...current, relativeEpsilon: value ?? 1e-9 }))} step={1e-9} /></div><div className="form-footer"><p>All thirteen supported indicator buffers must match after warmup before certification.</p><button className="primary" disabled={busy || !form.referencePath || !form.outputPath} onClick={run}>{busy ? "Comparing buffers…" : "Compare indicators"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">Indicator parity</p><h2>{result.symbol} · {result.timeframe}</h2></div><span className="grade-pill">{result.passed ? "passed" : "failed"}</span></div><div className="job-kpis"><Kpi label="Fields" value={formatNumber(result.fieldCount)} note="Required buffers" /><Kpi label="Compared rows" value={formatNumber(result.comparedRows)} note={`${formatNumber(result.sourceRows)} source rows`} /><Kpi label="Mismatches" value={formatNumber(result.mismatchCount)} note="Across all fields" /></div><ArtifactPath label="Indicator parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No indicator probe compared" copy="Run the bundled QuantForge indicator probe EA in MT5, export its CSV, then verify SMA, EMA, WMA, RSI, ATR, ranges, z-score, percentile and rate-of-change buffers here." />}</div>;
 }
 
+function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (message: string | null) => void; onOpenDatabank: (path: string) => void }) {
+  const [symbols, setSymbols] = useState<SymbolPack[]>([]);
+  const [profiles, setProfiles] = useState<SavedDiscoverProfile[]>([]);
+  const [profileId, setProfileId] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [globalWorkers, setGlobalWorkers] = useState(0);
+  const [concurrentLanes, setConcurrentLanes] = useState(2);
+  const [job, setJob] = useState<PortfolioDiscoverJobView | null>(null);
+  const [activeAsset, setActiveAsset] = useState("");
+  const [assetWorkspace, setAssetWorkspace] = useState<DatabankWorkspace | null>(null);
+  const [assetLoading, setAssetLoading] = useState(false);
+  const [assetSelected, setAssetSelected] = useState<string | null>(null);
+  const [assetDetail, setAssetDetail] = useState<EliteDetail | null>(null);
+  const [assetDetailLoading, setAssetDetailLoading] = useState(false);
+  const [assetDetailOpen, setAssetDetailOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const active = job?.status === "running";
+
+  useEffect(() => {
+    void Promise.all([listSymbols(), listDiscoverProfiles()])
+      .then(([available, saved]) => {
+        setSymbols(available);
+        setProfiles(saved);
+      })
+      .catch((reason) => onError(String(reason)));
+    void getPortfolioDiscoverJob().then(setJob).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => {
+      void getPortfolioDiscoverJob().then(setJob).catch((reason) => onError(String(reason)));
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  const selectedProfile = profiles.find((profile) => profile.id === profileId);
+  const recipe = selectedProfile?.settings;
+  const recommendedSymbols = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY", "AUDUSD", "USDCAD"];
+  const displaySymbols = useMemo(() => [...symbols].sort((left, right) => {
+    const leftRank = recommendedSymbols.indexOf(left.symbol);
+    const rightRank = recommendedSymbols.indexOf(right.symbol);
+    return (leftRank < 0 ? 99 : leftRank) - (rightRank < 0 ? 99 : rightRank) || left.symbol.localeCompare(right.symbol);
+  }), [symbols]);
+  const selectedSymbols = symbols.filter((symbol) => selected.has(symbol.symbol));
+  const activeLane = job?.lanes.find((lane) => lane.symbol === activeAsset) ?? job?.lanes[0] ?? null;
+  function toggle(symbol: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(symbol)) next.delete(symbol); else if (next.size < 7) next.add(symbol);
+      return next;
+    });
+  }
+  function useLiquidSix() {
+    const preferred = new Set(recommendedSymbols);
+    setSelected(new Set(symbols.filter((symbol) => preferred.has(symbol.symbol)).map((symbol) => symbol.symbol)));
+  }
+  function bindAsset(symbol: SymbolPack): PortfolioDiscoverAsset {
+    return {
+      symbol: symbol.symbol,
+      dataPath: symbol.dataPath,
+      metadataPath: symbol.metadataPath,
+      // A scanned data pack already has its immutable timezone metadata. The
+      // importer intentionally rejects a second manual timezone override.
+      sourceTimezone: null,
+      m1DataPath: symbol.m1DataPath,
+      m1MetadataPath: symbol.m1MetadataPath,
+      m1SourceTimezone: null,
+      brokerPath: symbol.brokerPath,
+    };
+  }
+  async function start() {
+    if (!recipe) { onError("Choose a saved Discover profile. Its frozen recipe will be copied to every selected asset."); return; }
+    if (selectedSymbols.length < 2) { onError("Select at least two complete assets for the campaign."); return; }
+    setBusy(true); onError(null);
+    try {
+      const request: PortfolioDiscoverRequest = {
+        recipe: {
+          ...recipe,
+          mode: "new",
+          selectedSymbol: null,
+          dataPath: "",
+          metadataPath: null,
+          m1DataPath: "",
+          m1MetadataPath: null,
+          brokerPath: "",
+          databankPath: "",
+          promotionSplit: true,
+          packDataDir: null,
+          multiSymbolMinimumPass: 0,
+          factoryAfterDiscover: false,
+        },
+        assets: selectedSymbols.map(bindAsset),
+        globalWorkerThreads: globalWorkers,
+        concurrentLanes,
+      };
+      const started = await startPortfolioDiscover(request);
+      setJob(started);
+      setActiveAsset(started.lanes[0]?.symbol ?? "");
+      setAssetWorkspace(null);
+    } catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  async function stop() {
+    try { setJob(await stopPortfolioDiscover()); }
+    catch (reason) { onError(String(reason)); }
+  }
+
+  async function inspectAssetElite(fingerprint: string) {
+    if (!activeLane) return;
+    setAssetSelected(fingerprint);
+    setAssetDetail(null);
+    setAssetDetailLoading(true);
+    setAssetDetailOpen(true);
+    onError(null);
+    try {
+      if (activeLane.status === "running") {
+        await getPortfolioLiveDatabank(activeLane.symbol);
+      } else {
+        await loadDatabankPath(activeLane.outputPath);
+      }
+      setAssetDetail(await loadElite(fingerprint));
+    } catch (reason) {
+      onError(`Could not open ${activeLane.symbol} strategy: ${String(reason)}`);
+      setAssetDetailOpen(false);
+    } finally {
+      setAssetDetailLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!job?.lanes.length) return;
+    if (!job.lanes.some((lane) => lane.symbol === activeAsset)) {
+      setActiveAsset(job.lanes[0].symbol);
+    }
+  }, [job?.jobId, job?.lanes, activeAsset]);
+
+  useEffect(() => {
+    if (!activeLane) return;
+    const hasRows = activeLane.holdingElites + activeLane.databankElites > 0;
+    if (!hasRows) {
+      setAssetWorkspace(null);
+      return;
+    }
+    let cancelled = false;
+    setAssetLoading(true);
+    const load = activeLane.status === "running"
+      ? getPortfolioLiveDatabank(activeLane.symbol)
+      : loadDatabankPath(activeLane.outputPath);
+    void load
+      .then((workspace) => { if (!cancelled) setAssetWorkspace(workspace); })
+      .catch((reason) => { if (!cancelled) onError(`Could not refresh ${activeLane.symbol}: ${String(reason)}`); })
+      .finally(() => { if (!cancelled) setAssetLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeLane?.symbol, activeLane?.status, activeLane?.holdingElites, activeLane?.databankElites]);
+
+  const assetRows = useMemo(
+    () => assetWorkspace
+      ? [...(assetWorkspace.holding ?? []), ...assetWorkspace.elites].sort((left, right) => (right.foldMedianR ?? right.evidence) - (left.foldMedianR ?? left.evidence))
+      : [],
+    [assetWorkspace],
+  );
+
+  return <div className="tool-content multi-discover-workspace">
+    <section className="panel campaign-intro">
+      <div className="campaign-intro-copy">
+        <p className="eyebrow">Multi-asset Discover</p>
+        <h2>Build separate strategy pools, together.</h2>
+        <p>Choose one proven recipe and the markets to search. Every market keeps its own development data, validation and sealed final holdout.</p>
+      </div>
+      <div className="campaign-assurance"><span>Independent research lanes</span><strong>OOS is never shared</strong></div>
+    </section>
+    <section className="panel campaign-launcher">
+      <div className="campaign-section-head"><div><p className="eyebrow">1 · Recipe</p><h2>Choose your search recipe</h2></div><span className={recipe ? "campaign-ready" : "campaign-pending"}>{recipe ? "Ready" : "Required"}</span></div>
+      <label className="campaign-recipe"><span>Saved Discover recipe</span><select disabled={active} value={profileId} onChange={(event) => setProfileId(event.target.value)}><option value="">Choose a saved recipe…</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{recipe ? "The same rules are copied to every selected market. Seeds, paths and holdouts stay separate." : "Save a simple low-complexity recipe in Single asset Discover, then return here."}</small></label>
+      <div className="campaign-controls"><NumberField label="Scout CPU workers" value={globalWorkers} onChange={(value) => setGlobalWorkers(value ?? 0)} min={0} /><NumberField label="Markets at once" value={concurrentLanes} onChange={(value) => setConcurrentLanes(Math.min(7, Math.max(1, value ?? 2)))} min={1} max={7} /></div>
+      <p className="campaign-cpu-note">Leave CPU workers at 0 for automatic. Two markets at once is the safer starting point.</p>
+    </section>
+    <section className="panel campaign-assets">
+      <div className="campaign-section-head"><div><p className="eyebrow">2 · Markets</p><h2>Choose 2–7 independent lanes</h2></div><button type="button" className="quiet-action" disabled={active || symbols.length === 0} onClick={useLiquidSix}>Select liquid six</button></div>
+      <div className="campaign-selection-summary"><strong>{selectedSymbols.length}</strong><span>markets selected</span><small>{selectedSymbols.length < 2 ? "Choose at least two to begin" : "Ready to run as separate research lanes"}</small></div>
+      <div className="campaign-asset-grid">{displaySymbols.map((symbol) => {
+        const isSelected = selected.has(symbol.symbol);
+        return <label key={symbol.symbol} className={`campaign-asset-card ${isSelected ? "selected" : ""}`}>
+          <input type="checkbox" disabled={active || (!isSelected && selected.size >= 7)} checked={isSelected} onChange={() => toggle(symbol.symbol)} />
+          <span className="asset-check" aria-hidden="true">{isSelected ? "✓" : ""}</span>
+          <strong>{symbol.symbol}</strong>
+          <small>H1 + M1 data ready</small>
+          <span className="asset-lane-label">Independent lane</span>
+        </label>;
+      })}</div>
+      <div className="campaign-start"><div><strong>{selectedProfile?.name ?? "Choose a recipe to continue"}</strong><span>Recommended first set: EURUSD, GBPUSD, USDJPY, EURJPY, AUDUSD and USDCAD.</span></div><button type="button" className="primary" disabled={active || busy || !recipe || selectedSymbols.length < 2} onClick={() => void start()}>{busy ? "Starting…" : "Start multi-asset Discover"}</button></div>
+    </section>
+    {job && job.totalLanes > 0 && <section className={job.status === "failed" ? "panel result-panel result-fail" : "panel result-panel result-pass"}>
+      <div className="result-hero"><div><p className="eyebrow">Multi-asset campaign</p><h2>{job.phase}</h2></div><span className="grade-pill">{job.status}</span></div>
+      <p>{job.message}</p><div className="job-kpis"><Kpi label="Lanes" value={`${job.completedLanes}/${job.totalLanes}`} note={`${job.activeLanes} active · ${job.concurrentLanes} at once`} /><Kpi label="Evaluated" value={formatNumber(job.totalEvaluationCount)} note="all isolated lanes" /><Kpi label="Holding" value={formatNumber(job.totalHoldingElites)} note="ready for per-asset battery" /><Kpi label="Databank" value={formatNumber(job.totalDatabankElites)} note="across assets" /></div>
+      <div className="campaign-lane-grid">{job.lanes.map((lane) => <article key={lane.symbol} className={`campaign-lane-card ${lane.status}`}>
+        <header><div><strong>{lane.symbol}</strong><span>{lane.status === "running" ? "Running" : lane.status}</span></div><small>{lane.workerThreads} scout</small></header>
+        <p>{lane.phase}</p>
+        <div className="campaign-lane-metrics"><span><strong>{formatNumber(lane.evaluationCount)}</strong> tested</span><span><strong>{formatNumber(lane.holdingElites)}</strong> Holding</span><span><strong>{formatNumber(lane.databankElites)}</strong> Databank</span></div>
+        {lane.status === "failed" && <small className="lane-error" title={lane.message}>{lane.message}</small>}
+      </article>)}</div>
+      {active && <div className="form-footer"><p>Stopping preserves a checkpoint for every lane after its current generation.</p><button type="button" className="danger" disabled={job.stopRequested} onClick={() => void stop()}>{job.stopRequested ? "Stopping…" : "Stop campaign safely"}</button></div>}
+    </section>}
+    {job && job.totalLanes > 0 && <section className={`panel discover-live-databank ${assetRows.length ? "" : "empty"}`}>
+      <div className="panel-heading"><div><p className="eyebrow">Individual live Databanks</p><h2>{activeLane ? `${activeLane.symbol} Databank` : "Choose an asset"}</h2></div><span className="read-only-badge">click an asset tab</span></div>
+      <div className="workspace-tabs campaign-asset-tabs" role="tablist" aria-label="Campaign assets">{job.lanes.map((lane) => <button key={lane.symbol} type="button" role="tab" aria-selected={lane.symbol === activeAsset} className={lane.symbol === activeAsset ? "active" : ""} onClick={() => setActiveAsset(lane.symbol)}>{lane.symbol} <small>{lane.holdingElites + lane.databankElites}</small></button>)}</div>
+      {activeLane?.status === "failed" ? <div className="job-error"><strong>{activeLane.symbol} failed</strong><span>{activeLane.message}</span></div> : assetLoading ? <p>Refreshing {activeLane?.symbol}…</p> : assetRows.length > 0 ? <><p className="live-strip-hint">Click a strategy for its full partitioned M1 curve and recorded IS/OOS expectancy. This is inspection only; it never changes Discover, ranking, or promotion.</p><EliteTable batchSelection={new Set()} compact onSelect={(fingerprint) => void inspectAssetElite(fingerprint)} onToggle={() => {}} rows={assetRows} selected={assetSelected} showBatch={false} /><div className="form-footer"><p>{formatNumber(assetRows.length)} {activeLane?.symbol} strategies in Holding and Databank.</p><button type="button" className="secondary" onClick={() => activeLane && onOpenDatabank(activeLane.outputPath)}>Open full {activeLane?.symbol} Databank</button></div></> : <p>{activeLane?.status === "queued" ? `${activeLane.symbol} is queued. It will start when a running lane finishes.` : `${activeLane?.symbol ?? "This asset"} has no Holding deposits yet.`}</p>}
+    </section>}
+    {assetDetailOpen && activeLane && <CampaignStrategyPreviewModal
+      detail={assetDetail}
+      loading={assetDetailLoading}
+      row={assetRows.find((row) => row.fingerprint === assetSelected) ?? null}
+      symbol={activeLane.symbol}
+      workspace={assetWorkspace}
+      onClose={() => setAssetDetailOpen(false)}
+    />}
+  </div>;
+}
+
+// Kept only so existing Portfolio navigation does not dead-end. Campaigns now
+// live in Discover, where their per-asset Databank tabs are available.
+function PortfolioDiscoverCampaign({ onError }: { onError: (message: string | null) => void }) {
+  return <WorkspacePrimer title="Multi-asset Discover moved" copy="Open Discover, then choose Multi-asset campaign. That workspace keeps every asset's live Holding and Databank separate behind its own tab." />;
+}
+
 function PortfolioWorkspace({ onError, workspace }: { onError: (message: string | null) => void; workspace: DatabankWorkspace | null }) {
+  const [tab, setTab] = useState<"discover" | "pack">("discover");
   const [form, setForm] = useState<PortfolioRequest>({ databankPath: workspace?.sourcePath ?? "", brokerPath: "", outputPath: "", objective: "risk_adjusted_return", maximumPairwiseCorrelation: .7, maximumWeightPerStrategy: .25, maximumSymbolExposure: 1, maximumCohortExposure: .5, maximumStrategies: 10, minimumReturnPercent: 0, cvarTailFraction: .05, stressTrials: 1000, stressBlockLength: 5, seed: 42 });
   const [result, setResult] = useState<PortfolioView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof PortfolioRequest>(key: K, value: PortfolioRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await buildPortfolio(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>;
+  return <div className="wide-tool-content"><div className="workspace-tabs"><button className={tab === "discover" ? "active" : ""} onClick={() => setTab("discover")}>Portfolio Discover</button><button className={tab === "pack" ? "active" : ""} onClick={() => setTab("pack")}>Pack Databank</button></div>{tab === "discover" ? <PortfolioDiscoverCampaign onError={onError} /> : <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>}</div>;
 }
 
 function VaultWorkspace({ onError }: { onError: (message: string | null) => void }) {
@@ -6364,6 +6609,78 @@ function PartitionEquityChart({
       </div>
     </section>
   );
+}
+
+function CampaignStrategyPreviewModal({
+  detail,
+  loading,
+  row,
+  symbol,
+  workspace,
+  onClose,
+}: {
+  detail: EliteDetail | null;
+  loading: boolean;
+  row: EliteRow | null;
+  symbol: string;
+  workspace: DatabankWorkspace | null;
+  onClose: () => void;
+}) {
+  const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
+  const [partitionBusy, setPartitionBusy] = useState(false);
+  const [partitionError, setPartitionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!detail) {
+      setPartitionView(null);
+      setPartitionBusy(false);
+      return;
+    }
+    let cancelled = false;
+    setPartitionView(null);
+    setPartitionError(null);
+    setPartitionBusy(true);
+    void getElitePartitionEquity(detail.fingerprint)
+      .then((next) => {
+        if (!cancelled) setPartitionView(next);
+      })
+      .catch((reason) => {
+        if (!cancelled) setPartitionError(String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setPartitionBusy(false);
+      });
+    return () => { cancelled = true; };
+  }, [detail?.fingerprint]);
+
+  return <div className="elite-detail-modal-backdrop" onClick={onClose} role="presentation">
+    <div className="campaign-strategy-preview" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label={`${symbol} strategy preview`}>
+      <header className="campaign-preview-head">
+        <div><p className="eyebrow">{symbol} · strategy preview</p><h2>{row?.strategyId ?? "Loading strategy…"}</h2><small>{detail?.thesis ?? "Stored Development performance and validation record."}</small><span className="inspected-holdout-badge">Inspected holdout · reporting only</span></div>
+        <button className="secondary" type="button" onClick={onClose}>Close</button>
+      </header>
+      {loading || !row ? <div className="inspector-loading">Preparing the stored strategy preview…</div> : <div className="campaign-preview-body">
+        <section className="campaign-preview-equity full-partition">
+          <div className="campaign-preview-disclosure"><span>Exact M1 replay, partitioned at this run's stored IS / OOS boundaries.</span><small>Displayed results are not read by Discover, ranking, Holding, or promotion.</small></div>
+          <PartitionEquityChart
+            view={partitionView}
+            busy={partitionBusy}
+            researchGrade={workspace?.researchGrade ?? false}
+            m1FidelityVerified={workspace?.m1FidelityVerified ?? true}
+          />
+          {partitionError && <p className="negative">Could not replay the full partitioned curve: {partitionError}</p>}
+        </section>
+        <section className="campaign-preview-stats" aria-label="Strategy statistics">
+          <div><span>Trades</span><strong>{formatNumber(row.trades)}</strong></div>
+          <div><span>Return</span><strong className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</strong></div>
+          <div><span>Drawdown</span><strong>{row.drawdownPercent.toFixed(2)}%</strong></div>
+          <div><span>Recovery</span><strong>{formatRecoveryFactor(row)}</strong></div>
+          <div><span>Sharpe</span><strong>{row.sharpeRatio?.toFixed(2) ?? "—"}</strong></div>
+          <div><span>Fold R</span><strong>{row.foldMedianR.toFixed(3)}</strong></div>
+        </section>
+      </div>}
+    </div>
+  </div>;
 }
 
 function EliteDetailModal({

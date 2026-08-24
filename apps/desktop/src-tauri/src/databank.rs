@@ -825,12 +825,10 @@ pub async fn get_elite_partition_equity(
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
             .clone();
-        if elite_is_sealed_protected(&elite) {
-            return Err(
-                "This Production Lane strategy is sealed-protected. Use the explicit one-shot Sealed Final workflow after the shortlist is frozen."
-                    .into(),
-            );
-        }
+        // Full partition replays are an explicit, read-only inspection action.
+        // Their result is never fed back into Discover, Holding, ranking, or
+        // promotion. Production Lane entries are therefore allowed here when
+        // the operator chooses to inspect the entire downloaded databank.
         (
             elite,
             loaded.source.clone(),
