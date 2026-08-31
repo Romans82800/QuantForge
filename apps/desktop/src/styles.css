@@ -2573,6 +2573,22 @@ select {
   fill: rgba(110, 125, 143, .025);
 }
 
+.partition-equity-svg .region-overlay.region-is {
+  fill: rgba(34, 150, 135, .16);
+}
+
+.partition-equity-svg .region-overlay.region-oos1 {
+  fill: rgba(217, 156, 64, .22);
+}
+
+.partition-equity-svg .region-overlay.region-oos2 {
+  fill: rgba(105, 118, 229, .20);
+}
+
+.partition-equity-svg .region-overlay {
+  pointer-events: none;
+}
+
 .partition-equity-svg .divider {
   stroke: #647684;
   stroke-width: .75;
@@ -2586,6 +2602,18 @@ select {
   stroke-width: 1.65;
   vector-effect: non-scaling-stroke;
   filter: drop-shadow(0 0 2px rgba(53, 212, 189, .16));
+}
+
+.partition-equity-svg .equity-path-is {
+  stroke: #35d4bd;
+}
+
+.partition-equity-svg .equity-path-oos1 {
+  stroke: #e7b65c;
+}
+
+.partition-equity-svg .equity-path-oos2 {
+  stroke: #8f9df0;
 }
 
 .partition-equity-svg .equity-area {

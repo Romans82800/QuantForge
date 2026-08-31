@@ -862,10 +862,17 @@ fn run_discovery(
             "this databank was built from an IS partition; enable the identical promotion split to continue it".to_owned()
         })?
     };
-    let evaluation_oos1 = if bank.data_hash == search_decision.data_hash {
-        None
-    } else {
+    // When promotion_split is enabled, always apply the OOS1 holdout gate. The
+    // previous data_hash check skipped holdout whenever the databank still
+    // referenced the full decision series, which silently admitted strategies
+    // without an OOS1 expectancy check.
+    let evaluation_oos1 = if holdout_gate_active(
+        promotion_split,
+        bank.data_hash == search_decision.data_hash,
+    ) {
         oos1_ref
+    } else {
+        None
     };
     let evaluation_m1 = if bank.execution_data_hash == m1.dataset.data_hash {
         &m1.dataset
@@ -1370,6 +1377,10 @@ fn effective_worker_threads(configured: usize) -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
+}
+
+fn holdout_gate_active(promotion_split: bool, bank_uses_full_decision: bool) -> bool {
+    promotion_split || !bank_uses_full_decision
 }
 
 fn recipe_fraction(artifact: &EvolveArtifact, key: &str, fallback: f64) -> f64 {
@@ -2007,6 +2018,14 @@ mod tests {
         // would otherwise halve the reported evaluations per hour.
         assert!(clock.active_hours() <= before);
         assert!(clock.active_hours() > 0.0);
+    }
+
+    #[test]
+    fn holdout_gate_stays_active_when_promotion_split_is_enabled() {
+        assert!(holdout_gate_active(true, true));
+        assert!(holdout_gate_active(true, false));
+        assert!(!holdout_gate_active(false, true));
+        assert!(holdout_gate_active(false, false));
     }
 
     #[test]

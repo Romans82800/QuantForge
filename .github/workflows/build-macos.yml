@@ -1,17 +1,14 @@
-# Windows x86_64 (Intel/AMD) installer for QuantForge.
-# Trigger: Actions → "Build Windows x64" → Run workflow
-# Artifact: QuantForge-windows-x64 (NSIS .exe and/or MSI)
+# macOS universal/arm64 installer for QuantForge.
+# Artifact: QuantForge-macos (QuantForge.app zip)
 
-name: Build Windows x64
+name: Build macOS
 
 on:
   workflow_dispatch:
-  # Also run on this branch so the first Windows build works before the
-  # workflow exists on the repo default branch (workflow_dispatch requires that).
   push:
     branches:
-      - cursor/is-oos1-oos2-parallel-challenge
       - cursor/equity-partitions-holdout-41e9
+      - cursor/is-oos1-oos2-parallel-challenge
       - main
       - master
 
@@ -20,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,17 +41,22 @@ jobs:
         working-directory: apps/desktop
         run: pnpm install --frozen-lockfile
 
-      - name: Build QuantForge (Windows x64 release)
+      - name: Build QuantForge (macOS release)
         working-directory: apps/desktop
         run: pnpm tauri build
 
-      - name: Upload Windows installers
+      - name: Package QuantForge.app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/bundle/macos/QuantForge.app \
+            QuantForge-macos.zip
+
+      - name: Upload macOS app
         uses: actions/upload-artifact@v4
         with:
-          name: QuantForge-windows-x64
+          name: QuantForge-macos
           path: |
-            target/release/bundle/nsis/*.exe
-            target/release/bundle/msi/*.msi
-            target/release/quantforge-desktop.exe
+            QuantForge-macos.zip
+            target/release/bundle/macos/QuantForge.app
           if-no-files-found: error
           retention-days: 30
