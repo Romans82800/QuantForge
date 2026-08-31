@@ -5050,11 +5050,35 @@ function PartitionEquityChart({
   const lastX = xAt(chartPoints.at(-1)!.timestampMs);
   const chartBottom = height - pad;
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
-  const isX = xAt(view.isEndTimestampMs);
-  const oos1X = xAt(view.oos1EndTimestampMs);
+  const fullT0 = view.points[0].timestampMs;
+  const fullT1 = view.points[view.points.length - 1].timestampMs;
+  const fullTSpan = Math.max(fullT1 - fullT0, 1);
+  const xAtFull = (timestamp: number) =>
+    pad + ((timestamp - fullT0) / fullTSpan) * (width - pad * 2);
+  const isX = xAtFull(view.isEndTimestampMs);
+  const oos1X = xAtFull(view.oos1EndTimestampMs);
+  const totalBars = view.isBars + view.oos1Bars + view.oos2Bars;
+  const isShare = totalBars > 0 ? (view.isBars / totalBars) * 100 : 0;
+  const oos1Share = totalBars > 0 ? (view.oos1Bars / totalBars) * 100 : 0;
+  const oos2Share = totalBars > 0 ? (view.oos2Bars / totalBars) * 100 : 0;
+  const splitLabel = `${formatNumber(isShare, 0)}% · ${formatNumber(oos1Share, 0)}% · ${formatNumber(oos2Share, 0)}%`;
   const gradientId = large ? "equity-area-large" : "equity-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
+  const isSegment = view.points.filter((point) => point.timestampMs < view.isEndTimestampMs);
+  const oos1Segment = view.points.filter(
+    (point) => point.timestampMs >= view.isEndTimestampMs && point.timestampMs < view.oos1EndTimestampMs,
+  );
+  const oos2Segment = view.points.filter((point) => point.timestampMs >= view.oos1EndTimestampMs);
+  const bridgedOos1 = isSegment.length > 0 && oos1Segment.length > 0
+    ? [isSegment[isSegment.length - 1], ...oos1Segment]
+    : oos1Segment;
+  const bridgedOos2 = bridgedOos1.length > 0 && oos2Segment.length > 0
+    ? [bridgedOos1[bridgedOos1.length - 1], ...oos2Segment]
+    : oos2Segment;
+  const segmentPath = (segment: typeof view.points) => segment
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
+    .join(" ");
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
@@ -5062,7 +5086,7 @@ function PartitionEquityChart({
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
           <small>
-            {view.executionEngine} · IS 60% · OOS1 20% · OOS2 20% (display only)
+            {view.executionEngine} · IS / OOS1 / OOS2 {splitLabel} (OOS2 display only)
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>
@@ -5108,15 +5132,23 @@ function PartitionEquityChart({
             </g>
           );
         })}
+        <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
+        {sample === "full" ? (
+          <>
+            {isSegment.length >= 2 && <path d={segmentPath(isSegment)} className="equity-path equity-path-is" />}
+            {bridgedOos1.length >= 2 && <path d={segmentPath(bridgedOos1)} className="equity-path equity-path-oos1" />}
+            {bridgedOos2.length >= 2 && <path d={segmentPath(bridgedOos2)} className="equity-path equity-path-oos2" />}
+          </>
+        ) : (
+          <path d={path} className="equity-path" />
+        )}
         {sample === "full" && <>
-          <rect x={pad} y={pad} width={isX - pad} height={height - pad * 2} className="region-is" />
-          <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1" />
-          <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2" />
+          <rect x={pad} y={pad} width={Math.max(0, isX - pad)} height={height - pad * 2} className="region-is region-overlay" />
+          <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1 region-overlay" />
+          <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2 region-overlay" />
           <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
           <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
         </>}
-        <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
-        <path d={path} className="equity-path" />
         <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
         {sample === "full" ? <>
           <text x={pad + 6} y={pad + 14} className="region-label">IS</text>

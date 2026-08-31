@@ -11,6 +11,15 @@ function equityCurveValues(
   return signature;
 }
 
+function partitionSplitLabel(view: PartitionEquityView): string {
+  const totalBars = view.isBars + view.oos1Bars + view.oos2Bars;
+  if (totalBars <= 0) return "IS / OOS1 / OOS2";
+  const isShare = (view.isBars / totalBars) * 100;
+  const oos1Share = (view.oos1Bars / totalBars) * 100;
+  const oos2Share = (view.oos2Bars / totalBars) * 100;
+  return `${formatNumber(isShare, 0)}% · ${formatNumber(oos1Share, 0)}% · ${formatNumber(oos2Share, 0)}%`;
+}
+
 export function StoredSignatureChart({
   initialBalance,
   returnPercent,
@@ -128,6 +137,16 @@ export function EquityCurvePanel({
   );
 }
 
+function Kpi({ label, value, note }: { label: string; value: string; note: string }) {
+  return (
+    <article className="kpi">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{note}</small>
+    </article>
+  );
+}
+
 export function PartitionEquityChart({
   view,
   busy,
@@ -184,83 +203,115 @@ export function PartitionEquityChart({
   const chartBottom = height - pad;
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
 
-  const isX = xAt(view.isEndTimestampMs);
-  const oos1X = xAt(view.oos1EndTimestampMs);
+  const fullT0 = view.points[0].timestampMs;
+  const fullT1 = view.points[view.points.length - 1].timestampMs;
+  const fullTSpan = Math.max(fullT1 - fullT0, 1);
+  const xAtFull = (timestamp: number) =>
+    pad + ((timestamp - fullT0) / fullTSpan) * (width - pad * 2);
+  const isX = xAtFull(view.isEndTimestampMs);
+  const oos1X = xAtFull(view.oos1EndTimestampMs);
+  const splitLabel = partitionSplitLabel(view);
   const gradientId = large ? "equity-area-large" : "equity-area-small";
 
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
+  const isSegment = view.points.filter((point) => point.timestampMs < view.isEndTimestampMs);
+  const oos1Segment = view.points.filter(
+    (point) => point.timestampMs >= view.isEndTimestampMs && point.timestampMs < view.oos1EndTimestampMs,
+  );
+  const oos2Segment = view.points.filter((point) => point.timestampMs >= view.oos1EndTimestampMs);
+  const bridgedOos1 = isSegment.length > 0 && oos1Segment.length > 0
+    ? [isSegment[isSegment.length - 1], ...oos1Segment]
+    : oos1Segment;
+  const bridgedOos2 = bridgedOos1.length > 0 && oos2Segment.length > 0
+    ? [bridgedOos1[bridgedOos1.length - 1], ...oos2Segment]
+    : oos2Segment;
+  const segmentPath = (segment: typeof view.points) => segment
+    .map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`)
+    .join(" ");
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
-      <div className="partition-equity-head" style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
+      <div className="partition-equity-head">
         <div>
           <p className="eyebrow">M1-chronology full-run equity</p>
-          <small style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>
-            {view.executionEngine} · IS 60% · OOS1 20% · OOS2 20% (display only)
+          <small>
+            {view.executionEngine} · IS / OOS1 / OOS2 {splitLabel} (OOS2 display only)
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
           </small>
         </div>
-        <div className="partition-equity-scale" style={{ display: 'flex', gap: '16px', alignItems: 'center', fontSize: '13px' }}>
-          <label className="partition-sample-select" style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            Sample
-            <select
-              value={sample}
-              onChange={(event) => setSample(event.target.value as typeof sample)}
-              style={{ padding: '4px', borderRadius: '4px', background: 'var(--bg-inset)', border: '1px solid var(--border)', color: 'var(--fg)' }}
-            >
+        <div className="partition-equity-scale">
+          <label className="partition-sample-select">Sample
+            <select value={sample} onChange={(event) => setSample(event.target.value as typeof sample)}>
               <option value="full">Full (IS + OOS)</option>
               <option value="is">IS</option>
               <option value="oos1">OOS 1</option>
               <option value="oos2">OOS 2</option>
             </select>
           </label>
-          <span style={{ color: 'var(--positive)' }}>${formatNumber(max, 0)} peak</span>
-          <span style={{ color: 'var(--negative)' }}>${formatNumber(min, 0)} trough</span>
+          <span>${formatNumber(max, 0)} peak</span>
+          <span>${formatNumber(min, 0)} trough</span>
         </div>
       </div>
-      <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve" style={{ width: '100%', height: 'auto', background: 'var(--bg-inset)', borderRadius: '8px' }}>
+      <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Partitioned equity curve">
         <defs>
           <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="var(--accent)" stopOpacity=".30" />
-            <stop offset="68%" stopColor="var(--accent)" stopOpacity=".08" />
-            <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+            <stop offset="0%" stopColor="#35d4bd" stopOpacity=".30" />
+            <stop offset="68%" stopColor="#1eae9a" stopOpacity=".08" />
+            <stop offset="100%" stopColor="#1eae9a" stopOpacity="0" />
           </linearGradient>
         </defs>
-
         {horizontalGuides.map((guide) => {
           const y = pad + (guide / 4) * (height - pad * 2);
           const value = max - (guide / 4) * span;
           return (
             <g key={`h-${guide}`}>
-              <line x1={pad} y1={y} x2={width - pad} y2={y} stroke="var(--border)" strokeDasharray="4 4" />
-              {large && <text x={width - pad - 4} y={y - 4} textAnchor="end" fill="var(--fg-dim)" fontSize="10px">${formatNumber(value, 0)}</text>}
+              <line x1={pad} y1={y} x2={width - pad} y2={y} className="chart-grid-line" />
+              {large && <text x={width - pad - 4} y={y - 4} textAnchor="end" className="chart-axis-label">${formatNumber(value, 0)}</text>}
             </g>
           );
         })}
-
         {verticalGuides.map((guide) => {
           const fraction = guide / 6;
           const x = pad + fraction * (width - pad * 2);
+          const timestamp = t0 + fraction * tSpan;
           return (
             <g key={`v-${guide}`}>
-              <line x1={x} y1={pad} x2={x} y2={height - pad} stroke="var(--border)" strokeDasharray="4 4" />
+              <line x1={x} y1={pad} x2={x} y2={height - pad} className="chart-grid-line vertical" />
+              {large && <text x={x} y={height - 4} textAnchor={guide === 0 ? "start" : guide === 6 ? "end" : "middle"} className="chart-axis-label">{new Date(timestamp).getUTCFullYear()}</text>}
             </g>
           );
         })}
-
-        {sample === "full" && (
+        <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
+        {sample === "full" ? (
           <>
-            <line x1={isX} y1={pad} x2={isX} y2={height - pad} stroke="var(--negative)" strokeWidth="1.5" strokeDasharray="4 4" />
-            <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} stroke="var(--negative)" strokeWidth="1.5" strokeDasharray="4 4" />
-            <text x={isX - 8} y={pad + 12} fill="var(--fg-dim)" fontSize="10px" textAnchor="end">IS end</text>
-            <text x={oos1X - 8} y={pad + 12} fill="var(--fg-dim)" fontSize="10px" textAnchor="end">OOS1 end</text>
+            {isSegment.length >= 2 && <path d={segmentPath(isSegment)} className="equity-path equity-path-is" />}
+            {bridgedOos1.length >= 2 && <path d={segmentPath(bridgedOos1)} className="equity-path equity-path-oos1" />}
+            {bridgedOos2.length >= 2 && <path d={segmentPath(bridgedOos2)} className="equity-path equity-path-oos2" />}
           </>
+        ) : (
+          <path d={path} className="equity-path" />
         )}
-
-        <path d={areaPath} fill={`url(#${gradientId})`} />
-        <path d={path} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
+        {sample === "full" && <>
+          <rect x={pad} y={pad} width={Math.max(0, isX - pad)} height={height - pad * 2} className="region-is region-overlay" />
+          <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1 region-overlay" />
+          <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2 region-overlay" />
+          <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
+          <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
+        </>}
+        <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
+        {sample === "full" ? <>
+          <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
+          <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>
+          <text x={oos1X + 6} y={pad + 14} className="region-label">OOS2</text>
+        </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
+      <div className="partition-kpis">
+        <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
+        <Kpi label="OOS1 expectancy (R)" value={formatNumber(view.oos1Expectancy / 1000, 2)} note={view.oos1ExpectancyRatio === null ? "no ratio" : `${view.oos1ExpectancyRatio.toFixed(2)}× IS · chart split`} />
+        <Kpi label="OOS2 expectancy (R)" value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
+        <Kpi label="Bars" value={`${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note="IS / OOS1 / OOS2 · databank split" />
+      </div>
     </section>
   );
 }
