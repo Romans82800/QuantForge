@@ -1,0 +1,62 @@
+# macOS universal/arm64 installer for QuantForge.
+# Artifact: QuantForge-macos (QuantForge.app zip)
+
+name: Build macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/equity-partitions-holdout-41e9
+      - cursor/is-oos1-oos2-parallel-challenge
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build QuantForge (macOS release)
+        working-directory: apps/desktop
+        run: pnpm tauri build
+
+      - name: Package QuantForge.app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/bundle/macos/QuantForge.app \
+            QuantForge-macos.zip
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantForge-macos
+          path: |
+            QuantForge-macos.zip
+            target/release/bundle/macos/QuantForge.app
+          if-no-files-found: error
+          retention-days: 30
