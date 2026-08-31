@@ -11,6 +11,7 @@ on:
   push:
     branches:
       - cursor/is-oos1-oos2-parallel-challenge
+      - cursor/equity-partitions-holdout-41e9
       - main
       - master
 
