@@ -1302,13 +1302,18 @@ pub fn run_holding_battery_and_promote(
     }
 }
 
-/// Concatenate consecutive decision partitions for a validation replay. OOS2
-/// is never accepted by this helper or stored in the promotion context.
+/// Concatenate decision partitions for a validation replay.  A segmented
+/// timeline can interleave validation and training windows, so the caller's
+/// filtered datasets are not necessarily in chronological order.  Sort and
+/// deduplicate here before replay; feeding `IST` followed by `ISV1` would make
+/// the M1 judge seek backwards and report false missing-open errors.
 #[allow(dead_code)]
 fn join_datasets(first: &BarDataset, second: &BarDataset) -> BarDataset {
     let mut bars = Vec::with_capacity(first.bars.len() + second.bars.len());
     bars.extend_from_slice(&first.bars);
     bars.extend_from_slice(&second.bars);
+    bars.sort_unstable_by_key(|bar| bar.timestamp_ms);
+    bars.dedup_by_key(|bar| bar.timestamp_ms);
     BarDataset {
         data_hash: bar_content_hash(&bars),
         source_rows: bars.len(),

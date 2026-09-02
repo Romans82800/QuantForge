@@ -1324,7 +1324,9 @@ pub(crate) fn build_decision_from_m1(
             .map(|bar| bar.timestamp_ms)
             .collect::<Vec<_>>()
     });
-    build_timeframe_from_m1(m1, interval_ms, grid.as_deref()).map_err(|error| error.to_string())
+    build_timeframe_from_m1(m1, interval_ms, grid.as_deref())
+        .map(|dataset| align_decision_opens_to_m1(dataset, m1))
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn build_decision_from_m1_quotes(
@@ -1344,7 +1346,52 @@ pub(crate) fn build_decision_from_m1_quotes(
             .collect::<Vec<_>>()
     });
     build_timeframe_from_m1_with_quotes(m1, quotes, broker_point, interval_ms, grid.as_deref())
+        .map(|dataset| align_decision_opens_to_m1(dataset, m1))
         .map_err(|error| error.to_string())
+}
+
+/// Higher-timeframe exports can contain a partial first bar whose nominal
+/// open precedes the first available M1 quote (common at a session boundary).
+/// The M1 judge requires an execution bar exactly at each decision open, so
+/// remove those partial decision bars once, at the shared data-building seam.
+/// This keeps Discover, Databank replay, Retester and Parity Lab on identical
+/// chronology instead of letting every caller handle the edge case differently.
+fn align_decision_opens_to_m1(dataset: BarDataset, m1: &BarDataset) -> BarDataset {
+    let BarDataset {
+        data_hash: original_hash,
+        source_rows: original_source_rows,
+        duplicate_rows_removed,
+        input_was_sorted,
+        delimiter,
+        source_timezone,
+        bars: source_bars,
+    } = dataset;
+    let original_count = source_bars.len();
+    let bars = source_bars
+        .into_iter()
+        .filter(|decision| {
+            m1.bars
+                .binary_search_by_key(&decision.timestamp_ms, |bar| bar.timestamp_ms)
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    BarDataset {
+        data_hash: if bars.len() == original_count {
+            original_hash
+        } else {
+            quantforge_data::bar_content_hash(&bars)
+        },
+        source_rows: if bars.len() == original_count {
+            original_source_rows
+        } else {
+            bars.len()
+        },
+        duplicate_rows_removed,
+        input_was_sorted,
+        delimiter,
+        source_timezone,
+        bars,
+    }
 }
 
 pub(crate) fn load_bound_broker(
