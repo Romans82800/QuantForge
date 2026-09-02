@@ -1,8 +1,8 @@
 use crate::grammar::{entry_condition_count, exit_condition_count};
 use crate::model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, Elite, EvidenceComponents,
-    GateResult, LongShortSkewBucket, NicheKey, RobustnessEvidence, ScoutFitnessMode,
-    ThreeLevelBucket, recovery_factor,
+    GateResult, LongShortSkewBucket, NicheKey, RobustnessEvidence, ThreeLevelBucket,
+    recovery_factor,
 };
 use quantforge_core::{FloatPolicy, quantize};
 use quantforge_eval::{PositionSide, ScoutResult};
@@ -43,7 +43,6 @@ pub(crate) fn deposit_to_accepted_pool(
         bank.config.max_per_entry_family.saturating_mul(2).max(16),
         0,
         true,
-        bank.config.scout_fitness_mode,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -73,7 +72,6 @@ pub(crate) fn deposit_to_databank(
         0,
         0,
         false,
-        bank.config.scout_fitness_mode,
         candidate,
         DepositDecision::AcceptedToDatabank,
         DepositDecision::ReplacedInDatabank,
@@ -100,7 +98,6 @@ pub(crate) fn deposit_to_holding(
         0,
         0,
         false,
-        bank.config.scout_fitness_mode,
         candidate,
         DepositDecision::AcceptedToHolding,
         DepositDecision::ReplacedInHolding,
@@ -135,7 +132,6 @@ pub(crate) fn deposit_to_specialist_pool(
         bank.config.max_per_entry_family.saturating_mul(2).max(16),
         0,
         true,
-        bank.config.scout_fitness_mode,
         candidate,
         DepositDecision::AcceptedToPot,
         DepositDecision::ReplacedInPot,
@@ -175,7 +171,6 @@ fn deposit_into_stack(
     max_per_family: usize,
     peer_family_count: usize,
     niche_per_island: bool,
-    scout_fitness_mode: ScoutFitnessMode,
     candidate: CandidateEvaluation,
     accepted: DepositDecision,
     replaced: DepositDecision,
@@ -186,11 +181,7 @@ fn deposit_into_stack(
     let family = entry_family_key(&candidate.strategy);
     let descriptor = descriptor(&candidate.strategy, &candidate.result);
     let niche = niche_key(&descriptor);
-    let evidence = evidence(
-        &candidate.strategy,
-        &candidate.result,
-        scout_fitness_mode,
-    );
+    let evidence = evidence(&candidate.strategy, &candidate.result);
     let signature = equity_signature(&candidate.result, 64);
     let maximum_correlation = entries
         .iter()
@@ -282,8 +273,7 @@ fn deposit_into_stack(
             .iter()
             .enumerate()
             .filter(|(_, elite)| {
-                elite.niche == niche
-                    && (!niche_per_island || elite.island_id == island_id)
+                elite.niche == niche && (!niche_per_island || elite.island_id == island_id)
             })
             .map(|(index, _)| index)
             .collect();
@@ -463,7 +453,10 @@ pub fn entry_family_key(strategy: &StrategyIr) -> String {
     }
 }
 
-fn collect_indicator_ops(expr: &quantforge_ir::BoolExpr, out: &mut std::collections::BTreeSet<String>) {
+fn collect_indicator_ops(
+    expr: &quantforge_ir::BoolExpr,
+    out: &mut std::collections::BTreeSet<String>,
+) {
     use quantforge_ir::BoolExpr;
     match expr {
         BoolExpr::Compare { left, right, .. }
@@ -490,7 +483,10 @@ fn collect_indicator_ops(expr: &quantforge_ir::BoolExpr, out: &mut std::collecti
     }
 }
 
-fn collect_numeric_ops(expr: &quantforge_ir::NumericExpr, out: &mut std::collections::BTreeSet<String>) {
+fn collect_numeric_ops(
+    expr: &quantforge_ir::NumericExpr,
+    out: &mut std::collections::BTreeSet<String>,
+) {
     use quantforge_ir::NumericExpr;
     if let NumericExpr::Indicator { value } = expr {
         out.insert(indicator_operator_name(value));
@@ -518,79 +514,7 @@ fn three_level(value: f64, first: f64, second: f64) -> ThreeLevelBucket {
     }
 }
 
-/// Log-scaled, uncapped sample-depth weight used in scout ranking.
-pub(crate) fn trade_count_evidence(trade_count: usize) -> f64 {
-    (trade_count as f64 + 1.0).ln() * 3.0
-}
-
-fn evidence(
-    strategy: &StrategyIr,
-    result: &ScoutResult,
-    mode: ScoutFitnessMode,
-) -> EvidenceComponents {
-    match mode {
-        ScoutFitnessMode::RawIs => evidence_raw_is(strategy, result),
-        ScoutFitnessMode::StableFold => evidence_stable_fold(strategy, result),
-    }
-}
-
-/// SQX-style scout fitness: pooled IS expectancy/return/PF dominate; fold
-/// stability is only a light tie-break.
-fn evidence_raw_is(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
-    let pooled_r = if result.metrics.expectancy_r.is_finite() && result.metrics.expectancy_r != 0.0
-    {
-        result.metrics.expectancy_r
-    } else {
-        crate::fold_r::calendar_year_fold_r(&result.trades).pooled_r
-    };
-    let expectancy_component = (pooled_r / 0.20).tanh() * 30.0;
-    let return_pct_component = (result.metrics.return_percent / 20.0).tanh() * 15.0;
-    let net_profit_component =
-        (result.metrics.net_profit / (result.metrics.initial_balance * 0.20)).tanh() * 10.0;
-    let recovery_component = (recovery_factor(&result.metrics) / 5.0).tanh() * 12.0;
-    let sharpe_component = (result.metrics.sharpe_ratio.unwrap_or(0.0) / 3.0).tanh() * 8.0;
-    let fold = crate::fold_r::calendar_year_fold_r(&result.trades);
-    let stability_penalty = if fold.usable {
-        (fold.fold_spread / 0.25).tanh() * 2.0
-            + ((fold.max_year_share - 0.55).max(0.0) / 0.30).tanh() * 2.0
-    } else {
-        0.0
-    };
-    let return_component = expectancy_component
-        + return_pct_component
-        + net_profit_component
-        + recovery_component
-        + sharpe_component
-        - stability_penalty;
-    let effective_profit_factor = result.metrics.profit_factor.unwrap_or({
-        if result.metrics.net_profit > 0.0 {
-            10.0
-        } else {
-            0.0
-        }
-    });
-    let profit_factor_component = if effective_profit_factor > 0.0 {
-        ((effective_profit_factor - 1.0) / 0.75).tanh() * 22.0
-    } else {
-        -20.0
-    };
-    let trade_count_bonus = trade_count_evidence(result.metrics.trade_count);
-    let drawdown_penalty = (result.metrics.max_drawdown_percent / 20.0).tanh() * 18.0;
-    let complexity_penalty = strategy.complexity().score as f64 * 0.35;
-    let total = return_component + profit_factor_component + trade_count_bonus
-        - drawdown_penalty
-        - complexity_penalty;
-    EvidenceComponents {
-        return_component: quantized(return_component),
-        profit_factor_component: quantized(profit_factor_component),
-        trade_count_bonus: quantized(trade_count_bonus),
-        drawdown_penalty: quantized(drawdown_penalty),
-        complexity_penalty: quantized(complexity_penalty),
-        total: quantized(total),
-    }
-}
-
-fn evidence_stable_fold(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
+fn evidence(strategy: &StrategyIr, result: &ScoutResult) -> EvidenceComponents {
     // Rank the R that showed up across Development years, not pooled IS dollars.
     // A 0.4R IS gift concentrated in one year must lose to a 0.10R that repeats.
     let fold = crate::fold_r::calendar_year_fold_r(&result.trades);
@@ -619,9 +543,9 @@ fn evidence_stable_fold(strategy: &StrategyIr, result: &ScoutResult) -> Evidence
     } else {
         -20.0
     };
-    // Uncapped log confidence: thin books (~100 trades) cannot rank like deep
-    // ones with the same fold-R. ~100→14 pts, ~300→17, ~1000→21 (grows forever).
-    let trade_count_bonus = trade_count_evidence(result.metrics.trade_count);
+    // Confidence saturates around 300 trades and can contribute at most five
+    // points. 1,500 trades therefore cannot overwhelm expectancy/recovery/PF.
+    let trade_count_bonus = (1.0 - (-(result.metrics.trade_count as f64) / 100.0).exp()) * 5.0;
     let drawdown_penalty = (result.metrics.max_drawdown_percent / 20.0).tanh() * 20.0;
     let complexity_penalty = strategy.complexity().score as f64 * 0.40;
     let total = return_component + profit_factor_component + trade_count_bonus
@@ -737,7 +661,7 @@ fn quantized(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Databank, DiscoverTelemetry, GateConfig, ScoutFitnessMode};
+    use crate::model::{Databank, DiscoverTelemetry, GateConfig};
     use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION, generate_seed};
     use quantforge_core::ContentHash;
     use quantforge_eval::{BacktestMetrics, EquityPoint, ScoutConfig, ScoutResult, ScoutTelemetry};
@@ -822,37 +746,6 @@ mod tests {
             },
             telemetry: ScoutTelemetry::default(),
         }
-    }
-
-    #[test]
-    fn raw_is_fitness_prefers_higher_pooled_expectancy() {
-        let strategy = generate_seed(7, 0);
-        let mut high = profitable_result();
-        high.metrics.trade_count = 220;
-        high.metrics.expectancy_r = 0.18;
-        high.metrics.return_percent = 12.0;
-        high.metrics.net_profit = 12_000.0;
-        high.metrics.profit_factor = Some(1.4);
-        let mut low = profitable_result();
-        low.metrics.trade_count = 220;
-        low.metrics.expectancy_r = 0.06;
-        low.metrics.return_percent = 4.0;
-        low.metrics.net_profit = 4_000.0;
-        low.metrics.profit_factor = Some(1.15);
-        let high_score = super::evidence(&strategy, &high, ScoutFitnessMode::RawIs);
-        let low_score = super::evidence(&strategy, &low, ScoutFitnessMode::RawIs);
-        assert!(high_score.total > low_score.total);
-    }
-
-    #[test]
-    fn trade_count_evidence_grows_without_cap() {
-        let at_103 = super::trade_count_evidence(103);
-        let at_350 = super::trade_count_evidence(350);
-        let at_1000 = super::trade_count_evidence(1_000);
-        assert!(at_350 > at_103);
-        assert!(at_1000 > at_350);
-        // Old capped formula topped out near 5 pts; 1000 vs 103 must beat that gap.
-        assert!(at_1000 - at_103 > 5.0);
     }
 
     #[test]
@@ -1053,7 +946,11 @@ mod tests {
         .unwrap();
         assert_eq!(accepted, DepositDecision::AcceptedToPot);
         assert_eq!(bank.accepted_pool.len(), 2);
-        let islands: Vec<u16> = bank.accepted_pool.iter().map(|elite| elite.island_id).collect();
+        let islands: Vec<u16> = bank
+            .accepted_pool
+            .iter()
+            .map(|elite| elite.island_id)
+            .collect();
         assert!(islands.contains(&0) && islands.contains(&1));
     }
 
@@ -1147,11 +1044,13 @@ mod tests {
         }
         second_result.metrics.return_percent = 0.5;
         second_result.metrics.net_profit = 500.0;
-        let same_family = (0..2048)
+        let same_family = (0..32)
             .map(|offset| generate_seed(7, offset))
             .find(|strategy| {
                 entry_family_key(strategy) == family
-                    && strategy.structural_fingerprint(quantforge_core::FloatPolicy::default()).ok()
+                    && strategy
+                        .structural_fingerprint(quantforge_core::FloatPolicy::default())
+                        .ok()
                         != generate_seed(7, 0)
                             .structural_fingerprint(quantforge_core::FloatPolicy::default())
                             .ok()

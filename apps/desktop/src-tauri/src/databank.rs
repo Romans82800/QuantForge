@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tauri::State;
 use thiserror::Error;
 
@@ -94,10 +94,10 @@ struct RobustnessSnapshot {
     config: DiscoverConfig,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DesktopState {
-    pub(crate) loaded: RwLock<Option<LoadedDatabank>>,
-    partition_equity_cache: RwLock<BTreeMap<String, PartitionEquityView>>,
+    pub(crate) loaded: Arc<RwLock<Option<LoadedDatabank>>>,
+    partition_equity_cache: Arc<RwLock<BTreeMap<String, PartitionEquityView>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1737,6 +1737,10 @@ pub struct HoldingBatteryRequest {
     /// Stop the battery once Databank reaches this many elites. `None` or `0` keeps every passer.
     #[serde(default)]
     pub target_databank: Option<usize>,
+    /// Run the complete battery for evidence and graduate tested candidates,
+    /// including failures. This is an explicit audit action only.
+    #[serde(default)]
+    pub audit_and_graduate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -4005,4 +4009,35 @@ fn run_fidelity_demo_sync(request: &FidelityDemoRequest) -> Result<FidelityDemoV
         output_path,
         results,
     })
+}
+
+/// Resolve the decision timeframe used by a saved archive. Newer manifests
+/// carry it explicitly; filename detection keeps older archives usable.
+pub(crate) fn archive_decision_timeframe(artifact: &EvolveArtifact, source_path: &Path) -> &'static str {
+    if let Some(timeframe) = artifact
+        .manifest
+        .recipe
+        .config
+        .get("decision_timeframe")
+        .and_then(Value::as_str)
+    {
+        return match timeframe.to_ascii_uppercase().as_str() {
+            "M15" => "M15",
+            "H4" => "H4",
+            _ => "H1",
+        };
+    }
+    let filename = source_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .or_else(|| Path::new(&artifact.source).file_stem().and_then(|name| name.to_str()))
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if filename.contains("_M15_") || filename.ends_with("_M15") {
+        "M15"
+    } else if filename.contains("_H4_") || filename.ends_with("_H4") {
+        "H4"
+    } else {
+        "H1"
+    }
 }

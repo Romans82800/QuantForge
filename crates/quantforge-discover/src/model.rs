@@ -114,6 +114,10 @@ pub struct SearchRangeProfile {
     pub atr_target_multiple: SearchRange,
     #[serde(rename = "riskTargetMultiple", alias = "risk_target_multiple")]
     pub risk_target_multiple: SearchRange,
+    #[serde(rename = "fixedStopPips", alias = "fixed_stop_pips")]
+    pub fixed_stop_pips: SearchRange,
+    #[serde(rename = "fixedTargetPips", alias = "fixed_target_pips")]
+    pub fixed_target_pips: SearchRange,
     #[serde(rename = "pendingDistanceAtr", alias = "pending_distance_atr")]
     pub pending_distance_atr: SearchRange,
     #[serde(rename = "pendingExpiryBars", alias = "pending_expiry_bars")]
@@ -174,6 +178,8 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.5),
             atr_target_multiple: SearchRange::new(1.0, 6.0, 1.0),
             risk_target_multiple: SearchRange::new(0.75, 4.5, 0.5),
+            fixed_stop_pips: SearchRange::new(10.0, 80.0, 5.0),
+            fixed_target_pips: SearchRange::new(15.0, 120.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 2.0, 0.5),
             pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
             time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
@@ -206,6 +212,8 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.5),
             atr_target_multiple: SearchRange::new(1.5, 8.0, 1.0),
             risk_target_multiple: SearchRange::new(1.0, 5.0, 0.5),
+            fixed_stop_pips: SearchRange::new(10.0, 100.0, 5.0),
+            fixed_target_pips: SearchRange::new(15.0, 150.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 3.0, 0.5),
             pending_expiry_bars: SearchRange::new(1.0, 12.0, 1.0),
             time_stop_bars: SearchRange::new(2.0, 48.0, 1.0),
@@ -236,6 +244,8 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(0.5, 8.0, 0.5),
             atr_target_multiple: SearchRange::new(1.0, 12.0, 0.5),
             risk_target_multiple: SearchRange::new(0.5, 8.0, 0.5),
+            fixed_stop_pips: SearchRange::new(10.0, 120.0, 5.0),
+            fixed_target_pips: SearchRange::new(15.0, 180.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 4.0, 0.25),
             pending_expiry_bars: SearchRange::new(1.0, 24.0, 1.0),
             time_stop_bars: SearchRange::new(2.0, 96.0, 1.0),
@@ -663,6 +673,16 @@ pub struct DiscoverConfig {
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
+    #[serde(default = "default_sl_tp_only_exits")]
+    pub sl_tp_only_exits: bool,
+    #[serde(default)]
+    pub allow_fixed_pip_stops: bool,
+    #[serde(default = "default_fixed_pip_size_points")]
+    pub fixed_pip_size_points: f64,
+    #[serde(default)]
+    pub allow_indicator_exit_rules: bool,
+    #[serde(default)]
+    pub allow_time_stops: bool,
     /// Individually opt-in execution genes. Off in the high-parity Selected-TF
     /// baseline; enabling them widens search and makes M1/MT5 final gates more
     /// important — they do not block Discover breeding.
@@ -835,6 +855,14 @@ fn default_simple_exits() -> bool {
     true
 }
 
+fn default_sl_tp_only_exits() -> bool {
+    false
+}
+
+fn default_fixed_pip_size_points() -> f64 {
+    10.0
+}
+
 fn default_max_one_entry_per_day() -> bool {
     true
 }
@@ -1005,6 +1033,11 @@ impl Default for DiscoverConfig {
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
+            sl_tp_only_exits: default_sl_tp_only_exits(),
+            allow_fixed_pip_stops: false,
+            fixed_pip_size_points: default_fixed_pip_size_points(),
+            allow_indicator_exit_rules: false,
+            allow_time_stops: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,

@@ -7,28 +7,45 @@ mod fold_r;
 mod grammar;
 mod holding_corr;
 mod islands;
+mod meta_learning;
 mod methodology;
 mod model;
 mod multi_symbol;
 mod permutation;
+mod production_bakeoff;
+mod production_lane;
 mod robustness;
+mod timeframe_bakeoff;
 
 pub use archive::{entry_family_key, niche_label};
 pub use bakeoff::{
     ConditionBakeoffConfig, ConditionBakeoffReport, ConditionBakeoffRow, run_condition_bakeoff,
 };
+pub use engine::{
+    EvolutionSession, HoldingBatteryAuditResult, HoldingBatteryReject, HoldingBatteryResult,
+    HoldingBypassResult,
+    audit_holding_battery,
+    continue_evolution, continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
+    evolve_new_with_pack_and_quotes, holding_factory_score, new_databank,
+    promote_all_holding_without_robustness, promote_selected_holding_without_robustness,
+    run_holding_battery_and_promote,
+};
 pub use fold_r::FoldRStats;
+pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use holding_corr::{
     HoldingCorrShrinkReport, align_daily_pnl, apply_holding_daily_corr_shrink,
     daily_pnl_from_trades,
 };
-pub use engine::{
-    EvolutionSession, HoldingBatteryReject, HoldingBatteryResult, continue_evolution,
-    continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
-    evolve_new_with_pack_and_quotes, holding_factory_score, new_databank,
-    run_holding_battery_and_promote,
+pub use meta_learning::{
+    MetaCalibrationBin, MetaCandidate, MetaDataset, MetaDatasetRow, MetaDatasetScope,
+    MetaEvaluationReport, MetaExpectancyEvaluationReport, MetaExpectancyModel,
+    MetaExpectancyPrediction, MetaExpectancyWalkForwardEpisode, MetaExpectancyWalkForwardReport,
+    MetaFeatureRecord, MetaFutureOutcome, MetaLabel, MetaLearningConfig, MetaLearningError,
+    MetaLearningInput, MetaLogisticModel, MetaPrediction, MetaReplayCandidate, MetaReplayOrigin,
+    MetaReplayWindow, MetaWalkForwardEpisode, MetaWalkForwardReport, MetaWindow, MetaWindowRole,
+    build_meta_dataset, build_meta_learning_input_from_replay, run_meta_expectancy_walk_forward,
+    run_meta_walk_forward,
 };
-pub use grammar::{generate_seed, generate_seed_for_family, mutate_strategy};
 pub use methodology::{
     FactorCellSummary, FactorContrast, FactorDraw, FactorRecipe, MethodologyGridConfig,
     MethodologyReport, run_methodology_grid,
@@ -47,14 +64,32 @@ pub use multi_symbol::{DEFAULT_FX_PACK, DISPLAY_ONLY_SYMBOLS, PackSymbol, screen
 pub use permutation::{
     PermutationNullConfig, PermutationNullReport, run_permutation_null, stationary_bootstrap_bars,
 };
+pub use production_bakeoff::{
+    ProductionBakeoffArmReport, ProductionBakeoffConfig, ProductionBakeoffDecision,
+    ProductionBakeoffReport, ProductionBakeoffStrictInput, ProductionBakeoffStrictSummary,
+    ProductionBakeoffSummary, SealedCandidateResult, run_production_bakeoff,
+};
+pub use production_lane::{
+    PRODUCTION_LANE_ID, PRODUCTION_LANE_SCHEMA_VERSION, PRODUCTION_LANE_SCORE_FORMULA,
+    ProductionLaneCandidateRow, ProductionLaneConfig, ProductionLaneReplay, ProductionLaneReport,
+    ProductionLaneWindow, ProductionLaneWindowSummary, run_production_lane,
+};
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
     MONTE_CARLO_SKIP_TRADE_PROBABILITY, OPT_PROFILE_MAX_TESTS, OPT_PROFILE_PROFIT_OPT_PCT,
-    OPT_PROFILE_STEPS, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, PARAM_RECOVERY_MEDIAN_HIGH,
-    PARAM_RECOVERY_MEDIAN_LOW, RobustnessConfig, RobustnessOutcome, RobustnessReject,
-    SEQUENTIAL_WALK_FORWARD_PASS_FRACTION, development_cpcv_diagnostic,
+    OPT_PROFILE_STEPS, PARAM_RECOVERY_MEDIAN_HIGH, PARAM_RECOVERY_MEDIAN_LOW,
+    PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, RobustnessAuditOutcome, RobustnessConfig,
+    RobustnessOutcome, RobustnessReject, development_cpcv_diagnostic,
     passes_recovery_median_band, recovery_to_median_ratio, run_m1_holding_admission,
-    run_m1_predeposit_robustness,
+    run_m1_predeposit_robustness, run_m1_predeposit_robustness_audit,
+    SEQUENTIAL_WALK_FORWARD_PASS_FRACTION,
+};
+pub use timeframe_bakeoff::{
+    TimeframeAblationComparison, TimeframeAblationConfig, TimeframeAblationReport,
+    TimeframeAblationRow, TimeframeBakeoffConfig, TimeframeBakeoffLaneRow, TimeframeBakeoffPair,
+    TimeframeBakeoffReport, TimeframeGateConfig, TimeframeRollingReport, TimeframeRollingRow,
+    TimeframeRollingWindow, TimeframeSelectionMode, run_timeframe_ablation, run_timeframe_bakeoff,
+    run_timeframe_rolling_ablation,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

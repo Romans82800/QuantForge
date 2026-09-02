@@ -623,11 +623,13 @@ pub fn start_discover(
                         max_correlation: request.factory_max_correlation,
                         queue_limit: factory_queue,
                         target_databank: factory_target,
+                        audit_and_graduate: false,
                     };
                     match crate::holding_battery::spawn_factory_from_archive(
                         request.databank_path.clone(),
                         factory,
                         &battery_state,
+                        None,
                     ) {
                         Ok(_) => {
                             if let Ok(mut view) = job.write() {
@@ -2510,6 +2512,11 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             .unwrap_or(0.25),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
+        sl_tp_only_exits: false,
+        allow_fixed_pip_stops: false,
+        fixed_pip_size_points: 10.0,
+        allow_indicator_exit_rules: false,
+        allow_time_stops: false,
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
         allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
