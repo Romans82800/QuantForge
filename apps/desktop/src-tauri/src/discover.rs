@@ -1217,10 +1217,36 @@ fn run_discovery(
     };
     let (validation_fraction, sealed_fraction) =
         normalize_split_fractions(validation_fraction, sealed_fraction)?;
-    let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| unsealed_partition(&search_decision, validation_fraction, sealed_fraction))
-        .transpose()?;
-    let oos1_dataset = None;
+    let persisted_parts = continued_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.manifest.recipe.config.get("data_range_parts"))
+        .and_then(|value| serde_json::from_value::<Vec<DataRangePartRequest>>(value.clone()).ok())
+        .unwrap_or_default();
+    let timeline_parts = if request.data_range_parts.is_empty() {
+        persisted_parts
+    } else {
+        request.data_range_parts.clone()
+    };
+    let has_dated_timeline = timeline_parts.iter().any(|part| {
+        !part.start_date.trim().is_empty() && !part.end_date.trim().is_empty()
+    });
+    let (development_dataset, oos1_dataset) = if has_dated_timeline {
+        // Only IST training bars drive breeding and ranking. All ISV bars are
+        // supplied as a separate validation sample; OOS bars are never loaded
+        // by Discover. This keeps an interleaved ISV → IST → ISV → OOS plan
+        // semantically correct without pretending it is a contiguous split.
+        (
+            Some(schedule_partition_dataset(&search_decision, &timeline_parts, "training")?),
+            Some(schedule_partition_dataset(&search_decision, &timeline_parts, "validation")?),
+        )
+    } else {
+        (
+            (promotion_split || request.mode == DiscoverMode::Continue)
+                .then(|| unsealed_partition(&search_decision, validation_fraction, sealed_fraction))
+                .transpose()?,
+            None,
+        )
+    };
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
     // Search uses every bar except the sealed holdout. OOS1 is not a pick gate.
     let m1_eval = &m1.dataset;
@@ -2314,6 +2340,45 @@ fn unsealed_partition(
     .map_err(|error| error.to_string())?;
     let end = plan.development.bar_count + plan.validation.bar_count;
     slice_partition(dataset, 0, end)
+}
+
+fn schedule_partition_dataset(
+    dataset: &BarDataset,
+    parts: &[DataRangePartRequest],
+    kind: &str,
+) -> Result<BarDataset, String> {
+    let ranges = parts
+        .iter()
+        .filter(|part| part.kind == kind)
+        .map(|part| {
+            let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+                .map_err(|error| error.to_string())?;
+            let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+                .map_err(|error| error.to_string())?;
+            Ok((start, end))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if ranges.is_empty() {
+        return Err(format!("timeline has no {kind} part"));
+    }
+    let bars = dataset
+        .bars
+        .iter()
+        .filter(|bar| ranges.iter().any(|(start, end)| bar.timestamp_ms >= *start && bar.timestamp_ms < *end))
+        .cloned()
+        .collect::<Vec<_>>();
+    if bars.is_empty() {
+        return Err(format!("timeline {kind} part contains no decision bars"));
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
 }
 
 #[allow(dead_code)]
