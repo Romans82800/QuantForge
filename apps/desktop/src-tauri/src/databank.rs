@@ -1,14 +1,14 @@
 use crate::data_lab::{
     build_decision_from_m1, build_decision_from_m1_quotes, load_bound_broker, load_quote_sidecar,
-    trim_market_history_to_dates, trim_market_history_to_year,
+    trim_market_history_to_year,
 };
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::{ContentHash, FloatPolicy};
-use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes};
+use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
 use quantforge_discover::{
     Databank, DiscoverConfig, Elite, LongShortSkewBucket, NicheKey, RobustnessConfig,
     RobustnessEvidence, RobustnessReject, ThreeLevelBucket, niche_label,
-    run_m1_predeposit_robustness,
+    run_m1_predeposit_robustness_audit,
 };
 use quantforge_eval::evaluate_strategy;
 use quantforge_export_mql5::{Mql5ExportConfig, TesterConfig, generate_bundle};
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tauri::State;
 use thiserror::Error;
 
@@ -62,19 +62,6 @@ pub(crate) struct LoadedDatabank {
     pub(crate) m1_metadata_path: Option<String>,
     pub(crate) validation_fraction: f64,
     pub(crate) sealed_fraction: f64,
-    pub(crate) history_start_date: Option<String>,
-    pub(crate) history_end_date: Option<String>,
-    pub(crate) decision_timeframe: String,
-    pub(crate) data_range_parts: Vec<StoredDataRangePart>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct StoredDataRangePart {
-    id: String,
-    kind: String,
-    start_date: String,
-    end_date: String,
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +81,9 @@ struct RobustnessSnapshot {
     config: DiscoverConfig,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DesktopState {
-    pub(crate) loaded: RwLock<Option<LoadedDatabank>>,
-    partition_equity_cache: RwLock<BTreeMap<String, PartitionEquityView>>,
+    pub(crate) loaded: Arc<RwLock<Option<LoadedDatabank>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -116,6 +102,7 @@ pub struct DatabankWorkspace {
     run_id: String,
     created_at: String,
     data_hash: String,
+    decision_timeframe: String,
     broker_spec_hash: String,
     grammar_version: String,
     legacy_read_only: bool,
@@ -131,6 +118,10 @@ pub struct DatabankWorkspace {
     require_m1_precision: bool,
     m1_fidelity_verified: bool,
     simple_exits: bool,
+    sl_tp_only_exits: bool,
+    allow_fixed_pip_stops: bool,
+    allow_indicator_exit_rules: bool,
+    allow_time_stops: bool,
     allow_break_even: bool,
     allow_trailing_stops: bool,
     allow_partial_exits: bool,
@@ -336,6 +327,9 @@ pub struct EliteDetail {
     fold_usable: bool,
     strategy_ir: Value,
     equity_signature: Vec<f64>,
+    /// Production Lane entries must not trigger the normal full-history chart,
+    /// because that chart includes the sealed final partition.
+    sealed_protected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     robustness: Option<EliteRobustnessView>,
 }
@@ -363,22 +357,12 @@ pub struct PartitionEquityPoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PartitionEquityPartition {
-    id: String,
-    kind: String,
-    start_timestamp_ms: i64,
-    end_timestamp_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PartitionEquityView {
     fingerprint: String,
     strategy_id: String,
     execution_engine: String,
     initial_balance: f64,
     points: Vec<PartitionEquityPoint>,
-    partitions: Vec<PartitionEquityPartition>,
     is_end_timestamp_ms: i64,
     oos1_end_timestamp_ms: i64,
     oos2_end_timestamp_ms: i64,
@@ -565,11 +549,6 @@ fn install_databank_artifact(
     workspace.broker_path = broker.clone();
     let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
     let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
-    let history_start_date = manifest_path(&artifact, "history_start_date");
-    let history_end_date = manifest_path(&artifact, "history_end_date");
-    let data_range_parts = manifest_range_parts(&artifact);
-    let decision_timeframe = manifest_path(&artifact, "decision_timeframe")
-        .unwrap_or_else(|| "H1".into());
     *state
         .loaded
         .write()
@@ -584,10 +563,6 @@ fn install_databank_artifact(
         m1_metadata_path,
         validation_fraction,
         sealed_fraction,
-        history_start_date,
-        history_end_date,
-        decision_timeframe,
-        data_range_parts,
     });
     Ok(workspace)
 }
@@ -835,7 +810,7 @@ pub async fn get_elite_partition_equity(
     fingerprint: String,
     state: State<'_, DesktopState>,
 ) -> Result<PartitionEquityView, String> {
-    let (cache_key, snapshot) = {
+    let snapshot = {
         let loaded = state
             .loaded
             .read()
@@ -850,27 +825,11 @@ pub async fn get_elite_partition_equity(
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
             .clone();
-        let cache_key = format!(
-            "{}:{}:{:.8}:{:.8}:{:?}:{:?}:{}:{:?}",
-            loaded.databank_path,
-            fingerprint,
-            loaded.validation_fraction,
-            loaded.sealed_fraction,
-            loaded.history_start_date,
-            loaded.history_end_date,
-            loaded.decision_timeframe,
-            loaded.data_range_parts,
-        );
-        if let Some(cached) = state
-            .partition_equity_cache
-            .read()
-            .map_err(|_| "partition equity cache is unavailable".to_owned())?
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-        (cache_key, (
+        // Full partition replays are an explicit, read-only inspection action.
+        // Their result is never fed back into Discover, Holding, ranking, or
+        // promotion. Production Lane entries are therefore allowed here when
+        // the operator chooses to inspect the entire downloaded databank.
+        (
             elite,
             loaded.source.clone(),
             loaded.broker.clone(),
@@ -881,13 +840,9 @@ pub async fn get_elite_partition_equity(
             loaded.validation_fraction,
             loaded.sealed_fraction,
             loaded.bank.config.history_start_year,
-            loaded.history_start_date.clone(),
-            loaded.history_end_date.clone(),
-            loaded.decision_timeframe.clone(),
-            loaded.data_range_parts.clone(),
-        ))
+        )
     };
-    let view = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let (
             elite,
             source,
@@ -899,10 +854,6 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
-            history_start_date,
-            history_end_date,
-            decision_timeframe,
-            data_range_parts,
         ) = snapshot;
         partition_equity_for_elite(
             &elite,
@@ -915,20 +866,10 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
-            history_start_date.as_deref(),
-            history_end_date.as_deref(),
-            &decision_timeframe,
-            &data_range_parts,
         )
     })
     .await
-    .map_err(|error| format!("partition equity task failed: {error}"))??;
-    state
-        .partition_equity_cache
-        .write()
-        .map_err(|_| "partition equity cache is unavailable".to_owned())?
-        .insert(cache_key, view.clone());
-    Ok(view)
+    .map_err(|error| format!("partition equity task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -969,9 +910,40 @@ pub async fn run_elite_robustness(
             config: loaded.bank.config.clone(),
         }
     };
-    tauri::async_runtime::spawn_blocking(move || run_elite_robustness_sync(&request, &snapshot))
+    let databank_path = snapshot.databank_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || run_elite_robustness_sync(&request, &snapshot))
         .await
-        .map_err(|error| format!("Results robustness task failed: {error}"))?
+        .map_err(|error| format!("Results robustness task failed: {error}"))??;
+    // Results audits are evidence only: persist them so an inspected strategy
+    // keeps its panels after the window is closed or the app restarts.
+    if let Some(evidence) = result.evidence.clone() {
+        let mut bank = {
+            let loaded = state
+                .loaded
+                .read()
+                .map_err(|_| DesktopError::StateUnavailable.to_string())?;
+            loaded
+                .as_ref()
+                .ok_or_else(|| DesktopError::NoDatabank.to_string())?
+                .bank
+                .clone()
+        };
+        if let Some(elite) = bank
+            .elites
+            .iter_mut()
+            .find(|elite| elite.structural_fingerprint.as_str() == result.fingerprint)
+        {
+            elite.robustness = Some(evidence);
+            elite.gate_results.retain(|gate| gate.name != "results_robustness_audit");
+            elite.gate_results.push(quantforge_discover::GateResult {
+                name: "results_robustness_audit".into(),
+                passed: result.passed,
+                detail: "Detailed Results audit saved after Databank admission; it was not used for selection.".into(),
+            });
+            persist_loaded_bank(&databank_path, &bank, &state)?;
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn infer_quote_sidecar_path(m1_path: &str) -> Option<PathBuf> {
@@ -1118,7 +1090,7 @@ fn run_elite_robustness_sync(
         indicator_engine: snapshot.config.scout.indicator_engine,
         calendar_year_folds: snapshot.config.calendar_year_folds,
     };
-    let outcome = run_m1_predeposit_robustness(
+    let outcome = run_m1_predeposit_robustness_audit(
         &snapshot.elite.strategy,
         &is_decision,
         &m1_source.dataset,
@@ -1129,13 +1101,18 @@ fn run_elite_robustness_sync(
         true,
     );
     let (passed, blocker, message, evidence) = match outcome {
-        Ok(outcome) => (
-            true,
-            None,
-            "Passed M1 retention, walk-forward, Monte Carlo and parameter-neighborhood gates."
-                .to_owned(),
-            outcome.evidence,
-        ),
+        Ok(outcome) => {
+            let blocker = (!outcome.passed).then(|| outcome.blockers.join("; "));
+            let message = if outcome.passed {
+                "Completed and passed every M1/Development robustness check.".to_owned()
+            } else {
+                format!(
+                    "Completed every M1/Development robustness check. Failed: {}.",
+                    blocker.as_deref().unwrap_or("robustness gate")
+                )
+            };
+            (outcome.passed, blocker, message, Some(outcome.evidence))
+        }
         Err(reject) => {
             let (blocker, message) = robustness_reject_detail(reject);
             (false, Some(blocker.to_owned()), message.to_owned(), None)
@@ -1294,7 +1271,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",
-            "Failed SQX OptProfile ProfitOptPct or orig Ret/DD outside 0.75–1.50 of the neighbourhood median.",
+            "Failed ±param survival or orig Ret/DD outside 0.85–1.25 of the neighbourhood median.",
         ),
     }
 }
@@ -1325,10 +1302,6 @@ fn partition_equity_for_elite(
     validation_fraction: f64,
     sealed_fraction: f64,
     history_start_year: u16,
-    history_start_date: Option<&str>,
-    history_end_date: Option<&str>,
-    decision_timeframe: &str,
-    range_parts: &[StoredDataRangePart],
 ) -> Result<PartitionEquityView, String> {
     let mut loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
@@ -1350,13 +1323,6 @@ fn partition_equity_for_elite(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
-    trim_market_history_to_dates(
-        &mut loaded.dataset,
-        &mut m1.dataset,
-        quote_dataset.as_mut(),
-        history_start_date,
-        history_end_date,
-    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1364,25 +1330,11 @@ fn partition_equity_for_elite(
     }
     // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
     // align with the exported EA and external MT5 backtests.
-    let decision_dataset = match decision_timeframe {
-        "M15" => match quote_dataset.as_ref() {
-            Some(quotes) => build_timeframe_from_m1_with_quotes(
-                &m1.dataset,
-                quotes,
-                broker.point,
-                15 * 60 * 1000,
-                None,
-            ).map_err(|error| error.to_string())?,
-            None => build_timeframe_from_m1(&m1.dataset, 15 * 60 * 1000, None)
-                .map_err(|error| error.to_string())?,
-        },
-        "H1" => match quote_dataset.as_ref() {
-            Some(quotes) => {
-                build_decision_from_m1_quotes(&m1.dataset, Some(&loaded.dataset), quotes, broker.point)?
-            }
-            None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
-        },
-        other => return Err(format!("unsupported replay decision timeframe {other}")),
+    let decision_dataset = match quote_dataset.as_ref() {
+        Some(quotes) => {
+            build_decision_from_m1_quotes(&m1.dataset, Some(&loaded.dataset), quotes, broker.point)?
+        }
+        None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
     };
     // Use the databank's sealed split, not a hardcoded 20/20. Discover gated this
     // elite on IS/OOS1 cut with these fractions; a mismatched chart invents a
@@ -1445,21 +1397,7 @@ fn partition_equity_for_elite(
     let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
         .then_some(oos1_expectancy / is_expectancy);
 
-    let partitions = if range_parts.is_empty() {
-        vec![
-            PartitionEquityPartition { id: "IST".into(), kind: "training".into(), start_timestamp_ms: decision_dataset.bars.first().map(|bar| bar.timestamp_ms).unwrap_or(0), end_timestamp_ms: is_end },
-            PartitionEquityPartition { id: "ISV1".into(), kind: "validation".into(), start_timestamp_ms: is_end, end_timestamp_ms: oos1_end },
-            PartitionEquityPartition { id: "OOS1".into(), kind: "holdout".into(), start_timestamp_ms: oos1_end, end_timestamp_ms: oos2_end },
-        ]
-    } else {
-        range_parts.iter().filter_map(|part| {
-            let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date).ok()?;
-            let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date).ok()?;
-            Some(PartitionEquityPartition { id: part.id.clone(), kind: part.kind.clone(), start_timestamp_ms: start, end_timestamp_ms: end })
-        }).collect()
-    };
-    let boundaries = partitions.iter().skip(1).map(|part| part.start_timestamp_ms).collect::<Vec<_>>();
-    let points = downsample_equity(&result.equity, 480, &boundaries);
+    let points = downsample_equity(&result.equity, 480, is_end, oos1_end);
     let trades: Vec<TradeRowView> = result
         .trades
         .iter()
@@ -1483,7 +1421,6 @@ fn partition_equity_for_elite(
         execution_engine: result.engine.clone(),
         initial_balance: scout.initial_balance,
         points,
-        partitions,
         is_end_timestamp_ms: is_end,
         oos1_end_timestamp_ms: oos1_end,
         oos2_end_timestamp_ms: oos2_end,
@@ -1569,7 +1506,8 @@ fn segment_return(
 fn downsample_equity(
     equity: &[quantforge_eval::EquityPoint],
     target: usize,
-    boundaries: &[i64],
+    is_end: i64,
+    oos1_end: i64,
 ) -> Vec<PartitionEquityPoint> {
     if equity.is_empty() {
         return Vec::new();
@@ -1586,14 +1524,19 @@ fn downsample_equity(
     let mut keep = std::collections::BTreeSet::new();
     keep.insert(0);
     keep.insert(equity.len() - 1);
-    for boundary in boundaries {
-        if let Some(index) = equity
-            .iter()
-            .position(|point| point.timestamp_ms >= *boundary)
-            .map(|index| index.saturating_sub(1))
-        {
-            keep.insert(index);
-        }
+    if let Some(index) = equity
+        .iter()
+        .position(|point| point.timestamp_ms >= is_end)
+        .map(|index| index.saturating_sub(1))
+    {
+        keep.insert(index);
+    }
+    if let Some(index) = equity
+        .iter()
+        .position(|point| point.timestamp_ms >= oos1_end)
+        .map(|index| index.saturating_sub(1))
+    {
+        keep.insert(index);
     }
     let step = ((equity.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
     let mut cursor = 0.0;
@@ -1737,6 +1680,10 @@ pub struct HoldingBatteryRequest {
     /// Stop the battery once Databank reaches this many elites. `None` or `0` keeps every passer.
     #[serde(default)]
     pub target_databank: Option<usize>,
+    /// Run the full battery for evidence, then graduate every tested Holding
+    /// candidate whether it passed or failed. Never used by Discover itself.
+    #[serde(default)]
+    pub audit_and_graduate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1754,8 +1701,8 @@ pub struct HoldingBatteryView {
     workspace: DatabankWorkspace,
 }
 
-/// Legacy Holding → Databank battery. Kept for serde/archive tooling; UI removed.
-#[allow(dead_code)]
+/// Run the deferred M1 battery + OOS1 on Holding candidates and promote passes
+/// into Databank elites. Failures stay in Holding.
 #[tauri::command]
 pub async fn run_holding_battery(
     request: HoldingBatteryRequest,
@@ -1784,12 +1731,9 @@ pub async fn run_holding_battery(
             loaded.source.clone(),
             loaded.broker.clone(),
             loaded.metadata_path.clone(),
-            loaded
-                .m1_source
-                .clone()
-                .ok_or_else(|| {
-                    "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
-                })?,
+            loaded.m1_source.clone().ok_or_else(|| {
+                "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
+            })?,
             loaded.m1_metadata_path.clone(),
             loaded.validation_fraction,
             loaded.sealed_fraction,
@@ -1825,8 +1769,8 @@ pub async fn run_holding_battery(
     .map_err(|error| format!("Holding battery task failed: {error}"))??;
     let (bank, report) = result;
     persist_loaded_bank(&databank_path, &bank, &state)?;
-    let workspace = load_databank_path(Path::new(&databank_path), &state)
-        .map_err(|error| error.to_string())?;
+    let workspace =
+        load_databank_path(Path::new(&databank_path), &state).map_err(|error| error.to_string())?;
     Ok(HoldingBatteryView {
         promoted: report.promoted,
         rejected: report.rejected,
@@ -1834,13 +1778,11 @@ pub async fn run_holding_battery(
     })
 }
 
-#[allow(dead_code)]
 struct HoldingBatteryReport {
     promoted: usize,
     rejected: Vec<HoldingBatteryRejectRow>,
 }
 
-#[allow(dead_code)]
 fn run_holding_battery_sync(
     bank: &mut Databank,
     fingerprints: &[String],
@@ -1867,8 +1809,9 @@ fn run_holding_battery_sync(
         quote_dataset.as_mut(),
         bank.config.history_start_year,
     )?;
-    let plan = DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
-        .map_err(|error| error.to_string())?;
+    let plan =
+        DataSplitPlan::chronological(&decision.dataset, validation_fraction, sealed_fraction)
+            .map_err(|error| error.to_string())?;
     let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
     let oos1 = if plan.validation.bar_count == 0 {
         None
@@ -1879,16 +1822,28 @@ fn run_holding_battery_sync(
             plan.development.bar_count + plan.validation.bar_count,
         )?)
     };
-    let m1_plan =
-        DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
-            .map_err(|error| error.to_string())?;
+    let m1_plan = DataSplitPlan::chronological(&m1.dataset, validation_fraction, sealed_fraction)
+        .map_err(|error| error.to_string())?;
     let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
+    let m1_unsealed = slice_bars(
+        &m1.dataset,
+        0,
+        m1_plan.development.bar_count + m1_plan.validation.bar_count,
+    )?;
     let m1_eval = if bank.execution_data_hash == m1_development.data_hash {
         &m1_development
     } else if bank.execution_data_hash == m1.dataset.data_hash {
         &m1.dataset
     } else {
         &m1_development
+    };
+
+    // OOS1 replay needs M1 continuity through the end of the validation slice,
+    // but never receives any OOS2 M1 bars.
+    let m1_battery = if oos1.is_some() {
+        &m1_unsealed
+    } else {
+        m1_eval
     };
 
     let mut promoted = 0usize;
@@ -1911,7 +1866,7 @@ fn run_holding_battery_sync(
             &target,
             &development,
             oos1.as_ref(),
-            m1_eval,
+            m1_battery,
             quote_dataset.as_ref(),
             &broker,
         ) {
@@ -1966,8 +1921,8 @@ pub(crate) fn persist_evolve_artifact(
     std::mem::swap(&mut artifact.databank, bank);
     artifact.coverage = artifact.databank.coverage();
     artifact.qd_score = artifact.databank.qd_score();
-    let written = quantforge_storage::write_json_replacing(path, artifact)
-        .map_err(|error| error.to_string());
+    let written =
+        quantforge_storage::write_json_replacing(path, artifact).map_err(|error| error.to_string());
     std::mem::swap(&mut artifact.databank, bank);
     written
 }
@@ -2969,6 +2924,7 @@ fn workspace_view(
         run_id: artifact.manifest.run_id.clone(),
         created_at: artifact.manifest.created_at.to_rfc3339(),
         data_hash: bank.data_hash.as_str().into(),
+        decision_timeframe: archive_decision_timeframe(artifact, source_path).into(),
         broker_spec_hash: bank.broker_spec_hash.as_str().into(),
         grammar_version: bank.grammar_version.clone(),
         legacy_read_only: bank.schema_version == LEGACY_DATABANK_SCHEMA_VERSION,
@@ -3004,6 +2960,10 @@ fn workspace_view(
         require_m1_precision: bank.config.require_m1_precision,
         m1_fidelity_verified: artifact_m1_fidelity_verified(artifact),
         simple_exits: bank.config.simple_exits,
+        sl_tp_only_exits: bank.config.sl_tp_only_exits,
+        allow_fixed_pip_stops: bank.config.allow_fixed_pip_stops,
+        allow_indicator_exit_rules: bank.config.allow_indicator_exit_rules,
+        allow_time_stops: bank.config.allow_time_stops,
         allow_break_even: bank.config.allow_break_even,
         allow_trailing_stops: bank.config.allow_trailing_stops,
         allow_partial_exits: bank.config.allow_partial_exits,
@@ -3016,6 +2976,39 @@ fn workspace_view(
         condition_groups: coverage_condition_groups(bank),
         elites: bank.elites.iter().map(elite_row).collect(),
         holding: bank.holding.iter().map(elite_row).collect(),
+    }
+}
+
+/// New archives record the lane in their recipe. Older archives are identified
+/// from their immutable databank filename first, then their source filename.
+/// This is only used to choose the correct desktop action; the battery still
+/// verifies the exact Development hash before it evaluates anything.
+pub(crate) fn archive_decision_timeframe(artifact: &EvolveArtifact, source_path: &Path) -> &'static str {
+    if let Some(timeframe) = artifact
+        .manifest
+        .recipe
+        .config
+        .get("decision_timeframe")
+        .and_then(Value::as_str)
+    {
+        return match timeframe.to_ascii_uppercase().as_str() {
+            "H4" => "H4",
+            "M15" => "M15",
+            _ => "H1",
+        };
+    }
+    let filename = source_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .or_else(|| Path::new(&artifact.source).file_stem().and_then(|name| name.to_str()))
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if filename.contains("_H4_") || filename.ends_with("_H4") {
+        "H4"
+    } else if filename.contains("_M15_") || filename.ends_with("_M15") {
+        "M15"
+    } else {
+        "H1"
     }
 }
 
@@ -3052,17 +3045,6 @@ pub(crate) fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: 
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1.0)
         .unwrap_or(fallback)
-}
-
-fn manifest_range_parts(artifact: &EvolveArtifact) -> Vec<StoredDataRangePart> {
-    artifact
-        .manifest
-        .recipe
-        .config
-        .get("data_range_parts")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
 }
 
 fn companion_metadata_path(data_path: &str) -> Option<String> {
@@ -3201,8 +3183,16 @@ fn elite_detail(elite: &Elite) -> Result<EliteDetail, serde_json::Error> {
         fold_usable: elite.fold_r.usable,
         strategy_ir: serde_json::to_value(&elite.strategy)?,
         equity_signature: elite.equity_signature.clone(),
+        sealed_protected: elite_is_sealed_protected(elite),
         robustness: elite_robustness(elite)?,
     })
+}
+
+fn elite_is_sealed_protected(elite: &Elite) -> bool {
+    elite
+        .gate_results
+        .iter()
+        .any(|gate| gate.name == "production_lane_v1" && gate.passed)
 }
 
 fn elite_robustness(elite: &Elite) -> Result<Option<EliteRobustnessView>, serde_json::Error> {

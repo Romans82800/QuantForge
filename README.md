@@ -146,6 +146,162 @@ partition only. Databank can export an elite's exact strategy IR; Challenge,
 Parity Lab, Vault, Portfolio and Deploy then carry that identity through the
 full promotion chain. See [the desktop workspace](apps/desktop/README.md).
 
+### Leakage-safe meta-selection research
+
+The research-only `meta-learn` command fits an interpretable logistic model on
+IS-side strategy evidence and evaluates it on later validation windows. The
+recommended configuration uses 6-month labels for training and a 12-month label
+for confirmation. The final sealed window is evaluated only after the model has
+been fit; sealed rows can never enter training. Asset identity is excluded by
+default and can be enabled explicitly with `--include-asset-identity`.
+
+Build the input directly from existing Databank elites with `meta-build`. Each
+origin is an IS snapshot plus one or more later windows sharing its feature
+cutoff. The source is truncated before every label end, and incomplete trades
+at the boundary are excluded. A minimal spec is:
+
+```json
+{
+  "origins": [
+    {
+      "id": "usdjpy-2016",
+      "databank": "runs/USDJPY/Databank/USDJPY_H1_2016_databank.json",
+      "source": "ICMarketsSC-Demo_USDJPY_H1_2016_present.tsv",
+      "metadata": "ICMarketsSC-Demo_USDJPY_H1_2016_present.metadata.csv",
+      "m1Source": "ICMarketsSC-Demo_USDJPY_M1_2016_present.tsv",
+      "m1Metadata": "ICMarketsSC-Demo_USDJPY_M1_2016_present.metadata.csv",
+      "featureSource": "snapshots/USDJPY_H1_through_2023.tsv",
+      "featureMetadata": "snapshots/USDJPY_H1_through_2023.metadata.csv",
+      "featureM1Source": "snapshots/USDJPY_M1_through_2023.tsv",
+      "featureM1Metadata": "snapshots/USDJPY_M1_through_2023.metadata.csv",
+      "featureEndDate": "2024-01-01",
+      "pool": "elites",
+      "broker": "USDJPY.broker.json",
+      "asset": "USDJPY",
+      "windows": [
+        {
+          "id": "usdjpy-2016-validation",
+          "role": "validation",
+          "featureCutoffTimestampMs": 1704067199000,
+          "labelStartTimestampMs": 1704067200000,
+          "labelEndTimestampMs": 1719792000000,
+          "horizonMonths": 6
+        }
+      ]
+    }
+  ]
+}
+```
+
+Run it with:
+
+```sh
+cargo run -p quantforge-cli -- meta-build \
+  --spec meta-build.json \
+  --out meta-learning-input.json
+```
+
+Use separate origins for separate historical feature cutoffs. When `m1Source`
+is supplied, QuantForge rebuilds the decision timeframe from M1 using the same
+grid as Evolve. `featureSource` and `featureM1Source` must be the exact
+snapshots used to create the Databank: the rebuilt decision-data hash must
+match the Databank and its last bar must not be later than the feature cutoff.
+This means a full present-day source cannot be relabeled as an old IS snapshot.
+The builder replays the selected Databank pool (`elites` by default); use
+`pool: "holding"` when the historical run deferred its heavy robustness
+battery. It does not change trading logic or promote candidates.
+
+For new historical Databanks, pass the same cutoff directly to Evolve; H1 and
+M1 are clipped together without copying the source files:
+
+```sh
+cargo run -p quantforge-cli -- evolve ... \
+  --end-date 2024-01-01 \
+  --databank runs/USDJPY/Databank/USDJPY_H1_through_2023.json
+```
+
+```sh
+cargo run -p quantforge-cli -- meta-learn \
+  --input meta-learning-input.json \
+  --out meta-learning-report.json
+```
+
+`meta-learning-input.json` contains chronological `windows`, IS-only
+`candidates.features` (including fold, recovery, parameter-neighbourhood,
+trade-count, family and complexity evidence), and later `outcomes` keyed by
+window ID. The report includes AUC, precision@K, Brier/ECE calibration and the
+future-expectancy lift of selected versus unselected candidates. This pipeline
+does not alter Discover or trading execution logic.
+
+For the research target that matters most—future expectancy in R—use the
+separate `meta-expectancy` command. It fits an interpretable ridge regression
+on the same IS-only evidence, ranks candidates by predicted later expectancy,
+and reports RMSE, rank correlation and selected-versus-unselected future
+expectancy. It uses the same walk-forward and sealed-window rules, and asset
+identity remains excluded unless explicitly enabled.
+
+```sh
+cargo run -p quantforge-cli -- meta-expectancy \
+  --input meta-learning-input.json \
+  --out meta-expectancy-report.json
+```
+
+The binary survival model and the direct-expectancy model are deliberately
+separate research paths. A good survival AUC is not sufficient evidence that
+the selected strategies have higher expectancy; the direct-expectancy report's
+sealed lift is the relevant decision metric for this objective.
+
+### One-shot H4 production-recipe bakeoff
+
+To decide whether the current Holding robustness battery is removing viable H4
+strategies, run one frozen-cohort comparison. The command uses the saved
+Databank and battery report, applies only unsealed basic gates and ranking, and
+replays every selected strategy once on the sealed final partition with the
+existing M1 judge and broker costs. It compares the strict battery, an
+`IS expectancy × sqrt(trade count)` lane, and a same-size seeded random control.
+
+```sh
+cargo run -p quantforge-cli -- production-bakeoff H1_DATA.tsv \
+  --metadata H1_DATA.metadata.csv \
+  --m1 M1_DATA.tsv \
+  --m1-metadata M1_DATA.metadata.csv \
+  --databank runs/USDJPY/Databank/USDJPY_H4_databank.json \
+  --battery-report runs/USDJPY/Databank/USDJPY_H4_databank_battery.csv \
+  --broker USDJPY.broker.json \
+  --expected-cohort-size 52 \
+  --out runs/USDJPY/production-bakeoff.json
+```
+
+If a matching `<M1_DATA>.quotes.csv` exists, it is used automatically; pass
+`--quote-path` to select it explicitly. The output is no-clobber and contains
+the cohort IDs, rejection counts, hashes, split boundaries, seed, scoring
+formula, all sealed metrics and calendar-year results, plus the precommitted
+adoption decision. A mismatch between the saved cohort, battery rows or data
+hashes stops the run without writing a report.
+
+### H4 Production Lane v1
+
+Open an H4 Discover archive, go to **Holding**, and choose **Run Production
+Lane v1**. The lane freezes the complete Holding cohort, rebuilds H4 from the
+archive's bound M1 chronology, and refuses to run unless the reconstructed
+Development hash exactly matches the archive.
+
+Each strategy is replayed on Development M1 only. Basic gates plus positive
+6- and 12-month median expectancy/coverage determine eligibility; 3-month,
+calendar-year, Monte Carlo and parameter-neighbourhood results are retained as
+warnings rather than extra automatic rejections. Eligible strategies are
+ranked by `Development expectancy R × sqrt(trade count)`, with 12-month median,
+6-month median, recovery factor and lower drawdown as deterministic
+tie-breakers. The top 20% are promoted subject to the existing niche, family
+and correlation limits. Non-selected strategies remain in Holding.
+
+The command writes a no-clobber `*_production_lane_v1_*.json` report beside the
+Databank before promotion. It records the source artifact hash, exact split
+boundary, fixed configuration, every candidate decision and selected IDs. The
+sealed final partition is not loaded into the replay or selector; evaluate it
+only later through the existing one-shot Sealed Final workflow after the
+recipe and cross-asset shortlist are frozen.
+
 Write a quality report and its run manifest with:
 
 ```sh

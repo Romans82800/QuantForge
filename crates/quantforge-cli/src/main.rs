@@ -3,12 +3,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use quantforge_broker::{DayOfWeek, SymbolSpecification};
 use quantforge_data::{
     BarDataset, DataQualityReport, Mt5ExportMetadata, QualityGrade, QuoteBarDataset,
-    SourceTimezone, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
+    SourceTimezone, bar_content_hash, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes,
+    infer_median_interval_ms, quote_bar_content_hash,
 };
 use quantforge_discover::{
     ConditionBakeoffConfig, Databank, DiscoverConfig, DiscoverRunMode, GateConfig,
-    MethodologyGridConfig, PermutationNullConfig, UniversalGrammarConfig, continue_evolution,
-    evolve_new, run_condition_bakeoff, run_methodology_grid, run_permutation_null,
+    MetaLearningConfig, MetaLearningInput, MetaReplayCandidate, MetaReplayOrigin, MetaReplayWindow,
+    MetaWindow, MethodologyGridConfig, PermutationNullConfig, ProductionBakeoffConfig,
+    ProductionBakeoffStrictInput, SealedCandidateResult, UniversalGrammarConfig,
+    build_meta_learning_input_from_replay, continue_evolution, evolve_new, run_condition_bakeoff,
+    run_meta_expectancy_walk_forward, run_meta_walk_forward, run_methodology_grid,
+    run_permutation_null, run_production_bakeoff,
 };
 use quantforge_eval::{CostModel, ScoutConfig, ScoutResult, evaluate_strategy};
 use quantforge_export_mql5::{
@@ -39,7 +44,9 @@ use quantforge_storage::{
     claim_sealed_access_once, sealed_final_path, write_directory_new, write_json_new,
     write_json_versioned, write_sealed_final_once, write_text_new,
 };
-use quantforge_tick::{JudgeConfig, JudgeResult, evaluate_strategy_m1};
+use quantforge_tick::{
+    JudgeConfig, JudgeResult, evaluate_strategy_m1, evaluate_strategy_m1_from,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,6 +151,14 @@ enum Command {
     ConditionBakeoff(ConditionBakeoffArgs),
     /// Factor grid across entry/exit condition counts × recipes → OOS1 retention.
     MethodologyResearch(MethodologyResearchArgs),
+    /// Fit and evaluate the leakage-safe IS-evidence meta-selector.
+    MetaLearn(MetaLearnArgs),
+    /// Fit and evaluate the leakage-safe direct-expectancy meta-ranker.
+    MetaExpectancy(MetaExpectancyArgs),
+    /// Build a leakage-safe meta-learning input by replaying Databank elites.
+    MetaBuild(MetaBuildArgs),
+    /// Compare the current Holding battery with a simple sealed-period rank lane.
+    ProductionBakeoff(ProductionBakeoffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -263,6 +278,136 @@ struct MethodologyResearchArgs {
 }
 
 #[derive(Debug, Args)]
+struct MetaLearnArgs {
+    /// JSON input containing MetaLearningInput windows, IS features and later outcomes.
+    #[arg(long)]
+    input: PathBuf,
+    /// Write the walk-forward metrics and final sealed evaluation here.
+    #[arg(long)]
+    out: PathBuf,
+    /// Opt in to asset identity as a categorical feature.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    include_asset_identity: bool,
+    #[arg(long)]
+    minimum_future_trades: Option<usize>,
+    #[arg(long)]
+    minimum_retention: Option<f64>,
+    #[arg(long)]
+    top_k_fraction: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+struct MetaExpectancyArgs {
+    /// JSON input containing MetaLearningInput windows, IS features and later outcomes.
+    #[arg(long)]
+    input: PathBuf,
+    /// Write the direct-expectancy walk-forward report here.
+    #[arg(long)]
+    out: PathBuf,
+    /// Opt in to asset identity as a categorical feature.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    include_asset_identity: bool,
+    #[arg(long)]
+    top_k_fraction: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+struct MetaBuildArgs {
+    /// JSON specification naming Databank artifacts, source data, broker files and windows.
+    #[arg(long)]
+    spec: PathBuf,
+    /// Write the replayed MetaLearningInput here.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ProductionBakeoffArgs {
+    /// H1 source used by the Databank to define the H4 decision grid.
+    #[command(flatten)]
+    source: DataSourceArgs,
+    /// Full M1 execution source used for the sealed replay.
+    #[arg(long)]
+    m1: PathBuf,
+    #[arg(
+        long,
+        value_name = "IANA_TIMEZONE",
+        required_unless_present = "m1_metadata",
+        conflicts_with = "m1_metadata"
+    )]
+    m1_source_timezone: Option<SourceTimezone>,
+    #[arg(
+        long,
+        value_name = "METADATA_CSV",
+        required_unless_present = "m1_source_timezone",
+        conflicts_with = "m1_source_timezone"
+    )]
+    m1_metadata: Option<PathBuf>,
+    /// Existing Evolve Databank artifact containing the frozen Holding cohort.
+    #[arg(long)]
+    databank: PathBuf,
+    /// Existing Holding battery CSV. Defaults to the Databank sibling report.
+    #[arg(long)]
+    battery_report: Option<PathBuf>,
+    /// Optional normalized or MT5 tester bid/ask quote sidecar. If omitted,
+    /// `<m1>.quotes.csv` is used when present.
+    #[arg(long)]
+    quote_path: Option<PathBuf>,
+    /// Broker SymbolSpecification used by the original run.
+    #[arg(long)]
+    broker: PathBuf,
+    /// Abort if the saved cohort does not contain this many candidates.
+    #[arg(long)]
+    expected_cohort_size: Option<usize>,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long, default_value_t = 0.20)]
+    selection_fraction: f64,
+    #[arg(long, default_value_t = 0.10)]
+    minimum_lift_r: f64,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaBuildSpec {
+    #[serde(default)]
+    config: MetaLearningConfig,
+    origins: Vec<MetaBuildOriginSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaBuildOriginSpec {
+    id: String,
+    databank: PathBuf,
+    source: PathBuf,
+    metadata: Option<PathBuf>,
+    /// Optional M1 source used by Evolve to synthesize the decision timeframe.
+    m1_source: Option<PathBuf>,
+    m1_metadata: Option<PathBuf>,
+    /// Snapshot used to build the Databank; its hash and last bar are checked.
+    feature_source: Option<PathBuf>,
+    feature_metadata: Option<PathBuf>,
+    feature_m1_source: Option<PathBuf>,
+    feature_m1_metadata: Option<PathBuf>,
+    feature_end_date: Option<NaiveDate>,
+    /// Databank pool to replay: `elites` (default) or `holding`.
+    pool: Option<String>,
+    broker: PathBuf,
+    asset: Option<String>,
+    windows: Vec<MetaWindow>,
+}
+
+#[derive(Debug)]
+struct LoadedMetaBuildOrigin {
+    windows: Vec<MetaWindow>,
+    datasets: Vec<BarDataset>,
+    candidates: Vec<MetaReplayCandidate>,
+}
+
+#[derive(Debug, Args)]
 struct DataSourceArgs {
     path: PathBuf,
     /// IANA timezone of naive timestamps, for example Europe/Helsinki.
@@ -325,6 +470,9 @@ struct EvolveArgs {
     /// Broker-local calendar year of the first bar kept (2016 or 2020).
     #[arg(long, default_value_t = quantforge_data::DEFAULT_HISTORY_START_YEAR)]
     history_start_year: u16,
+    /// Exclusive UTC calendar date for this historical snapshot, YYYY-MM-DD.
+    #[arg(long)]
+    end_date: Option<NaiveDate>,
     #[arg(long)]
     initial: Option<usize>,
     #[arg(long)]
@@ -392,11 +540,15 @@ struct EvolveArgs {
     /// Allow a data-quality Fail and record the override in the manifest.
     #[arg(long)]
     allow_failed_data: bool,
-    /// Search unsealed history (everything except the sealed holdout). OOS1 is not a pick.
+    /// Search Development history and reserve OOS1/OOS2 from strategy construction.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     promotion_split: bool,
+    /// Optional OOS1 reserve. Set 0 to disable OOS1; values up to 0.5 are allowed.
     #[arg(long, default_value_t = quantforge_quality::DEFAULT_VALIDATION_FRACTION)]
     validation_fraction: f64,
+    /// OOS1 expectancy as a multiple of Development expectancy (0–2; above 1 requires improvement).
+    #[arg(long)]
+    oos1_expectancy_retention: Option<f64>,
     #[arg(long, default_value_t = quantforge_quality::DEFAULT_SEALED_FRACTION)]
     sealed_fraction: f64,
 }
@@ -980,6 +1132,12 @@ struct EvolveArtifact {
     databank: Databank,
 }
 
+#[derive(Debug, Serialize)]
+struct ProductionBakeoffArtifact {
+    manifest: RunManifest,
+    report: quantforge_discover::ProductionBakeoffReport,
+}
+
 #[derive(Debug, Deserialize)]
 struct ScoutArtifactInput {
     manifest: RunManifest,
@@ -1392,6 +1550,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::PermutationNull(args) => permutation_null_command(args)?,
         Command::ConditionBakeoff(args) => condition_bakeoff_command(args)?,
         Command::MethodologyResearch(args) => methodology_research_command(args)?,
+        Command::MetaLearn(args) => meta_learn_command(args)?,
+        Command::MetaExpectancy(args) => meta_expectancy_command(args)?,
+        Command::MetaBuild(args) => meta_build_command(args)?,
+        Command::ProductionBakeoff(args) => production_bakeoff_command(args)?,
     }
     Ok(())
 }
@@ -1561,6 +1723,758 @@ fn methodology_research_command(args: MethodologyResearchArgs) -> Result<(), Box
         );
     }
     Ok(())
+}
+
+fn meta_learn_command(args: MetaLearnArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "meta-learning artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let mut input: MetaLearningInput = read_json(&args.input)?;
+    if args.include_asset_identity {
+        input.config.include_asset_identity = true;
+    }
+    if let Some(value) = args.minimum_future_trades {
+        input.config.minimum_future_trades = value;
+    }
+    if let Some(value) = args.minimum_retention {
+        input.config.minimum_retention = value;
+    }
+    if let Some(value) = args.top_k_fraction {
+        input.config.top_k_fraction = value;
+    }
+    let report = run_meta_walk_forward(&input)?;
+    write_json_new(&args.out, &report)?;
+    println!(
+        "meta-learn wrote {} ({} walk-forward episodes; sealed_evaluation={})",
+        args.out.display(),
+        report.episodes.len(),
+        report.final_sealed_evaluation.is_some()
+    );
+    for episode in &report.episodes {
+        println!(
+            "  {} {:?}: train_rows={} auc={} precision@K={} lift={}",
+            episode.evaluation_window_id,
+            episode.evaluation_role,
+            episode.training_rows,
+            format_metric(episode.report.auc),
+            format_metric(episode.report.precision_at_k),
+            format_metric(episode.report.selected_future_expectancy_lift_r),
+        );
+    }
+    Ok(())
+}
+
+fn meta_expectancy_command(args: MetaExpectancyArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "direct-expectancy meta artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let mut input: MetaLearningInput = read_json(&args.input)?;
+    if args.include_asset_identity {
+        input.config.include_asset_identity = true;
+    }
+    if let Some(value) = args.top_k_fraction {
+        input.config.top_k_fraction = value;
+    }
+    let report = run_meta_expectancy_walk_forward(&input)?;
+    write_json_new(&args.out, &report)?;
+    println!(
+        "meta-expectancy wrote {} ({} walk-forward episodes; sealed_evaluation={})",
+        args.out.display(),
+        report.episodes.len(),
+        report.final_sealed_evaluation.is_some()
+    );
+    for episode in &report.episodes {
+        println!(
+            "  {} {:?}: train_rows={} rank_corr={} lift={}",
+            episode.evaluation_window_id,
+            episode.evaluation_role,
+            episode.training_rows,
+            format_metric(episode.report.rank_correlation),
+            format_metric(episode.report.selected_future_expectancy_lift_r),
+        );
+    }
+    Ok(())
+}
+
+fn meta_build_command(args: MetaBuildArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "meta-learning input already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let spec: MetaBuildSpec = read_json(&args.spec)?;
+    if spec.origins.is_empty() {
+        return Err("meta-build spec must contain at least one origin".into());
+    }
+
+    let mut loaded = Vec::with_capacity(spec.origins.len());
+    for origin in spec.origins {
+        if origin.windows.is_empty() {
+            return Err(format!(
+                "meta-build origin {} must contain at least one window",
+                origin.id
+            )
+            .into());
+        }
+        let artifact: EvolveArtifact = read_json(&origin.databank)?;
+        let feature_source_path = origin
+            .feature_source
+            .clone()
+            .unwrap_or_else(|| origin.source.clone());
+        let broker: SymbolSpecification = read_json(&origin.broker)?;
+        broker.validate()?;
+        let feature_m1_source_path = origin.feature_m1_source.clone().or_else(|| {
+            (feature_source_path == origin.source)
+                .then(|| origin.m1_source.clone())
+                .flatten()
+        });
+        let mut feature_source = load_meta_decision_dataset(
+            &feature_source_path,
+            origin.feature_metadata.as_deref().or_else(|| {
+                (feature_source_path == origin.source)
+                    .then_some(origin.metadata.as_deref())
+                    .flatten()
+            }),
+            feature_m1_source_path.as_deref(),
+            origin.feature_m1_metadata.as_deref().or_else(|| {
+                (feature_m1_source_path == origin.m1_source)
+                    .then_some(origin.m1_metadata.as_deref())
+                    .flatten()
+            }),
+            artifact.databank.config.history_start_year,
+            &broker,
+        )?;
+        if let Some(end_date) = origin.feature_end_date {
+            let end_timestamp_ms = end_date
+                .and_hms_opt(0, 0, 0)
+                .ok_or("invalid feature snapshot end date")?
+                .and_utc()
+                .timestamp_millis();
+            feature_source = clip_dataset_before_timestamp(&feature_source, end_timestamp_ms)?;
+        }
+        if feature_source.data_hash != artifact.databank.data_hash {
+            return Err(format!(
+                "meta-build origin {} feature decision-data hash does not match Databank data_hash",
+                origin.id
+            )
+            .into());
+        }
+        let source = load_meta_decision_dataset(
+            &origin.source,
+            origin.metadata.as_deref(),
+            origin.m1_source.as_deref(),
+            origin.m1_metadata.as_deref(),
+            artifact.databank.config.history_start_year,
+            &broker,
+        )?;
+
+        let cutoff = origin.windows[0].feature_cutoff_timestamp_ms;
+        if origin
+            .windows
+            .iter()
+            .any(|window| window.feature_cutoff_timestamp_ms != cutoff)
+        {
+            return Err(format!(
+                "meta-build origin {} must use one feature cutoff across its windows",
+                origin.id
+            )
+            .into());
+        }
+        if feature_source
+            .bars
+            .last()
+            .is_some_and(|bar| bar.timestamp_ms > cutoff)
+        {
+            return Err(format!(
+                "meta-build origin {} feature source extends past its feature cutoff; provide the actual IS snapshot",
+                origin.id
+            )
+            .into());
+        }
+        let scout = artifact.databank.config.scout.clone();
+        let pool = origin.pool.as_deref().unwrap_or("elites");
+        let source_pool = match pool {
+            "elites" => &artifact.databank.elites,
+            "holding" => &artifact.databank.holding,
+            other => {
+                return Err(format!(
+                    "meta-build origin {} has unknown pool {other}; use elites or holding",
+                    origin.id
+                )
+                .into());
+            }
+        };
+        let candidates = source_pool
+            .iter()
+            .map(|elite| MetaReplayCandidate {
+                features: quantforge_discover::MetaFeatureRecord::from_elite(
+                    elite.structural_fingerprint.to_string(),
+                    origin.asset.clone(),
+                    cutoff,
+                    elite,
+                ),
+                strategy: elite.strategy.clone(),
+                broker: broker.clone(),
+                scout: scout.clone(),
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(format!(
+                "meta-build origin {} has no Databank elites to replay",
+                origin.id
+            )
+            .into());
+        }
+        let datasets = origin
+            .windows
+            .iter()
+            .map(|window| bounded_meta_dataset(&source, window.label_end_timestamp_ms))
+            .collect::<Vec<_>>();
+        loaded.push(LoadedMetaBuildOrigin {
+            windows: origin.windows,
+            datasets,
+            candidates,
+        });
+    }
+
+    let replay_origins = loaded
+        .iter()
+        .map(|origin| MetaReplayOrigin {
+            windows: origin
+                .windows
+                .iter()
+                .zip(origin.datasets.iter())
+                .map(|(window, dataset)| MetaReplayWindow {
+                    window: window.clone(),
+                    dataset,
+                })
+                .collect(),
+            candidates: origin.candidates.clone(),
+        })
+        .collect::<Vec<_>>();
+    let input = build_meta_learning_input_from_replay(&replay_origins, spec.config)?;
+    write_json_new(&args.out, &input)?;
+    let outcomes = input
+        .candidates
+        .iter()
+        .map(|candidate| candidate.outcomes.len())
+        .sum::<usize>();
+    println!(
+        "meta-build wrote {} ({} windows, {} candidates, {} replay outcomes)",
+        args.out.display(),
+        input.windows.len(),
+        input.candidates.len(),
+        outcomes
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductionBakeoffBatteryRow {
+    status: String,
+    fingerprint: String,
+    reason: String,
+}
+
+fn production_bakeoff_command(args: ProductionBakeoffArgs) -> Result<(), Box<dyn Error>> {
+    if args.out.exists() {
+        return Err(format!(
+            "production-bakeoff artifact already exists and will not be replaced: {}",
+            args.out.display()
+        )
+        .into());
+    }
+    let artifact: EvolveArtifact = read_json(&args.databank)?;
+    let manifest_config = &artifact.manifest.recipe.config;
+    let promotion_split = manifest_config
+        .get("promotion_split")
+        .and_then(Value::as_bool)
+        .ok_or("Databank manifest is missing promotion_split")?;
+    if !promotion_split {
+        return Err("production-bakeoff requires a Databank created with promotion_split=true".into());
+    }
+    let validation_fraction = manifest_config
+        .get("validation_fraction")
+        .and_then(Value::as_f64)
+        .ok_or("Databank manifest is missing validation_fraction")?;
+    let sealed_fraction = manifest_config
+        .get("sealed_fraction")
+        .and_then(Value::as_f64)
+        .ok_or("Databank manifest is missing sealed_fraction")?;
+    if sealed_fraction <= 0.0 {
+        return Err("production-bakeoff requires a non-zero sealed fraction".into());
+    }
+
+    let (mut source_dataset, source_metadata) = load_source(&args.source)?;
+    let m1_source = DataSourceArgs {
+        path: args.m1.clone(),
+        source_timezone: args.m1_source_timezone,
+        metadata: args.m1_metadata.clone(),
+    };
+    let (mut m1_dataset, m1_metadata) = load_source(&m1_source)?;
+    let history_start_year = artifact.databank.config.history_start_year;
+    source_dataset.trim_before_calendar_year(history_start_year)?;
+    m1_dataset.trim_before_calendar_year(history_start_year)?;
+    let broker_spec: SymbolSpecification = read_json(&args.broker)?;
+    broker_spec.validate()?;
+    let inferred_quote_path = args.quote_path.clone().or_else(|| {
+        let candidate = args.m1.with_extension("quotes.csv");
+        candidate.is_file().then_some(candidate)
+    });
+    let mut quote_dataset = inferred_quote_path
+        .as_deref()
+        .map(|path| load_quote_sidecar(path, m1_metadata.as_ref()))
+        .transpose()?;
+    if let Some(quotes) = quote_dataset.as_mut() {
+        let m1_start = m1_dataset
+            .bars
+            .first()
+            .ok_or("M1 execution source is empty after history trim")?
+            .timestamp_ms;
+        quotes.trim_before_timestamp_ms(m1_start)?;
+    }
+    if let Some(quotes) = quote_dataset.as_ref() {
+        quotes
+            .validate_against(&m1_dataset)
+            .map_err(|error| format!("quote sidecar does not match M1: {error}"))?;
+    }
+    let (full_decision, split, decision_builder) = rebuild_bakeoff_decision_dataset(
+        &source_dataset,
+        &m1_dataset,
+        quote_dataset.as_ref(),
+        broker_spec.point,
+        &artifact.databank.data_hash,
+        validation_fraction,
+        sealed_fraction,
+    )?;
+    let sealed_start_index = full_decision
+        .bars
+        .iter()
+        .position(|bar| bar.timestamp_ms == split.sealed_final.start_timestamp_ms)
+        .ok_or("sealed split boundary is not present in the rebuilt decision dataset")?;
+    let unsealed = slice_partition(&full_decision, 0, sealed_start_index)?;
+    if unsealed.data_hash != artifact.databank.data_hash {
+        return Err(format!(
+            "rebuilt unsealed decision hash {} does not match Databank hash {}",
+            unsealed.data_hash, artifact.databank.data_hash
+        )
+        .into());
+    }
+    let sealed = slice_partition(&full_decision, sealed_start_index, full_decision.bars.len())?;
+    if sealed.data_hash != split.sealed_final.data_hash {
+        return Err("rebuilt sealed decision hash does not match the split plan".into());
+    }
+
+    let battery_path = args.battery_report.unwrap_or_else(|| {
+        let stem = args
+            .databank
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("databank");
+        args.databank
+            .with_file_name(format!("{stem}_battery.csv"))
+    });
+    let strict_input = read_production_bakeoff_battery(&battery_path)?;
+    if strict_input.tested_fingerprints.is_empty() {
+        return Err(format!(
+            "Holding battery report contains no candidate rows: {}",
+            battery_path.display()
+        )
+        .into());
+    }
+
+    let mut candidate_map = BTreeMap::new();
+    for elite in artifact
+        .databank
+        .holding
+        .iter()
+        .chain(artifact.databank.elites.iter())
+    {
+        let fingerprint = elite.structural_fingerprint.to_string();
+        if strict_input.tested_fingerprints.contains(&fingerprint) {
+            candidate_map.entry(fingerprint).or_insert_with(|| elite.clone());
+        }
+    }
+    let missing = strict_input
+        .tested_fingerprints
+        .iter()
+        .filter(|fingerprint| !candidate_map.contains_key(*fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Holding battery references {} candidates absent from Holding/Databank: {}",
+            missing.len(),
+            missing.join(", ")
+        )
+        .into());
+    }
+    let candidates = candidate_map.into_values().collect::<Vec<_>>();
+    if let Some(expected) = args.expected_cohort_size {
+        if candidates.len() != expected {
+            return Err(format!(
+                "frozen cohort size mismatch: expected {expected}, saved artifact contains {}",
+                candidates.len()
+            )
+            .into());
+        }
+    }
+
+    let bakeoff_config = ProductionBakeoffConfig {
+        seed: args.seed,
+        selection_fraction: args.selection_fraction,
+        minimum_lift_r: args.minimum_lift_r,
+        ..ProductionBakeoffConfig::default()
+    };
+    let empty_results = BTreeMap::new();
+    let preliminary = run_production_bakeoff(
+        &artifact.databank,
+        &candidates,
+        &strict_input,
+        &empty_results,
+        unsealed.data_hash.clone(),
+        sealed.data_hash.clone(),
+        split.sealed_final.start_timestamp_ms,
+        split.sealed_final.end_timestamp_ms_exclusive,
+        bakeoff_config.clone(),
+    )?;
+    let selected_ids = preliminary
+        .arms
+        .iter()
+        .flat_map(|arm| arm.selected_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let by_id = candidates
+        .iter()
+        .map(|elite| (elite.strategy.id.clone(), elite))
+        .collect::<BTreeMap<_, _>>();
+    let warmup_start_index = sealed_start_index.saturating_sub(320);
+    let decision_eval = slice_partition(&full_decision, warmup_start_index, full_decision.bars.len())?;
+    let m1_eval = clip_dataset_from_timestamp(
+        &m1_dataset,
+        decision_eval
+            .bars
+            .first()
+            .ok_or("decision warm-up window is empty")?
+            .timestamp_ms,
+    )?;
+    let quote_eval = quote_dataset
+        .as_ref()
+        .map(|quotes| clip_quote_dataset_from_timestamp(quotes, m1_eval.bars[0].timestamp_ms))
+        .transpose()?;
+    let judge_config = JudgeConfig {
+        initial_balance: artifact.databank.config.scout.initial_balance,
+        costs: artifact.databank.config.scout.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: artifact.databank.config.scout.indicator_engine,
+        entry_window: artifact.databank.config.scout.entry_window.clone(),
+    };
+    let mut sealed_results = BTreeMap::new();
+    for id in selected_ids {
+        let elite = by_id
+            .get(&id)
+            .ok_or_else(|| format!("selected strategy {id} is absent from the frozen cohort"))?;
+        let result = match quote_eval.as_ref() {
+            Some(quotes) => quantforge_tick::evaluate_strategy_m1_from_with_quotes(
+                &elite.strategy,
+                &decision_eval,
+                &m1_eval,
+                quotes,
+                &broker_spec,
+                &judge_config,
+                split.sealed_final.start_timestamp_ms,
+            )?,
+            None => evaluate_strategy_m1_from(
+                &elite.strategy,
+                &decision_eval,
+                &m1_eval,
+                &broker_spec,
+                &judge_config,
+                split.sealed_final.start_timestamp_ms,
+            )?,
+        };
+        sealed_results.insert(
+            elite.structural_fingerprint.to_string(),
+            SealedCandidateResult {
+                metrics: result.metrics,
+                trades: result.trades,
+                equity: result.equity,
+            },
+        );
+    }
+
+    let report = run_production_bakeoff(
+        &artifact.databank,
+        &candidates,
+        &strict_input,
+        &sealed_results,
+        unsealed.data_hash.clone(),
+        sealed.data_hash.clone(),
+        split.sealed_final.start_timestamp_ms,
+        split.sealed_final.end_timestamp_ms_exclusive,
+        bakeoff_config.clone(),
+    )?;
+    let broker_hash = broker_spec.content_hash()?;
+    let mut report_config = BTreeMap::<String, Value>::from([
+        ("databank".into(), json!(display_path(&args.databank))),
+        ("battery_report".into(), json!(display_path(&battery_path))),
+        ("source".into(), json!(display_path(&args.source.path))),
+        ("m1_source".into(), json!(display_path(&args.m1))),
+        (
+            "quote_source".into(),
+            json!(inferred_quote_path.as_ref().map(|path| display_path(path))),
+        ),
+        ("broker".into(), json!(display_path(&args.broker))),
+        ("validation_fraction".into(), json!(validation_fraction)),
+        ("sealed_fraction".into(), json!(sealed_fraction)),
+        ("production_bakeoff_config".into(), serde_json::to_value(&bakeoff_config)?),
+        ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
+        ("decision_builder".into(), json!(decision_builder)),
+    ]);
+    report_config.insert("unsealed_data_hash".into(), json!(&unsealed.data_hash));
+    report_config.insert("sealed_data_hash".into(), json!(&sealed.data_hash));
+    report_config.insert("source_data_hash".into(), json!(&source_dataset.data_hash));
+    report_config.insert("m1_data_hash".into(), json!(&m1_dataset.data_hash));
+    if let Some(metadata) = source_metadata {
+        report_config.insert("source_metadata_hash".into(), json!(metadata.metadata_hash));
+    }
+    if let Some(metadata) = m1_metadata {
+        report_config.insert("m1_metadata_hash".into(), json!(metadata.metadata_hash));
+    }
+    let manifest = RunManifest::new(
+        "production_bakeoff",
+        RunRecipe {
+            data_hash: Some(full_decision.data_hash.clone()),
+            broker_spec_hash: Some(broker_hash),
+            grammar_version: Some(artifact.databank.grammar_version.clone()),
+            seed: Some(args.seed),
+            config: report_config,
+            override_flags: Vec::new(),
+        },
+    )?;
+    let output = ProductionBakeoffArtifact { manifest, report };
+    write_json_new(&args.out, &output)?;
+    println!(
+        "production-bakeoff wrote {} (cohort={} simple_selected={} adopt_simple_lane={})",
+        args.out.display(),
+        output.report.cohort_fingerprints.len(),
+        output
+            .report
+            .arms
+            .iter()
+            .find(|arm| arm.name == "simple_rank")
+            .map(|arm| arm.selected)
+            .unwrap_or(0),
+        output.report.decision.adopt_simple_lane
+    );
+    Ok(())
+}
+
+fn read_production_bakeoff_battery(
+    path: &Path,
+) -> Result<ProductionBakeoffStrictInput, Box<dyn Error>> {
+    let mut reader = csv::ReaderBuilder::new().trim(csv::Trim::All).from_path(path)?;
+    let mut input = ProductionBakeoffStrictInput::default();
+    for row in reader.deserialize::<ProductionBakeoffBatteryRow>() {
+        let row = row?;
+        if row.fingerprint.trim().is_empty() {
+            continue;
+        }
+        input.tested_fingerprints.insert(row.fingerprint.clone());
+        if row.status.eq_ignore_ascii_case("passed") {
+            input.passed_fingerprints.insert(row.fingerprint);
+        } else {
+            let reason = if row.reason.trim().is_empty() {
+                "unknown"
+            } else {
+                row.reason.trim()
+            };
+            *input.rejection_counts.entry(reason.into()).or_default() += 1;
+        }
+    }
+    Ok(input)
+}
+
+fn rebuild_bakeoff_decision_dataset(
+    source_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker_point: f64,
+    target_unsealed_hash: &quantforge_core::ContentHash,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<(BarDataset, DataSplitPlan, String), Box<dyn Error>> {
+    let source_interval = infer_median_interval_ms(&source_dataset.bars)
+        .ok_or("cannot infer the decision timeframe interval from the source")?;
+    let source_grid = source_dataset
+        .bars
+        .iter()
+        .map(|bar| bar.timestamp_ms)
+        .collect::<Vec<_>>();
+    let four_hour_interval = source_interval
+        .checked_mul(4)
+        .ok_or("decision interval overflow while trying H4 reconstruction")?;
+    let attempts = [
+        (
+            "source-interval-with-source-grid",
+            source_interval,
+            Some(source_grid.clone()),
+        ),
+        ("four-hour-floor-grid", four_hour_interval, None),
+        (
+            "four-hour-with-source-grid",
+            four_hour_interval,
+            Some(source_grid),
+        ),
+    ];
+    let build = |interval_ms: i64, grid: Option<&[i64]>| {
+        if let Some(quotes) = quote_dataset {
+            build_timeframe_from_m1_with_quotes(
+                m1_dataset,
+                quotes,
+                broker_point,
+                interval_ms,
+                grid,
+            )
+        } else {
+            build_timeframe_from_m1(m1_dataset, interval_ms, grid)
+        }
+    };
+    let mut observed = Vec::new();
+    for (label, interval_ms, grid) in attempts {
+        let full = build(interval_ms, grid.as_deref())?;
+        let split = DataSplitPlan::chronological(&full, validation_fraction, sealed_fraction)?;
+        let sealed_start_index = full
+            .bars
+            .iter()
+            .position(|bar| bar.timestamp_ms == split.sealed_final.start_timestamp_ms)
+            .ok_or("split boundary is absent from rebuilt decision bars")?;
+        let unsealed = slice_partition(&full, 0, sealed_start_index)?;
+        if &unsealed.data_hash == target_unsealed_hash {
+            return Ok((full, split, label.into()));
+        }
+        observed.push(format!("{label}={}", unsealed.data_hash));
+    }
+    Err(format!(
+        "no supported decision-bar reconstruction matched Databank unsealed hash {}; observed {}",
+        target_unsealed_hash,
+        observed.join(", ")
+    )
+    .into())
+}
+
+fn clip_quote_dataset_from_timestamp(
+    dataset: &QuoteBarDataset,
+    start_timestamp_ms: i64,
+) -> Result<QuoteBarDataset, Box<dyn Error>> {
+    let start = dataset
+        .bars
+        .iter()
+        .position(|bar| bar.timestamp_ms >= start_timestamp_ms)
+        .ok_or("quote dataset has no bars at or after the decision warm-up start")?;
+    let bars = dataset.bars[start..].to_vec();
+    Ok(QuoteBarDataset {
+        source_rows: bars.len(),
+        source_timezone: dataset.source_timezone.clone(),
+        data_hash: quote_bar_content_hash(&bars),
+        schema_version: dataset.schema_version,
+        source_model: dataset.source_model,
+        bars,
+    })
+}
+
+fn clip_dataset_from_timestamp(
+    dataset: &BarDataset,
+    start_timestamp_ms: i64,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let start = dataset
+        .bars
+        .iter()
+        .position(|bar| bar.timestamp_ms >= start_timestamp_ms)
+        .ok_or("execution dataset has no bars at or after the decision warm-up start")?;
+    slice_partition(dataset, start, dataset.bars.len())
+}
+
+fn bounded_meta_dataset(source: &BarDataset, end_exclusive_timestamp_ms: i64) -> BarDataset {
+    let bars = source
+        .bars
+        .iter()
+        .filter(|bar| bar.timestamp_ms < end_exclusive_timestamp_ms)
+        .cloned()
+        .collect::<Vec<_>>();
+    BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: source.input_was_sorted,
+        delimiter: source.delimiter,
+        source_timezone: source.source_timezone.clone(),
+        bars,
+    }
+}
+
+fn load_meta_decision_dataset(
+    source_path: &Path,
+    metadata_path: Option<&Path>,
+    m1_source_path: Option<&Path>,
+    m1_metadata_path: Option<&Path>,
+    history_start_year: u16,
+    broker: &SymbolSpecification,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let source_metadata_path = metadata_path
+        .map(Path::to_path_buf)
+        .or_else(|| default_meta_metadata_path(source_path));
+    let source_args = DataSourceArgs {
+        path: source_path.to_path_buf(),
+        source_timezone: None,
+        metadata: source_metadata_path,
+    };
+    let (mut decision_grid, metadata) = load_source(&source_args)?;
+    validate_metadata_broker_binding(metadata.as_ref(), broker)?;
+    decision_grid.trim_before_calendar_year(history_start_year)?;
+
+    let Some(m1_source_path) = m1_source_path else {
+        return Ok(decision_grid);
+    };
+    let m1_metadata_path = m1_metadata_path
+        .map(Path::to_path_buf)
+        .or_else(|| default_meta_metadata_path(m1_source_path));
+    let m1_args = DataSourceArgs {
+        path: m1_source_path.to_path_buf(),
+        source_timezone: None,
+        metadata: m1_metadata_path,
+    };
+    let (mut m1, m1_metadata) = load_source(&m1_args)?;
+    validate_metadata_broker_binding(m1_metadata.as_ref(), broker)?;
+    m1.trim_before_calendar_year(history_start_year)?;
+    let interval_ms = infer_median_interval_ms(&decision_grid.bars)
+        .ok_or("cannot infer the decision timeframe interval from the feature grid")?;
+    let grid = decision_grid
+        .bars
+        .iter()
+        .map(|bar| bar.timestamp_ms)
+        .collect::<Vec<_>>();
+    Ok(build_timeframe_from_m1(&m1, interval_ms, Some(&grid))?)
+}
+
+fn default_meta_metadata_path(source_path: &Path) -> Option<PathBuf> {
+    let candidate = source_path.with_extension("metadata.csv");
+    candidate.is_file().then_some(candidate)
+}
+
+fn format_metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "n/a".into())
 }
 
 fn permutation_null_command(args: PermutationNullArgs) -> Result<(), Box<dyn Error>> {
@@ -4003,6 +4917,13 @@ fn join_windows_relative(base: &Path, relative: &str) -> PathBuf {
 }
 
 fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
+    validate_evolve_split(args.validation_fraction, args.sealed_fraction)?;
+    if args.validation_fraction > 0.0 && !args.promotion_split {
+        return Err(
+            "OOS1 validation requires --promotion-split so Development, OOS1 and sealed OOS2 remain separate"
+                .into(),
+        );
+    }
     let (mut dataset, metadata) = load_source(&args.source)?;
     let m1_source = DataSourceArgs {
         path: args.m1.clone(),
@@ -4018,6 +4939,15 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
     };
     dataset.trim_before_calendar_year(history_start_year)?;
     m1_dataset.trim_before_calendar_year(history_start_year)?;
+    if let Some(end_date) = args.end_date {
+        let end_timestamp_ms = end_date
+            .and_hms_opt(0, 0, 0)
+            .ok_or("invalid snapshot end date")?
+            .and_utc()
+            .timestamp_millis();
+        dataset = clip_dataset_before_timestamp(&dataset, end_timestamp_ms)?;
+        m1_dataset = clip_dataset_before_timestamp(&m1_dataset, end_timestamp_ms)?;
+    }
     let quality = DataQualityReport::analyze(&dataset);
     if quality.grade == QualityGrade::Fail && !args.allow_failed_data {
         return Err(format!(
@@ -4048,15 +4978,29 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         interval_ms
     );
 
+    let oos1_enabled = args.promotion_split && args.validation_fraction > 0.0;
     let development = args
         .promotion_split
-        .then(|| unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .then(|| {
+            if oos1_enabled {
+                development_partition(&dataset, args.validation_fraction, args.sealed_fraction)
+            } else {
+                unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction)
+            }
+        })
         .transpose()?;
-    let oos1 = None;
+    let oos1 = oos1_enabled
+        .then(|| oos1_partition(&dataset, args.validation_fraction, args.sealed_fraction))
+        .transpose()?;
     let search_dataset = development.as_ref().unwrap_or(&dataset);
+    let m1_validation_window = if oos1_enabled {
+        unsealed_partition(&dataset, args.validation_fraction, args.sealed_fraction)?
+    } else {
+        search_dataset.clone()
+    };
     let m1_is = args
         .promotion_split
-        .then(|| clip_dataset_to_window(&m1_dataset, search_dataset))
+        .then(|| clip_dataset_to_window(&m1_dataset, &m1_validation_window))
         .transpose()?;
     let m1_eval = m1_is.as_ref().unwrap_or(&m1_dataset);
 
@@ -4129,6 +5073,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
         ("generations_requested".into(), json!(args.generations)),
         ("starting_generation".into(), json!(starting_generation)),
         ("continued".into(), json!(args.continue_existing)),
+        ("end_date".into(), json!(args.end_date)),
         ("data_quality_grade".into(), json!(quality.grade)),
         ("data_quality_score".into(), json!(quality.score)),
         ("promotion_split".into(), json!(args.promotion_split)),
@@ -4136,6 +5081,7 @@ fn evolve_command(args: EvolveArgs) -> Result<(), Box<dyn Error>> {
             "validation_fraction".into(),
             json!(args.validation_fraction),
         ),
+        ("oos1_pick_enabled".into(), json!(oos1_enabled)),
         ("sealed_fraction".into(), json!(args.sealed_fraction)),
         ("is_label".into(), json!("in_sample")),
         ("oos1_label".into(), json!("out_of_sample_1_pick")),
@@ -4740,10 +5686,15 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
             minimum_return_retention: args.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: quantforge_discover::SearchRangeProfile::default(),
-        oos1_expectancy_retention: 0.7,
+        oos1_expectancy_retention: args.oos1_expectancy_retention.unwrap_or(0.7),
         minimum_development_expectancy_r: 0.25,
         require_m1_precision: false,
         simple_exits: true,
+        sl_tp_only_exits: true,
+        allow_fixed_pip_stops: false,
+        fixed_pip_size_points: 10.0,
+        allow_indicator_exit_rules: false,
+        allow_time_stops: false,
         allow_break_even: false,
         allow_trailing_stops: false,
         allow_partial_exits: false,
@@ -4819,6 +5770,24 @@ fn development_partition(
 ) -> Result<BarDataset, Box<dyn Error>> {
     let plan = DataSplitPlan::chronological(dataset, validation_fraction, sealed_fraction)?;
     slice_partition(dataset, 0, plan.development.bar_count)
+}
+
+fn validate_evolve_split(
+    validation_fraction: f64,
+    sealed_fraction: f64,
+) -> Result<(), Box<dyn Error>> {
+    if !validation_fraction.is_finite()
+        || !sealed_fraction.is_finite()
+        || !(0.0..=0.5).contains(&validation_fraction)
+        || !(0.05..=0.4).contains(&sealed_fraction)
+        || validation_fraction + sealed_fraction >= 0.9
+    {
+        return Err(
+            "OOS1 reserve must be 0–50%, sealed holdout must be 5–40%, and at least 10% must remain for Development"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn unsealed_partition(
@@ -4898,6 +5867,33 @@ fn clip_dataset_to_window(
     })
 }
 
+fn clip_dataset_before_timestamp(
+    dataset: &BarDataset,
+    end_exclusive_timestamp_ms: i64,
+) -> Result<BarDataset, Box<dyn Error>> {
+    let bars = dataset
+        .bars
+        .iter()
+        .filter(|bar| bar.timestamp_ms < end_exclusive_timestamp_ms)
+        .cloned()
+        .collect::<Vec<_>>();
+    if bars.len() < 2 {
+        return Err(format!(
+            "snapshot ending at {end_exclusive_timestamp_ms} contains fewer than 2 bars"
+        )
+        .into());
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
 fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>> {
     if args.initial.is_some()
         || args.batch.is_some()
@@ -4912,12 +5908,14 @@ fn reject_continuation_overrides(args: &EvolveArgs) -> Result<(), Box<dyn Error>
         || args.minimum_profit_factor.is_some()
         || args.minimum_return_drawdown.is_some()
         || args.minimum_m1_return_retention.is_some()
+        || args.oos1_expectancy_retention.is_some()
         || args.flatten_at_22
         || args.commission_per_lot_round_turn.is_some()
         || args.slippage_points_per_side.is_some()
         || args.fallback_spread_points.is_some()
         || args.max_spread_points.is_some()
         || args.initial_balance.is_some()
+        || args.end_date.is_some()
     {
         return Err(
             "a continuation uses the databank's immutable stored search, gate and cost configuration; pass only --generations"

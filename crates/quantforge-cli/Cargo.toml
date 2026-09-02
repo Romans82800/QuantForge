@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
+csv.workspace = true
 clap.workspace = true
 quantforge-broker.workspace = true
 quantforge-core.workspace = true

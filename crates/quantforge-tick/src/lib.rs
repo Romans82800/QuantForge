@@ -173,7 +173,38 @@ pub fn evaluate_strategy_m1(
     broker: &SymbolSpecification,
     config: &JudgeConfig,
 ) -> Result<JudgeResult, JudgeError> {
-    evaluate_strategy_m1_internal(strategy, decision_dataset, m1_dataset, None, broker, config)
+    evaluate_strategy_m1_internal(
+        strategy,
+        decision_dataset,
+        m1_dataset,
+        None,
+        broker,
+        config,
+        None,
+    )
+}
+
+/// Replays M1 execution with the same indicator warm-up as the normal judge,
+/// but forbids new entries before `entry_start_timestamp_ms`. This is used by
+/// research reports that need a sealed chronological evaluation without
+/// resetting indicator state at the partition boundary.
+pub fn evaluate_strategy_m1_from(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    broker: &SymbolSpecification,
+    config: &JudgeConfig,
+    entry_start_timestamp_ms: i64,
+) -> Result<JudgeResult, JudgeError> {
+    evaluate_strategy_m1_internal(
+        strategy,
+        decision_dataset,
+        m1_dataset,
+        None,
+        broker,
+        config,
+        Some(entry_start_timestamp_ms),
+    )
 }
 
 pub fn evaluate_strategy_m1_with_quotes(
@@ -191,6 +222,30 @@ pub fn evaluate_strategy_m1_with_quotes(
         Some(quote_dataset),
         broker,
         config,
+        None,
+    )
+}
+
+/// Quote-aware counterpart to [`evaluate_strategy_m1_from`]. It preserves the
+/// complete indicator warm-up while forbidding entries before the sealed
+/// partition boundary.
+pub fn evaluate_strategy_m1_from_with_quotes(
+    strategy: &StrategyIr,
+    decision_dataset: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: &QuoteBarDataset,
+    broker: &SymbolSpecification,
+    config: &JudgeConfig,
+    entry_start_timestamp_ms: i64,
+) -> Result<JudgeResult, JudgeError> {
+    evaluate_strategy_m1_internal(
+        strategy,
+        decision_dataset,
+        m1_dataset,
+        Some(quote_dataset),
+        broker,
+        config,
+        Some(entry_start_timestamp_ms),
     )
 }
 
@@ -201,6 +256,7 @@ fn evaluate_strategy_m1_internal(
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
     config: &JudgeConfig,
+    entry_start_timestamp_ms: Option<i64>,
 ) -> Result<JudgeResult, JudgeError> {
     if decision_dataset.bars.len() < 2 {
         return Err(JudgeError::InsufficientDecisionBars);
@@ -498,6 +554,7 @@ fn evaluate_strategy_m1_internal(
             && pending.is_none()
             && !closed_this_decision
             && !(strategy.manage.flatten_end_of_day && in_close_blackout)
+            && entry_start_timestamp_ms.is_none_or(|timestamp| start >= timestamp)
             && decision_index >= signal_warmup_bars
         {
             let filters_pass = strategy

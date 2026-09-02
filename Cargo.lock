@@ -2501,6 +2501,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "csv",
  "quantforge-broker",
  "quantforge-core",
  "quantforge-data",
@@ -2575,6 +2576,7 @@ name = "quantforge-discover"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "csv",
  "quantforge-broker",
  "quantforge-core",
  "quantforge-data",

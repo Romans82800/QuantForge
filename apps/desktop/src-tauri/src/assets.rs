@@ -6,10 +6,8 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 /// Preferred pack folder names, newest-first. QUANTFORGE_DATA_PACK overrides.
-const DATA_PACK_CANDIDATES: &[&str] = &[
-    "ICMarkets_EST7_2016_present",
-    "ICMarkets_EST7_2020_present",
-];
+const DATA_PACK_CANDIDATES: &[&str] =
+    &["ICMarkets_EST7_2016_present", "ICMarkets_EST7_2020_present"];
 const DEMO_PREFIX: &str = "ICMarketsSC-Demo_";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

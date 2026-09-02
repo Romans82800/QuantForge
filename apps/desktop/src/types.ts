@@ -63,20 +63,12 @@ export interface PartitionEquityPoint {
   equity: number;
 }
 
-export interface PartitionEquityPartition {
-  id: string;
-  kind: "training" | "validation" | "holdout";
-  startTimestampMs: number;
-  endTimestampMs: number;
-}
-
 export interface PartitionEquityView {
   fingerprint: string;
   strategyId: string;
   executionEngine: string;
   initialBalance: number;
   points: PartitionEquityPoint[];
-  partitions: PartitionEquityPartition[];
   isEndTimestampMs: number;
   oos1EndTimestampMs: number;
   oos2EndTimestampMs: number;
@@ -174,6 +166,7 @@ export interface DatabankWorkspace {
   runId: string;
   createdAt: string;
   dataHash: string;
+  decisionTimeframe: "H1" | "M15" | "H4" | string;
   brokerSpecHash: string;
   grammarVersion: string;
   legacyReadOnly: boolean;
@@ -189,6 +182,10 @@ export interface DatabankWorkspace {
   requireM1Precision: boolean;
   m1FidelityVerified: boolean;
   simpleExits: boolean;
+  slTpOnlyExits: boolean;
+  allowFixedPipStops: boolean;
+  allowIndicatorExitRules: boolean;
+  allowTimeStops: boolean;
   allowBreakEven: boolean;
   allowTrailingStops: boolean;
   allowPartialExits: boolean;
@@ -378,6 +375,8 @@ export interface EliteDetail {
   foldUsable: boolean;
   strategyIr: unknown;
   equitySignature: number[];
+  /** True when only the explicit one-shot Sealed Final workflow may reveal future rows. */
+  sealedProtected: boolean;
   /** Present when Discover persisted robustness gate detail; otherwise UI shows "not recorded". */
   robustness?: EliteRobustnessView | null;
 }
@@ -539,14 +538,73 @@ export interface ConditionBakeoffRequest {
   historyStartYear?: number | null;
 }
 
-export type ScoutFitnessModeId = "raw_is" | "stable_fold";
+export interface TimeframeBakeoffLaneRow {
+  timeframe: "H1" | "H4";
+  draws: number;
+  screened: number;
+  oos1Survivors: number;
+  oos1SurvivalRate: number;
+  medianIsExpectancyR: number | null;
+  medianOos1ExpectancyR: number | null;
+  medianRetention: number | null;
+  medianTradeCount: number | null;
+  medianDrawdownPercent: number | null;
+  medianRecoveryFactor: number | null;
+  medianSharpe: number | null;
+  selectedOos1ExpectancyR: number | null;
+  unselectedOos1ExpectancyR: number | null;
+  selectedFutureExpectancyLiftR: number | null;
+}
+
+export interface TimeframeBakeoffPair {
+  pairedComparisons: number;
+  h1Oos1Wins: number;
+  h4Oos1Wins: number;
+  h4RetentionLift: number | null;
+  h4PassRateLift: number;
+  h4SelectedFutureExpectancyLiftR: number | null;
+  recommendation: string;
+}
+
+export interface TimeframeBakeoffReport {
+  evaluations: number;
+  rows: TimeframeBakeoffLaneRow[];
+  pair: TimeframeBakeoffPair;
+}
+
+export interface TimeframeBakeoffRequest {
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+  drawsPerCell: number;
+  seed: number;
+  minimumTrades: number;
+  minimumReturnPercent: number;
+  minimumProfitFactor: number;
+  maximumDrawdownPercent: number;
+  oos1Retention: number;
+  commissionPerLotRoundTurn: number;
+  slippagePointsPerSide: number;
+  fallbackSpreadPoints: number | null;
+  validationFraction: number;
+  sealedFraction: number;
+  minimumEntryConditions: number;
+  maximumEntryConditions: number;
+  minimumExitConditions: number;
+  maximumExitConditions: number;
+  historyStartYear?: number | null;
+}
 
 export interface DiscoverRequest {
   mode: DiscoverMode;
   /** Explicit UI selection. The backend refuses data/broker bindings for another symbol. */
   selectedSymbol: string | null;
   dataPath: string;
-  decisionTimeframe: "H1" | "M15" | null;
+  decisionTimeframe: "H1" | "M15" | "H4" | null;
   metadataPath: string | null;
   sourceTimezone: string | null;
   m1DataPath: string;
@@ -562,8 +620,6 @@ export interface DiscoverRequest {
   noveltyWeight: number | null;
   seed: number | null;
   universalGrammar: UniversalGrammarConfig | null;
-  /** Named production families to allow; null/empty means the balanced catalog. */
-  selectedSearchFamilies: string[] | null;
   runMode: DiscoverRunModeId | null;
   generalIslandCount: number | null;
   refinementIslandCount: number | null;
@@ -573,7 +629,6 @@ export interface DiscoverRequest {
   earlyStopPotElites: number | null;
   targetDatabankElites: number | null;
   searchRanges: SearchRangeProfile | null;
-  scoutFitnessMode: ScoutFitnessModeId | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
@@ -589,6 +644,10 @@ export interface DiscoverRequest {
   oos1ExpectancyRetention: number | null;
   requireM1Precision: boolean | null;
   simpleExits: boolean | null;
+  slTpOnlyExits: boolean | null;
+  allowFixedPipStops: boolean | null;
+  allowIndicatorExitRules: boolean | null;
+  allowTimeStops: boolean | null;
   allowBreakEven: boolean | null;
   allowTrailingStops: boolean | null;
   allowPartialExits: boolean | null;
@@ -634,22 +693,11 @@ export interface DiscoverRequest {
   sealedFraction: number | null;
   /** Broker-local calendar year of the first bar kept (2016 or 2020). */
   historyStartYear: number | null;
-  historyStartDate: string | null;
-  historyEndDate: string | null;
-  dataRangeParts: DataRangePart[];
   /** After Discover checkpoints, shrink Holding and battery remaining names. */
   factoryAfterDiscover: boolean | null;
   factoryQueueLimit: number | null;
   factoryTargetDatabank: number | null;
   factoryMaxCorrelation: number | null;
-}
-
-export type DataRangeKind = "training" | "validation" | "holdout";
-export interface DataRangePart {
-  id: string;
-  kind: DataRangeKind;
-  startDate: string;
-  endDate: string;
 }
 
 export interface SavedDiscoverProfile {
@@ -671,6 +719,8 @@ export interface SearchRangeProfile {
   atrStopMultiple: SearchRange;
   atrTargetMultiple: SearchRange;
   riskTargetMultiple: SearchRange;
+  fixedStopPips: SearchRange;
+  fixedTargetPips: SearchRange;
   pendingDistanceAtr: SearchRange;
   pendingExpiryBars: SearchRange;
   timeStopBars: SearchRange;
@@ -800,6 +850,58 @@ export interface DiscoverJobView {
   message: string;
 }
 
+/** One complete market binding used by an isolated Portfolio Discover lane. */
+export interface PortfolioDiscoverAsset {
+  symbol: string;
+  dataPath: string;
+  metadataPath: string | null;
+  sourceTimezone: string | null;
+  m1DataPath: string;
+  m1MetadataPath: string | null;
+  m1SourceTimezone: string | null;
+  brokerPath: string;
+}
+
+export interface PortfolioDiscoverRequest {
+  recipe: DiscoverRequest;
+  assets: PortfolioDiscoverAsset[];
+  /** Shared Scout CPU budget; 0 lets QuantForge divide available CPUs. */
+  globalWorkerThreads: number;
+  /** Full-market data loads are staged to avoid memory and I/O contention. */
+  concurrentLanes: number;
+}
+
+export interface PortfolioDiscoverLaneView {
+  symbol: string;
+  outputPath: string;
+  status: string;
+  phase: string;
+  evaluationCount: number;
+  holdingElites: number;
+  databankElites: number;
+  evaluationsPerHour: number;
+  workerThreads: number;
+  message: string;
+}
+
+export interface PortfolioDiscoverJobView {
+  jobId: string | null;
+  status: "idle" | "running" | "completed" | "stopped" | "failed" | string;
+  phase: string;
+  globalWorkerThreads: number;
+  concurrentLanes: number;
+  activeLanes: number;
+  completedLanes: number;
+  totalLanes: number;
+  totalEvaluationCount: number;
+  totalHoldingElites: number;
+  totalDatabankElites: number;
+  startedAtMs: number | null;
+  stopRequested: boolean;
+  message: string;
+  lanes: PortfolioDiscoverLaneView[];
+}
+
 export interface BatteryItemView {
   fingerprint: string;
   strategyId: string;
@@ -811,6 +913,7 @@ export interface BatteryItemView {
 
 export interface BatteryJobView {
   jobId: string | null;
+  jobKind: "battery" | "production_lane" | string;
   status: "idle" | "running" | "completed" | "stopped" | "failed" | string;
   phase: string;
   message: string;
@@ -844,6 +947,9 @@ export interface BatteryJobView {
   holdingBeforeShrink?: number;
   holdingAfterShrink?: number;
   targetDatabank?: number | null;
+  auditAndGraduate?: boolean;
+  reportPath?: string | null;
+  workspace?: DatabankWorkspace | null;
 }
 
 export interface ChallengeRequest {

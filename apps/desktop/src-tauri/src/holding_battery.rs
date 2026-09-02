@@ -1,21 +1,29 @@
 //! Discover-style job runner for on-demand Holding → Databank battery.
 
 use crate::data_lab::{
-    apply_history_start_year, load_bound_broker, load_quote_sidecar, trim_market_history_to_year,
+    apply_history_start_year, build_decision_from_m1, build_decision_from_m1_quotes,
+    load_bound_broker, load_quote_sidecar, trim_market_history_to_year,
 };
 use crate::databank::{
-    DesktopState, EvolveArtifact, HoldingBatteryRequest, infer_quote_sidecar_path, persist_bank_file,
-    persist_loaded_bank, reload_workspace_from_path, slice_bars,
+    DesktopState, EvolveArtifact, HoldingBatteryRequest, infer_quote_sidecar_path,
+    persist_bank_file, persist_loaded_bank, reload_workspace_from_path, slice_bars,
 };
-use quantforge_data::BarDataset;
+use quantforge_core::ContentHash;
+use quantforge_data::{
+    BarDataset, QuoteBarDataset, bar_content_hash, build_timeframe_from_m1,
+    build_timeframe_from_m1_with_quotes, quote_bar_content_hash,
+};
 use quantforge_discover::{
-    Databank, Elite, RobustnessEvidence, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
-    holding_factory_score,
+    Databank, Elite, GateResult, ProductionLaneConfig, ProductionLaneReplay, ProductionLaneReport,
+    RobustnessEvidence, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
+    holding_factory_score, promote_selected_holding_without_robustness, run_production_lane,
 };
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_quality::DataSplitPlan;
+use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_with_quotes};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +31,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
+
+/// Called after a factory promotion has been durably checkpointed.  Discover
+/// uses this to replace its otherwise-finished live snapshot, so its dashboard
+/// cannot keep reporting the pre-battery Holding/Databank counts.
+pub(crate) type FactoryCheckpoint = Arc<dyn Fn(&EvolveArtifact) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,8 +66,17 @@ pub struct BatteryKillMix {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HoldingBypassView {
+    promoted: usize,
+    replaced: usize,
+    workspace: crate::databank::DatabankWorkspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatteryJobView {
     job_id: Option<String>,
+    job_kind: &'static str,
     status: &'static str,
     phase: String,
     message: String,
@@ -78,12 +100,18 @@ pub struct BatteryJobView {
     holding_before_shrink: usize,
     holding_after_shrink: usize,
     target_databank: Option<usize>,
+    audit_and_graduate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<crate::databank::DatabankWorkspace>,
 }
 
 impl BatteryJobView {
     fn idle() -> Self {
         Self {
             job_id: None,
+            job_kind: "battery",
             status: "idle",
             phase: "Ready".into(),
             message: "Select Holding strategies and start the battery.".into(),
@@ -106,6 +134,9 @@ impl BatteryJobView {
             holding_before_shrink: 0,
             holding_after_shrink: 0,
             target_databank: None,
+            audit_and_graduate: false,
+            report_path: None,
+            workspace: None,
         }
     }
 }
@@ -125,7 +156,9 @@ impl Default for BatteryJobState {
 }
 
 #[tauri::command]
-pub fn get_holding_battery_job(state: State<'_, BatteryJobState>) -> Result<BatteryJobView, String> {
+pub fn get_holding_battery_job(
+    state: State<'_, BatteryJobState>,
+) -> Result<BatteryJobView, String> {
     state
         .job
         .read()
@@ -147,6 +180,55 @@ pub fn stop_holding_battery(state: State<'_, BatteryJobState>) -> Result<Battery
     view.phase = "Stopping after the current strategy".into();
     view.message = "Stop requested — finishing the in-flight battery, then checkpointing.".into();
     Ok(view.clone())
+}
+
+/// Explicit research override: graduate the current Holding cohort without
+/// running CPCV, walk-forward, Monte Carlo or parameter-neighborhood tests.
+/// Holding admission's existing basic/M1 checks have already run; this command
+/// only changes where those entries are stored.
+#[tauri::command]
+pub fn promote_holding_without_robustness(
+    desktop: State<'_, DesktopState>,
+    state: State<'_, BatteryJobState>,
+) -> Result<HoldingBypassView, String> {
+    if state.is_busy()? {
+        return Err(
+            "stop or finish the Holding battery before promoting Holding without robustness".into(),
+        );
+    }
+    let (mut bank, databank_path, count, legacy_read_only) = {
+        let loaded = desktop
+            .loaded
+            .read()
+            .map_err(|_| "desktop databank state is unavailable".to_owned())?;
+        let loaded = loaded.as_ref().ok_or_else(|| {
+            "no databank is loaded — open the Discover checkpoint first".to_owned()
+        })?;
+        (
+            loaded.bank.clone(),
+            loaded.databank_path.clone(),
+            loaded.bank.holding.len(),
+            loaded.legacy_read_only,
+        )
+    };
+    if legacy_read_only {
+        return Err(
+            "Schema-v5 databanks are read-only. Run a fresh Discover archive before promoting Holding."
+                .into(),
+        );
+    }
+    if count == 0 {
+        return Err("Holding is empty".into());
+    }
+
+    let result = quantforge_discover::promote_all_holding_without_robustness(&mut bank);
+    persist_loaded_bank(&databank_path, &bank, &desktop)?;
+    let workspace = reload_workspace_from_path(Path::new(&databank_path), &desktop)?;
+    Ok(HoldingBypassView {
+        promoted: result.promoted,
+        replaced: result.replaced,
+        workspace,
+    })
 }
 
 impl BatteryJobState {
@@ -197,14 +279,23 @@ pub fn start_holding_battery_job(
         .as_millis() as u64;
     let started = BatteryJobView {
         job_id: Some(format!("battery-{now_ms}")),
+        job_kind: if request.audit_and_graduate {
+            "audit_graduate"
+        } else {
+            "battery"
+        },
         status: "running",
-        phase: if request.shrink_first || request.ranked {
+        phase: if request.shrink_first {
             "Preparing factory".into()
+        } else if request.ranked {
+            "Ranking Holding queue".into()
         } else {
             "Loading market data".into()
         },
-        message: if request.ranked {
-            "Ranking Holding after shrink, then running the robustness battery on the remaining names.".into()
+        message: if request.audit_and_graduate {
+            "Running the full battery as an audit, then graduating every Holding strategy regardless of result.".into()
+        } else if request.ranked {
+            "Ranking the current Holding cohort, then running the robustness battery one strategy at a time.".into()
         } else {
             format!(
                 "Queued {} Holding strategies for the robustness battery.",
@@ -230,17 +321,23 @@ pub fn start_holding_battery_job(
         holding_before_shrink: snapshot.artifact.databank.holding.len(),
         holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
+        audit_and_graduate: request.audit_and_graduate,
+        report_path: None,
+        workspace: None,
     };
     *state
         .job
         .write()
         .map_err(|_| "battery job state is unavailable")? = started.clone();
 
+    let desktop = desktop.inner().clone();
     let job = Arc::clone(&state.job);
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request) {
+        if let Err(error) =
+            run_factory_or_battery(job, stop, snapshot, request, Some(desktop), None)
+        {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -253,11 +350,119 @@ pub fn start_holding_battery_job(
     Ok(started)
 }
 
+/// Run the fixed H4 Production Lane v1 against the complete frozen Holding
+/// cohort. Eligibility and ranking use Development M1 replays only; the sealed
+/// partition is never passed to the selector or evaluator.
+#[tauri::command]
+pub fn start_production_lane_job(
+    desktop: State<'_, DesktopState>,
+    state: State<'_, BatteryJobState>,
+) -> Result<BatteryJobView, String> {
+    if state.is_busy()? {
+        return Err("a Holding job is already running".into());
+    }
+    let snapshot = snapshot_loaded_archive(&desktop)?;
+    if snapshot.legacy_read_only {
+        return Err(
+            "Schema-v5 databanks are read-only. Run a fresh H4 Discover archive first.".into(),
+        );
+    }
+    let total = snapshot.artifact.databank.holding.len();
+    if total == 0 {
+        return Err("Holding is empty".into());
+    }
+    if snapshot.sealed_fraction <= 0.0 {
+        return Err("Production Lane requires a non-zero sealed partition".into());
+    }
+    let timeframe = crate::databank::archive_decision_timeframe(
+        &snapshot.artifact,
+        Path::new(&snapshot.databank_path),
+    );
+    if timeframe != "H4" {
+        return Err(format!(
+            "This is a {timeframe} Holding archive. Production Lane v1 is H4-only; use Run full robustness battery for this cohort. Nothing was evaluated or promoted."
+        ));
+    }
+
+    state.stop.store(false, Ordering::SeqCst);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as u64;
+    let items = snapshot
+        .artifact
+        .databank
+        .holding
+        .iter()
+        .map(|elite| BatteryItemView {
+            fingerprint: elite.structural_fingerprint.to_string(),
+            strategy_id: elite.strategy.id.clone(),
+            status: "queued",
+            reason: None,
+            evidence: elite.evidence.total,
+            trades: elite.metrics.trade_count,
+        })
+        .collect::<Vec<_>>();
+    let started = BatteryJobView {
+        job_id: Some(format!("production-lane-{now_ms}")),
+        job_kind: "production_lane",
+        status: "running",
+        phase: "Verifying H4 Development data".into(),
+        message: format!(
+            "Frozen cohort: {total}. Reconstructing H4 from M1 and matching the archive hash before replay."
+        ),
+        databank_path: Some(snapshot.databank_path.clone()),
+        total,
+        queued: total,
+        running: 0,
+        completed: 0,
+        passed: 0,
+        rejected: 0,
+        holding_remaining: total,
+        databank_elites: snapshot.artifact.databank.elites.len(),
+        batteries_per_hour: 0.0,
+        eta_seconds: None,
+        elapsed_seconds: 0.0,
+        stop_requested: false,
+        revision: 0,
+        items,
+        kill_mix: BatteryKillMix::default(),
+        holding_before_shrink: total,
+        holding_after_shrink: total,
+        target_databank: None,
+        audit_and_graduate: false,
+        report_path: None,
+        workspace: None,
+    };
+    *state
+        .job
+        .write()
+        .map_err(|_| "battery job state is unavailable")? = started.clone();
+
+    let desktop = desktop.inner().clone();
+    let job = Arc::clone(&state.job);
+    let stop = Arc::clone(&state.stop);
+    let job_for_err = Arc::clone(&job);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = run_production_lane_job(job, stop, snapshot, desktop) {
+            if let Ok(mut view) = job_for_err.write() {
+                view.status = "failed";
+                view.phase = "Production Lane stopped with an error".into();
+                view.message = error;
+                view.running = 0;
+                view.queued = 0;
+            }
+        }
+    });
+    Ok(started)
+}
+
 /// Overnight Discover → shrink → ranked battery. Safe to call after a checkpoint write.
 pub(crate) fn spawn_factory_from_archive(
     databank_path: String,
     request: HoldingBatteryRequest,
     state: &BatteryJobState,
+    factory_checkpoint: Option<FactoryCheckpoint>,
 ) -> Result<BatteryJobView, String> {
     if state.is_busy()? {
         return Err("a Holding battery job is already running".into());
@@ -270,9 +475,11 @@ pub(crate) fn spawn_factory_from_archive(
         .as_millis() as u64;
     let started = BatteryJobView {
         job_id: Some(format!("factory-{now_ms}")),
+        job_kind: "battery",
         status: "running",
         phase: "Preparing factory".into(),
-        message: "Discover finished — shrinking Holding and ranking the battery queue.".into(),
+        message: "Discover finished — ranking the current Holding cohort for the battery queue."
+            .into(),
         databank_path: Some(databank_path),
         total: 0,
         queued: 0,
@@ -292,6 +499,9 @@ pub(crate) fn spawn_factory_from_archive(
         holding_before_shrink: snapshot.artifact.databank.holding.len(),
         holding_after_shrink: snapshot.artifact.databank.holding.len(),
         target_databank: request.target_databank,
+        audit_and_graduate: false,
+        report_path: None,
+        workspace: None,
     };
     *state
         .job
@@ -301,7 +511,9 @@ pub(crate) fn spawn_factory_from_archive(
     let stop = Arc::clone(&state.stop);
     let job_for_err = Arc::clone(&job);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_factory_or_battery(job, stop, snapshot, request) {
+        if let Err(error) =
+            run_factory_or_battery(job, stop, snapshot, request, None, factory_checkpoint)
+        {
             if let Ok(mut view) = job_for_err.write() {
                 view.status = "failed";
                 view.phase = "Stopped with an error".into();
@@ -326,6 +538,19 @@ struct ArchiveSnapshot {
     legacy_read_only: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionLaneArtifact {
+    schema_version: u16,
+    source_databank_path: String,
+    source_artifact_hash: ContentHash,
+    decision_timeframe: &'static str,
+    sealed_start_timestamp_ms: i64,
+    sealed_fraction: f64,
+    validation_fraction: f64,
+    report: ProductionLaneReport,
+}
+
 fn snapshot_loaded_archive(desktop: &DesktopState) -> Result<ArchiveSnapshot, String> {
     let loaded = desktop
         .loaded
@@ -346,12 +571,9 @@ fn snapshot_loaded_archive(desktop: &DesktopState) -> Result<ArchiveSnapshot, St
         source: loaded.source.clone(),
         broker_path: loaded.broker.clone(),
         metadata_path: loaded.metadata_path.clone(),
-        m1_source: loaded
-            .m1_source
-            .clone()
-            .ok_or_else(|| {
-                "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
-            })?,
+        m1_source: loaded.m1_source.clone().ok_or_else(|| {
+            "This archive does not bind an M1 source; cannot run Holding battery.".to_owned()
+        })?,
         m1_metadata_path: loaded.m1_metadata_path.clone(),
         validation_fraction: loaded.validation_fraction,
         sealed_fraction: loaded.sealed_fraction,
@@ -366,8 +588,9 @@ fn snapshot_archive_file(databank_path: &str) -> Result<ArchiveSnapshot, String>
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let source = artifact.source.clone();
     let broker_path = artifact.broker.clone();
-    let m1_source = crate::databank::manifest_path(&artifact, "m1_source")
-        .ok_or_else(|| "This archive does not bind an M1 source; cannot run the factory.".to_owned())?;
+    let m1_source = crate::databank::manifest_path(&artifact, "m1_source").ok_or_else(|| {
+        "This archive does not bind an M1 source; cannot run the factory.".to_owned()
+    })?;
     let validation_fraction =
         crate::databank::manifest_fraction(&artifact, "validation_fraction", 0.0);
     let sealed_fraction =
@@ -375,11 +598,21 @@ fn snapshot_archive_file(databank_path: &str) -> Result<ArchiveSnapshot, String>
     let metadata_path = Path::new(&source)
         .with_extension("metadata.csv")
         .is_file()
-        .then(|| Path::new(&source).with_extension("metadata.csv").display().to_string());
+        .then(|| {
+            Path::new(&source)
+                .with_extension("metadata.csv")
+                .display()
+                .to_string()
+        });
     let m1_metadata_path = Path::new(&m1_source)
         .with_extension("metadata.csv")
         .is_file()
-        .then(|| Path::new(&m1_source).with_extension("metadata.csv").display().to_string());
+        .then(|| {
+            Path::new(&m1_source)
+                .with_extension("metadata.csv")
+                .display()
+                .to_string()
+        });
     Ok(ArchiveSnapshot {
         artifact,
         databank_path: databank_path.to_string(),
@@ -392,6 +625,341 @@ fn snapshot_archive_file(databank_path: &str) -> Result<ArchiveSnapshot, String>
         sealed_fraction,
         legacy_read_only: false,
     })
+}
+
+fn run_production_lane_job(
+    job: Arc<RwLock<BatteryJobView>>,
+    stop: Arc<AtomicBool>,
+    mut snapshot: ArchiveSnapshot,
+    desktop: DesktopState,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let source_bytes = std::fs::read(&snapshot.databank_path).map_err(|error| error.to_string())?;
+    let source_artifact_hash = ContentHash::sha256(&source_bytes);
+
+    let mut source = crate::data_lab::load_data_source(
+        &snapshot.source,
+        snapshot.metadata_path.as_deref(),
+        None,
+    )?;
+    let mut m1 = crate::data_lab::load_data_source(
+        &snapshot.m1_source,
+        snapshot.m1_metadata_path.as_deref(),
+        None,
+    )?;
+    let broker = load_bound_broker(&snapshot.broker_path, source.metadata.as_ref())?;
+    load_bound_broker(&snapshot.broker_path, m1.metadata.as_ref())?;
+    let mut quotes = infer_quote_sidecar_path(&snapshot.m1_source)
+        .filter(|path| path.is_file())
+        .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
+        .transpose()
+        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    trim_market_history_to_year(
+        &mut source.dataset,
+        &mut m1.dataset,
+        quotes.as_mut(),
+        snapshot.artifact.databank.config.history_start_year,
+    )?;
+
+    update_phase(
+        &job,
+        "Verifying H4 Development data",
+        "Rebuilding H4 from the bound M1 chronology; the archive Development hash must match exactly.",
+    );
+    let h4 = match quotes.as_ref() {
+        Some(quote_dataset) => build_timeframe_from_m1_with_quotes(
+            &m1.dataset,
+            quote_dataset,
+            broker.point,
+            14_400_000,
+            None,
+        ),
+        None => build_timeframe_from_m1(&m1.dataset, 14_400_000, None),
+    }
+    .map_err(|error| format!("cannot reconstruct H4 from M1: {error}"))?;
+    let plan =
+        DataSplitPlan::chronological(&h4, snapshot.validation_fraction, snapshot.sealed_fraction)
+            .map_err(|error| error.to_string())?;
+    if plan.sealed_final.bar_count == 0 {
+        return Err("Production Lane requires a non-empty sealed final partition".into());
+    }
+    let development = slice_bars(&h4, 0, plan.development.bar_count)?;
+    if development.data_hash != snapshot.artifact.databank.data_hash {
+        return Err(format!(
+            "This Holding archive is not bound to the reconstructed H4 Development data (archive {}, reconstructed {}). Nothing was evaluated or promoted.",
+            snapshot.artifact.databank.data_hash, development.data_hash,
+        ));
+    }
+    let development_start = development
+        .bars
+        .first()
+        .map(|bar| bar.timestamp_ms)
+        .ok_or_else(|| "H4 Development partition is empty".to_owned())?;
+    let development_end = h4
+        .bars
+        .get(plan.development.bar_count)
+        .map(|bar| bar.timestamp_ms)
+        .ok_or_else(|| "H4 split has no later validation/sealed boundary".to_owned())?;
+    let sealed_start_index = plan.development.bar_count + plan.validation.bar_count;
+    let sealed_start = h4
+        .bars
+        .get(sealed_start_index)
+        .map(|bar| bar.timestamp_ms)
+        .ok_or_else(|| "H4 sealed partition boundary is missing".to_owned())?;
+    let m1_development = slice_dataset_by_time(&m1.dataset, development_start, development_end)?;
+    let quote_development = quotes.as_ref().map(|quote_dataset| {
+        slice_quotes_by_time(quote_dataset, development_start, development_end)
+    });
+
+    let candidates = snapshot.artifact.databank.holding.clone();
+    let judge = JudgeConfig {
+        initial_balance: snapshot.artifact.databank.config.scout.initial_balance,
+        costs: snapshot.artifact.databank.config.scout.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: snapshot.artifact.databank.config.scout.indicator_engine,
+        entry_window: snapshot.artifact.databank.config.scout.entry_window,
+    };
+    update_phase(
+        &job,
+        "Replaying frozen H4 cohort on Development M1",
+        "3/6/12-month evidence and ranking are computed without loading validation or sealed rows.",
+    );
+
+    let mut replays = BTreeMap::<String, ProductionLaneReplay>::new();
+    let mut completed = 0usize;
+    const REPLAY_BATCH: usize = 4;
+    for batch in candidates.chunks(REPLAY_BATCH) {
+        if stop.load(Ordering::SeqCst) {
+            if let Ok(mut view) = job.write() {
+                view.status = "stopped";
+                view.phase = "Production Lane stopped safely".into();
+                view.message = "No selection was made and no Holding strategy was promoted.".into();
+                view.running = 0;
+                view.queued = 0;
+                view.stop_requested = false;
+            }
+            return Ok(());
+        }
+        for elite in batch {
+            mark_item(&job, elite.structural_fingerprint.as_str(), "running", None);
+        }
+        let outcomes = batch
+            .par_iter()
+            .map(|elite| {
+                let result = match quote_development.as_ref() {
+                    Some(quote_dataset) => evaluate_strategy_m1_with_quotes(
+                        &elite.strategy,
+                        &development,
+                        &m1_development,
+                        quote_dataset,
+                        &broker,
+                        &judge,
+                    ),
+                    None => evaluate_strategy_m1(
+                        &elite.strategy,
+                        &development,
+                        &m1_development,
+                        &broker,
+                        &judge,
+                    ),
+                };
+                (elite.structural_fingerprint.to_string(), result)
+            })
+            .collect::<Vec<_>>();
+        for (fingerprint, result) in outcomes {
+            completed += 1;
+            match result {
+                Ok(result) => {
+                    mark_item(&job, &fingerprint, "replayed", None);
+                    replays.insert(
+                        fingerprint,
+                        ProductionLaneReplay {
+                            metrics: result.metrics,
+                            trades: result.trades,
+                        },
+                    );
+                }
+                Err(error) => {
+                    mark_item(
+                        &job,
+                        &fingerprint,
+                        "rejected",
+                        Some(format!("Development M1 replay failed: {error}")),
+                    );
+                }
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64().max(1e-6);
+        if let Ok(mut view) = job.write() {
+            view.completed = completed;
+            view.queued = candidates.len().saturating_sub(completed);
+            view.running = 0;
+            view.batteries_per_hour = completed as f64 / elapsed * 3600.0;
+            view.elapsed_seconds = elapsed;
+            let remaining = candidates.len().saturating_sub(completed);
+            view.eta_seconds =
+                (completed > 0).then_some(remaining as f64 / (completed as f64 / elapsed));
+            view.phase = format!("Production Lane replay {completed}/{}", candidates.len());
+            view.message = format!(
+                "Development-only M1 replay: {completed}/{} complete.",
+                candidates.len()
+            );
+        }
+    }
+
+    update_phase(
+        &job,
+        "Selecting Production Lane cohort",
+        "Applying fixed basic gates, 6/12-month stability and expectancy × √trades ranking.",
+    );
+    let report = run_production_lane(
+        &snapshot.artifact.databank,
+        &candidates,
+        &replays,
+        development.data_hash.clone(),
+        development_start,
+        development_end,
+        ProductionLaneConfig::default(),
+    )?;
+    for row in &report.rows {
+        let (status, reason) = if row.selected {
+            ("selected", None)
+        } else if row.eligible {
+            (
+                "eligible",
+                Some("Eligible but outside the top-20%/diversity budget".into()),
+            )
+        } else {
+            ("rejected", Some(row.rejection_reasons.join("; ")))
+        };
+        mark_item(&job, &row.fingerprint, status, reason);
+    }
+
+    let report_path = production_lane_report_path(&snapshot.databank_path)?;
+    let artifact = ProductionLaneArtifact {
+        schema_version: 1,
+        source_databank_path: snapshot.databank_path.clone(),
+        source_artifact_hash,
+        decision_timeframe: "H4",
+        sealed_start_timestamp_ms: sealed_start,
+        sealed_fraction: snapshot.sealed_fraction,
+        validation_fraction: snapshot.validation_fraction,
+        report: report.clone(),
+    };
+    quantforge_storage::write_json_new(&report_path, &artifact)
+        .map_err(|error| format!("cannot write immutable Production Lane report: {error}"))?;
+
+    if !report.selected_fingerprints.is_empty() {
+        let selected = report
+            .selected_fingerprints
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        promote_selected_holding_without_robustness(
+            &mut snapshot.artifact.databank,
+            &selected,
+            Some(GateResult {
+                name: "production_lane_v1".into(),
+                passed: true,
+                detail: format!(
+                    "Selected using H4 Development only: 6/12-month stability and {}. Sealed final was not opened.",
+                    report.score_formula
+                ),
+            }),
+        );
+        persist_snapshot(&mut snapshot)?;
+    }
+    // Refresh the shared backend state from the exact bytes just written and
+    // carry the resulting workspace in the completed job. The frontend can
+    // update atomically instead of racing a second polling-triggered reload.
+    let workspace = reload_workspace_from_path(Path::new(&snapshot.databank_path), &desktop)?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    if let Ok(mut view) = job.write() {
+        view.status = "completed";
+        view.phase = "Production Lane complete".into();
+        view.message = format!(
+            "{} frozen → {} Development-eligible → {} selected and promoted. Sealed final remained unopened.",
+            report.source_cohort_size, report.eligible, report.selected
+        );
+        view.completed = candidates.len();
+        view.queued = 0;
+        view.running = 0;
+        view.passed = report.selected;
+        view.rejected = report.source_cohort_size.saturating_sub(report.eligible);
+        view.holding_remaining = snapshot.artifact.databank.holding.len();
+        view.databank_elites = snapshot.artifact.databank.elites.len();
+        view.elapsed_seconds = elapsed;
+        view.eta_seconds = Some(0.0);
+        view.stop_requested = false;
+        view.revision += 1;
+        view.report_path = Some(report_path.display().to_string());
+        view.workspace = Some(workspace);
+    }
+    Ok(())
+}
+
+fn slice_dataset_by_time(
+    dataset: &BarDataset,
+    start_timestamp_ms: i64,
+    end_timestamp_ms_exclusive: i64,
+) -> Result<BarDataset, String> {
+    let bars = dataset
+        .bars
+        .iter()
+        .filter(|bar| {
+            bar.timestamp_ms >= start_timestamp_ms && bar.timestamp_ms < end_timestamp_ms_exclusive
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if bars.is_empty() {
+        return Err("no M1 rows cover the H4 Development partition".into());
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
+fn slice_quotes_by_time(
+    quotes: &QuoteBarDataset,
+    start_timestamp_ms: i64,
+    end_timestamp_ms_exclusive: i64,
+) -> QuoteBarDataset {
+    let bars = quotes
+        .bars
+        .iter()
+        .filter(|bar| {
+            bar.timestamp_ms >= start_timestamp_ms && bar.timestamp_ms < end_timestamp_ms_exclusive
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    QuoteBarDataset {
+        data_hash: quote_bar_content_hash(&bars),
+        source_rows: bars.len(),
+        source_timezone: quotes.source_timezone.clone(),
+        schema_version: quotes.schema_version,
+        source_model: quotes.source_model,
+        bars,
+    }
+}
+
+fn production_lane_report_path(databank_path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(databank_path);
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("databank");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    Ok(path.with_file_name(format!("{stem}_production_lane_v1_{timestamp}.json")))
 }
 
 fn ranked_holding_fingerprints(bank: &Databank, limit: Option<usize>) -> Vec<String> {
@@ -417,11 +985,35 @@ fn ranked_holding_fingerprints(bank: &Databank, limit: Option<usize>) -> Vec<Str
 fn persist_snapshot(snapshot: &mut ArchiveSnapshot) -> Result<(), String> {
     snapshot.artifact.coverage = snapshot.artifact.databank.coverage();
     snapshot.artifact.qd_score = snapshot.artifact.databank.qd_score();
-    quantforge_storage::write_json_replacing(
-        Path::new(&snapshot.databank_path),
-        &snapshot.artifact,
-    )
-    .map_err(|error| error.to_string())
+    quantforge_storage::write_json_replacing(Path::new(&snapshot.databank_path), &snapshot.artifact)
+        .map_err(|error| error.to_string())
+}
+
+/// Persist a completed promotion immediately and, for an interactive desktop
+/// job, publish the exact refreshed workspace. This makes a passed candidate
+/// appear in Databank before the next candidate begins, while failed names
+/// remain visible in Holding.
+fn checkpoint_battery_promotion(
+    snapshot: &mut ArchiveSnapshot,
+    desktop: Option<&DesktopState>,
+    job: &Arc<RwLock<BatteryJobView>>,
+    factory_checkpoint: Option<&FactoryCheckpoint>,
+) -> Result<(), String> {
+    persist_snapshot(snapshot)?;
+    if let Some(publish) = factory_checkpoint {
+        publish(&snapshot.artifact);
+    }
+    let workspace = desktop
+        .map(|desktop| reload_workspace_from_path(Path::new(&snapshot.databank_path), desktop))
+        .transpose()?;
+    if let Ok(mut view) = job.write() {
+        if let Some(workspace) = workspace {
+            view.workspace = Some(workspace);
+        }
+        // This is an archive checkpoint revision, not merely a progress tick.
+        view.revision += 1;
+    }
+    Ok(())
 }
 
 fn run_factory_or_battery(
@@ -429,6 +1021,8 @@ fn run_factory_or_battery(
     stop: Arc<AtomicBool>,
     mut snapshot: ArchiveSnapshot,
     request: HoldingBatteryRequest,
+    desktop: Option<DesktopState>,
+    factory_checkpoint: Option<FactoryCheckpoint>,
 ) -> Result<(), String> {
     let holding_before = snapshot.artifact.databank.holding.len();
     if request.shrink_first {
@@ -437,12 +1031,17 @@ fn run_factory_or_battery(
             "Shrinking Holding",
             "Dropping daily P/L clones before the battery.",
         );
-        shrink_holding_snapshot(&mut snapshot, request.max_correlation.unwrap_or(DEFAULT_FACTORY_CORR))?;
+        shrink_holding_snapshot(
+            &mut snapshot,
+            request.max_correlation.unwrap_or(DEFAULT_FACTORY_CORR),
+        )?;
         persist_snapshot(&mut snapshot)?;
     }
     let holding_after = snapshot.artifact.databank.holding.len();
     let queue_take = optional_positive(request.queue_limit);
-    let target_databank = optional_positive(request.target_databank);
+    let target_databank = (!request.audit_and_graduate)
+        .then(|| optional_positive(request.target_databank))
+        .flatten();
     let fingerprints = if request.ranked || request.fingerprints.is_empty() {
         ranked_holding_fingerprints(&snapshot.artifact.databank, queue_take)
     } else {
@@ -454,16 +1053,20 @@ fn run_factory_or_battery(
     let items: Vec<_> = fingerprints
         .iter()
         .filter_map(|fingerprint| {
-            snapshot.artifact.databank.holding.iter().find(|elite| {
-                elite.structural_fingerprint.as_str() == fingerprint
-            }).map(|elite| BatteryItemView {
-                fingerprint: fingerprint.clone(),
-                strategy_id: elite.strategy.id.clone(),
-                status: "queued",
-                reason: None,
-                evidence: elite.evidence.total,
-                trades: elite.metrics.trade_count,
-            })
+            snapshot
+                .artifact
+                .databank
+                .holding
+                .iter()
+                .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+                .map(|elite| BatteryItemView {
+                    fingerprint: fingerprint.clone(),
+                    strategy_id: elite.strategy.id.clone(),
+                    status: "queued",
+                    reason: None,
+                    evidence: elite.evidence.total,
+                    trades: elite.metrics.trade_count,
+                })
         })
         .collect();
     if items.is_empty() {
@@ -484,15 +1087,29 @@ fn run_factory_or_battery(
             Some(n) => format!("Battery until {n} Databank names."),
             None => "Battery everyone queued; keep every passer.".to_owned(),
         };
+        let queue_stage = if request.shrink_first {
+            "after optional correlation shrink"
+        } else {
+            "ready"
+        };
         view.message = format!(
-            "Funnel {} Holding → {} after shrink → {} queued. {stop_note}",
+            "Funnel {} Holding → {} {queue_stage} → {} queued. {stop_note}",
             holding_before,
             holding_after,
             fingerprints.len(),
         );
     }
 
-    run_battery_job(job, stop, snapshot, fingerprints, target_databank)
+    run_battery_job(
+        job,
+        stop,
+        snapshot,
+        fingerprints,
+        target_databank,
+        desktop,
+        factory_checkpoint,
+        request.audit_and_graduate,
+    )
 }
 
 fn shrink_holding_snapshot(
@@ -512,7 +1129,10 @@ fn shrink_holding_snapshot(
         None,
     )?;
     let mut dataset = loaded.dataset;
-    apply_history_start_year(&mut dataset, snapshot.artifact.databank.config.history_start_year)?;
+    apply_history_start_year(
+        &mut dataset,
+        snapshot.artifact.databank.config.history_start_year,
+    )?;
     let broker = load_bound_broker(&snapshot.broker_path, loaded.metadata.as_ref())?;
     let plan = DataSplitPlan::chronological(
         &dataset,
@@ -545,6 +1165,9 @@ fn run_battery_job(
     mut snapshot: ArchiveSnapshot,
     fingerprints: Vec<String>,
     target_databank: Option<usize>,
+    desktop: Option<DesktopState>,
+    factory_checkpoint: Option<FactoryCheckpoint>,
+    audit_and_graduate: bool,
 ) -> Result<(), String> {
     let started = Instant::now();
     update_phase(
@@ -553,7 +1176,7 @@ fn run_battery_job(
         "Loading Development / M1 partitions for the battery…",
     );
 
-    let mut decision = crate::data_lab::load_data_source(
+    let mut decision_source = crate::data_lab::load_data_source(
         &snapshot.source,
         snapshot.metadata_path.as_deref(),
         None,
@@ -563,55 +1186,128 @@ fn run_battery_job(
         snapshot.m1_metadata_path.as_deref(),
         None,
     )?;
-    let broker = load_bound_broker(&snapshot.broker_path, decision.metadata.as_ref())?;
+    let broker = load_bound_broker(&snapshot.broker_path, decision_source.metadata.as_ref())?;
     load_bound_broker(&snapshot.broker_path, m1.metadata.as_ref())?;
     let mut quote_dataset = infer_quote_sidecar_path(&snapshot.m1_source)
         .filter(|path| path.is_file())
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
+    // Rebuild the selected timeframe from the bound M1 chronology. The source
+    // file supplies the H1 grid only; H4 archives commonly retain an H1 source
+    // path for display, so its bars can never be used blindly for promotion.
     trim_market_history_to_year(
-        &mut decision.dataset,
+        &mut decision_source.dataset,
         &mut m1.dataset,
         quote_dataset.as_mut(),
         snapshot.artifact.databank.config.history_start_year,
     )?;
-    let plan = DataSplitPlan::chronological(
-        &decision.dataset,
-        snapshot.validation_fraction,
-        snapshot.sealed_fraction,
-    )
-    .map_err(|error| error.to_string())?;
-    let development = slice_bars(&decision.dataset, 0, plan.development.bar_count)?;
-    let oos1 = if plan.validation.bar_count == 0 {
-        None
+    let h1 = match quote_dataset.as_ref() {
+        Some(quotes) => build_decision_from_m1_quotes(
+            &m1.dataset,
+            Some(&decision_source.dataset),
+            quotes,
+            broker.point,
+        ),
+        None => build_decision_from_m1(&m1.dataset, Some(&decision_source.dataset)),
+    }
+    .map_err(|error| format!("cannot reconstruct H1 from M1: {error}"))?;
+    let h1_plan =
+        DataSplitPlan::chronological(&h1, snapshot.validation_fraction, snapshot.sealed_fraction)
+            .map_err(|error| error.to_string())?;
+    let h1_development = slice_bars(&h1, 0, h1_plan.development.bar_count)?;
+    let (decision_timeframe, development, development_end) = if h1_development.data_hash
+        == snapshot.artifact.databank.data_hash
+    {
+        let end = h1
+            .bars
+            .get(h1_plan.development.bar_count)
+            .map(|bar| bar.timestamp_ms)
+            .ok_or_else(|| "H1 split has no later validation/sealed boundary".to_owned())?;
+        ("H1", h1_development, end)
     } else {
-        Some(slice_bars(
-            &decision.dataset,
-            plan.development.bar_count,
-            plan.development.bar_count + plan.validation.bar_count,
-        )?)
-    };
-    let m1_plan = DataSplitPlan::chronological(
-        &m1.dataset,
-        snapshot.validation_fraction,
-        snapshot.sealed_fraction,
-    )
-    .map_err(|error| error.to_string())?;
-    let m1_development = slice_bars(&m1.dataset, 0, m1_plan.development.bar_count)?;
-    let m1_owned: BarDataset =
-        if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
-            m1_development
-        } else if snapshot.artifact.databank.execution_data_hash == m1.dataset.data_hash {
-            m1.dataset.clone()
+        let h4 = match quote_dataset.as_ref() {
+            Some(quotes) => build_timeframe_from_m1_with_quotes(
+                &m1.dataset,
+                quotes,
+                broker.point,
+                14_400_000,
+                None,
+            ),
+            None => build_timeframe_from_m1(&m1.dataset, 14_400_000, None),
+        }
+        .map_err(|error| format!("cannot reconstruct H4 from M1: {error}"))?;
+        let h4_plan = DataSplitPlan::chronological(
+            &h4,
+            snapshot.validation_fraction,
+            snapshot.sealed_fraction,
+        )
+        .map_err(|error| error.to_string())?;
+        let h4_development = slice_bars(&h4, 0, h4_plan.development.bar_count)?;
+        if h4_development.data_hash == snapshot.artifact.databank.data_hash {
+            let end = h4
+                .bars
+                .get(h4_plan.development.bar_count)
+                .map(|bar| bar.timestamp_ms)
+                .ok_or_else(|| "H4 split has no later validation/sealed boundary".to_owned())?;
+            ("H4", h4_development, end)
         } else {
-            m1_development
-        };
+            return Err(format!(
+                "This Holding archive is not bound to the reconstructed H1 or H4 Development data (archive {}, H1 {}, H4 {}). Nothing was evaluated or promoted.",
+                snapshot.artifact.databank.data_hash,
+                h1_development.data_hash,
+                h4_development.data_hash,
+            ));
+        }
+    };
+    let development_start = development
+        .bars
+        .first()
+        .map(|bar| bar.timestamp_ms)
+        .ok_or_else(|| "H4 Development partition is empty".to_owned())?;
+    let m1_development = slice_dataset_by_time(&m1.dataset, development_start, development_end)?;
+    let quote_development = quote_dataset
+        .as_ref()
+        .map(|quotes| slice_quotes_by_time(quotes, development_start, development_end));
+    // Older Holding archives bind the complete M1 execution stream. This is
+    // safe: the judge receives Development decision bars only and iterates its
+    // M1 cursor only through those decision-bar intervals. Newer archives may
+    // instead bind the time-clipped Development M1 stream. Accept either exact
+    // binding; never substitute a third dataset.
+    let (m1_owned, quote_for_battery, execution_binding) = if snapshot
+        .artifact
+        .databank
+        .execution_data_hash
+        == m1.dataset.data_hash
+    {
+        (m1.dataset.clone(), quote_dataset.clone(), "full M1")
+    } else if snapshot.artifact.databank.execution_data_hash == m1_development.data_hash {
+        (m1_development, quote_development, "Development M1")
+    } else {
+        return Err(format!(
+            "This Holding archive is not bound to either approved {decision_timeframe} M1 execution dataset (archive {}, full {}, Development {}). Nothing was evaluated or promoted.",
+            snapshot.artifact.databank.execution_data_hash,
+            m1.dataset.data_hash,
+            m1_development.data_hash,
+        ));
+    };
 
     update_phase(
         &job,
-        "Running battery",
-        "Only full passes move to Databank; failures stay in Holding.",
+        if audit_and_graduate {
+            "Running full battery audit"
+        } else {
+            "Running battery"
+        },
+        &if audit_and_graduate {
+            format!(
+                "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Every result is recorded; every tested strategy will move to Databank."
+            )
+        } else {
+            format!(
+                "Verified {decision_timeframe} Development decisions with the hash-bound {execution_binding} execution stream. Only full passes move to Databank; failures stay in Holding."
+            )
+        },
     );
 
     let mut passed = 0usize;
@@ -646,18 +1342,46 @@ fn run_battery_job(
             .as_ref()
             .map(|elite| elite.structural_fingerprint.clone());
 
-        let outcome = match target {
+        let outcome: Result<(bool, Option<String>), (String, String)> = match target {
             None => Err(("other".to_owned(), "not in Holding".to_owned())),
+            Some(hash) if audit_and_graduate => {
+                let audit = quantforge_discover::audit_holding_battery(
+                    &mut snapshot.artifact.databank,
+                    &hash,
+                    &development,
+                    &m1_owned,
+                    quote_for_battery.as_ref(),
+                    &broker,
+                );
+                let (audit_passed, audit_reason) = match audit {
+                    Ok(result) => (result.passed, result.reason),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                let selected = BTreeSet::from([hash.to_string()]);
+                let graduated = quantforge_discover::promote_selected_holding_without_robustness(
+                    &mut snapshot.artifact.databank,
+                    &selected,
+                    None,
+                );
+                if graduated.promoted + graduated.replaced != 1 {
+                    Err((
+                        "other".to_owned(),
+                        "could not graduate audited Holding strategy".to_owned(),
+                    ))
+                } else {
+                    Ok((audit_passed, audit_reason))
+                }
+            }
             Some(hash) => quantforge_discover::run_holding_battery_and_promote(
                 &mut snapshot.artifact.databank,
                 &hash,
                 &development,
-                oos1.as_ref(),
+                None,
                 &m1_owned,
-                quote_dataset.as_ref(),
+                quote_for_battery.as_ref(),
                 &broker,
             )
-            .map(|_| ())
+            .map(|_| (true, None))
             .map_err(|error| (error.kill_bucket().to_string(), error.to_string())),
         };
 
@@ -665,11 +1389,23 @@ fn run_battery_job(
         let mut status = "rejected";
         let mut reason: Option<String> = None;
         match outcome {
-            Ok(()) => {
-                passed += 1;
+            Ok((audit_passed, audit_reason)) => {
                 dirty = true;
-                status = "passed";
-                mark_item(&job, fingerprint, "passed", None);
+                if audit_passed {
+                    passed += 1;
+                    status = "passed";
+                    mark_item(&job, fingerprint, "passed", None);
+                } else {
+                    rejected += 1;
+                    status = "audited_failed";
+                    reason = audit_reason.clone();
+                    mark_item(
+                        &job,
+                        fingerprint,
+                        "audited_failed",
+                        audit_reason,
+                    );
+                }
             }
             Err((bucket, reject_reason)) => {
                 rejected += 1;
@@ -697,8 +1433,8 @@ fn run_battery_job(
 
         let elapsed = started.elapsed().as_secs_f64().max(1e-6);
         let rate = completed as f64 / elapsed * 3600.0;
-        let target_hit = target_databank
-            .is_some_and(|target| snapshot.artifact.databank.elites.len() >= target);
+        let target_hit =
+            target_databank.is_some_and(|target| snapshot.artifact.databank.elites.len() >= target);
         let remaining = total.saturating_sub(completed);
         let eta = if completed > 0 && remaining > 0 && !target_hit {
             Some(remaining as f64 / (completed as f64 / elapsed))
@@ -734,34 +1470,55 @@ fn run_battery_job(
                 } else {
                     "Battery complete".into()
                 };
-                view.message = funnel_message(&view, passed, rejected, completed, target_hit);
+                view.message = funnel_message(
+                    &view,
+                    passed,
+                    rejected,
+                    completed,
+                    target_hit,
+                    audit_and_graduate,
+                );
                 view.stop_requested = false;
                 view.eta_seconds = Some(0.0);
                 view.running = 0;
                 view.queued = 0;
             } else {
-                view.phase = format!("Battery {completed}/{total}");
-                view.message = format!(
-                    "{} → {} after shrink → {completed} battered → {passed} pass / {rejected} fail · {rate:.1}/hr",
-                    view.holding_before_shrink,
-                    view.holding_after_shrink
+                view.phase = format!(
+                    "{} {completed}/{total}",
+                    if audit_and_graduate { "Audit" } else { "Battery" }
                 );
+                view.message = if audit_and_graduate {
+                    format!(
+                        "{} Holding → {completed} audited → {passed} passed / {rejected} failed tests → all {completed} moved to Databank · {rate:.1}/hr",
+                        view.holding_before_shrink
+                    )
+                } else {
+                    format!(
+                        "{} Holding → {completed} tested → {passed} moved to Databank / {rejected} remain in Holding · {rate:.1}/hr",
+                        view.holding_before_shrink
+                    )
+                };
             }
         }
 
-        // Rejects leave Holding unchanged. Passers checkpoint from the
-        // in-memory artifact so the next name is not stalled on a full
-        // re-parse of the pretty JSON archive.
-        if dirty && (finished || passed == 1 || passed % 5 == 0) {
+        // Rejects remain in Holding. Every successful candidate is saved and
+        // published before moving on, so the visible Holding/Databank counts
+        // can never lag a completed pass.
+        if dirty {
             if !finished {
-                let phase = format!("Saving checkpoint ({passed} Databank)");
+                let phase = format!("Promoted {passed}; syncing Databank");
                 update_phase(
                     &job,
                     &phase,
-                    "Writing the archive compactly; the next name is already queued.",
+                    "Saved the accepted strategy; starting the next one.",
                 );
             }
-            persist_snapshot(&mut snapshot)?;
+            checkpoint_battery_promotion(
+                &mut snapshot,
+                desktop.as_ref(),
+                &job,
+                factory_checkpoint.as_ref(),
+            )?;
             dirty = false;
         }
 
@@ -771,7 +1528,12 @@ fn run_battery_job(
     }
 
     if dirty {
-        let _ = persist_snapshot(&mut snapshot);
+        let _ = checkpoint_battery_promotion(
+            &mut snapshot,
+            desktop.as_ref(),
+            &job,
+            factory_checkpoint.as_ref(),
+        );
     }
     if let Ok(mut view) = job.write() {
         if view.status == "running" {
@@ -789,7 +1551,14 @@ fn run_battery_job(
             } else {
                 "Battery complete".into()
             };
-            view.message = funnel_message(&view, view.passed, view.rejected, view.completed, false);
+            view.message = funnel_message(
+                &view,
+                view.passed,
+                view.rejected,
+                view.completed,
+                false,
+                audit_and_graduate,
+            );
             view.stop_requested = false;
         }
     }
@@ -802,7 +1571,14 @@ fn funnel_message(
     rejected: usize,
     completed: usize,
     target_hit: bool,
+    audit_and_graduate: bool,
 ) -> String {
+    if audit_and_graduate {
+        return format!(
+            "{} Holding → {completed} audited → {passed} passed / {rejected} failed tests → all {completed} graduated to Databank. Battery evidence is recorded, not used as a gate.",
+            view.holding_before_shrink,
+        );
+    }
     let mix = &view.kill_mix;
     let target = if target_hit {
         " Databank target reached."
@@ -810,7 +1586,7 @@ fn funnel_message(
         ""
     };
     format!(
-        "{} Holding → {} after shrink → {completed} battered → {passed} Databank / {rejected} fail.{target} Kills: neighborhood {} · MC {} · folds {} · M1 {} · deposit {} · corr {} · clone {} · other {}.",
+        "{} Holding → {} queued → {completed} tested → {passed} Databank / {rejected} remain in Holding.{target} Kills: neighborhood {} · MC {} · folds {} · M1 {} · deposit {} · corr {} · clone {} · other {}.",
         view.holding_before_shrink,
         view.holding_after_shrink,
         mix.neighborhood,
@@ -924,7 +1700,8 @@ fn write_battery_csv_row(
         if !neighborhood.samples.is_empty() {
             std::fs::create_dir_all(&param_dir).map_err(|error| error.to_string())?;
             let sample_path = param_dir.join(format!("{}.csv", elite.strategy.id));
-            let mut writer = csv::Writer::from_path(&sample_path).map_err(|error| error.to_string())?;
+            let mut writer =
+                csv::Writer::from_path(&sample_path).map_err(|error| error.to_string())?;
             writer
                 .write_record([
                     "sample_index",
@@ -1057,9 +1834,7 @@ pub async fn shrink_holding_by_daily_corr(
             && current.completed >= current.total
             && current.running == 0;
         if current.status == "running" && !stale_running {
-            return Err(
-                "stop or finish the Holding battery before shrinking Holding".into(),
-            );
+            return Err("stop or finish the Holding battery before shrinking Holding".into());
         }
     }
 
@@ -1105,12 +1880,8 @@ pub async fn shrink_holding_by_daily_corr(
         let mut dataset = loaded.dataset;
         apply_history_start_year(&mut dataset, bank.config.history_start_year)?;
         let broker = load_bound_broker(&broker_path, loaded.metadata.as_ref())?;
-        let plan = DataSplitPlan::chronological(
-            &dataset,
-            validation_fraction,
-            sealed_fraction,
-        )
-        .map_err(|error| error.to_string())?;
+        let plan = DataSplitPlan::chronological(&dataset, validation_fraction, sealed_fraction)
+            .map_err(|error| error.to_string())?;
         let development = slice_bars(&dataset, 0, plan.development.bar_count)?;
         let cache = IndicatorBufferCache::new(development.bars.len());
         let scout = bank.config.scout.clone();
@@ -1119,21 +1890,12 @@ pub async fn shrink_holding_by_daily_corr(
             .holding
             .par_iter()
             .map(|elite| {
-                evaluate_strategy_cached(
-                    &elite.strategy,
-                    &development,
-                    &broker,
-                    &scout,
-                    &cache,
-                )
-                .map(|result| daily_pnl_from_trades(&result.trades, &timezone))
-                .unwrap_or_default()
+                evaluate_strategy_cached(&elite.strategy, &development, &broker, &scout, &cache)
+                    .map(|result| daily_pnl_from_trades(&result.trades, &timezone))
+                    .unwrap_or_default()
             })
             .collect();
-        let replayed = daily_pnl
-            .iter()
-            .filter(|days| !days.is_empty())
-            .count();
+        let replayed = daily_pnl.iter().filter(|days| !days.is_empty()).count();
         let report = apply_holding_daily_corr_shrink(&mut bank, &daily_pnl, max_correlation);
         persist_bank_file(&databank_path, &mut bank)?;
         Ok::<_, String>((report, replayed, databank_path, bank))

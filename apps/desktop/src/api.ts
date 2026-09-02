@@ -6,6 +6,7 @@ import type {
   BatchEaExportView,
   BatchTradeCsvExportView,
   BatchExportView,
+  BatteryJobView,
   CertifyRequest,
   AssembleEvidenceRequest,
   EvidenceView,
@@ -23,6 +24,8 @@ import type {
   EliteMql5SourceView,
   ConditionBakeoffReport,
   ConditionBakeoffRequest,
+  TimeframeBakeoffReport,
+  TimeframeBakeoffRequest,
   ExportRequest,
   ExportView,
   FidelityDemoRequest,
@@ -37,6 +40,8 @@ import type {
   ParityRequest,
   ParityView,
   PortfolioRequest,
+  PortfolioDiscoverRequest,
+  PortfolioDiscoverJobView,
   PortfolioView,
   SealedRequest,
   SealedView,
@@ -72,6 +77,70 @@ export async function chooseAndLoadDatabank(): Promise<DatabankWorkspace | null>
 
 export function loadDatabankPath(path: string): Promise<DatabankWorkspace> {
   return invoke<DatabankWorkspace>("load_databank", { path });
+}
+
+export function runHoldingBattery(fingerprints: string[]): Promise<{
+  promoted: number;
+  rejected: { fingerprint: string; reason: string }[];
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("run_holding_battery", { request: { fingerprints } });
+}
+
+export function startHoldingBatteryJob(
+  fingerprints: string[],
+  options?: {
+    ranked?: boolean;
+    shrinkFirst?: boolean;
+    maxCorrelation?: number;
+    queueLimit?: number;
+    targetDatabank?: number;
+    auditAndGraduate?: boolean;
+  },
+): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("start_holding_battery_job", {
+    request: {
+      fingerprints,
+      ranked: options?.ranked ?? false,
+      shrinkFirst: options?.shrinkFirst ?? false,
+      maxCorrelation: options?.maxCorrelation ?? null,
+      queueLimit: options?.queueLimit ?? null,
+      targetDatabank: options?.targetDatabank ?? null,
+      auditAndGraduate: options?.auditAndGraduate ?? false,
+    },
+  });
+}
+
+export function startProductionLaneJob(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("start_production_lane_job");
+}
+
+export function getHoldingBatteryJob(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("get_holding_battery_job");
+}
+
+export function stopHoldingBattery(): Promise<BatteryJobView> {
+  return invoke<BatteryJobView>("stop_holding_battery");
+}
+
+export function promoteHoldingWithoutRobustness(): Promise<{
+  promoted: number;
+  replaced: number;
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("promote_holding_without_robustness");
+}
+
+export function shrinkHoldingByDailyCorr(maxCorrelation: number): Promise<{
+  kept: number;
+  dropped: number;
+  maxCorrelation: number;
+  replayed: number;
+  workspace: DatabankWorkspace;
+}> {
+  return invoke("shrink_holding_by_daily_corr", {
+    request: { maxCorrelation },
+  });
 }
 
 export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityDemoView> {
@@ -202,10 +271,34 @@ export function startDiscover(request: DiscoverRequest): Promise<DiscoverJobView
   return invoke<DiscoverJobView>("start_discover", { request });
 }
 
+export function startPortfolioDiscover(
+  request: PortfolioDiscoverRequest,
+): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("start_portfolio_discover", { request });
+}
+
+export function getPortfolioDiscoverJob(): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("get_portfolio_discover_job");
+}
+
+export function getPortfolioLiveDatabank(symbol: string): Promise<DatabankWorkspace> {
+  return invoke<DatabankWorkspace>("get_portfolio_live_databank", { symbol });
+}
+
+export function stopPortfolioDiscover(): Promise<PortfolioDiscoverJobView> {
+  return invoke<PortfolioDiscoverJobView>("stop_portfolio_discover");
+}
+
 export function runConditionBakeoff(
   request: ConditionBakeoffRequest,
 ): Promise<ConditionBakeoffReport> {
   return invoke<ConditionBakeoffReport>("run_condition_bakeoff", { request });
+}
+
+export function runTimeframeBakeoff(
+  request: TimeframeBakeoffRequest,
+): Promise<TimeframeBakeoffReport> {
+  return invoke<TimeframeBakeoffReport>("run_timeframe_bakeoff", { request });
 }
 
 export async function promoteEliteToVault(fingerprint: string): Promise<string | null> {
