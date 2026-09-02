@@ -11,8 +11,8 @@ pub use challenge::{
     MultipleTestingReport, ParameterNeighbor, ParameterNeighborhoodReport, PurgedFoldReport,
     SelectionBiasLevel, deflated_trade_sharpe, expected_max_lucky_sharpe,
     monte_carlo_from_trade_profits, monte_carlo_trade_resampling_with_skip,
-    parameter_permutation_neighbors, passes_p80_profit_retention, perturb_strategy_parameters,
-    run_challenge, trade_sharpe_proxy,
+    opt_profile_sys_param_permutation_neighbors, parameter_permutation_neighbors,
+    passes_p80_profit_retention, perturb_strategy_parameters, run_challenge, trade_sharpe_proxy,
 };
 pub use incubation::{
     INCUBATION_SCHEMA_VERSION, IncubationBlocker, IncubationError, IncubationKillRules,

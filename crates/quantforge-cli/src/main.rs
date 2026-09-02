@@ -4765,7 +4765,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         max_elites_per_niche: 2,
         max_promoted_per_niche: 4,
         max_per_entry_family: 8,
-        build_to_holding: true,
+        build_to_holding: false,
         require_m1_robustness: true,
         robustness_folds: 8,
         robustness_monte_carlo_trials: 1_000,

@@ -141,7 +141,7 @@ export function PartitionEquityChart({
   m1FidelityVerified: boolean;
   large?: boolean;
 }) {
-  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("full");
+  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("is");
 
   if (busy && !view) {
     return <div className="partition-equity loading">Replaying full IS / OOS1 / OOS2 equity…</div>;
@@ -202,7 +202,7 @@ export function PartitionEquityChart({
     <section className={large ? "partition-equity large" : "partition-equity"}>
       <div className="partition-equity-head" style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
         <div>
-          <p className="eyebrow">M1-chronology full-run equity</p>
+          <p className="eyebrow">{sample === "is" ? "M1-chronology Development equity" : "M1-chronology full-run equity"}</p>
           <small style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>
             {splitNote}
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
@@ -216,8 +216,8 @@ export function PartitionEquityChart({
               onChange={(event) => setSample(event.target.value as typeof sample)}
               style={{ padding: '4px', borderRadius: '4px', background: 'var(--bg-inset)', border: '1px solid var(--border)', color: 'var(--fg)' }}
             >
+              <option value="is">Development (matches Databank)</option>
               <option value="full">Full (IS + OOS)</option>
-              <option value="is">IS</option>
               <option value="oos1">OOS 1</option>
               <option value="oos2">OOS 2</option>
             </select>

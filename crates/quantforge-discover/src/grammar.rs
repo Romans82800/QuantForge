@@ -13,6 +13,22 @@ use rand_chacha::ChaCha8Rng;
 
 /// Institutional indicator-period ladder (Search Families).
 const PERIODS: [u16; 3] = [10, 14, 20];
+
+/// Coherent production catalogs. `Universal` remains supported for legacy
+/// databanks and explicit methodology probes, but live Discover does not draw
+/// arbitrary indicators from one combined bag.
+pub(crate) const PRODUCTION_SEARCH_FAMILIES: [SearchFamily; 10] = [
+    SearchFamily::TrendPullback,
+    SearchFamily::MomentumBurst,
+    SearchFamily::DonchianBreakout,
+    SearchFamily::MeanReversionBand,
+    SearchFamily::ZScoreReversion,
+    SearchFamily::SessionOrb,
+    SearchFamily::ImpulseCandle,
+    SearchFamily::VolSqueezeBreak,
+    SearchFamily::SupplyDemandReclaim,
+    SearchFamily::SweepReclaim,
+];
 /// ATR / R-multiple ladder in 0.25 steps (cross-symbol comparable).  These
 /// are proposal values only; the sealed SearchRangeProfile remains the source
 /// of truth for the actual gene space.
@@ -449,7 +465,12 @@ pub(crate) fn build_seed(
     let (long, short) = if family == SearchFamily::Universal {
         universal_entries(rng, universal)
     } else {
-        family_entries(family, rng, max_atoms.max(1))
+        family_entries(
+            family,
+            rng,
+            universal.minimum_entry_conditions,
+            universal.maximum_entry_conditions.min(max_atoms.max(1)),
+        )
     };
     let (exit_long, exit_short) = if family == SearchFamily::Universal {
         let (long, short) = universal_exits(rng, universal);
@@ -606,7 +627,12 @@ pub(crate) fn mutate_with_rng(
                 let (long, short) = if family == SearchFamily::Universal {
                     universal_entries(rng, universal)
                 } else {
-                    family_entries(family, rng, max_atoms)
+                    family_entries(
+                        family,
+                        rng,
+                        universal.minimum_entry_conditions,
+                        universal.maximum_entry_conditions.min(max_atoms),
+                    )
                 };
                 child.meta.thesis_hint = family_name(family).into();
                 child.side = Side::Both;
@@ -638,7 +664,12 @@ pub(crate) fn mutate_with_rng(
                 let (long, short) = if family == SearchFamily::Universal {
                     universal_entries(rng, universal)
                 } else {
-                    family_entries(family, rng, max_atoms)
+                    family_entries(
+                        family,
+                        rng,
+                        universal.minimum_entry_conditions,
+                        universal.maximum_entry_conditions.min(max_atoms),
+                    )
                 };
                 child.side = Side::Both;
                 child.entry = EntrySignals {
@@ -727,12 +758,39 @@ pub(crate) fn classify_family(strategy: &StrategyIr) -> FamilyStyle {
 fn family_entries(
     family: SearchFamily,
     rng: &mut ChaCha8Rng,
-    max_atoms: usize,
+    minimum_atoms: usize,
+    maximum_atoms: usize,
 ) -> (BoolExpr, BoolExpr) {
     let atoms = family_entry_atoms(family, rng);
-    let upper = atoms.len().min(max_atoms).max(1);
-    let count = rng.gen_range(1..=upper);
-    select_entry_atoms(&atoms, rng, count)
+    let upper = atoms.len().min(maximum_atoms).max(1);
+    let lower = minimum_atoms.min(upper).max(1);
+    let count = rng.gen_range(lower..=upper);
+
+    // Each catalog orders its two strongest variants first. Choose one as the
+    // primary trigger, then add confirmations from the rest. This avoids
+    // overfit blocks such as two equivalent breakout thresholds being ANDed
+    // together while preserving useful within-family diversity.
+    let primary_count = atoms.len().min(2);
+    let primary = rng.gen_range(0..primary_count);
+    let mut selected = vec![atoms[primary].clone()];
+    let mut confirmations: Vec<_> = atoms
+        .iter()
+        .enumerate()
+        .filter_map(|(index, atom)| {
+            (index != primary && index >= primary_count).then_some(atom.clone())
+        })
+        .collect();
+    for index in 0..confirmations.len() {
+        let swap_with = rng.gen_range(index..confirmations.len());
+        confirmations.swap(index, swap_with);
+    }
+    // Use the alternative primary only when genuine confirmations cannot
+    // satisfy the configured block size.
+    confirmations.extend(atoms.iter().enumerate().filter_map(|(index, atom)| {
+        (index != primary && index < primary_count).then_some(atom.clone())
+    }));
+    selected.extend(confirmations.into_iter().take(count.saturating_sub(1)));
+    select_entry_atoms(&selected, rng, selected.len())
 }
 
 fn universal_entries(
@@ -2904,6 +2962,31 @@ mod tests {
     }
 
     #[test]
+    fn production_catalogs_keep_their_defining_signal() {
+        let signatures = [
+            (SearchFamily::TrendPullback, &["ema", "sma"][..]),
+            (SearchFamily::MomentumBurst, &["rsi", "roc"][..]),
+            (SearchFamily::DonchianBreakout, &["donchian", "highest"][..]),
+            (SearchFamily::MeanReversionBand, &["percentile_in_range", "rsi"][..]),
+            (SearchFamily::ZScoreReversion, &["z_score"][..]),
+            (SearchFamily::SessionOrb, &["session_range"][..]),
+            (SearchFamily::ImpulseCandle, &["body_range_ratio", "close_location_in_bar"][..]),
+            (SearchFamily::VolSqueezeBreak, &["atr_percentile"][..]),
+            (SearchFamily::SupplyDemandReclaim, &["swing_base_zone"][..]),
+            (SearchFamily::SweepReclaim, &["liquidity_sweep_score"][..]),
+        ];
+        for (sequence, (family, expected)) in signatures.into_iter().enumerate() {
+            let seed = generate_seed_for_family(73, sequence as u64, family);
+            let entry = serde_json::to_string(&seed.entry).expect("entry serializes");
+            assert!(
+                expected.iter().any(|operator| entry.contains(operator)),
+                "{} escaped its defining catalog: {entry}",
+                family.label()
+            );
+        }
+    }
+
+    #[test]
     fn oversized_children_are_trimmed_until_the_ir_validates() {
         let limits = IrLimits::default();
         let mut oversized = generate_seed(11, 2);
@@ -3057,9 +3140,8 @@ mod tests {
     }
 
     #[test]
-    fn entry_signals_use_one_to_three_family_atoms() {
+    fn entry_signals_use_two_to_four_coherent_family_atoms() {
         let population: Vec<_> = (0..400).map(|index| generate_seed(17, index)).collect();
-        let mut saw_single = false;
         let mut saw_and = false;
         let mut max_children = 0usize;
         for strategy in &population {
@@ -3080,12 +3162,11 @@ mod tests {
                 BoolExpr::Compare { .. }
                 | BoolExpr::CrossAbove { .. }
                 | BoolExpr::CrossBelow { .. } => {
-                    saw_single = true;
+                    assert_eq!(classify_family(strategy), FamilyStyle::Universal);
                 }
                 _ => {}
             }
         }
-        assert!(saw_single, "expected some single-atom entries");
         assert!(saw_and, "expected some And-combined entries");
         assert!(
             max_children >= 2,
@@ -3116,6 +3197,7 @@ mod tests {
         }
 
         let mut saw_two_entries = false;
+        let mut saw_four_entries = false;
         let mut saw_one_exit = false;
         let mut saw_three_exits = false;
         for sequence in 0..200 {
@@ -3125,9 +3207,10 @@ mod tests {
             // is on top-level condition blocks, not on leaf predicates.
             let entry_count = entry_condition_count(&strategy);
             let exit_count = exit_condition_count(&strategy);
-            assert_eq!(entry_count, 2);
+            assert!((2..=4).contains(&entry_count));
             assert!((1..=3).contains(&exit_count));
             saw_two_entries |= entry_count == 2;
+            saw_four_entries |= entry_count == 4;
             saw_one_exit |= exit_count == 1;
             saw_three_exits |= exit_count == 3;
 
@@ -3138,12 +3221,12 @@ mod tests {
             );
             assert!(!shifts.is_empty());
             assert!(
-                shifts.iter().all(|shift| (1..=3).contains(shift)),
+                shifts.iter().all(|shift| (1..=8).contains(shift)),
                 "universal shifts escaped the configured closed-bar range: {shifts:?}"
             );
             strategy.validate_export_safe(IrLimits::default()).unwrap();
         }
-        assert!(saw_two_entries);
+        assert!(saw_two_entries && saw_four_entries);
         assert!(saw_one_exit && saw_three_exits);
     }
 

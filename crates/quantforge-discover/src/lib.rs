@@ -37,7 +37,8 @@ pub use model::{
     BehaviorDescriptor, Databank, DepositDecision, DiscoverConfig, DiscoverError, DiscoverRunMode,
     DiscoverTelemetry, Elite, EvidenceComponents, FamilyStyle, GateConfig, GateResult,
     LongShortSkewBucket, M1RetentionEvidence, NicheKey, ParameterNeighborhoodEvidence,
-    ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, SearchFamily,
+    ParameterNeighborhoodSample, PrecisionGateConfig, RobustnessEvidence, ScoutFitnessMode,
+    SearchFamily,
     SearchFamilySpec, SearchRange, SearchRangeProfile, SymbolScreenResult, TRIAL_BUDGET_WARNING,
     ThreeLevelBucket, UniversalGrammarConfig, WalkForwardEvidence, WalkForwardFold,
     default_history_start_year,
@@ -48,10 +49,12 @@ pub use permutation::{
 };
 pub use robustness::{
     MONTE_CARLO_MAX_DRAWDOWN_RATIO, MONTE_CARLO_P80_PROFIT_RETENTION,
-    MONTE_CARLO_SKIP_TRADE_PROBABILITY, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION,
-    PARAM_RECOVERY_MEDIAN_HIGH, PARAM_RECOVERY_MEDIAN_LOW, RobustnessConfig, RobustnessOutcome,
-    RobustnessReject, development_cpcv_diagnostic, passes_recovery_median_band,
-    recovery_to_median_ratio, run_m1_holding_admission, run_m1_predeposit_robustness,
+    MONTE_CARLO_SKIP_TRADE_PROBABILITY, OPT_PROFILE_MAX_TESTS, OPT_PROFILE_PROFIT_OPT_PCT,
+    OPT_PROFILE_STEPS, PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION, PARAM_RECOVERY_MEDIAN_HIGH,
+    PARAM_RECOVERY_MEDIAN_LOW, RobustnessConfig, RobustnessOutcome, RobustnessReject,
+    SEQUENTIAL_WALK_FORWARD_PASS_FRACTION, development_cpcv_diagnostic,
+    passes_recovery_median_band, recovery_to_median_ratio, run_m1_holding_admission,
+    run_m1_predeposit_robustness,
 };
 
 pub const DATABANK_SCHEMA_VERSION: u16 = 6;

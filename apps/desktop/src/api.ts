@@ -6,7 +6,6 @@ import type {
   BatchEaExportView,
   BatchTradeCsvExportView,
   BatchExportView,
-  BatteryJobView,
   CertifyRequest,
   AssembleEvidenceRequest,
   EvidenceView,
@@ -73,56 +72,6 @@ export async function chooseAndLoadDatabank(): Promise<DatabankWorkspace | null>
 
 export function loadDatabankPath(path: string): Promise<DatabankWorkspace> {
   return invoke<DatabankWorkspace>("load_databank", { path });
-}
-
-export function runHoldingBattery(fingerprints: string[]): Promise<{
-  promoted: number;
-  rejected: { fingerprint: string; reason: string }[];
-  workspace: DatabankWorkspace;
-}> {
-  return invoke("run_holding_battery", { request: { fingerprints } });
-}
-
-export function startHoldingBatteryJob(
-  fingerprints: string[],
-  options?: {
-    ranked?: boolean;
-    shrinkFirst?: boolean;
-    maxCorrelation?: number;
-    queueLimit?: number;
-    targetDatabank?: number;
-  },
-): Promise<BatteryJobView> {
-  return invoke<BatteryJobView>("start_holding_battery_job", {
-    request: {
-      fingerprints,
-      ranked: options?.ranked ?? false,
-      shrinkFirst: options?.shrinkFirst ?? false,
-      maxCorrelation: options?.maxCorrelation ?? null,
-      queueLimit: options?.queueLimit ?? null,
-      targetDatabank: options?.targetDatabank ?? null,
-    },
-  });
-}
-
-export function getHoldingBatteryJob(): Promise<BatteryJobView> {
-  return invoke<BatteryJobView>("get_holding_battery_job");
-}
-
-export function stopHoldingBattery(): Promise<BatteryJobView> {
-  return invoke<BatteryJobView>("stop_holding_battery");
-}
-
-export function shrinkHoldingByDailyCorr(maxCorrelation: number): Promise<{
-  kept: number;
-  dropped: number;
-  maxCorrelation: number;
-  replayed: number;
-  workspace: DatabankWorkspace;
-}> {
-  return invoke("shrink_holding_by_daily_corr", {
-    request: { maxCorrelation },
-  });
 }
 
 export function runFidelityDemo(request: FidelityDemoRequest): Promise<FidelityDemoView> {

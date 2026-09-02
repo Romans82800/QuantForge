@@ -5,6 +5,7 @@ mod databank;
 mod deploy;
 mod discover;
 mod evidence;
+#[allow(dead_code)]
 mod holding_battery;
 mod parity_lab;
 mod portfolio;
@@ -44,11 +45,6 @@ pub fn run() {
             databank::export_elite_eas,
             databank::export_elite_trade_csvs,
             databank::promote_elite_to_vault,
-            databank::run_holding_battery,
-            holding_battery::start_holding_battery_job,
-            holding_battery::get_holding_battery_job,
-            holding_battery::stop_holding_battery,
-            holding_battery::shrink_holding_by_daily_corr,
             databank::run_fidelity_demo,
             data_lab::inspect_data,
             data_lab::import_market_folder,

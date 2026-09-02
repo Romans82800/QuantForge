@@ -1,6 +1,7 @@
 use crate::data_lab::{
     apply_history_start_year, build_decision_from_m1, build_decision_from_m1_quotes, display_path,
     load_bound_broker, load_data_source, load_quote_sidecar, trim_market_history_to_year,
+    trim_market_history_to_dates,
 };
 use crate::databank::{
     DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
@@ -126,9 +127,9 @@ pub struct DiscoverRequest {
     /// artifact before the operating system is forced to kill it.
     max_memory_mb: Option<u64>,
     require_m1_robustness: Option<bool>,
-    /// When true, Discover fills Holding instead of Databank. Default false:
-    /// overnight Discover grows Databank after H1 permutation/folds/MC.
+    /// Stage M1-fidelity survivors in Holding before the full robustness battery.
     build_to_holding: Option<bool>,
+    /// Sequential Development walk-forward fold count (hard deposit selector).
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_monte_carlo_block_length: Option<usize>,
@@ -138,9 +139,9 @@ pub struct DiscoverRequest {
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
-    /// Fraction of ±param neighbors that must survive (default 0.55).
+    /// SQX ProfitOptPct fraction of one-param neighbours that must be profitable (default 0.25).
     minimum_neighborhood_survival_fraction: Option<f64>,
-    /// Broker-local calendar-year folds; every year must pass (strict opt-in).
+    /// Legacy: calendar-year folds are diagnostics only (never a hard kill).
     calendar_year_folds: Option<bool>,
     /// Hard deflated-Sharpe floor; omit for report-only.
     minimum_deflated_trade_sharpe: Option<f64>,
@@ -151,6 +152,8 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
+    /// Optional allow-list of named production families selected in the UI.
+    selected_search_families: Option<Vec<quantforge_discover::SearchFamily>>,
     /// `fast_scout`, `full_harvest`, `quota_harvest`, or `high_performance_islands`.
     run_mode: Option<String>,
     general_island_count: Option<usize>,
@@ -163,6 +166,7 @@ pub struct DiscoverRequest {
     /// Early-stop when databank reaches this many elites (Quota Harvest default 100).
     target_databank_elites: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
+    scout_fitness_mode: Option<quantforge_discover::ScoutFitnessMode>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -173,6 +177,14 @@ pub struct DiscoverRequest {
     sealed_fraction: Option<f64>,
     /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
     history_start_year: Option<u16>,
+    /// Optional broker-local inclusive date bounds. These take precedence over
+    /// the legacy year shortcut for new runs.
+    history_start_date: Option<String>,
+    history_end_date: Option<String>,
+    /// Optional SQX-style ordered range parts. The current evaluator uses the
+    /// outer bounds and preserves the labels for the run contract.
+    #[serde(default)]
+    data_range_parts: Vec<DataRangePartRequest>,
     /// After Discover checkpoints, shrink Holding and battery remaining names.
     #[serde(default)]
     factory_after_discover: Option<bool>,
@@ -182,6 +194,15 @@ pub struct DiscoverRequest {
     factory_target_databank: Option<usize>,
     #[serde(default)]
     factory_max_correlation: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataRangePartRequest {
+    id: String,
+    kind: String,
+    start_date: String,
+    end_date: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -587,7 +608,12 @@ pub fn start_discover(
                 }
             }
             Ok(()) => {
-                if request.factory_after_discover.unwrap_or(false) {
+                // Holding is the explicit M1-passed staging queue.  At the
+                // end of a Discover batch, automatically drain that queue
+                // through the heavy battery when the user enabled the factory.
+                // This keeps overnight work hands-off while the checkpoint
+                // written by run_discovery remains a recoverable boundary.
+                if request.factory_after_discover.unwrap_or(true) {
                     let factory_queue = request.factory_queue_limit.filter(|&n| n > 0);
                     let factory_target = request.factory_target_databank.filter(|&n| n > 0);
                     let factory = crate::databank::HoldingBatteryRequest {
@@ -605,22 +631,16 @@ pub fn start_discover(
                     ) {
                         Ok(_) => {
                             if let Ok(mut view) = job.write() {
-                                let factory_note = match factory_target {
-                                    Some(n) => format!(
-                                        "Factory started: shrink Holding, then battery until {n} Databank names."
-                                    ),
-                                    None => {
-                                        "Factory started: shrink Holding, then battery everyone left after shrink."
-                                            .to_owned()
-                                    }
-                                };
-                                view.message = format!("{}. {factory_note}", view.message);
+                                view.message = format!(
+                                    "{}. Holding battery started: M1 survivors are now running CPCV/walk-forward, parameter and Monte Carlo tests.",
+                                    view.message
+                                );
                             }
                         }
                         Err(error) => {
                             if let Ok(mut view) = job.write() {
                                 view.message = format!(
-                                    "{}. Factory did not start: {error}",
+                                    "{}. Holding was saved safely; automatic battery did not start: {error}",
                                     view.message
                                 );
                             }
@@ -643,7 +663,7 @@ pub fn get_discover_live_databank(
         .read()
         .map_err(|_| "discover live databank state is unavailable")?
         .clone()
-        .ok_or_else(|| "the live archive has no Holding or Databank strategies yet".to_owned())?;
+        .ok_or_else(|| "the live archive has no Databank strategies yet".to_owned())?;
     let source_path = state
         .job
         .read()
@@ -765,8 +785,11 @@ pub fn stop_discover(state: State<'_, DiscoverState>) -> Result<DiscoverJobView,
 }
 
 fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
-    if request.data_path.trim().is_empty()
-        || request.m1_data_path.trim().is_empty()
+    validate_range_parts(&request.data_range_parts)?;
+    let m15_without_decision_file = request.decision_timeframe == Some(DecisionTimeframe::M15)
+        && !request.m1_data_path.trim().is_empty();
+    if ((!m15_without_decision_file && request.data_path.trim().is_empty())
+        || request.m1_data_path.trim().is_empty())
         || request.broker_path.trim().is_empty()
         || request.databank_path.trim().is_empty()
     {
@@ -798,12 +821,15 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         if let Some(year) = request.history_start_year {
             quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
         }
-        let validation = request
-            .validation_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
-        let sealed = request
-            .sealed_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
+        // A fully dated timeline is authoritative. Ignore stale legacy
+        // reserve fields when the editor has supplied a valid schedule.
+        let (validation, sealed) = match range_schedule_contract(&request.data_range_parts)? {
+            Some(schedule) => (schedule.validation_fraction, schedule.sealed_fraction),
+            None => (
+                request.validation_fraction.unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION),
+                request.sealed_fraction.unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION),
+            ),
+        };
         normalize_split_fractions(validation, sealed)?;
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
@@ -893,6 +919,88 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_range_parts(parts: &[DataRangePartRequest]) -> Result<(), String> {
+    let mut previous_end: Option<i64> = None;
+    for part in parts {
+        if part.start_date.trim().is_empty() && part.end_date.trim().is_empty() { continue; }
+        if part.start_date.trim().is_empty() || part.end_date.trim().is_empty() {
+            return Err(format!("range '{}' needs both a start and end date", part.id));
+        }
+        if !matches!(part.kind.as_str(), "training" | "validation" | "holdout") {
+            return Err(format!("unknown data range kind '{}'", part.kind));
+        }
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|e| e.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|e| e.to_string())?;
+        if start >= end { return Err(format!("range '{}' has an invalid date order", part.id)); }
+        if previous_end.is_some_and(|previous| start < previous) {
+            return Err("data range parts must be ordered and non-overlapping".into());
+        }
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+struct RangeScheduleContract {
+    start_date: String,
+    end_date: String,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+}
+
+/// Turn the visible ordered schedule into the engine's actual research
+/// contract. Multiple adjacent OOS parts remain separately named in the
+/// artifact, but their combined duration is excluded from Discover.
+fn range_schedule_contract(parts: &[DataRangePartRequest]) -> Result<Option<RangeScheduleContract>, String> {
+    let dated = parts
+        .iter()
+        .filter(|part| !part.start_date.trim().is_empty() || !part.end_date.trim().is_empty())
+        .collect::<Vec<_>>();
+    if dated.is_empty() {
+        return Ok(None);
+    }
+    validate_range_parts(parts)?;
+    if dated.iter().any(|part| part.start_date.trim().is_empty() || part.end_date.trim().is_empty()) {
+        return Err("every active data range part needs a start and end date".into());
+    }
+
+    let mut validation_ms = 0i64;
+    let mut sealed_ms = 0i64;
+    let mut total_ms = 0i64;
+    let mut previous_end = None;
+    for part in &dated {
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|error| error.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|error| error.to_string())?;
+        if previous_end.is_some_and(|previous| start != previous) {
+            return Err("active data range parts must be adjacent; close gaps or remove unused parts".into());
+        }
+        previous_end = Some(end);
+        let duration = end - start;
+        total_ms += duration;
+        match part.kind.as_str() {
+            // SQX permits walk-forward schedules such as ISV1 → IST → ISV2
+            // → OOS. Keep the rows in their calendar order and aggregate the
+            // two in-sample kinds independently; the chart retains every row.
+            "training" => {}
+            "validation" => validation_ms += duration,
+            "holdout" => sealed_ms += duration,
+            _ => unreachable!("range kinds were validated above"),
+        }
+    }
+    if validation_ms == 0 || sealed_ms == 0 || total_ms <= validation_ms + sealed_ms {
+        return Err("schedule needs IST training, ISV validation, and at least one sealed OOS part".into());
+    }
+    Ok(Some(RangeScheduleContract {
+        start_date: dated.first().expect("not empty").start_date.clone(),
+        end_date: dated.last().expect("not empty").end_date.clone(),
+        validation_fraction: validation_ms as f64 / total_ms as f64,
+        sealed_fraction: sealed_ms as f64 / total_ms as f64,
+    }))
+}
+
 /// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
 /// pack. Decision-timeframe paths are allowed here because H1/M15 packs are
 /// derived from the same M1 stream and therefore share its sibling sidecar.
@@ -927,7 +1035,7 @@ fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMet
 }
 
 fn run_discovery(
-    request: DiscoverRequest,
+    mut request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
     live_artifact: &Arc<RwLock<Option<EvolveArtifact>>>,
     paused: &Arc<AtomicBool>,
@@ -935,14 +1043,25 @@ fn run_discovery(
 ) -> Result<(), String> {
     let clock = ActiveClock::new();
     clock.begin_evaluation_session(0);
+    if request.mode == DiscoverMode::New {
+        if let Some(schedule) = range_schedule_contract(&request.data_range_parts)? {
+            request.history_start_date = Some(schedule.start_date);
+            request.history_end_date = Some(schedule.end_date);
+            request.validation_fraction = Some(schedule.validation_fraction);
+            request.sealed_fraction = Some(schedule.sealed_fraction);
+        }
+    }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
-    let mut loaded = load_data_source(
-        &request.data_path,
-        request.metadata_path.as_deref(),
-        request.source_timezone.as_deref(),
-    )?;
+    let decision_timeframe = request.decision_timeframe.unwrap_or(DecisionTimeframe::H1);
+    let mut loaded = if decision_timeframe == DecisionTimeframe::M15 && request.data_path.trim().is_empty() {
+        // M15 is derived from the canonical M1 stream; no separate decision
+        // file is required.
+        load_data_source(&request.m1_data_path, request.m1_metadata_path.as_deref(), request.m1_source_timezone.as_deref())?
+    } else {
+        load_data_source(&request.data_path, request.metadata_path.as_deref(), request.source_timezone.as_deref())?
+    };
     let mut m1 = load_data_source(
         &request.m1_data_path,
         request.m1_metadata_path.as_deref(),
@@ -980,6 +1099,15 @@ fn run_discovery(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
+    if request.history_start_date.is_some() || request.history_end_date.is_some() {
+        trim_market_history_to_dates(
+            &mut loaded.dataset,
+            &mut m1.dataset,
+            quote_dataset.as_mut(),
+            request.history_start_date.as_deref(),
+            request.history_end_date.as_deref(),
+        )?;
+    }
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1110,7 +1238,7 @@ fn run_discovery(
                 job,
                 "Evaluating initial grammar population",
                 &format!(
-                    "Fold-stable Development R fills Holding. Sealed holdout is never loaded."
+                    "Development R fills the pot; M1 fidelity admits to Holding, then walk-forward + OptProfile + Monte Carlo promote to Databank. Sealed holdout is never loaded."
                 ),
             )?;
             let mut config = new_config(&request)?;
@@ -1135,8 +1263,15 @@ fn run_discovery(
             let artifact = continued_artifact
                 .expect("continuation always loads the databank before partitioning");
             let starting_generation = artifact.databank.completed_generations;
+            let mut bank = artifact.databank;
+            // Preserve the configured M1 → Holding → battery pipeline when a
+            // session is resumed.  Holding is a visible staging area, never a
+            // certification bypass: its candidates still require the full
+            // battery before they can enter the Databank.
+            bank.config.build_to_holding = request.build_to_holding.unwrap_or(true);
+            bank.config.require_m1_robustness = true;
             (
-                artifact.databank,
+                bank,
                 Some(artifact.manifest.recipe_hash),
                 starting_generation,
             )
@@ -1169,20 +1304,11 @@ fn run_discovery(
 
     let mut completed_now = 0u64;
     let mut last_checkpoint_active_seconds = clock.active_seconds();
-    let mut last_holding_count = bank.holding.len();
-    let mut holding_stall_generations = 0u64;
-    const HOLDING_STALL_GENERATIONS: u64 = 25;
-    const HOLDING_STALL_MIN: usize = 40;
 
     let quota_met = |bank: &Databank| -> bool {
         bank.config
             .target_databank_elites
             .is_some_and(|target| bank.quota_progress_count() >= target)
-    };
-    let holding_plateaued = |bank: &Databank, stall: u64| -> bool {
-        bank.config.build_to_holding
-            && stall >= HOLDING_STALL_GENERATIONS
-            && bank.holding.len() >= HOLDING_STALL_MIN
     };
 
     // Dataset selection is fixed for the run: `validate_resume` requires the
@@ -1348,15 +1474,6 @@ fn run_discovery(
         if quota_met(&bank) {
             break;
         }
-        if holding_plateaued(&bank, holding_stall_generations) {
-            if let Ok(mut view) = job.write() {
-                view.message = format!(
-                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
-                    bank.holding.len()
-                );
-            }
-            break;
-        }
         if !run_until_stopped && completed_now >= soft_budget {
             break;
         }
@@ -1375,9 +1492,9 @@ fn run_discovery(
         };
         let breeding = bank.pot_size() >= bank.config.mutate_after_elites;
         let status_message = if breeding {
-            "Scout keeps breeding. Side workers run M1 80/130 into Holding. Fold-R, plateau, CPCV, and Monte Carlo wait for the Holding battery. OOS2 is untouched."
+            "Scout keeps breeding. Side workers admit M1 survivors to Holding; the full robustness battery promotes Holding into Databank. OOS2 is untouched."
         } else {
-            "Candidates enter the Development reservoir only. After breeding unlocks: M1 80/130 → Holding. Databank tests run from the Holding tab."
+            "Candidates enter the Development reservoir only. After breeding unlocks: M1 → Holding → walk-forward + OptProfile + Monte Carlo → Databank."
         };
         update_phase(job, &phase_label, status_message)?;
 
@@ -1395,15 +1512,6 @@ fn run_discovery(
             )
             .map_err(|error| error.to_string())?;
         completed_now += 1;
-        if bank.config.build_to_holding {
-            let holding_now = bank.holding.len();
-            if holding_now > last_holding_count {
-                last_holding_count = holding_now;
-                holding_stall_generations = 0;
-            } else {
-                holding_stall_generations += 1;
-            }
-        }
         publish_live_databank(
             live_artifact,
             &request,
@@ -1484,21 +1592,10 @@ fn run_discovery(
             }
         }
 
-        // Deposited Holding is enough to stop. Waiting out the M1 queue after
+        // Databank quota is enough to stop. Waiting out the promotion queue after
         // every generation serialized scout behind promotion and is why
-        // Looked-at crawled versus the old pipelined runs. A Holding plateau
-        // (no new names for many generations) also stops so thin symbols can
-        // factory instead of waiting on a quota they will never fill.
+        // Looked-at crawled versus the old pipelined runs.
         if quota_met(&bank) {
-            break;
-        }
-        if holding_plateaued(&bank, holding_stall_generations) {
-            if let Ok(mut view) = job.write() {
-                view.message = format!(
-                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
-                    bank.holding.len()
-                );
-            }
             break;
         }
     }
@@ -1583,7 +1680,7 @@ fn finish_discovery(
         clock,
     )?;
 
-    if bank.elites.is_empty() && bank.accepted_pool.is_empty() {
+    if bank.elites.is_empty() && bank.accepted_pool.is_empty() && bank.holding.is_empty() {
         let funnel = funnel_summary(&bank);
         let mut view = job
             .write()
@@ -1591,7 +1688,7 @@ fn finish_discovery(
         view.status = "completed";
         view.phase = "Completed with an empty bank".into();
         view.message = format!(
-            "No elites passed the post-breed pipeline (Development CPCV/robustness → M1 → OOS1 validation) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
+            "No candidates passed M1 into Holding after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
             bank.evaluation_count, completed_now
         );
         view.output_path = None;
@@ -1674,13 +1771,8 @@ fn finish_discovery(
         .is_some_and(|target| bank.quota_progress_count() >= target);
     view.phase = if quota_complete {
         format!(
-            "Quota complete · {} {}",
-            bank.quota_progress_count(),
-            if bank.config.build_to_holding {
-                "holding"
-            } else {
-                "databank elites"
-            }
+            "Quota complete · {} databank elites",
+            bank.quota_progress_count()
         )
     } else if stop_was_early(completed_now, soft_budget, run_until_stopped) {
         "Stopped and checkpointed".into()
@@ -1691,12 +1783,7 @@ fn finish_discovery(
     view.latest_immutable_snapshot_path = Some(display_path(&snapshot));
     view.message = if quota_complete {
         format!(
-            "Reached {} quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
-            if bank.config.build_to_holding {
-                "Holding"
-            } else {
-                "databank"
-            },
+            "Reached databank quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
             bank.quota_progress_count(),
             bank.config.target_databank_elites.unwrap_or(0),
             view.evaluation_count
@@ -1840,6 +1927,25 @@ fn build_discover_artifact(
         ("m1_quality_grade".into(), json!(m1_quality.grade)),
         ("m1_quality_score".into(), json!(m1_quality.score)),
         ("desktop_job".into(), json!(true)),
+        // Results must replay the identical market window and decision bars
+        // that Discover used. Without this contract, an M15 strategy could be
+        // redrawn as H1 across a longer history and look unrelated to its row.
+        (
+            "decision_timeframe".into(),
+            json!(match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
+                DecisionTimeframe::H1 => "H1",
+                DecisionTimeframe::M15 => "M15",
+            }),
+        ),
+        ("history_start_date".into(), json!(request.history_start_date)),
+        ("history_end_date".into(), json!(request.history_end_date)),
+        // Keep every named calendar region, not merely the two aggregate
+        // fractions. Results uses this immutable schedule to draw the same
+        // IST/ISV/OOS boundaries the search actually used.
+        (
+            "data_range_parts".into(),
+            serde_json::to_value(&request.data_range_parts).map_err(|error| error.to_string())?,
+        ),
         ("promotion_split".into(), json!(true)),
         ("validation_fraction".into(), json!(validation_fraction)),
         ("sealed_fraction".into(), json!(sealed_fraction)),
@@ -2369,6 +2475,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         tournament_size: 4,
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
+        search_families: request.selected_search_families.clone().unwrap_or_default(),
         universal_grammar: request.universal_grammar.clone().unwrap_or_default(),
         run_mode: request
             .run_mode
@@ -2396,6 +2503,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
+        scout_fitness_mode: request.scout_fitness_mode.unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
         minimum_development_expectancy_r: request
             .minimum_development_expectancy_r
@@ -2423,6 +2531,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         max_elites_per_niche: 8,
         max_promoted_per_niche: 4,
         max_per_entry_family: 24,
+        // M1 fidelity is deliberately isolated from the heavier tests. This
+        // keeps fast Discover throughput while giving the user a real Holding
+        // queue to inspect or send through CPCV/WF, parameter and MC tests.
         build_to_holding: request.build_to_holding.unwrap_or(true),
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(8),
@@ -2439,13 +2550,15 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_monte_carlo_max_drawdown_ratio: request
             .robustness_monte_carlo_max_drawdown_ratio
             .unwrap_or(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
-        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(200),
+        robustness_neighborhood_samples: request
+            .robustness_neighborhood_samples
+            .unwrap_or(quantforge_discover::OPT_PROFILE_MAX_TESTS),
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
         minimum_neighborhood_survival_fraction: request
             .minimum_neighborhood_survival_fraction
-            .unwrap_or(0.55),
+            .unwrap_or(quantforge_discover::OPT_PROFILE_PROFIT_OPT_PCT),
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
@@ -2684,37 +2797,32 @@ fn update_bank(
     let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
     let queue_depth = telemetry.promotion_queue_depth;
     let inflight = telemetry.promotion_inflight;
-    let holding_label = if bank.config.build_to_holding {
-        "holding"
-    } else {
-        "databank"
-    };
     let phase = if let Some(target) = target_databank {
         format!(
-            "Quota · {holding_label} {quota_count}/{target} · pot {pot_elites} · gen {completed_now}"
+            "Quota · databank {quota_count}/{target} · pot {pot_elites} · gen {completed_now}"
         )
     } else if breeding_active {
         format!(
-            "Breeding · pot {pot_elites} · holding {holding_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
+            "Breeding · pot {pot_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
         )
     } else {
         format!(
-            "Filling initial pot · {pot_elites}/{mutate_after} · holding {holding_elites} · gen {completed_now}"
+            "Filling initial pot · {pot_elites}/{mutate_after} · databank {databank_elites} · gen {completed_now}"
         )
     };
     let pot_message = if let Some(target) = target_databank {
         format!(
-            "Quota Harvest: {holding_label} {quota_count}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
+            "Quota Harvest: databank {quota_count}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
             funnel_summary(bank)
         )
     } else if breeding_active {
         format!(
-            "Build continues; Holding pipeline on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · holding {holding_elites} · databank {databank_elites}. {}",
+            "Build continues; walk-forward + OptProfile + Monte Carlo on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · databank {databank_elites}. {}",
             funnel_summary(bank)
         )
     } else {
         format!(
-            "Development reservoir {pot_elites} (breed at {mutate_after}). Holding {holding_elites} after breeding (H1+M1; battery deferred). {} more reservoir members until breeding. {}",
+            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank admits after H1 gates + sequential walk-forward + OptProfile + Monte Carlo. {} more reservoir members until breeding. {}",
             mutate_after.saturating_sub(pot_elites),
             funnel_summary(bank)
         )
@@ -2867,6 +2975,7 @@ mod tests {
             multi_symbol_minimum_pass: Some(0),
             pack_data_dir: None,
             universal_grammar: None,
+            selected_search_families: None,
             run_mode: Some("full_harvest".into()),
             general_island_count: None,
             refinement_island_count: None,
@@ -2876,6 +2985,7 @@ mod tests {
             early_stop_pot_elites: None,
             target_databank_elites: None,
             search_ranges: None,
+            scout_fitness_mode: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,
@@ -2885,6 +2995,9 @@ mod tests {
             validation_fraction: None,
             sealed_fraction: None,
             history_start_year: None,
+            history_start_date: None,
+            history_end_date: None,
+            data_range_parts: Vec::new(),
             factory_after_discover: None,
             factory_queue_limit: None,
             factory_target_databank: None,
@@ -3185,5 +3298,33 @@ mod tests {
         assert_eq!(built.bars.len(), 1);
         assert!((built.bars[0].high - 1.2).abs() < 1e-9);
         assert_eq!(built.bars[0].tick_volume, 59);
+    }
+
+    #[test]
+    fn dated_schedule_becomes_the_holdout_contract() {
+        let parts = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2022-01-01".into(), end_date: "2022-06-29".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2022-06-30".into(), end_date: "2022-08-28".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2022-08-29".into(), end_date: "2022-10-27".into() },
+            DataRangePartRequest { id: "OOS2".into(), kind: "holdout".into(), start_date: "2022-10-28".into(), end_date: "2022-12-26".into() },
+        ];
+        let contract = range_schedule_contract(&parts).expect("valid schedule").expect("dated");
+        assert_eq!(contract.start_date, "2022-01-01");
+        assert_eq!(contract.end_date, "2022-12-26");
+        assert!((contract.validation_fraction - (60.0 / 360.0)).abs() < 1e-9);
+        assert!((contract.sealed_fraction - (120.0 / 360.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn segmented_schedule_can_interleave_validation_and_training() {
+        let parts = vec![
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2022-01-01".into(), end_date: "2022-10-02".into() },
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2022-10-03".into(), end_date: "2023-07-05".into() },
+            DataRangePartRequest { id: "ISV2".into(), kind: "validation".into(), start_date: "2023-07-06".into(), end_date: "2024-04-07".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2024-04-08".into(), end_date: "2025-01-07".into() },
+        ];
+        let contract = range_schedule_contract(&parts).expect("mixed schedule should be valid").expect("dated");
+        assert!(contract.validation_fraction > 0.5);
+        assert!(contract.sealed_fraction > 0.2);
     }
 }

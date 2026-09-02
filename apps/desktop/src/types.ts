@@ -63,12 +63,20 @@ export interface PartitionEquityPoint {
   equity: number;
 }
 
+export interface PartitionEquityPartition {
+  id: string;
+  kind: "training" | "validation" | "holdout";
+  startTimestampMs: number;
+  endTimestampMs: number;
+}
+
 export interface PartitionEquityView {
   fingerprint: string;
   strategyId: string;
   executionEngine: string;
   initialBalance: number;
   points: PartitionEquityPoint[];
+  partitions: PartitionEquityPartition[];
   isEndTimestampMs: number;
   oos1EndTimestampMs: number;
   oos2EndTimestampMs: number;
@@ -531,6 +539,8 @@ export interface ConditionBakeoffRequest {
   historyStartYear?: number | null;
 }
 
+export type ScoutFitnessModeId = "raw_is" | "stable_fold";
+
 export interface DiscoverRequest {
   mode: DiscoverMode;
   /** Explicit UI selection. The backend refuses data/broker bindings for another symbol. */
@@ -552,6 +562,8 @@ export interface DiscoverRequest {
   noveltyWeight: number | null;
   seed: number | null;
   universalGrammar: UniversalGrammarConfig | null;
+  /** Named production families to allow; null/empty means the balanced catalog. */
+  selectedSearchFamilies: string[] | null;
   runMode: DiscoverRunModeId | null;
   generalIslandCount: number | null;
   refinementIslandCount: number | null;
@@ -561,6 +573,7 @@ export interface DiscoverRequest {
   earlyStopPotElites: number | null;
   targetDatabankElites: number | null;
   searchRanges: SearchRangeProfile | null;
+  scoutFitnessMode: ScoutFitnessModeId | null;
   minimumTrades: number | null;
   maximumDrawdownPercent: number | null;
   minimumReturnPercent: number | null;
@@ -621,11 +634,22 @@ export interface DiscoverRequest {
   sealedFraction: number | null;
   /** Broker-local calendar year of the first bar kept (2016 or 2020). */
   historyStartYear: number | null;
+  historyStartDate: string | null;
+  historyEndDate: string | null;
+  dataRangeParts: DataRangePart[];
   /** After Discover checkpoints, shrink Holding and battery remaining names. */
   factoryAfterDiscover: boolean | null;
   factoryQueueLimit: number | null;
   factoryTargetDatabank: number | null;
   factoryMaxCorrelation: number | null;
+}
+
+export type DataRangeKind = "training" | "validation" | "holdout";
+export interface DataRangePart {
+  id: string;
+  kind: DataRangeKind;
+  startDate: string;
+  endDate: string;
 }
 
 export interface SavedDiscoverProfile {

@@ -201,7 +201,7 @@ export function entryOrderError(request: EntryOrderToggles): string | null {
   return null;
 }
 
-const DEFAULT_PERTURBATION_FRACTION = 0.2;
+const DEFAULT_PERTURBATION_FRACTION = 0.3;
 
 /// The form edits whole percent while the request carries a fraction.
 export function perturbationPercent(

@@ -1340,6 +1340,151 @@ pub fn parameter_permutation_neighbors(
     Ok(neighbors)
 }
 
+/// SQX OptProfileSysParamPermutation grid: one parameter at a time, swept from
+/// `(1 - distribution)` to `(1 + distribution)` in `steps` points (SQX defaults:
+/// distribution=0.30, steps=25, max_tests=1000).
+pub fn opt_profile_sys_param_permutation_neighbors(
+    strategy: &StrategyIr,
+    distribution_fraction: f64,
+    steps: usize,
+    max_tests: usize,
+) -> Result<Vec<StrategyIr>, ChallengeError> {
+    let distribution = distribution_fraction.clamp(0.01, 0.95);
+    let steps = steps.max(2);
+    let max_tests = max_tests.max(1);
+    let mut axes: Vec<(&str, Box<dyn Fn(&mut StrategyIr, f64)>)> = Vec::new();
+    axes.push((
+        "sl",
+        Box::new(|candidate, factor| match &mut candidate.stops.stop_loss {
+            StopLossPolicy::AtrMultiple { multiplier, .. }
+            | StopLossPolicy::RangeMultiple { multiplier, .. } => {
+                *multiplier = (*multiplier * factor).clamp(0.05, 20.0)
+            }
+            StopLossPolicy::FixedPoints { points } => *points = (*points * factor).max(0.01),
+        }),
+    ));
+    axes.push((
+        "tp",
+        Box::new(|candidate, factor| match &mut candidate.stops.take_profit {
+            TakeProfitPolicy::RiskMultiple { multiple } => {
+                *multiple = (*multiple * factor).clamp(0.05, 20.0)
+            }
+            TakeProfitPolicy::AtrMultiple { multiplier, .. } => {
+                *multiplier = (*multiplier * factor).clamp(0.05, 20.0)
+            }
+            TakeProfitPolicy::FixedPoints { points } => *points = (*points * factor).max(0.01),
+        }),
+    ));
+    axes.push((
+        "atr",
+        Box::new(|candidate, factor| {
+            let scale = |period: &mut u16| {
+                *period = (f64::from(*period) * factor).round().clamp(2.0, 500.0) as u16;
+            };
+            match &mut candidate.stops.stop_loss {
+                StopLossPolicy::AtrMultiple { period, .. }
+                | StopLossPolicy::RangeMultiple { period, .. } => scale(period),
+                StopLossPolicy::FixedPoints { .. } => {}
+            }
+            if let TakeProfitPolicy::AtrMultiple { period, .. } = &mut candidate.stops.take_profit {
+                scale(period);
+            }
+            match &mut candidate.entry.order {
+                EntryOrderPolicy::Stop { distance, .. } | EntryOrderPolicy::Limit { distance, .. } => {
+                    if let EntryDistancePolicy::AtrMultiple { period, .. }
+                    | EntryDistancePolicy::RangeMultiple { period, .. } = distance
+                    {
+                        scale(period);
+                    }
+                }
+                EntryOrderPolicy::Market => {}
+            }
+            if let Some(TrailingPolicy::AtrMultiple { period, .. }) = &mut candidate.manage.trailing
+            {
+                scale(period);
+            }
+        }),
+    ));
+    axes.push((
+        "entry",
+        Box::new(|candidate, factor| {
+            if let EntryOrderPolicy::Stop {
+                distance,
+                expiry_bars,
+            }
+            | EntryOrderPolicy::Limit {
+                distance,
+                expiry_bars,
+            } = &mut candidate.entry.order
+            {
+                match distance {
+                    EntryDistancePolicy::FixedPoints { points } => {
+                        *points = (*points * factor).max(0.01)
+                    }
+                    EntryDistancePolicy::AtrMultiple { multiplier, .. }
+                    | EntryDistancePolicy::RangeMultiple { multiplier, .. } => {
+                        *multiplier = (*multiplier * factor).clamp(0.01, 20.0)
+                    }
+                }
+                *expiry_bars = (f64::from(*expiry_bars) * factor).round().clamp(1.0, 500.0) as u16;
+            }
+        }),
+    ));
+    axes.push((
+        "manage",
+        Box::new(|candidate, factor| {
+            if let Some(value) = &mut candidate.manage.break_even_at_r {
+                *value = (*value * factor).clamp(0.05, 20.0);
+            }
+            if let Some(trailing) = &mut candidate.manage.trailing {
+                match trailing {
+                    TrailingPolicy::RiskMultiple {
+                        activate_at_r,
+                        distance_r,
+                    } => {
+                        *activate_at_r = (*activate_at_r * factor).clamp(0.05, 20.0);
+                        *distance_r = (*distance_r * factor).clamp(0.05, 20.0);
+                    }
+                    TrailingPolicy::AtrMultiple {
+                        activate_at_r,
+                        multiplier,
+                        ..
+                    } => {
+                        *activate_at_r = (*activate_at_r * factor).clamp(0.05, 20.0);
+                        *multiplier = (*multiplier * factor).clamp(0.05, 20.0);
+                    }
+                }
+            }
+            if let Some(bars) = &mut candidate.manage.time_stop_bars {
+                *bars = (f64::from(*bars) * factor).round().clamp(1.0, 5000.0) as u16;
+            }
+        }),
+    ));
+
+    let lo = 1.0 - distribution;
+    let hi = 1.0 + distribution;
+    let mut neighbors = Vec::new();
+    'outer: for (label, mutator) in &axes {
+        for step in 0..steps {
+            let t = step as f64 / (steps - 1) as f64;
+            let factor = lo + (hi - lo) * t;
+            if (factor - 1.0).abs() < 1e-9 {
+                continue;
+            }
+            let mut neighbor = strategy.clone();
+            neighbor.id = format!("{}-spp-{label}-{step}", strategy.id);
+            mutator(&mut neighbor, factor);
+            let neighbor = neighbor.canonicalized(FloatPolicy::default())?;
+            neighbor.validate_export_safe(quantforge_ir::IrLimits::default())?;
+            neighbors.push(neighbor);
+            if neighbors.len() >= max_tests {
+                break 'outer;
+            }
+        }
+    }
+    Ok(neighbors)
+}
+
 fn perturb_bool(expression: &mut BoolExpr, fraction: f64, rng: &mut ChaCha8Rng) {
     match expression {
         BoolExpr::Compare { left, right, .. }

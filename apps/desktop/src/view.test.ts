@@ -88,7 +88,7 @@ describe("databank view rules", () => {
   });
 
   it("edits the parameter jitter in whole percent and rejects useless bands", () => {
-    expect(perturbationPercent({ robustnessPerturbationFraction: null })).toBe(20);
+    expect(perturbationPercent({ robustnessPerturbationFraction: null })).toBe(30);
     expect(perturbationPercent({ robustnessPerturbationFraction: 0.35 })).toBe(35);
     expect(perturbationError({ robustnessPerturbationFraction: 0 })).toMatch(/between 1% and 100%/);
     expect(perturbationError({ robustnessPerturbationFraction: 1.5 })).toMatch(/between 1% and 100%/);

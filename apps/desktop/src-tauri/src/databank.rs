@@ -1,10 +1,10 @@
 use crate::data_lab::{
     build_decision_from_m1, build_decision_from_m1_quotes, load_bound_broker, load_quote_sidecar,
-    trim_market_history_to_year,
+    trim_market_history_to_dates, trim_market_history_to_year,
 };
 use quantforge_broker::{BrokerClock, SymbolSpecification};
 use quantforge_core::{ContentHash, FloatPolicy};
-use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash};
+use quantforge_data::{BarDataset, DataQualityReport, QualityGrade, bar_content_hash, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes};
 use quantforge_discover::{
     Databank, DiscoverConfig, Elite, LongShortSkewBucket, NicheKey, RobustnessConfig,
     RobustnessEvidence, RobustnessReject, ThreeLevelBucket, niche_label,
@@ -62,6 +62,19 @@ pub(crate) struct LoadedDatabank {
     pub(crate) m1_metadata_path: Option<String>,
     pub(crate) validation_fraction: f64,
     pub(crate) sealed_fraction: f64,
+    pub(crate) history_start_date: Option<String>,
+    pub(crate) history_end_date: Option<String>,
+    pub(crate) decision_timeframe: String,
+    pub(crate) data_range_parts: Vec<StoredDataRangePart>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredDataRangePart {
+    id: String,
+    kind: String,
+    start_date: String,
+    end_date: String,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +97,7 @@ struct RobustnessSnapshot {
 #[derive(Default)]
 pub struct DesktopState {
     pub(crate) loaded: RwLock<Option<LoadedDatabank>>,
+    partition_equity_cache: RwLock<BTreeMap<String, PartitionEquityView>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -349,12 +363,22 @@ pub struct PartitionEquityPoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PartitionEquityPartition {
+    id: String,
+    kind: String,
+    start_timestamp_ms: i64,
+    end_timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartitionEquityView {
     fingerprint: String,
     strategy_id: String,
     execution_engine: String,
     initial_balance: f64,
     points: Vec<PartitionEquityPoint>,
+    partitions: Vec<PartitionEquityPartition>,
     is_end_timestamp_ms: i64,
     oos1_end_timestamp_ms: i64,
     oos2_end_timestamp_ms: i64,
@@ -541,6 +565,11 @@ fn install_databank_artifact(
     workspace.broker_path = broker.clone();
     let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
     let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
+    let history_start_date = manifest_path(&artifact, "history_start_date");
+    let history_end_date = manifest_path(&artifact, "history_end_date");
+    let data_range_parts = manifest_range_parts(&artifact);
+    let decision_timeframe = manifest_path(&artifact, "decision_timeframe")
+        .unwrap_or_else(|| "H1".into());
     *state
         .loaded
         .write()
@@ -555,6 +584,10 @@ fn install_databank_artifact(
         m1_metadata_path,
         validation_fraction,
         sealed_fraction,
+        history_start_date,
+        history_end_date,
+        decision_timeframe,
+        data_range_parts,
     });
     Ok(workspace)
 }
@@ -802,7 +835,7 @@ pub async fn get_elite_partition_equity(
     fingerprint: String,
     state: State<'_, DesktopState>,
 ) -> Result<PartitionEquityView, String> {
-    let snapshot = {
+    let (cache_key, snapshot) = {
         let loaded = state
             .loaded
             .read()
@@ -817,7 +850,27 @@ pub async fn get_elite_partition_equity(
             .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
             .clone();
-        (
+        let cache_key = format!(
+            "{}:{}:{:.8}:{:.8}:{:?}:{:?}:{}:{:?}",
+            loaded.databank_path,
+            fingerprint,
+            loaded.validation_fraction,
+            loaded.sealed_fraction,
+            loaded.history_start_date,
+            loaded.history_end_date,
+            loaded.decision_timeframe,
+            loaded.data_range_parts,
+        );
+        if let Some(cached) = state
+            .partition_equity_cache
+            .read()
+            .map_err(|_| "partition equity cache is unavailable".to_owned())?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        (cache_key, (
             elite,
             loaded.source.clone(),
             loaded.broker.clone(),
@@ -828,9 +881,13 @@ pub async fn get_elite_partition_equity(
             loaded.validation_fraction,
             loaded.sealed_fraction,
             loaded.bank.config.history_start_year,
-        )
+            loaded.history_start_date.clone(),
+            loaded.history_end_date.clone(),
+            loaded.decision_timeframe.clone(),
+            loaded.data_range_parts.clone(),
+        ))
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let view = tauri::async_runtime::spawn_blocking(move || {
         let (
             elite,
             source,
@@ -842,6 +899,10 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
+            history_start_date,
+            history_end_date,
+            decision_timeframe,
+            data_range_parts,
         ) = snapshot;
         partition_equity_for_elite(
             &elite,
@@ -854,10 +915,20 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
+            history_start_date.as_deref(),
+            history_end_date.as_deref(),
+            &decision_timeframe,
+            &data_range_parts,
         )
     })
     .await
-    .map_err(|error| format!("partition equity task failed: {error}"))?
+    .map_err(|error| format!("partition equity task failed: {error}"))??;
+    state
+        .partition_equity_cache
+        .write()
+        .map_err(|_| "partition equity cache is unavailable".to_owned())?
+        .insert(cache_key, view.clone());
+    Ok(view)
 }
 
 #[tauri::command]
@@ -1223,7 +1294,7 @@ fn robustness_reject_detail(reject: RobustnessReject) -> (&'static str, &'static
         ),
         RobustnessReject::ParamNeighborhood => (
             "parameter_neighborhood",
-            "Failed ±param survival or orig Ret/DD outside 0.85–1.25 of the neighbourhood median.",
+            "Failed SQX OptProfile ProfitOptPct or orig Ret/DD outside 0.75–1.50 of the neighbourhood median.",
         ),
     }
 }
@@ -1254,6 +1325,10 @@ fn partition_equity_for_elite(
     validation_fraction: f64,
     sealed_fraction: f64,
     history_start_year: u16,
+    history_start_date: Option<&str>,
+    history_end_date: Option<&str>,
+    decision_timeframe: &str,
+    range_parts: &[StoredDataRangePart],
 ) -> Result<PartitionEquityView, String> {
     let mut loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
@@ -1275,6 +1350,13 @@ fn partition_equity_for_elite(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
+    trim_market_history_to_dates(
+        &mut loaded.dataset,
+        &mut m1.dataset,
+        quote_dataset.as_mut(),
+        history_start_date,
+        history_end_date,
+    )?;
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1282,11 +1364,25 @@ fn partition_equity_for_elite(
     }
     // Match Discover/Parity Lab: decision OHLC is synthesized from M1 so aggregates
     // align with the exported EA and external MT5 backtests.
-    let decision_dataset = match quote_dataset.as_ref() {
-        Some(quotes) => {
-            build_decision_from_m1_quotes(&m1.dataset, Some(&loaded.dataset), quotes, broker.point)?
-        }
-        None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
+    let decision_dataset = match decision_timeframe {
+        "M15" => match quote_dataset.as_ref() {
+            Some(quotes) => build_timeframe_from_m1_with_quotes(
+                &m1.dataset,
+                quotes,
+                broker.point,
+                15 * 60 * 1000,
+                None,
+            ).map_err(|error| error.to_string())?,
+            None => build_timeframe_from_m1(&m1.dataset, 15 * 60 * 1000, None)
+                .map_err(|error| error.to_string())?,
+        },
+        "H1" => match quote_dataset.as_ref() {
+            Some(quotes) => {
+                build_decision_from_m1_quotes(&m1.dataset, Some(&loaded.dataset), quotes, broker.point)?
+            }
+            None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
+        },
+        other => return Err(format!("unsupported replay decision timeframe {other}")),
     };
     // Use the databank's sealed split, not a hardcoded 20/20. Discover gated this
     // elite on IS/OOS1 cut with these fractions; a mismatched chart invents a
@@ -1349,7 +1445,21 @@ fn partition_equity_for_elite(
     let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
         .then_some(oos1_expectancy / is_expectancy);
 
-    let points = downsample_equity(&result.equity, 480, is_end, oos1_end);
+    let partitions = if range_parts.is_empty() {
+        vec![
+            PartitionEquityPartition { id: "IST".into(), kind: "training".into(), start_timestamp_ms: decision_dataset.bars.first().map(|bar| bar.timestamp_ms).unwrap_or(0), end_timestamp_ms: is_end },
+            PartitionEquityPartition { id: "ISV1".into(), kind: "validation".into(), start_timestamp_ms: is_end, end_timestamp_ms: oos1_end },
+            PartitionEquityPartition { id: "OOS1".into(), kind: "holdout".into(), start_timestamp_ms: oos1_end, end_timestamp_ms: oos2_end },
+        ]
+    } else {
+        range_parts.iter().filter_map(|part| {
+            let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date).ok()?;
+            let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date).ok()?;
+            Some(PartitionEquityPartition { id: part.id.clone(), kind: part.kind.clone(), start_timestamp_ms: start, end_timestamp_ms: end })
+        }).collect()
+    };
+    let boundaries = partitions.iter().skip(1).map(|part| part.start_timestamp_ms).collect::<Vec<_>>();
+    let points = downsample_equity(&result.equity, 480, &boundaries);
     let trades: Vec<TradeRowView> = result
         .trades
         .iter()
@@ -1373,6 +1483,7 @@ fn partition_equity_for_elite(
         execution_engine: result.engine.clone(),
         initial_balance: scout.initial_balance,
         points,
+        partitions,
         is_end_timestamp_ms: is_end,
         oos1_end_timestamp_ms: oos1_end,
         oos2_end_timestamp_ms: oos2_end,
@@ -1458,8 +1569,7 @@ fn segment_return(
 fn downsample_equity(
     equity: &[quantforge_eval::EquityPoint],
     target: usize,
-    is_end: i64,
-    oos1_end: i64,
+    boundaries: &[i64],
 ) -> Vec<PartitionEquityPoint> {
     if equity.is_empty() {
         return Vec::new();
@@ -1476,19 +1586,14 @@ fn downsample_equity(
     let mut keep = std::collections::BTreeSet::new();
     keep.insert(0);
     keep.insert(equity.len() - 1);
-    if let Some(index) = equity
-        .iter()
-        .position(|point| point.timestamp_ms >= is_end)
-        .map(|index| index.saturating_sub(1))
-    {
-        keep.insert(index);
-    }
-    if let Some(index) = equity
-        .iter()
-        .position(|point| point.timestamp_ms >= oos1_end)
-        .map(|index| index.saturating_sub(1))
-    {
-        keep.insert(index);
+    for boundary in boundaries {
+        if let Some(index) = equity
+            .iter()
+            .position(|point| point.timestamp_ms >= *boundary)
+            .map(|index| index.saturating_sub(1))
+        {
+            keep.insert(index);
+        }
     }
     let step = ((equity.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
     let mut cursor = 0.0;
@@ -1649,8 +1754,8 @@ pub struct HoldingBatteryView {
     workspace: DatabankWorkspace,
 }
 
-/// Run the deferred M1 battery + OOS1 on Holding candidates and promote passes
-/// into Databank elites. Failures stay in Holding.
+/// Legacy Holding → Databank battery. Kept for serde/archive tooling; UI removed.
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn run_holding_battery(
     request: HoldingBatteryRequest,
@@ -1729,11 +1834,13 @@ pub async fn run_holding_battery(
     })
 }
 
+#[allow(dead_code)]
 struct HoldingBatteryReport {
     promoted: usize,
     rejected: Vec<HoldingBatteryRejectRow>,
 }
 
+#[allow(dead_code)]
 fn run_holding_battery_sync(
     bank: &mut Databank,
     fingerprints: &[String],
@@ -2945,6 +3052,17 @@ pub(crate) fn manifest_fraction(artifact: &EvolveArtifact, key: &str, fallback: 
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1.0)
         .unwrap_or(fallback)
+}
+
+fn manifest_range_parts(artifact: &EvolveArtifact) -> Vec<StoredDataRangePart> {
+    artifact
+        .manifest
+        .recipe
+        .config
+        .get("data_range_parts")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 fn companion_metadata_path(data_path: &str) -> Option<String> {

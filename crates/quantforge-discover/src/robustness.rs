@@ -12,8 +12,8 @@ use quantforge_eval::{
 };
 use quantforge_ir::{BoolExpr, IndicatorExpr, NumericExpr, StrategyIr};
 use quantforge_quality::{
-    DevelopmentCpcvPlan, monte_carlo_trade_resampling_with_skip, parameter_permutation_neighbors,
-    perturb_strategy_parameters,
+    DevelopmentCpcvPlan, monte_carlo_trade_resampling_with_skip,
+    opt_profile_sys_param_permutation_neighbors,
 };
 
 pub use quantforge_quality::{
@@ -62,9 +62,9 @@ impl std::fmt::Display for RobustnessReject {
             Self::M1Fidelity => "M1 fidelity",
             Self::FoldStability => "calendar-year fold stability (pooled/median R, concentration)",
             Self::Cpcv => "CPCV folds",
-            Self::WalkForward => "walk-forward",
+            Self::WalkForward => "sequential Development walk-forward",
             Self::MonteCarlo => "Monte Carlo",
-            Self::ParamNeighborhood => "parameter neighborhood / Ret/DD 0.85–1.25",
+            Self::ParamNeighborhood => "parameter neighborhood / ProfitOptPct / Ret/DD 0.75–1.50",
         })
     }
 }
@@ -104,26 +104,33 @@ pub struct RobustnessConfig {
     /// Mirrors the scout entry window so M1 retention is not measured against a
     /// different trading session than the one that admitted the candidate.
     pub entry_window: quantforge_eval::EntryWindow,
-    /// When true, folds are broker-local calendar years and every year must pass.
+    /// Legacy flag: calendar-year folds are diagnostics only (never a hard kill).
     pub calendar_year_folds: bool,
 }
+
+/// Majority of chronological Development folds must stay positive.
+pub const SEQUENTIAL_WALK_FORWARD_PASS_FRACTION: f64 = 0.60;
 
 /// SQX-style RetestWithHigherPrecision defaults retained for trade count and
 /// drawdown. QuantForge makes return retention configurable and defaults it to
 /// 90% for promotion-grade databanks.
 pub(crate) const SQX_TRADE_RETENTION: f64 = 0.80;
 pub(crate) const SQX_DRAWDOWN_EXPANSION: f64 = 1.30;
-/// Results and promotion test the actual local plateau. ±20% matches the SQX
-/// parameter-sensitivity default: wide enough to expose a knife-edge fit, narrow
-/// enough that a genuinely robust plateau survives.
-pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.20;
+/// SQX OptProfileSysParamPermutation default distribution (±30%).
+pub const PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION: f64 = 0.30;
 /// SQX-style trade manipulation: each resampled path removes 10% of fills.
-/// Original recovery factor must sit this close to the neighbourhood median.
-/// Knife-edge fits land on the tails of the ret/DD histogram and collapse in holdout.
-pub const PARAM_RECOVERY_MEDIAN_LOW: f64 = 0.85;
-pub const PARAM_RECOVERY_MEDIAN_HIGH: f64 = 1.25;
+/// Orig Ret/DD must sit this close to the neighbourhood median (user band;
+/// SQX Results SPP shows % Orig/Median as a diagnostic).
+pub const PARAM_RECOVERY_MEDIAN_LOW: f64 = 0.75;
+pub const PARAM_RECOVERY_MEDIAN_HIGH: f64 = 1.50;
 /// Histogram of ret/DD is too noisy below this many finite neighbour recoveries.
 const PARAM_RECOVERY_BAND_MIN_SAMPLES: usize = 20;
+/// SQX OptProfile Steps (points per parameter axis).
+pub const OPT_PROFILE_STEPS: usize = 25;
+/// SQX OptProfile MaxTests.
+pub const OPT_PROFILE_MAX_TESTS: usize = 1_000;
+/// SQX ProfitOptPct default (your Retest project uses 25).
+pub const OPT_PROFILE_PROFIT_OPT_PCT: f64 = 0.25;
 
 /// M1 80/130 fidelity only. Fold stability, plateau, CPCV, and Monte Carlo are
 /// the Databank battery, not Holding admission.
@@ -235,98 +242,28 @@ pub fn run_m1_predeposit_robustness(
         &h1_cache,
     )
     .map_err(|_| RobustnessReject::ParamNeighborhood)?;
-    if !crate::fold_r::calendar_year_fold_r(&h1_run.trades).passes_stability() {
-        return Err(RobustnessReject::FoldStability);
-    }
-    // H1 permutation / Ret/DD before CPCV or Monte Carlo.
-    let parameter_neighborhood =
-        evaluate_h1_neighborhood(strategy, is_decision, broker, config, &h1_run.metrics)?;
-
-    let (fold_rows, fold_scheme, purge_bars, embargo_bars, required_fraction) =
-        if config.calendar_year_folds {
-            let ranges = calendar_year_fold_ranges(is_decision, &broker.timezone)
-                .map_err(|_| RobustnessReject::Cpcv)?;
-            let rows = evaluate_development_ranges(
-                strategy,
-                is_decision,
-                m1_dataset,
-                quote_dataset,
-                broker,
-                &judge,
-                config,
-                &ranges,
-            )?;
-            (rows, "development_calendar_year".into(), 0, 0, 1.0)
-        } else {
-            let contract = DevelopmentCpcvPlan::for_development_bars(is_decision.bars.len());
-            let rows = evaluate_development_cpcv(
-                strategy,
-                is_decision,
-                m1_dataset,
-                quote_dataset,
-                broker,
-                &judge,
-                config,
-                &contract,
-            )?;
-            (
-                rows,
-                "development_cpcv_6_choose_2_h1".into(),
-                contract.purge_bars,
-                contract.embargo_bars,
-                config.minimum_passing_fold_fraction,
-            )
-        };
-    if fold_rows.is_empty() {
-        return Err(RobustnessReject::Cpcv);
-    }
-    let passing_folds = fold_rows.iter().filter(|fold| fold.passed).count();
-    let fold_fraction = passing_folds as f64 / fold_rows.len().max(1) as f64;
-    if fold_fraction + 1e-12 < required_fraction {
-        return Err(RobustnessReject::Cpcv);
-    }
-    let walk_forward_evidence = WalkForwardEvidence {
-        fold_scheme,
-        total_folds: fold_rows.len(),
-        passing_folds,
-        passing_fraction: fold_fraction,
-        required_passing_fraction: required_fraction,
-        purge_bars,
-        embargo_bars,
-        folds: fold_rows,
-    };
-
-    // CPCV deliberately permutes held-out Development groups and therefore
-    // does not test chronological degradation. Follow it with distinct,
-    // ordered windows so regime decay must also survive before promotion.
-    let sequential_ranges =
-        sequential_walk_forward_ranges(is_decision.bars.len(), config.folds.max(3))
-            .ok_or(RobustnessReject::WalkForward)?;
-    let sequential_rows = evaluate_development_ranges(
+    // Deposit recipe for holdout generalization:
+    // 1) sequential chronological Development walk-forward (hard selector)
+    // 2) OptProfile + Monte Carlo (fragility screen)
+    // Calendar-year / CPCV rows are diagnostics only — never hard kills here.
+    let sequential_walk_forward = evaluate_sequential_walk_forward(
         strategy,
         is_decision,
         m1_dataset,
         quote_dataset,
         broker,
-        &judge,
         config,
-        &sequential_ranges,
     )?;
-    let sequential_passing = sequential_rows.iter().filter(|fold| fold.passed).count();
-    let sequential_fraction = sequential_passing as f64 / sequential_rows.len().max(1) as f64;
-    if sequential_fraction + 1e-12 < config.minimum_passing_fold_fraction {
-        return Err(RobustnessReject::WalkForward);
-    }
-    let sequential_walk_forward = WalkForwardEvidence {
-        fold_scheme: "development_sequential_walk_forward_h1".into(),
-        total_folds: sequential_rows.len(),
-        passing_folds: sequential_passing,
-        passing_fraction: sequential_fraction,
-        required_passing_fraction: config.minimum_passing_fold_fraction,
-        purge_bars: 0,
-        embargo_bars: 0,
-        folds: sequential_rows,
-    };
+    let calendar_diagnostic = calendar_year_diagnostic(
+        strategy,
+        is_decision,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        config,
+    );
+    let parameter_neighborhood =
+        evaluate_h1_neighborhood(strategy, is_decision, broker, config, &h1_run.metrics)?;
 
     let profits: Vec<_> = h1_run
         .trades
@@ -349,8 +286,7 @@ pub fn run_m1_predeposit_robustness(
     );
     mc.baseline_max_drawdown_percent = h1_run.metrics.max_drawdown_percent;
     mc.maximum_drawdown_ratio = config.monte_carlo_max_drawdown_ratio;
-    // Require a non-negative median path and the configured P80 retention gate
-    // encoded in `mc.passed`.
+    // SQX MonteCarloManipulation: non-negative median + P80 retention / DD ratio.
     if !mc.passed || mc.median_net_profit < 0.0 {
         return Err(RobustnessReject::MonteCarlo);
     }
@@ -359,7 +295,16 @@ pub fn run_m1_predeposit_robustness(
         result: baseline_result,
         evidence: Some(RobustnessEvidence {
             m1_retention: retention_evidence,
-            walk_forward: walk_forward_evidence,
+            walk_forward: calendar_diagnostic.unwrap_or(WalkForwardEvidence {
+                fold_scheme: "calendar_year_diagnostic_unavailable".into(),
+                total_folds: 0,
+                passing_folds: 0,
+                passing_fraction: 1.0,
+                required_passing_fraction: 0.0,
+                purge_bars: 0,
+                embargo_bars: 0,
+                folds: Vec::new(),
+            }),
             sequential_walk_forward: Some(sequential_walk_forward),
             monte_carlo: mc,
             parameter_neighborhood,
@@ -449,49 +394,38 @@ fn evaluate_h1_neighborhood(
     use rayon::prelude::*;
     let scout = neighborhood_scout_config(config);
     let cache = IndicatorBufferCache::new(is_decision.bars.len());
-    let mut permutation_neighbors =
-        parameter_permutation_neighbors(strategy, config.parameter_perturbation_fraction)
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
-    let sample_rows: Vec<(usize, Option<StrategyIr>)> = (0..config.neighborhood_samples)
-        .map(|sample| {
-            let neighbor = permutation_neighbors
-                .first()
-                .cloned()
-                .map(|first| {
-                    permutation_neighbors.remove(0);
-                    first
-                })
-                .or_else(|| {
-                    perturb_strategy_parameters(
-                        strategy,
-                        config.parameter_perturbation_fraction,
-                        sample,
-                        config.seed,
-                    )
-                    .ok()
-                });
-            (sample, neighbor)
-        })
-        .collect();
-    let neighborhood_samples: Vec<ParameterNeighborhoodSample> = sample_rows
+    let neighbors = opt_profile_sys_param_permutation_neighbors(
+        strategy,
+        config.parameter_perturbation_fraction,
+        OPT_PROFILE_STEPS,
+        OPT_PROFILE_MAX_TESTS,
+    )
+    .unwrap_or_default();
+    if neighbors.is_empty() {
+        return Err(RobustnessReject::ParamNeighborhood);
+    }
+    let required_profit_opt = config
+        .minimum_neighborhood_survival_fraction
+        .max(OPT_PROFILE_PROFIT_OPT_PCT)
+        .min(1.0);
+    let neighborhood_samples: Vec<ParameterNeighborhoodSample> = neighbors
         .par_iter()
+        .enumerate()
         .filter_map(|(sample, neighbor)| {
-            let neighbor = neighbor.as_ref()?;
             let result =
                 evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache).ok()?;
-            let survived = neighborhood_survives(&result.metrics, h1_metrics, config);
-            Some(neighborhood_sample(*sample, &result.metrics, survived))
+            // SQX ProfitOptPct: neighbour counts if net profit > 0.
+            let survived = result.metrics.net_profit > 0.0;
+            Some(neighborhood_sample(sample, &result.metrics, survived))
         })
         .collect();
     let evaluated_samples = neighborhood_samples.len();
-    let surviving = neighborhood_samples.iter().filter(|row| row.survived).count();
-    if evaluated_samples * 2 < config.neighborhood_samples {
+    if evaluated_samples == 0 {
         return Err(RobustnessReject::ParamNeighborhood);
     }
-    let survival = surviving as f64 / evaluated_samples.max(1) as f64;
-    if survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
+    let surviving = neighborhood_samples.iter().filter(|row| row.survived).count();
+    let survival = surviving as f64 / evaluated_samples as f64;
+    if survival + 1e-12 < required_profit_opt {
         return Err(RobustnessReject::ParamNeighborhood);
     }
     let recoveries: Vec<f64> = neighborhood_samples
@@ -507,36 +441,17 @@ fn evaluate_h1_neighborhood(
         return Err(RobustnessReject::ParamNeighborhood);
     }
 
-    let plateau_neighbors = adx_plateau_neighbors(strategy, config);
-    let mut plateau_surviving = 0usize;
-    let mut plateau_survival_fraction = None;
-    if !plateau_neighbors.is_empty() {
-        plateau_surviving = plateau_neighbors
-            .iter()
-            .filter_map(|neighbor| {
-                evaluate_strategy_cached(neighbor, is_decision, broker, &scout, &cache)
-                    .ok()
-                    .map(|result| neighborhood_survives(&result.metrics, h1_metrics, config))
-            })
-            .filter(|passed| *passed)
-            .count();
-        let plateau_survival = plateau_surviving as f64 / plateau_neighbors.len() as f64;
-        plateau_survival_fraction = Some(plateau_survival);
-        if plateau_survival + 1e-12 < config.minimum_neighborhood_survival_fraction {
-            return Err(RobustnessReject::ParamNeighborhood);
-        }
-    }
     Ok(ParameterNeighborhoodEvidence {
-        method: "h1_cached_axis_plus_seeded_joint".into(),
+        method: "sqx_opt_profile_sys_param_permutation".into(),
         perturbation_fraction: config.parameter_perturbation_fraction,
-        samples_requested: config.neighborhood_samples,
+        samples_requested: neighbors.len(),
         samples_evaluated: evaluated_samples,
         surviving_samples: surviving,
         survival_fraction: survival,
-        required_survival_fraction: config.minimum_neighborhood_survival_fraction,
-        plateau_neighbors: plateau_neighbors.len(),
-        plateau_surviving,
-        plateau_survival_fraction,
+        required_survival_fraction: required_profit_opt,
+        plateau_neighbors: 0,
+        plateau_surviving: 0,
+        plateau_survival_fraction: None,
         original_metrics: Some(h1_metrics.clone()),
         median_recovery_factor,
         original_recovery_to_median,
@@ -893,9 +808,9 @@ pub(crate) fn calendar_year_fold_ranges(
     }
 }
 
-/// Ordered, non-overlapping Development test windows used after CPCV.
-/// Indicator warm-up is supplied by `evaluate_development_window`; only trades
-/// entering inside each chronological window are scored.
+/// Ordered, non-overlapping Development test windows used as the deposit
+/// selector. Indicator warm-up is supplied by `evaluate_development_window`;
+/// only trades entering inside each chronological window are scored.
 fn sequential_walk_forward_ranges(
     bars: usize,
     requested_folds: usize,
@@ -919,6 +834,108 @@ fn sequential_walk_forward_ranges(
         ranges.push((start, end));
     }
     Some(ranges)
+}
+
+fn evaluate_sequential_walk_forward(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+) -> Result<WalkForwardEvidence, RobustnessReject> {
+    let ranges = sequential_walk_forward_ranges(development.bars.len(), config.folds)
+        .ok_or(RobustnessReject::WalkForward)?;
+    let judge = JudgeConfig {
+        initial_balance: config.initial_balance,
+        costs: config.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+    };
+    let folds = evaluate_development_ranges(
+        strategy,
+        development,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+        config,
+        &ranges,
+    )?;
+    let total_folds = folds.len();
+    let passing_folds = folds.iter().filter(|fold| fold.passed).count();
+    let passing_fraction = if total_folds == 0 {
+        0.0
+    } else {
+        passing_folds as f64 / total_folds as f64
+    };
+    let required = config
+        .minimum_passing_fold_fraction
+        .max(SEQUENTIAL_WALK_FORWARD_PASS_FRACTION)
+        .min(1.0);
+    let evidence = WalkForwardEvidence {
+        fold_scheme: "sequential_chronological_development".into(),
+        total_folds,
+        passing_folds,
+        passing_fraction,
+        required_passing_fraction: required,
+        purge_bars: 0,
+        embargo_bars: 0,
+        folds,
+    };
+    if passing_fraction + 1e-12 < required {
+        return Err(RobustnessReject::WalkForward);
+    }
+    Ok(evidence)
+}
+
+/// Broker-local calendar years on Development. Recorded for inspection only —
+/// never used as a hard deposit reject.
+fn calendar_year_diagnostic(
+    strategy: &StrategyIr,
+    development: &BarDataset,
+    m1_dataset: &BarDataset,
+    quote_dataset: Option<&QuoteBarDataset>,
+    broker: &SymbolSpecification,
+    config: &RobustnessConfig,
+) -> Option<WalkForwardEvidence> {
+    let ranges = calendar_year_fold_ranges(development, &development.source_timezone).ok()?;
+    let judge = JudgeConfig {
+        initial_balance: config.initial_balance,
+        costs: config.costs.clone(),
+        allow_execution_gaps: false,
+        indicator_engine: config.indicator_engine,
+        entry_window: config.entry_window,
+    };
+    let folds = evaluate_development_ranges(
+        strategy,
+        development,
+        m1_dataset,
+        quote_dataset,
+        broker,
+        &judge,
+        config,
+        &ranges,
+    )
+    .ok()?;
+    let total_folds = folds.len();
+    let passing_folds = folds.iter().filter(|fold| fold.passed).count();
+    let passing_fraction = if total_folds == 0 {
+        0.0
+    } else {
+        passing_folds as f64 / total_folds as f64
+    };
+    Some(WalkForwardEvidence {
+        fold_scheme: "calendar_year_diagnostic".into(),
+        total_folds,
+        passing_folds,
+        passing_fraction,
+        required_passing_fraction: 0.0,
+        purge_bars: 0,
+        embargo_bars: 0,
+        folds,
+    })
 }
 
 /// SQX RetestWithHigherPrecision acceptance (80% net/return, 80% trades, DD < 130%).
@@ -965,6 +982,19 @@ fn effective_pf(metrics: &quantforge_eval::BacktestMetrics) -> f64 {
         } else {
             0.0
         })
+}
+
+/// Fold-level selector aligned with the holdout goal: enough trades and a
+/// positive expectancy (or net profit) window — not full deposit gates.
+fn sequential_fold_passed(
+    trades: usize,
+    metrics: &quantforge_eval::BacktestMetrics,
+    config: &RobustnessConfig,
+) -> bool {
+    if trades < config.minimum_fold_trades {
+        return false;
+    }
+    metrics.expectancy_r > 0.0 || metrics.net_profit > 0.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1118,10 +1148,7 @@ fn evaluate_development_window(
             trade.entry_timestamp_ms >= start_ms && trade.entry_timestamp_ms <= last_open_ms
         })
         .count();
-    let passed = trades >= config.minimum_fold_trades
-        && result.metrics.return_percent > config.minimum_return_percent
-        && effective_pf(&result.metrics) >= config.minimum_profit_factor
-        && result.metrics.max_drawdown_percent <= config.maximum_drawdown_percent;
+    let passed = sequential_fold_passed(trades, &result.metrics, config);
     let trade_profits = result.trades.iter().map(|trade| trade.net_profit).collect();
     let relative_equity = result
         .equity
@@ -1429,6 +1456,72 @@ mod tests {
     }
 
     #[test]
+    fn sequential_fold_pass_requires_trades_and_positive_edge() {
+        let config = RobustnessConfig {
+            folds: 8,
+            monte_carlo_trials: 10,
+            monte_carlo_block_length: 5,
+            monte_carlo_skip_trade_probability: 0.1,
+            monte_carlo_minimum_p80_profit_retention: 0.6,
+            monte_carlo_max_drawdown_ratio: 1.75,
+            neighborhood_samples: 10,
+            seed: 1,
+            initial_balance: 100_000.0,
+            costs: quantforge_eval::CostModel::default(),
+            minimum_return_retention: 0.9,
+            minimum_fold_trades: 2,
+            minimum_return_percent: 0.0,
+            minimum_profit_factor: 1.0,
+            maximum_drawdown_percent: 30.0,
+            minimum_passing_fold_fraction: SEQUENTIAL_WALK_FORWARD_PASS_FRACTION,
+            minimum_neighborhood_survival_fraction: 0.25,
+            parameter_perturbation_fraction: 0.3,
+            adx_period_min: 7,
+            adx_period_max: 28,
+            adx_period_step: 1,
+            adx_threshold_min: 15.0,
+            adx_threshold_max: 40.0,
+            adx_threshold_step: 1.0,
+            indicator_engine: quantforge_eval::IndicatorEngine::Mt5,
+            entry_window: quantforge_eval::EntryWindow::default(),
+            calendar_year_folds: false,
+        };
+        let positive = quantforge_eval::BacktestMetrics {
+            initial_balance: 100_000.0,
+            ending_balance: 101_000.0,
+            net_profit: 1_000.0,
+            return_percent: 1.0,
+            trade_count: 5,
+            winning_trades: 3,
+            losing_trades: 2,
+            win_rate: 60.0,
+            profit_factor: Some(1.5),
+            max_drawdown: 100.0,
+            max_drawdown_percent: 1.0,
+            sharpe_ratio: None,
+            expectancy: 200.0,
+            expectancy_r: 0.2,
+            median_r: 0.1,
+        };
+        let negative = quantforge_eval::BacktestMetrics {
+            net_profit: -500.0,
+            expectancy_r: -0.1,
+            ..positive.clone()
+        };
+        assert!(sequential_fold_passed(5, &positive, &config));
+        assert!(!sequential_fold_passed(1, &positive, &config));
+        assert!(!sequential_fold_passed(5, &negative, &config));
+    }
+
+    #[test]
+    fn sequential_pass_fraction_matches_majority_positive_goal() {
+        assert!((SEQUENTIAL_WALK_FORWARD_PASS_FRACTION - 0.60).abs() < 1e-12);
+        let required = SEQUENTIAL_WALK_FORWARD_PASS_FRACTION;
+        assert!(5.0 / 8.0 + 1e-12 >= required);
+        assert!(4.0 / 8.0 + 1e-12 < required);
+    }
+
+    #[test]
     fn cpcv_combination_metrics_pool_component_trade_outcomes() {
         // The first regime loses on its own, but the two-group CPCV path is
         // profitable with PF > 1. A combination must be judged as that pooled
@@ -1525,7 +1618,7 @@ mod tests {
     #[test]
     fn recovery_median_band_rejects_original_on_the_tail() {
         let recoveries = vec![1.0; 40];
-        let high = recovery_to_median_ratio(1.40, &recoveries);
+        let high = recovery_to_median_ratio(1.60, &recoveries);
         let low = recovery_to_median_ratio(0.70, &recoveries);
         assert!(!passes_recovery_median_band(high, recoveries.len()));
         assert!(!passes_recovery_median_band(low, recoveries.len()));

@@ -1,6 +1,6 @@
 //! Deterministic MT5 bar ingestion and data-quality diagnostics.
 
-use chrono::{Datelike, Duration, LocalResult, NaiveDateTime, TimeZone, Timelike, Utc, Weekday};
+use chrono::{Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use csv::{ReaderBuilder, StringRecord, Trim};
 use quantforge_core::{ContentHash, HashError, stable_json_hash};
@@ -200,6 +200,20 @@ impl QuoteBarDataset {
         }
         Ok(removed)
     }
+
+    /// Drop quote bars at or after `end_ms` (UTC). Rehashes when anything is removed.
+    pub fn trim_at_or_after_timestamp_ms(&mut self, end_ms: i64) -> Result<usize, DataError> {
+        let keep_to = self.bars.partition_point(|bar| bar.timestamp_ms < end_ms);
+        if keep_to == 0 {
+            return Err(DataError::EmptyAfterHistoryTrim { start_ms: end_ms });
+        }
+        let removed = self.bars.len().saturating_sub(keep_to);
+        if removed > 0 {
+            self.bars.truncate(keep_to);
+            self.data_hash = quote_bar_content_hash(&self.bars);
+        }
+        Ok(removed)
+    }
 }
 
 #[derive(Debug)]
@@ -328,6 +342,20 @@ impl BarDataset {
         Ok(removed)
     }
 
+    /// Drop bars at or after `end_ms` (UTC). Rehashes when anything is removed.
+    pub fn trim_at_or_after_timestamp_ms(&mut self, end_ms: i64) -> Result<usize, DataError> {
+        let keep_to = self.bars.partition_point(|bar| bar.timestamp_ms < end_ms);
+        if keep_to == 0 {
+            return Err(DataError::EmptyAfterHistoryTrim { start_ms: end_ms });
+        }
+        let removed = self.bars.len().saturating_sub(keep_to);
+        if removed > 0 {
+            self.bars.truncate(keep_to);
+            self.data_hash = bar_content_hash(&self.bars);
+        }
+        Ok(removed)
+    }
+
     /// Drop bars whose broker-local wall time is before 1 Jan of `year`.
     pub fn trim_before_calendar_year(&mut self, year: u16) -> Result<usize, DataError> {
         let start_ms = history_start_cutoff_ms(&self.source_timezone, year)?;
@@ -357,6 +385,47 @@ pub fn history_start_cutoff_ms(source_timezone: &str, year: u16) -> Result<i64, 
         value: stamp,
         reason,
     })
+}
+
+/// UTC millisecond instant of broker-local `date` at midnight. The accepted
+/// wire format is ISO `YYYY-MM-DD`, matching the desktop date input.
+pub fn history_date_cutoff_ms(source_timezone: &str, date: &str) -> Result<i64, DataError> {
+    let timezone: SourceTimezone = source_timezone.parse()?;
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
+        DataError::InvalidTimestamp {
+            row: 0,
+            value: date.to_owned(),
+            reason: "expected an ISO date in YYYY-MM-DD format",
+        }
+    })?;
+    let stamp = format!("{} 00:00:00", parsed.format("%Y.%m.%d"));
+    parse_timestamp(&stamp, timezone).map_err(|reason| DataError::InvalidTimestamp {
+        row: 0,
+        value: date.to_owned(),
+        reason,
+    })
+}
+
+/// Exclusive UTC cutoff immediately after the broker-local end date.
+pub fn history_end_exclusive_cutoff_ms(
+    source_timezone: &str,
+    date: &str,
+) -> Result<i64, DataError> {
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
+        DataError::InvalidTimestamp {
+            row: 0,
+            value: date.to_owned(),
+            reason: "expected an ISO date in YYYY-MM-DD format",
+        }
+    })?;
+    let next = parsed
+        .checked_add_signed(Duration::days(1))
+        .ok_or_else(|| DataError::InvalidTimestamp {
+            row: 0,
+            value: date.to_owned(),
+            reason: "end date overflows the supported calendar".into(),
+        })?;
+    history_date_cutoff_ms(source_timezone, &next.format("%Y-%m-%d").to_string())
 }
 
 const IC_MARKETS_EST_PLUS_7: &str = "ICMarkets/EST+7";

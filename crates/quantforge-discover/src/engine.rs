@@ -3,13 +3,15 @@ use crate::archive::{
     deposit_to_specialist_pool, remove_holding_by_fingerprint,
 };
 use crate::grammar::{
-    apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
+    PRODUCTION_SEARCH_FAMILIES, apply_search_ranges, build_seed, classify_family, crossover,
+    mutate_with_rng, rng_for,
 };
 #[cfg(test)]
 use crate::model::recovery_factor;
 use crate::model::{
     Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateConfig, GateResult,
-    SearchFamily, SymbolScreenResult,
+    SearchFamily,
+    SymbolScreenResult,
 };
 use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
@@ -645,7 +647,8 @@ fn promote_one(
         };
     }
 
-    // Legacy direct-to-databank path: optional full battery, then OOS1.
+    // Direct path retained only for explicitly legacy archives. New desktop
+    // runs stage the M1 survivor in Holding first.
     let m1_outcome = if context.require_m1_robustness {
         match crate::robustness::run_m1_predeposit_robustness(
             strategy,
@@ -830,12 +833,14 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
         minimum_return_percent: config.deposit_gates.minimum_return_percent,
         minimum_profit_factor: config.deposit_gates.minimum_profit_factor.min(1.0),
         maximum_drawdown_percent: config.deposit_gates.maximum_drawdown_percent.max(30.0),
-        minimum_passing_fold_fraction: 0.6,
+        minimum_passing_fold_fraction: crate::robustness::SEQUENTIAL_WALK_FORWARD_PASS_FRACTION,
         minimum_neighborhood_survival_fraction: config
             .minimum_neighborhood_survival_fraction
-            .max(0.55)
+            .max(crate::robustness::OPT_PROFILE_PROFIT_OPT_PCT)
             .min(1.0),
-        parameter_perturbation_fraction: config.robustness_perturbation_fraction,
+        parameter_perturbation_fraction: config
+            .robustness_perturbation_fraction
+            .max(crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
         adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
         adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
         adx_period_step: search.indicator_period.step.round().max(1.0) as u16,
@@ -943,7 +948,8 @@ pub fn run_holding_battery_and_promote(
     let robustness = robustness_config_from_discover(&bank.config);
     // Do not re-scout Selected-TF and re-gate M1 fidelity here. Holding admission
     // already passed that check against the pot H1; a fresh scout can disagree
-    // and falsely reject as M1Fidelity. Battery only runs CPCV / WFO / MC /
+    // and falsely reject as M1Fidelity. Battery runs sequential walk-forward,
+    // OptProfile, and Monte Carlo; calendar years are diagnostics only.
     // ±param (and OOS1 below). Use stored Holding M1 metrics as the retention
     // audit reference when no Selected-TF snapshot was kept on the elite.
     let prior_h1 = elite
@@ -1167,13 +1173,23 @@ pub fn new_databank(
     })
 }
 
+fn production_families(config: &DiscoverConfig) -> Vec<SearchFamily> {
+    let selected = config.search_families.iter()
+        .copied()
+        .filter(|family| *family != SearchFamily::Universal)
+        .collect::<Vec<_>>();
+    if selected.is_empty() { PRODUCTION_SEARCH_FAMILIES.to_vec() } else { selected }
+}
+
 fn generate_initial_population(config: &DiscoverConfig) -> Vec<StrategyIr> {
+    let selected = production_families(config);
     (0..config.initial_candidates)
         .map(|index| {
             let island_id = index % config.effective_island_count();
             let mut rng = rng_for(config.seed, 99, index as u64);
+            let family = selected[index % selected.len()];
             let mut seeded = build_seed(
-                SearchFamily::Universal,
+                family,
                 &mut rng,
                 format!("i{island_id}-seed-{index}"),
                 config.universal_grammar.maximum_entry_conditions.max(1),
@@ -1534,6 +1550,7 @@ fn run_generations(
 }
 
 fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
+    let selected = production_families(&bank.config);
     let pot_size = bank.accepted_pool.len();
     let breeding_unlocked = pot_size >= bank.config.mutate_after_elites;
     let max_atoms = bank
@@ -1550,9 +1567,11 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
             let mut rng = rng_for(bank.config.seed, generation + 10, index as u64);
+            let family = selected[(generation as usize + index) % selected.len()];
+            let family_style = family.style();
             let fresh_seed = |rng: &mut ChaCha8Rng| {
                 let mut seeded = build_seed(
-                    SearchFamily::Universal,
+                    family,
                     rng,
                     format!("i{island_id}-g{generation}-{index}"),
                     max_atoms,
@@ -1580,14 +1599,20 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             // passed the complete Development battery. It freezes the logical
             // tree and execution modules and perturbs existing numeric genes.
             let specialist_probability = 0.25;
-            if !bank.specialist_pool.is_empty() && rng.gen_bool(specialist_probability) {
-                let parent = crate::islands::tournament_in_elites(
+            let specialist_matches: Vec<_> = bank
+                .specialist_pool
+                .iter()
+                .enumerate()
+                .filter_map(|(index, elite)|
+                    (classify_family(&elite.strategy) == family_style).then_some(index))
+                .collect();
+            if !specialist_matches.is_empty() && rng.gen_bool(specialist_probability) {
+                let parent = tournament_from_indices(
                     &bank.specialist_pool,
+                    &specialist_matches,
                     &bank.config,
                     &mut rng,
-                    island_id,
-                )
-                .unwrap_or_else(|| tournament_in(&bank.specialist_pool, &bank.config, &mut rng));
+                );
                 if let Ok(mut child) = perturb_strategy_parameters(
                     &bank.specialist_pool[parent].strategy,
                     bank.config.robustness_perturbation_fraction,
@@ -1599,11 +1624,16 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 }
             }
 
-            let first_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
-                .unwrap_or_else(|| tournament(bank, &mut rng, None));
+            if !bank
+                .accepted_pool
+                .iter()
+                .any(|elite| classify_family(&elite.strategy) == family_style)
+            {
+                return fresh_seed(&mut rng);
+            }
+            let first_index = tournament(bank, &mut rng, Some(family_style));
             let first = &bank.accepted_pool[first_index];
-            let second_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
-                .unwrap_or_else(|| tournament(bank, &mut rng, None));
+            let second_index = tournament(bank, &mut rng, Some(family_style));
             let crossed = crossover(
                 &first.strategy,
                 &bank.accepted_pool[second_index].strategy,
@@ -1615,7 +1645,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 bank.config.structural_mutation_probability,
                 sequence,
                 false,
-                SearchFamily::Universal,
+                family,
                 &bank.config.universal_grammar,
             );
             child.id = format!("i{island_id}-g{generation}-{index}");
@@ -1701,7 +1731,10 @@ fn apply_production_policy(
     strategy.manage.flatten_end_of_day = config.flatten_at_22;
     strategy.manage.end_of_day_hour = config.end_of_day_hour;
     strategy.manage.max_one_entry_per_day = config.max_one_entry_per_day;
-    strategy.meta.thesis_hint = format!("{:?}", classify_family(&strategy)).to_ascii_lowercase();
+    // Preserve the canonical family tag written by the grammar. Debug-name
+    // lowercasing (for example `TrendPullback` -> `trendpullback`) is not a
+    // stable family identifier and previously forced fallback reclassification
+    // from whichever indicator happened to appear first.
     if config.simple_exits {
         enforce_simple_exits(&mut strategy, &config.search_ranges);
     } else {
@@ -1929,10 +1962,15 @@ fn tournament(
     winner
 }
 
-fn tournament_in(pool: &[Elite], config: &DiscoverConfig, rng: &mut ChaCha8Rng) -> usize {
-    let mut winner = rng.gen_range(0..pool.len());
+fn tournament_from_indices(
+    pool: &[Elite],
+    indices: &[usize],
+    config: &DiscoverConfig,
+    rng: &mut ChaCha8Rng,
+) -> usize {
+    let mut winner = indices[rng.gen_range(0..indices.len())];
     for _ in 1..config.tournament_size {
-        let contender = rng.gen_range(0..pool.len());
+        let contender = indices[rng.gen_range(0..indices.len())];
         if selection_is_better(&pool[contender], &pool[winner], config.novelty_weight) {
             winner = contender;
         }
@@ -2084,6 +2122,7 @@ mod tests {
 
     fn config() -> DiscoverConfig {
         DiscoverConfig {
+            search_families: crate::model::default_search_families(),
             initial_candidates: 32,
             batch_size: 16,
             correlation_threshold: 1.0,
@@ -2114,6 +2153,7 @@ mod tests {
                 minimum_return_retention: 0.0,
             },
             search_ranges: crate::model::SearchRangeProfile::default(),
+            scout_fitness_mode: crate::model::ScoutFitnessMode::default(),
             oos1_expectancy_retention: 0.0,
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: true,
@@ -2546,32 +2586,29 @@ mod tests {
     fn quota_mode_keeps_the_robustness_battery_discriminating() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
-        // Old presets clamped these down to 80/5/0.5, which passed everything.
         config.robustness_monte_carlo_trials = 80;
         config.robustness_neighborhood_samples = 5;
-        config.minimum_neighborhood_survival_fraction = 0.5;
+        config.minimum_neighborhood_survival_fraction = 0.1;
         config.apply_run_mode();
-        // A P95 drawdown read off fewer than ~1k resampled paths is noise.
         assert!(config.robustness_monte_carlo_trials >= 1_000);
-        // Ten deterministic axis neighbors come first; 200 H1-cached samples
-        // make the ret/DD histogram dense enough for the orig/median band.
-        assert!(config.robustness_neighborhood_samples >= 200);
-        assert!(config.minimum_neighborhood_survival_fraction >= 0.55);
+        assert!(config.robustness_neighborhood_samples >= 1_000);
+        assert!(config.minimum_neighborhood_survival_fraction >= 0.25);
+        assert!((config.robustness_perturbation_fraction - 0.30).abs() < 1e-9);
     }
 
     #[test]
-    fn quota_holding_is_not_capped_by_family_or_niche_inventory() {
+    fn quota_databank_is_not_capped_by_family_or_niche_inventory() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.apply_run_mode();
         assert_eq!(config.target_databank_elites, Some(400));
         assert!(config.build_to_holding);
-        assert!(config.max_holding_elites >= 2_000);
-        assert!(config.max_elites_per_niche >= 8);
+        assert!(config.max_databank_elites >= 2_000);
+        assert_eq!(config.max_elites_per_niche, 0);
     }
 
     #[test]
-    fn quota_mode_keeps_an_explicit_holding_target() {
+    fn quota_mode_keeps_an_explicit_databank_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.target_databank_elites = Some(500);
@@ -2583,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_mode_keeps_a_large_explicit_holding_target() {
+    fn quota_mode_keeps_a_large_explicit_databank_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.target_databank_elites = Some(2_000);
@@ -2657,6 +2694,23 @@ mod tests {
         let mut config = DiscoverConfig::default();
         config.promotion_queue_capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn live_initial_population_is_balanced_and_never_uses_universal() {
+        let mut cfg = config();
+        cfg.initial_candidates = PRODUCTION_SEARCH_FAMILIES.len() * 2;
+        let population = generate_initial_population(&cfg);
+        for family in PRODUCTION_SEARCH_FAMILIES {
+            let count = population
+                .iter()
+                .filter(|strategy| classify_family(strategy) == family.style())
+                .count();
+            assert_eq!(count, 2, "family {} was not balanced", family.label());
+        }
+        assert!(population
+            .iter()
+            .all(|strategy| classify_family(strategy) != crate::model::FamilyStyle::Universal));
     }
 
     #[test]
