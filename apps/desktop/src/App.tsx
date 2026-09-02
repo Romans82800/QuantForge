@@ -5690,8 +5690,20 @@ function PartitionEquityChart({
   const min = Math.min(...equities);
   const max = Math.max(...equities);
   const span = Math.max(max - min, 1e-9);
-  const t0 = chartPoints[0].timestampMs;
-  const t1 = chartPoints[chartPoints.length - 1].timestampMs;
+  // The horizontal axis must represent the configured research schedule, not
+  // merely the first/last trade.  A sparse or interleaved schedule can have
+  // no trade in one of its parts; anchoring to trade timestamps collapses that
+  // part to zero width and makes the curve appear not to follow the timeline.
+  // Use the persisted partition bounds whenever they are available, while
+  // retaining the old fallback for legacy databanks with no schedule.
+  const scheduleStart = partitions[0]?.startTimestampMs;
+  const scheduleEnd = partitions.at(-1)?.endTimestampMs;
+  const t0 = sample === "full" && Number.isFinite(scheduleStart)
+    ? scheduleStart!
+    : chartPoints[0].timestampMs;
+  const t1 = sample === "full" && Number.isFinite(scheduleEnd)
+    ? scheduleEnd!
+    : chartPoints[chartPoints.length - 1].timestampMs;
   const tSpan = Math.max(t1 - t0, 1);
   const xAt = (timestamp: number) => pad + ((timestamp - t0) / tSpan) * (width - pad * 2);
   const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
