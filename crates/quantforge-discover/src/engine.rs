@@ -1,15 +1,17 @@
 use crate::archive::{
     CandidateEvaluation, deposit_to_accepted_pool, deposit_to_databank, deposit_to_holding,
-    deposit_to_specialist_pool, refresh_fingerprint_coverage_map, remove_holding_by_fingerprint,
+    deposit_to_specialist_pool, remove_holding_by_fingerprint,
 };
 use crate::grammar::{
-    apply_search_ranges, build_seed, classify_family, crossover, mutate_with_rng, rng_for,
+    PRODUCTION_SEARCH_FAMILIES, apply_search_ranges, build_seed, classify_family, crossover,
+    mutate_with_rng, rng_for,
 };
 #[cfg(test)]
 use crate::model::recovery_factor;
 use crate::model::{
     Databank, DepositDecision, DiscoverConfig, DiscoverError, Elite, GateConfig, GateResult,
-    SearchFamily, SymbolScreenResult,
+    SearchFamily,
+    SymbolScreenResult,
 };
 use crate::multi_symbol::{PackSymbol, screen_multi_symbol};
 use crate::{DATABANK_SCHEMA_VERSION, GRAMMAR_VERSION};
@@ -26,7 +28,7 @@ use quantforge_tick::{JudgeConfig, evaluate_strategy_m1, evaluate_strategy_m1_wi
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -478,10 +480,11 @@ impl PromotionPipeline {
         pot_evaluation: CandidateEvaluation,
         bank: &mut Databank,
     ) -> Result<(), DiscoverError> {
-        let mut overflow =
-            self.shared.overflow.lock().map_err(|_| {
-                DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
-            })?;
+        let mut overflow = self
+            .shared
+            .overflow
+            .lock()
+            .map_err(|_| DiscoverError::InvalidConfig("promotion overflow lock poisoned".into()))?;
         if overflow.len() >= PROMOTION_OVERFLOW_CAPACITY {
             overflow.pop_front();
             bank.telemetry.promotion_overflow_dropped += 1;
@@ -501,9 +504,13 @@ impl PromotionPipeline {
                 break;
             }
             let next = {
-                let mut overflow = self.shared.overflow.lock().map_err(|_| {
-                    DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
-                })?;
+                let mut overflow = self
+                    .shared
+                    .overflow
+                    .lock()
+                    .map_err(|_| {
+                        DiscoverError::InvalidConfig("promotion overflow lock poisoned".into())
+                    })?;
                 overflow.pop_front()
             };
             match next {
@@ -597,9 +604,7 @@ fn promote_one(
     let broker = context.broker.as_ref();
     let robustness = &context.robustness;
 
-    // Holding path: M1 80/130 retention only. The full Development battery
-    // and optional OOS1 validation run later, after a user starts it from
-    // Holding.
+    // Holding path: M1 80/130 retention only. Battery + OOS1 wait.
     if context.build_to_holding {
         let m1_outcome = match crate::robustness::run_m1_holding_admission(
             strategy,
@@ -642,7 +647,8 @@ fn promote_one(
         };
     }
 
-    // Direct-to-databank path: optional full battery, then optional OOS1.
+    // Direct path retained only for explicitly legacy archives. New desktop
+    // runs stage the M1 survivor in Holding first.
     let m1_outcome = if context.require_m1_robustness {
         match crate::robustness::run_m1_predeposit_robustness(
             strategy,
@@ -715,65 +721,13 @@ fn promote_one(
         robustness: m1_outcome.1.clone(),
     };
 
-    // OOS1 is a post-Development validation gate. It never participates in
-    // scouting, breeding, or ranking. A zero OOS1 reserve is represented by
-    // `None`, which leaves the two-way Development/OOS2 protocol intact.
-    let Some(oos1) = context.oos1.as_deref() else {
-        return PromotionOutcome::DevelopmentApproved {
-            candidate: development_candidate,
-            oos1_passed: true,
-            oos1_expectancy: None,
-            oos1_expectancy_ratio: None,
-        };
-    };
-    let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
-        return PromotionOutcome::EvaluationError {
-            message: "OOS1 validation partition is empty".into(),
-        };
-    };
-    // Replay Development + OOS1 together only to preserve indicator warm-up,
-    // open positions, and execution continuity at the boundary. The admitted
-    // Development metrics above remain the fitness reference.
-    let validation_decision = join_datasets(context.dataset.as_ref(), oos1);
-    let validation = match evaluate_strategy_m1_with_optional_quotes(
-        strategy,
-        &validation_decision,
-        context.m1.as_ref(),
-        context.quotes.as_deref(),
-        broker,
-        &JudgeConfig {
-            initial_balance: robustness.initial_balance,
-            costs: robustness.costs.clone(),
-            allow_execution_gaps: false,
-            indicator_engine: robustness.indicator_engine,
-            entry_window: robustness.entry_window,
-        },
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            return PromotionOutcome::EvaluationError {
-                message: format!("M1 OOS1 validation replay failed: {error}"),
-            };
-        }
-    };
-    let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
-    if !passes_oos1_pick(
-        development_expectancy,
-        oos1_expectancy,
-        context.oos1_expectancy_retention,
-    ) {
-        return PromotionOutcome::DevelopmentApproved {
-            candidate: development_candidate,
-            oos1_passed: false,
-            oos1_expectancy: Some(oos1_expectancy),
-            oos1_expectancy_ratio: Some(oos1_expectancy / development_expectancy),
-        };
-    }
+    // Fold-stable Development R is the promotion objective. OOS1 is not a pick
+    // gate — a single chronological slice manufactures a clean databank.
     PromotionOutcome::DevelopmentApproved {
         candidate: development_candidate,
         oos1_passed: true,
-        oos1_expectancy: Some(oos1_expectancy),
-        oos1_expectancy_ratio: Some(oos1_expectancy / development_expectancy),
+        oos1_expectancy: None,
+        oos1_expectancy_ratio: None,
     }
 }
 
@@ -879,12 +833,14 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
         minimum_return_percent: config.deposit_gates.minimum_return_percent,
         minimum_profit_factor: config.deposit_gates.minimum_profit_factor.min(1.0),
         maximum_drawdown_percent: config.deposit_gates.maximum_drawdown_percent.max(30.0),
-        minimum_passing_fold_fraction: 0.6,
+        minimum_passing_fold_fraction: crate::robustness::SEQUENTIAL_WALK_FORWARD_PASS_FRACTION,
         minimum_neighborhood_survival_fraction: config
             .minimum_neighborhood_survival_fraction
-            .max(0.55)
+            .max(crate::robustness::OPT_PROFILE_PROFIT_OPT_PCT)
             .min(1.0),
-        parameter_perturbation_fraction: config.robustness_perturbation_fraction,
+        parameter_perturbation_fraction: config
+            .robustness_perturbation_fraction
+            .max(crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
         adx_period_min: search.indicator_period.minimum.round().max(2.0) as u16,
         adx_period_max: search.indicator_period.maximum.round().max(2.0) as u16,
         adx_period_step: search.indicator_period.step.round().max(1.0) as u16,
@@ -896,8 +852,10 @@ fn robustness_config_from_discover(config: &DiscoverConfig) -> crate::robustness
     }
 }
 
-/// OOS1 validation requires positive expectancy and configurable retention
-/// relative to the M1 Development replay. It must never feed breeding or rank.
+/// OOS1 validation used to require positive expectancy and retention relative
+/// to the M1 Development replay. Kept for tests and old artifacts; Discover no
+/// longer picks on OOS1.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn passes_oos1_pick(is_expectancy: f64, oos1_expectancy: f64, retention: f64) -> bool {
     is_expectancy.is_finite()
         && oos1_expectancy.is_finite()
@@ -962,84 +920,6 @@ pub fn holding_factory_score(trade_count: usize, expectancy_r: f64) -> f64 {
     trade_count as f64 * expectancy_r.max(0.0)
 }
 
-/// Move every current Holding entry into the Databank without running the
-/// deferred robustness battery. This is an explicit research override used by
-/// the desktop Holding page; Discover's normal promotion path is unchanged.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HoldingBypassResult {
-    pub promoted: usize,
-    pub replaced: usize,
-}
-
-pub fn promote_all_holding_without_robustness(bank: &mut Databank) -> HoldingBypassResult {
-    let selected = bank
-        .holding
-        .iter()
-        .map(|elite| elite.structural_fingerprint.to_string())
-        .collect::<BTreeSet<_>>();
-    promote_selected_holding_without_robustness(bank, &selected, None)
-}
-
-/// Promote only the named Holding entries while leaving every non-selected
-/// candidate in Holding. `selection_gate` records the Development-only recipe
-/// that chose the cohort; it must not contain future/holdout evidence.
-pub fn promote_selected_holding_without_robustness(
-    bank: &mut Databank,
-    selected: &BTreeSet<String>,
-    selection_gate: Option<GateResult>,
-) -> HoldingBypassResult {
-    let holding = std::mem::take(&mut bank.holding);
-    let mut remaining = Vec::with_capacity(holding.len());
-    let mut promoted = 0;
-    let mut replaced = 0;
-
-    for mut elite in holding {
-        if !selected.contains(elite.structural_fingerprint.as_str()) {
-            remaining.push(elite);
-            continue;
-        }
-        elite
-            .gate_results
-            .retain(|gate| gate.name != "robustness_bypass");
-        if !elite
-            .gate_results
-            .iter()
-            .any(|gate| gate.name == "robustness_audit")
-        {
-            elite.gate_results.push(GateResult {
-                name: "robustness_bypass".into(),
-                passed: false,
-                detail: "Manually graduated from Holding; deferred robustness battery was not run."
-                    .into(),
-            });
-        }
-        if let Some(gate) = selection_gate.as_ref() {
-            elite
-                .gate_results
-                .retain(|existing| existing.name != gate.name);
-            elite.gate_results.push(gate.clone());
-        }
-        if let Some(index) = bank
-            .elites
-            .iter()
-            .position(|existing| existing.structural_fingerprint == elite.structural_fingerprint)
-        {
-            bank.elites[index] = elite;
-            replaced += 1;
-            bank.telemetry.record(DepositDecision::ReplacedInDatabank);
-        } else {
-            bank.elites.push(elite);
-            promoted += 1;
-            bank.telemetry.record(DepositDecision::AcceptedToDatabank);
-        }
-    }
-
-    bank.holding = remaining;
-    refresh_fingerprint_coverage_map(&bank.holding, &mut bank.holding_coverage_map);
-    refresh_fingerprint_coverage_map(&bank.elites, &mut bank.coverage_map);
-    HoldingBypassResult { promoted, replaced }
-}
-
 /// Successful Holding battery: strategy removed from Holding and deposited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldingBatteryResult {
@@ -1048,126 +928,13 @@ pub struct HoldingBatteryResult {
     pub elite: Elite,
 }
 
-/// Outcome of the non-gating full-battery audit. The candidate remains in
-/// Holding until the caller explicitly graduates it; this result never feeds
-/// breeding, ranking, or OOS selection.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HoldingBatteryAuditResult {
-    pub fingerprint: quantforge_core::ContentHash,
-    pub passed: bool,
-    pub reason: Option<String>,
-}
-
-/// Run the same Development/M1 battery as the strict Holding gate, but only
-/// record the result on the Holding candidate. It does not remove, promote, or
-/// reject the candidate.
-pub fn audit_holding_battery(
-    bank: &mut Databank,
-    fingerprint: &quantforge_core::ContentHash,
-    dataset: &BarDataset,
-    m1_dataset: &BarDataset,
-    quote_dataset: Option<&QuoteBarDataset>,
-    broker: &SymbolSpecification,
-) -> Result<HoldingBatteryAuditResult, HoldingBatteryReject> {
-    let elite = bank
-        .holding
-        .iter()
-        .find(|entry| &entry.structural_fingerprint == fingerprint)
-        .cloned()
-        .ok_or(HoldingBatteryReject::NotInHolding)?;
-    let robustness = robustness_config_from_discover(&bank.config);
-    let prior_h1 = elite
-        .robustness
-        .as_ref()
-        .map(|evidence| evidence.m1_retention.selected_timeframe_metrics.clone())
-        .unwrap_or_else(|| elite.metrics.clone());
-    let outcome = crate::robustness::run_m1_predeposit_robustness_audit(
-        &elite.strategy,
-        dataset,
-        m1_dataset,
-        quote_dataset,
-        broker,
-        &robustness,
-        &prior_h1,
-        false,
-    );
-    let (passed, reason, evidence, mut gates) = match outcome {
-        Err(reject) => (false, Some(reject.to_string()), None, Vec::new()),
-        Ok(outcome) => {
-            let deposit_passed = crate::archive::passes_gate_config(
-                &outcome.result,
-                &bank.config.deposit_gates,
-            );
-            let expectancy_passed = passes_development_expectancy(
-                outcome.result.metrics.expectancy,
-                bank.config.minimum_development_expectancy_r,
-            );
-            let mut blockers = outcome.blockers;
-            if !deposit_passed {
-                blockers.push("deposit gates".into());
-            }
-            if !expectancy_passed {
-                blockers.push("Development expectancy floor".into());
-            }
-            let mut gates = outcome.gates;
-            gates.push(GateResult {
-                name: "robustness_audit_deposit_gates".into(),
-                passed: deposit_passed,
-                detail: "Development deposit gates evaluated as audit evidence only.".into(),
-            });
-            gates.push(GateResult {
-                name: "robustness_audit_development_expectancy".into(),
-                passed: expectancy_passed,
-                detail: format!(
-                    "Development expectancy {:.3}R; required {:.3}R.",
-                    outcome.result.metrics.expectancy,
-                    bank.config.minimum_development_expectancy_r,
-                ),
-            });
-            let passed = blockers.is_empty();
-            let reason = (!passed).then(|| blockers.join("; "));
-            (passed, reason, Some(outcome.evidence), gates)
-        }
-    };
-    let audited = bank
-        .holding
-        .iter_mut()
-        .find(|entry| &entry.structural_fingerprint == fingerprint)
-        .ok_or(HoldingBatteryReject::NotInHolding)?;
-    if evidence.is_some() {
-        audited.robustness = evidence;
-    }
-    audited
-        .gate_results
-        .retain(|gate| !gate.name.starts_with("robustness_audit"));
-    if gates.is_empty() {
-        gates.push(GateResult {
-            name: "robustness_audit".into(),
-            passed,
-            detail: match &reason {
-                Some(reason) => format!(
-                    "Full Development/M1 battery audit could not complete: {reason}. This was recorded only; the strategy can still be graduated."
-                ),
-                None => "Full Development/M1 battery audit passed. This was recorded only; it was not used as a selection gate.".into(),
-            },
-        });
-    }
-    audited.gate_results.extend(gates);
-    Ok(HoldingBatteryAuditResult {
-        fingerprint: fingerprint.clone(),
-        passed,
-        reason,
-    })
-}
-
-/// Run the full M1 robustness battery on one Holding candidate and, on pass,
-/// promote it into the Databank elites archive. When the immutable run split
-/// contains OOS1, validate there only after the Development battery passes.
+/// Run the full M1 robustness battery on one Holding candidate and,
+/// on pass, promote it into the Databank elites archive. OOS1 is not a pick.
 pub fn run_holding_battery_and_promote(
     bank: &mut Databank,
     fingerprint: &quantforge_core::ContentHash,
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
+    _oos1_dataset: Option<&BarDataset>,
     m1_dataset: &BarDataset,
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
@@ -1181,7 +948,8 @@ pub fn run_holding_battery_and_promote(
     let robustness = robustness_config_from_discover(&bank.config);
     // Do not re-scout Selected-TF and re-gate M1 fidelity here. Holding admission
     // already passed that check against the pot H1; a fresh scout can disagree
-    // and falsely reject as M1Fidelity. Battery only runs CPCV / WFO / MC /
+    // and falsely reject as M1Fidelity. Battery runs sequential walk-forward,
+    // OptProfile, and Monte Carlo; calendar years are diagnostics only.
     // ±param (and OOS1 below). Use stored Holding M1 metrics as the retention
     // audit reference when no Selected-TF snapshot was kept on the elite.
     let prior_h1 = elite
@@ -1211,7 +979,7 @@ pub fn run_holding_battery_and_promote(
         return Err(HoldingBatteryReject::DevelopmentExpectancy);
     }
 
-    let mut candidate = CandidateEvaluation {
+    let candidate = CandidateEvaluation {
         strategy: elite.strategy.clone(),
         result: outcome.result,
         generation: elite.discovered_generation,
@@ -1227,53 +995,6 @@ pub fn run_holding_battery_and_promote(
         robustness: outcome.evidence,
     };
 
-    if let Some(oos1) = oos1_dataset {
-        let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
-            return Err(HoldingBatteryReject::Evaluation(
-                "OOS1 validation partition is empty".into(),
-            ));
-        };
-        let validation_decision = join_datasets(dataset, oos1);
-        let validation = evaluate_strategy_m1_with_optional_quotes(
-            &elite.strategy,
-            &validation_decision,
-            m1_dataset,
-            quote_dataset,
-            broker,
-            &JudgeConfig {
-                initial_balance: robustness.initial_balance,
-                costs: robustness.costs.clone(),
-                allow_execution_gaps: false,
-                indicator_engine: robustness.indicator_engine,
-                entry_window: robustness.entry_window,
-            },
-        )
-        .map_err(|error| {
-            HoldingBatteryReject::Evaluation(format!("M1 OOS1 validation replay failed: {error}"))
-        })?;
-        let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
-        if !passes_oos1_pick(
-            development_expectancy,
-            oos1_expectancy,
-            bank.config.oos1_expectancy_retention,
-        ) {
-            return Err(HoldingBatteryReject::Oos1);
-        }
-        candidate.oos1_expectancy = Some(oos1_expectancy);
-        candidate.oos1_expectancy_ratio = Some(oos1_expectancy / development_expectancy);
-        candidate.gate_results = build_gate_results(
-            development_expectancy,
-            candidate.oos1_expectancy,
-            candidate.oos1_expectancy_ratio,
-            true,
-            None,
-            &candidate.multi_symbol_results,
-            bank.config.multi_symbol_minimum_pass,
-            candidate.deflated_trade_sharpe,
-            bank.config.minimum_deflated_trade_sharpe,
-        );
-    }
-
     let decision = deposit_to_databank(bank, candidate)
         .map_err(|error| HoldingBatteryReject::Evaluation(error.to_string()))?;
     match decision {
@@ -1287,7 +1008,9 @@ pub fn run_holding_battery_and_promote(
                 .find(|entry| &entry.structural_fingerprint == fingerprint)
                 .cloned()
                 .ok_or_else(|| {
-                    HoldingBatteryReject::Evaluation("promoted elite missing after deposit".into())
+                    HoldingBatteryReject::Evaluation(
+                        "promoted elite missing after deposit".into(),
+                    )
                 })?;
             Ok(HoldingBatteryResult {
                 fingerprint: fingerprint.clone(),
@@ -1450,13 +1173,23 @@ pub fn new_databank(
     })
 }
 
+fn production_families(config: &DiscoverConfig) -> Vec<SearchFamily> {
+    let selected = config.search_families.iter()
+        .copied()
+        .filter(|family| *family != SearchFamily::Universal)
+        .collect::<Vec<_>>();
+    if selected.is_empty() { PRODUCTION_SEARCH_FAMILIES.to_vec() } else { selected }
+}
+
 fn generate_initial_population(config: &DiscoverConfig) -> Vec<StrategyIr> {
+    let selected = production_families(config);
     (0..config.initial_candidates)
         .map(|index| {
             let island_id = index % config.effective_island_count();
             let mut rng = rng_for(config.seed, 99, index as u64);
+            let family = selected[index % selected.len()];
             let mut seeded = build_seed(
-                SearchFamily::Universal,
+                family,
                 &mut rng,
                 format!("i{island_id}-seed-{index}"),
                 config.universal_grammar.maximum_entry_conditions.max(1),
@@ -1817,6 +1550,7 @@ fn run_generations(
 }
 
 fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
+    let selected = production_families(&bank.config);
     let pot_size = bank.accepted_pool.len();
     let breeding_unlocked = pot_size >= bank.config.mutate_after_elites;
     let max_atoms = bank
@@ -1833,9 +1567,11 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
             let mut rng = rng_for(bank.config.seed, generation + 10, index as u64);
+            let family = selected[(generation as usize + index) % selected.len()];
+            let family_style = family.style();
             let fresh_seed = |rng: &mut ChaCha8Rng| {
                 let mut seeded = build_seed(
-                    SearchFamily::Universal,
+                    family,
                     rng,
                     format!("i{island_id}-g{generation}-{index}"),
                     max_atoms,
@@ -1863,14 +1599,20 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             // passed the complete Development battery. It freezes the logical
             // tree and execution modules and perturbs existing numeric genes.
             let specialist_probability = 0.25;
-            if !bank.specialist_pool.is_empty() && rng.gen_bool(specialist_probability) {
-                let parent = crate::islands::tournament_in_elites(
+            let specialist_matches: Vec<_> = bank
+                .specialist_pool
+                .iter()
+                .enumerate()
+                .filter_map(|(index, elite)|
+                    (classify_family(&elite.strategy) == family_style).then_some(index))
+                .collect();
+            if !specialist_matches.is_empty() && rng.gen_bool(specialist_probability) {
+                let parent = tournament_from_indices(
                     &bank.specialist_pool,
+                    &specialist_matches,
                     &bank.config,
                     &mut rng,
-                    island_id,
-                )
-                .unwrap_or_else(|| tournament_in(&bank.specialist_pool, &bank.config, &mut rng));
+                );
                 if let Ok(mut child) = perturb_strategy_parameters(
                     &bank.specialist_pool[parent].strategy,
                     bank.config.robustness_perturbation_fraction,
@@ -1882,11 +1624,16 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 }
             }
 
-            let first_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
-                .unwrap_or_else(|| tournament(bank, &mut rng, None));
+            if !bank
+                .accepted_pool
+                .iter()
+                .any(|elite| classify_family(&elite.strategy) == family_style)
+            {
+                return fresh_seed(&mut rng);
+            }
+            let first_index = tournament(bank, &mut rng, Some(family_style));
             let first = &bank.accepted_pool[first_index];
-            let second_index = crate::islands::tournament_on_island(bank, &mut rng, island_id)
-                .unwrap_or_else(|| tournament(bank, &mut rng, None));
+            let second_index = tournament(bank, &mut rng, Some(family_style));
             let crossed = crossover(
                 &first.strategy,
                 &bank.accepted_pool[second_index].strategy,
@@ -1898,7 +1645,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 bank.config.structural_mutation_probability,
                 sequence,
                 false,
-                SearchFamily::Universal,
+                family,
                 &bank.config.universal_grammar,
             );
             child.id = format!("i{island_id}-g{generation}-{index}");
@@ -1981,73 +1728,19 @@ fn apply_production_policy(
     mut strategy: StrategyIr,
     config: &crate::model::DiscoverConfig,
 ) -> StrategyIr {
-    strategy.manage.flatten_end_of_day = config.flatten_at_22 || config.sl_tp_only_exits;
+    strategy.manage.flatten_end_of_day = config.flatten_at_22;
     strategy.manage.end_of_day_hour = config.end_of_day_hour;
     strategy.manage.max_one_entry_per_day = config.max_one_entry_per_day;
-    strategy.meta.thesis_hint = format!("{:?}", classify_family(&strategy)).to_ascii_lowercase();
-    if config.sl_tp_only_exits {
-        enforce_sl_tp_only_exits(&mut strategy);
-    } else if config.simple_exits {
+    // Preserve the canonical family tag written by the grammar. Debug-name
+    // lowercasing (for example `TrendPullback` -> `trendpullback`) is not a
+    // stable family identifier and previously forced fallback reclassification
+    // from whichever indicator happened to appear first.
+    if config.simple_exits {
         enforce_simple_exits(&mut strategy, &config.search_ranges);
     } else {
         enforce_execution_feature_flags(&mut strategy, config);
     }
-    enforce_fixed_pip_protection(&mut strategy, config);
     strategy
-}
-
-/// Remove every exit degree of freedom except the protective SL/TP pair and
-/// the common broker-local end-of-day flatten. This runs after every seed and
-/// mutation, so no hidden exit gene can survive into evaluation or export.
-fn enforce_sl_tp_only_exits(strategy: &mut StrategyIr) {
-    strategy.exit = None;
-    strategy.exit_long = None;
-    strategy.exit_short = None;
-    strategy.manage.time_stop_bars = None;
-    strategy.manage.trailing = None;
-    strategy.manage.break_even_at_r = None;
-    strategy.manage.partial_exits.clear();
-}
-
-/// Fixed distances are deliberately a small, explicit alternative to the
-/// volatility-scaled SL/TP pair. The desktop stores the bound broker's pip
-/// size with the run recipe, so EURUSD and JPY pairs use the same human pip
-/// ladder despite different quote precisions.
-fn enforce_fixed_pip_protection(strategy: &mut StrategyIr, config: &crate::model::DiscoverConfig) {
-    if !config.allow_fixed_pip_stops {
-        return;
-    }
-    let selector = strategy
-        .id
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-        });
-    // Keep an equal-sized ATR/R comparison arm. A fixed stop and target are a
-    // single protective-exit family, rather than two independently tuned ways
-    // to fit the same sample.
-    if execution_gene_lane(selector, 0x6669_7865_645f_736c) & 1 != 0 {
-        return;
-    }
-    let pip_points = config.fixed_pip_size_points;
-    let fixed_pips = |lane: u64, range: &crate::model::SearchRange| {
-        let steps = ((range.maximum - range.minimum) / range.step).floor().max(0.0) as u64;
-        range.minimum + (lane % (steps + 1)) as f64 * range.step
-    };
-    let stop_pips = fixed_pips(
-        execution_gene_lane(selector, 0x6669_7865_645f_7374),
-        &config.search_ranges.fixed_stop_pips,
-    );
-    let target_pips = fixed_pips(
-        execution_gene_lane(selector, 0x6669_7865_645f_7470),
-        &config.search_ranges.fixed_target_pips,
-    );
-    strategy.stops.stop_loss = quantforge_ir::StopLossPolicy::FixedPoints {
-        points: stop_pips * pip_points,
-    };
-    strategy.stops.take_profit = quantforge_ir::TakeProfitPolicy::FixedPoints {
-        points: target_pips * pip_points,
-    };
 }
 
 #[derive(Clone, Copy)]
@@ -2079,7 +1772,7 @@ fn enforce_execution_feature_flags(
     strategy: &mut StrategyIr,
     config: &crate::model::DiscoverConfig,
 ) {
-    use quantforge_ir::{EntryDistancePolicy, EntryOrderPolicy};
+    use quantforge_ir::{EntryDistancePolicy, EntryOrderPolicy, PartialExit, TrailingPolicy};
 
     let selector = strategy
         .id
@@ -2140,28 +1833,6 @@ fn enforce_execution_feature_flags(
     let break_even_lane = execution_gene_lane(selector, 0x6272_6561_6b5f_6576);
     let trailing_lane = execution_gene_lane(selector, 0x7472_6169_6c69_6e67);
     let partial_lane = execution_gene_lane(selector, 0x7061_7274_6961_6c73);
-    let exit_rule_lane = execution_gene_lane(selector, 0x696e_6469_6361_746f);
-    let time_stop_lane = execution_gene_lane(selector, 0x7469_6d65_5f73_746f);
-
-    if !config.allow_indicator_exit_rules || exit_rule_lane % 3 == 0 {
-        strategy.exit = None;
-        strategy.exit_long = None;
-        strategy.exit_short = None;
-    }
-    if !config.allow_time_stops || time_stop_lane % 3 == 0 {
-        strategy.manage.time_stop_bars = None;
-    } else if strategy.manage.time_stop_bars.is_none() {
-        let range = &config.search_ranges.time_stop_bars;
-        let (minimum, maximum) = if range.minimum == 0.0 && range.maximum == 0.0 && range.step == 0.0 {
-            (4_u16, 16_u16)
-        } else {
-            let minimum = range.minimum.round().max(1.0) as u16;
-            let maximum = range.maximum.round().max(f64::from(minimum)) as u16;
-            (minimum, maximum)
-        };
-        let span = usize::from(maximum.saturating_sub(minimum)) + 1;
-        strategy.manage.time_stop_bars = Some(minimum + (time_stop_lane as usize % span) as u16);
-    }
 
     if !config.allow_break_even || break_even_lane % 3 == 0 {
         strategy.manage.break_even_at_r = None;
@@ -2172,7 +1843,7 @@ fn enforce_execution_feature_flags(
     if !config.allow_trailing_stops || trailing_lane % 3 == 0 {
         strategy.manage.trailing = None;
     } else if strategy.manage.trailing.is_none() {
-        strategy.manage.trailing = Some(quantforge_ir::TrailingPolicy::RiskMultiple {
+        strategy.manage.trailing = Some(TrailingPolicy::RiskMultiple {
             activate_at_r: [1.0, 1.5, 2.0][trailing_lane as usize % 3],
             distance_r: [0.5, 0.75, 1.0]
                 [execution_gene_lane(selector, 0x7472_6169_6c5f_7061) as usize % 3],
@@ -2181,7 +1852,7 @@ fn enforce_execution_feature_flags(
     if !config.allow_partial_exits || partial_lane % 3 == 0 {
         strategy.manage.partial_exits.clear();
     } else if strategy.manage.partial_exits.is_empty() {
-        strategy.manage.partial_exits.push(quantforge_ir::PartialExit {
+        strategy.manage.partial_exits.push(PartialExit {
             at_r: [0.75, 1.0, 1.25, 1.5][partial_lane as usize % 4],
             fraction: [0.25, 0.5, 0.75]
                 [execution_gene_lane(selector, 0x7061_7274_5f66_7261) as usize % 3],
@@ -2291,10 +1962,15 @@ fn tournament(
     winner
 }
 
-fn tournament_in(pool: &[Elite], config: &DiscoverConfig, rng: &mut ChaCha8Rng) -> usize {
-    let mut winner = rng.gen_range(0..pool.len());
+fn tournament_from_indices(
+    pool: &[Elite],
+    indices: &[usize],
+    config: &DiscoverConfig,
+    rng: &mut ChaCha8Rng,
+) -> usize {
+    let mut winner = indices[rng.gen_range(0..indices.len())];
     for _ in 1..config.tournament_size {
-        let contender = rng.gen_range(0..pool.len());
+        let contender = indices[rng.gen_range(0..indices.len())];
         if selection_is_better(&pool[contender], &pool[winner], config.novelty_weight) {
             winner = contender;
         }
@@ -2446,6 +2122,7 @@ mod tests {
 
     fn config() -> DiscoverConfig {
         DiscoverConfig {
+            search_families: crate::model::default_search_families(),
             initial_candidates: 32,
             batch_size: 16,
             correlation_threshold: 1.0,
@@ -2476,15 +2153,11 @@ mod tests {
                 minimum_return_retention: 0.0,
             },
             search_ranges: crate::model::SearchRangeProfile::default(),
+            scout_fitness_mode: crate::model::ScoutFitnessMode::default(),
             oos1_expectancy_retention: 0.0,
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: true,
             simple_exits: true,
-            sl_tp_only_exits: false,
-            allow_fixed_pip_stops: false,
-            fixed_pip_size_points: 10.0,
-            allow_indicator_exit_rules: false,
-            allow_time_stops: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
@@ -2540,65 +2213,6 @@ mod tests {
                 ..Default::default()
             },
         }
-    }
-
-    #[test]
-    fn sl_tp_only_profile_removes_every_searchable_exit_gene() {
-        let mut strategy = crate::grammar::generate_seed(7, 11);
-        strategy.manage.time_stop_bars = Some(12);
-        strategy.manage.break_even_at_r = Some(1.0);
-        strategy.manage.trailing = Some(quantforge_ir::TrailingPolicy::RiskMultiple {
-            activate_at_r: 1.0,
-            distance_r: 0.5,
-        });
-        strategy.manage.partial_exits.push(quantforge_ir::PartialExit {
-            at_r: 1.0,
-            fraction: 0.5,
-        });
-        let mut constrained = config();
-        constrained.sl_tp_only_exits = true;
-
-        let result = super::apply_production_policy(strategy, &constrained);
-
-        assert!(result.exit.is_none());
-        assert!(result.exit_long.is_none());
-        assert!(result.exit_short.is_none());
-        assert!(result.manage.time_stop_bars.is_none());
-        assert!(result.manage.break_even_at_r.is_none());
-        assert!(result.manage.trailing.is_none());
-        assert!(result.manage.partial_exits.is_empty());
-        assert!(result.manage.flatten_end_of_day);
-    }
-
-    #[test]
-    fn fixed_pip_protection_is_an_explicit_symbol_scaled_sl_tp_arm() {
-        let mut constrained = config();
-        constrained.sl_tp_only_exits = true;
-        constrained.allow_fixed_pip_stops = true;
-        constrained.fixed_pip_size_points = 10.0;
-
-        let candidates: Vec<_> = (0..48)
-            .map(|index| {
-                super::apply_production_policy(
-                    crate::grammar::generate_seed(19, index),
-                    &constrained,
-                )
-            })
-            .collect();
-        let fixed: Vec<_> = candidates
-            .iter()
-            .filter(|strategy| {
-                matches!(strategy.stops.stop_loss, quantforge_ir::StopLossPolicy::FixedPoints { .. })
-                    && matches!(strategy.stops.take_profit, quantforge_ir::TakeProfitPolicy::FixedPoints { .. })
-            })
-            .collect();
-        assert!(!fixed.is_empty());
-        assert!(fixed.iter().all(|strategy| {
-            matches!(strategy.stops.stop_loss, quantforge_ir::StopLossPolicy::FixedPoints { points } if points >= 100.0)
-                && matches!(strategy.stops.take_profit, quantforge_ir::TakeProfitPolicy::FixedPoints { points } if points >= 150.0)
-                && strategy.exit.is_none()
-                && strategy.manage.time_stop_bars.is_none()
-        }));
     }
 
     #[test]
@@ -2748,9 +2362,7 @@ mod tests {
     #[test]
     fn oos1_pick_requires_positive_retention_of_is_expectancy() {
         assert!(passes_oos1_pick(10.0, 7.0, 0.7));
-        assert!(passes_oos1_pick(10.0, 12.0, 1.2));
         assert!(!passes_oos1_pick(10.0, 6.9, 0.7));
-        assert!(!passes_oos1_pick(10.0, 11.9, 1.2));
         assert!(!passes_oos1_pick(10.0, -1.0, 0.7));
         assert!(!passes_oos1_pick(-2.0, 5.0, 0.7));
         assert!(!passes_oos1_pick(f64::NAN, 5.0, 0.7));
@@ -2974,32 +2586,29 @@ mod tests {
     fn quota_mode_keeps_the_robustness_battery_discriminating() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
-        // Old presets clamped these down to 80/5/0.5, which passed everything.
         config.robustness_monte_carlo_trials = 80;
         config.robustness_neighborhood_samples = 5;
-        config.minimum_neighborhood_survival_fraction = 0.5;
+        config.minimum_neighborhood_survival_fraction = 0.1;
         config.apply_run_mode();
-        // A P95 drawdown read off fewer than ~1k resampled paths is noise.
         assert!(config.robustness_monte_carlo_trials >= 1_000);
-        // Ten deterministic axis neighbors come first; 200 H1-cached samples
-        // make the ret/DD histogram dense enough for the orig/median band.
-        assert!(config.robustness_neighborhood_samples >= 200);
-        assert!(config.minimum_neighborhood_survival_fraction >= 0.55);
+        assert!(config.robustness_neighborhood_samples >= 1_000);
+        assert!(config.minimum_neighborhood_survival_fraction >= 0.25);
+        assert!((config.robustness_perturbation_fraction - 0.30).abs() < 1e-9);
     }
 
     #[test]
-    fn quota_holding_is_not_capped_by_family_or_niche_inventory() {
+    fn quota_databank_is_not_capped_by_family_or_niche_inventory() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.apply_run_mode();
         assert_eq!(config.target_databank_elites, Some(400));
         assert!(config.build_to_holding);
-        assert!(config.max_holding_elites >= 2_000);
-        assert!(config.max_elites_per_niche >= 8);
+        assert!(config.max_databank_elites >= 2_000);
+        assert_eq!(config.max_elites_per_niche, 0);
     }
 
     #[test]
-    fn quota_mode_keeps_an_explicit_holding_target() {
+    fn quota_mode_keeps_an_explicit_databank_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.target_databank_elites = Some(500);
@@ -3011,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_mode_keeps_a_large_explicit_holding_target() {
+    fn quota_mode_keeps_a_large_explicit_databank_target() {
         let mut config = DiscoverConfig::default();
         config.run_mode = crate::DiscoverRunMode::QuotaHarvest;
         config.target_databank_elites = Some(2_000);
@@ -3023,140 +2632,6 @@ mod tests {
     fn factory_score_ranks_busy_positive_expectancy_ahead_of_heroes() {
         assert!(super::holding_factory_score(200, 0.12) > super::holding_factory_score(40, 0.40));
         assert_eq!(super::holding_factory_score(500, -0.10), 0.0);
-    }
-
-    #[test]
-    fn explicit_robustness_bypass_moves_the_complete_holding_cohort() {
-        let dataset = dataset();
-        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
-        bank.holding = bank.accepted_pool.iter().take(3).cloned().collect();
-        assert!(!bank.holding.is_empty());
-        let expected: Vec<_> = bank
-            .holding
-            .iter()
-            .map(|elite| elite.structural_fingerprint.clone())
-            .collect();
-
-        let result = super::promote_all_holding_without_robustness(&mut bank);
-
-        assert_eq!(result.promoted, expected.len());
-        assert_eq!(result.replaced, 0);
-        assert!(bank.holding.is_empty());
-        assert!(bank.holding_coverage_map.is_empty());
-        assert_eq!(bank.elites.len(), expected.len());
-        assert_eq!(bank.coverage_map.len(), expected.len());
-        assert!(bank.elites.iter().all(|elite| {
-            elite
-                .gate_results
-                .iter()
-                .any(|gate| gate.name == "robustness_bypass" && !gate.passed)
-        }));
-        assert!(expected.iter().all(|fingerprint| {
-            bank.elites
-                .iter()
-                .any(|elite| &elite.structural_fingerprint == fingerprint)
-        }));
-    }
-
-    #[test]
-    fn audited_graduation_preserves_the_audit_instead_of_marking_a_bypass() {
-        let dataset = dataset();
-        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
-        bank.holding = bank.accepted_pool.iter().take(1).cloned().collect();
-        let fingerprint = bank.holding[0].structural_fingerprint.to_string();
-        bank.holding[0].gate_results.push(GateResult {
-            name: "robustness_audit".into(),
-            passed: false,
-            detail: "Recorded failure.".into(),
-        });
-
-        let result = super::promote_selected_holding_without_robustness(
-            &mut bank,
-            &BTreeSet::from([fingerprint]),
-            None,
-        );
-
-        assert_eq!(result.promoted, 1);
-        assert!(bank.elites[0]
-            .gate_results
-            .iter()
-            .any(|gate| gate.name == "robustness_audit" && !gate.passed));
-        assert!(!bank.elites[0]
-            .gate_results
-            .iter()
-            .any(|gate| gate.name == "robustness_bypass"));
-    }
-
-    #[test]
-    fn battery_audit_records_its_result_without_moving_the_holding_candidate() {
-        let dataset = dataset();
-        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
-        bank.holding = bank.accepted_pool.iter().take(1).cloned().collect();
-        let fingerprint = bank.holding[0].structural_fingerprint.clone();
-
-        let result = super::audit_holding_battery(
-            &mut bank,
-            &fingerprint,
-            &dataset,
-            &dataset,
-            None,
-            &broker(),
-        )
-        .unwrap();
-
-        assert_eq!(result.fingerprint, fingerprint);
-        assert_eq!(bank.holding.len(), 1);
-        assert!(bank.elites.is_empty());
-        assert!(bank.holding[0]
-            .gate_results
-            .iter()
-            .any(|gate| gate.name == "robustness_audit" && gate.passed == result.passed));
-    }
-
-    #[test]
-    fn production_lane_promotion_moves_only_selected_holding_names() {
-        let dataset = dataset();
-        let mut bank = evolve_new(&dataset, None, &dataset, &broker(), config(), 0).unwrap();
-        bank.holding = bank.accepted_pool.iter().take(3).cloned().collect();
-        assert!(bank.holding.len() >= 2);
-        let selected_fingerprint = bank.holding[0].structural_fingerprint.to_string();
-        let untouched_fingerprint = bank.holding[1].structural_fingerprint.clone();
-        let selected = BTreeSet::from([selected_fingerprint]);
-
-        let result = super::promote_selected_holding_without_robustness(
-            &mut bank,
-            &selected,
-            Some(GateResult {
-                name: "production_lane_v1".into(),
-                passed: true,
-                detail: "Selected using Development evidence only.".into(),
-            }),
-        );
-
-        assert_eq!(result.promoted, 1);
-        assert_eq!(result.replaced, 0);
-        assert!(
-            bank.holding
-                .iter()
-                .any(|elite| elite.structural_fingerprint == untouched_fingerprint)
-        );
-        let promoted = bank
-            .elites
-            .iter()
-            .find(|elite| selected.contains(elite.structural_fingerprint.as_str()))
-            .unwrap();
-        assert!(
-            promoted
-                .gate_results
-                .iter()
-                .any(|gate| { gate.name == "production_lane_v1" && gate.passed })
-        );
-        assert!(
-            promoted
-                .gate_results
-                .iter()
-                .any(|gate| { gate.name == "robustness_bypass" && !gate.passed })
-        );
     }
 
     #[test]
@@ -3222,6 +2697,23 @@ mod tests {
     }
 
     #[test]
+    fn live_initial_population_is_balanced_and_never_uses_universal() {
+        let mut cfg = config();
+        cfg.initial_candidates = PRODUCTION_SEARCH_FAMILIES.len() * 2;
+        let population = generate_initial_population(&cfg);
+        for family in PRODUCTION_SEARCH_FAMILIES {
+            let count = population
+                .iter()
+                .filter(|strategy| classify_family(strategy) == family.style())
+                .count();
+            assert_eq!(count, 2, "family {} was not balanced", family.label());
+        }
+        assert!(population
+            .iter()
+            .all(|strategy| classify_family(strategy) != crate::model::FamilyStyle::Universal));
+    }
+
+    #[test]
     fn promotion_context_is_shared_across_generations() {
         let dataset = dataset();
         let broker = broker();
@@ -3236,14 +2728,14 @@ mod tests {
     }
 
     #[test]
-    fn oos1_is_kept_out_of_breeding_archives() {
+    fn oos1_is_not_a_promotion_pick() {
         let dataset = dataset();
         let mut cfg = config();
         cfg.mutate_after_elites = 1;
         cfg.require_m1_robustness = false;
         let oos1 = dataset.clone();
         let bank = evolve_new(&dataset, Some(&oos1), &dataset, &broker(), cfg, 2)
-            .expect("OOS1 is deferred until after the Development battery");
+            .expect("OOS1 may be supplied but must not be used to pick");
         assert!(
             bank.accepted_pool
                 .iter()

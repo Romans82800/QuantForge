@@ -114,12 +114,6 @@ pub struct SearchRangeProfile {
     pub atr_target_multiple: SearchRange,
     #[serde(rename = "riskTargetMultiple", alias = "risk_target_multiple")]
     pub risk_target_multiple: SearchRange,
-    /// FX pips, converted to the bound broker's quote points only when the
-    /// optional fixed-pip protective-exit arm is enabled.
-    #[serde(rename = "fixedStopPips", alias = "fixed_stop_pips")]
-    pub fixed_stop_pips: SearchRange,
-    #[serde(rename = "fixedTargetPips", alias = "fixed_target_pips")]
-    pub fixed_target_pips: SearchRange,
     #[serde(rename = "pendingDistanceAtr", alias = "pending_distance_atr")]
     pub pending_distance_atr: SearchRange,
     #[serde(rename = "pendingExpiryBars", alias = "pending_expiry_bars")]
@@ -180,8 +174,6 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 4.0, 0.5),
             atr_target_multiple: SearchRange::new(1.0, 6.0, 1.0),
             risk_target_multiple: SearchRange::new(0.75, 4.5, 0.5),
-            fixed_stop_pips: SearchRange::new(10.0, 80.0, 5.0),
-            fixed_target_pips: SearchRange::new(15.0, 120.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 2.0, 0.5),
             pending_expiry_bars: SearchRange::new(2.0, 8.0, 1.0),
             time_stop_bars: SearchRange::new(4.0, 16.0, 1.0),
@@ -214,8 +206,6 @@ impl SearchRangeProfile {
             atr_stop_multiple: SearchRange::new(1.0, 5.0, 0.5),
             atr_target_multiple: SearchRange::new(1.5, 8.0, 1.0),
             risk_target_multiple: SearchRange::new(1.0, 5.0, 0.5),
-            fixed_stop_pips: SearchRange::new(10.0, 100.0, 5.0),
-            fixed_target_pips: SearchRange::new(15.0, 150.0, 5.0),
             pending_distance_atr: SearchRange::new(0.25, 3.0, 0.5),
             pending_expiry_bars: SearchRange::new(1.0, 12.0, 1.0),
             time_stop_bars: SearchRange::new(2.0, 48.0, 1.0),
@@ -237,6 +227,36 @@ impl SearchRangeProfile {
         }
     }
 
+    /// Widest SQX-style gene space: long indicator periods, broad stops/targets,
+    /// and session geometry suited to multi-year H1 discovery.
+    pub fn sqx_wide() -> Self {
+        Self {
+            indicator_period: SearchRange::new(5.0, 100.0, 1.0),
+            atr_period: SearchRange::new(5.0, 50.0, 1.0),
+            atr_stop_multiple: SearchRange::new(0.5, 8.0, 0.5),
+            atr_target_multiple: SearchRange::new(1.0, 12.0, 0.5),
+            risk_target_multiple: SearchRange::new(0.5, 8.0, 0.5),
+            pending_distance_atr: SearchRange::new(0.25, 4.0, 0.25),
+            pending_expiry_bars: SearchRange::new(1.0, 24.0, 1.0),
+            time_stop_bars: SearchRange::new(2.0, 96.0, 1.0),
+            rsi_upper: SearchRange::new(50.0, 85.0, 1.0),
+            rsi_lower: SearchRange::new(15.0, 50.0, 1.0),
+            adx_threshold: SearchRange::new(10.0, 45.0, 1.0),
+            roc_threshold: SearchRange::new(0.05, 8.0, 0.05),
+            percentile_low: SearchRange::new(3.0, 35.0, 1.0),
+            zscore_threshold: SearchRange::new(0.5, 4.0, 0.1),
+            impulse_body_ratio: SearchRange::new(0.45, 0.90, 0.05),
+            impulse_close_location: SearchRange::new(0.55, 0.95, 0.05),
+            atr_percentile_max: SearchRange::new(5.0, 60.0, 1.0),
+            atr_percentile_lookback: SearchRange::new(10.0, 120.0, 10.0),
+            session_start_hour: SearchRange::new(0.0, 22.0, 1.0),
+            session_range_bars: SearchRange::new(1.0, 8.0, 1.0),
+            swing_bars: SearchRange::new(2.0, 12.0, 1.0),
+            base_bars: SearchRange::new(2.0, 12.0, 1.0),
+            liquidity_sweep_threshold: SearchRange::new(0.0, 1.0, 0.25),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DiscoverError> {
         for (name, range) in [
             ("indicator_period", &self.indicator_period),
@@ -244,8 +264,6 @@ impl SearchRangeProfile {
             ("atr_stop_multiple", &self.atr_stop_multiple),
             ("atr_target_multiple", &self.atr_target_multiple),
             ("risk_target_multiple", &self.risk_target_multiple),
-            ("fixed_stop_pips", &self.fixed_stop_pips),
-            ("fixed_target_pips", &self.fixed_target_pips),
             ("pending_distance_atr", &self.pending_distance_atr),
             ("pending_expiry_bars", &self.pending_expiry_bars),
             ("time_stop_bars", &self.time_stop_bars),
@@ -265,16 +283,6 @@ impl SearchRangeProfile {
             ("base_bars", &self.base_bars),
             ("liquidity_sweep_threshold", &self.liquidity_sweep_threshold),
         ] {
-            // Optional pending expiry and time-stop genes use an all-zero
-            // range as their saved "off" state. They are never sampled until
-            // their execution-module switch is enabled.
-            if matches!(name, "pending_expiry_bars" | "time_stop_bars")
-                && range.minimum == 0.0
-                && range.maximum == 0.0
-                && range.step == 0.0
-            {
-                continue;
-            }
             range.validate(name)?;
         }
         Ok(())
@@ -480,6 +488,13 @@ pub struct UniversalGrammarConfig {
 
 impl Default for UniversalGrammarConfig {
     fn default() -> Self {
+        Self::sqx_wide()
+    }
+}
+
+impl UniversalGrammarConfig {
+    /// Compact H1/M15 grammar (2 entry atoms, tight shifts).
+    pub fn h1_compact() -> Self {
         Self {
             minimum_entry_conditions: 2,
             maximum_entry_conditions: 2,
@@ -487,6 +502,19 @@ impl Default for UniversalGrammarConfig {
             maximum_exit_conditions: 3,
             minimum_shift: 1,
             maximum_shift: 3,
+        }
+    }
+
+    /// SQX-style wider structure: up to four mirrored entry blocks and longer
+    /// closed-bar shifts so random search explores richer trees.
+    pub fn sqx_wide() -> Self {
+        Self {
+            minimum_entry_conditions: 2,
+            maximum_entry_conditions: 4,
+            minimum_exit_conditions: 1,
+            maximum_exit_conditions: 3,
+            minimum_shift: 1,
+            maximum_shift: 8,
         }
     }
 }
@@ -539,6 +567,17 @@ pub struct SearchFamilySpec {
     pub complexity_penalty_weight: f64,
 }
 
+/// How the H1 scout ranks pot parents before M1/Holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoutFitnessMode {
+    /// Pooled IS expectancy, return, PF — SQX-style build fitness.
+    #[default]
+    RawIs,
+    /// Median calendar-year fold-R minus spread — anti single-year luck.
+    StableFold,
+}
+
 /// Fast Scout = cheap H1 IS/OOS1; Full Harvest = multi-elite stacking + Selected-TF;
 /// Quota Harvest = ~20 databank elites per family without chasing pot 300.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +606,10 @@ pub const TRIAL_BUDGET_WARNING: u64 = 1_500;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscoverConfig {
+    /// Families allowed for this run. Empty legacy values are normalized to
+    /// the balanced production catalog by the engine.
+    #[serde(default = "default_search_families")]
+    pub search_families: Vec<SearchFamily>,
     pub initial_candidates: usize,
     pub batch_size: usize,
     pub correlation_threshold: f64,
@@ -597,8 +640,11 @@ pub struct DiscoverConfig {
     pub deposit_gates: GateConfig,
     pub precision: PrecisionGateConfig,
     /// Immutable numeric search space for indicators, stops and management genes.
-    #[serde(default)]
+    #[serde(default = "default_search_ranges")]
     pub search_ranges: SearchRangeProfile,
+    /// Scout tournament fitness: raw IS metrics vs fold-stable R.
+    #[serde(default)]
+    pub scout_fitness_mode: ScoutFitnessMode,
     /// Required OOS1 expectancy retention after the complete Development
     /// promotion battery. Unused: Discover no longer picks on OOS1.
     #[serde(default = "default_oos1_expectancy_retention")]
@@ -617,26 +663,6 @@ pub struct DiscoverConfig {
     /// hard time stop of at most 16 bars — higher H1↔M1 agreement.
     #[serde(default = "default_simple_exits")]
     pub simple_exits: bool,
-    /// Constrained production lane: only protective stop, take-profit and the
-    /// end-of-day flatten can close a trade. Indicator exits and time stops
-    /// are not searchable in this profile.
-    #[serde(default = "default_sl_tp_only_exits")]
-    pub sl_tp_only_exits: bool,
-    /// Allow a fixed-pip SL/TP pair alongside the ATR/R protective pair. The
-    /// desktop binds a pip to the selected FX broker's quote precision.
-    #[serde(default)]
-    pub allow_fixed_pip_stops: bool,
-    /// Number of broker points in one pip for the bound symbol (10 for 5- and
-    /// 3-decimal FX quotes, otherwise 1). Stored with the recipe so replays
-    /// cannot silently change the fixed-distance interpretation.
-    #[serde(default = "default_fixed_pip_size_points")]
-    pub fixed_pip_size_points: f64,
-    /// Permit indicator-based exit rules as an explicit research gene.
-    #[serde(default)]
-    pub allow_indicator_exit_rules: bool,
-    /// Permit a time stop / "exit after N bars" as an explicit research gene.
-    #[serde(default)]
-    pub allow_time_stops: bool,
     /// Individually opt-in execution genes. Off in the high-parity Selected-TF
     /// baseline; enabling them widens search and makes M1/MT5 final gates more
     /// important — they do not block Discover breeding.
@@ -720,16 +746,13 @@ pub struct DiscoverConfig {
     /// battery. `0` disables the cap.
     #[serde(default = "default_max_per_entry_family")]
     pub max_per_entry_family: usize,
-    /// When true (default), post-breed survivors go to Holding after H1 gates +
-    /// M1 fidelity — not Databank. Heavy WFO/MC/±param/OOS1 wait for an
-    /// on-demand battery. When false, legacy path deposits straight to Databank.
+    /// Stage M1-fidelity survivors in Holding before they run the full
+    /// robustness battery. Holding is not certified and never feeds breeding;
+    /// only battery survivors can enter the Databank.
     #[serde(default = "default_build_to_holding")]
     pub build_to_holding: bool,
-    /// After breeding unlocks, run the M1 walk-forward / Monte Carlo / ±param
-    /// neighborhood battery before databank admission. Ignored when
-    /// `build_to_holding` is true (battery is deferred). Holding promotion
-    /// never waits on a full M1 queue; full-harvest Databank promotion still
-    /// blocks on pot admits.
+    /// After breeding unlocks, run the M1 OptProfile / Monte Carlo battery
+    /// before databank admission.
     #[serde(default = "default_require_m1_robustness")]
     pub require_m1_robustness: bool,
     #[serde(default = "default_robustness_folds")]
@@ -757,8 +780,8 @@ pub struct DiscoverConfig {
     /// Fraction of ±param neighbors that must survive for databank promotion.
     #[serde(default = "default_minimum_neighborhood_survival_fraction")]
     pub minimum_neighborhood_survival_fraction: f64,
-    /// Use broker-local calendar-year folds (every year must pass) instead of
-    /// contiguous index slices.
+    /// Legacy UI flag. Calendar-year folds are always diagnostics on deposit;
+    /// they never hard-kill. Kept for sealed-config compatibility.
     #[serde(default = "default_calendar_year_folds")]
     pub calendar_year_folds: bool,
     /// When set, databank admission requires deflated trade Sharpe ≥ this floor.
@@ -810,16 +833,6 @@ fn default_require_m1_precision() -> bool {
 
 fn default_simple_exits() -> bool {
     true
-}
-
-fn default_sl_tp_only_exits() -> bool {
-    // Keep old serialized archives and direct library callers behaviourally
-    // stable. The desktop new-job recipe explicitly enables this profile.
-    false
-}
-
-fn default_fixed_pip_size_points() -> f64 {
-    10.0
 }
 
 fn default_max_one_entry_per_day() -> bool {
@@ -883,8 +896,6 @@ fn default_build_to_holding() -> bool {
 }
 
 fn default_require_m1_robustness() -> bool {
-    // Legacy direct-to-databank path runs the M1 robustness battery.
-    // Default Discover uses `build_to_holding` and defers this battery.
     true
 }
 
@@ -918,25 +929,22 @@ fn default_robustness_monte_carlo_max_drawdown_ratio() -> f64 {
 }
 
 fn default_robustness_neighborhood_samples() -> usize {
-    // Ten deterministic one-axis neighbors run first (sl, tp, atr, entry, manage
-    // × lo/hi); everything past them is randomized joint jitter that perturbs the
-    // entry indicator periods. 200 H1-cached samples make the ret/DD histogram
-    // dense enough for the 0.85–1.25 orig/median band.
-    200
-}
-
-fn default_allow_market_entries() -> bool {
-    true
+    // SQX OptProfile: up to MaxTests one-param grid points (±30% × 25 steps).
+    crate::robustness::OPT_PROFILE_MAX_TESTS
 }
 
 fn default_robustness_perturbation_fraction() -> f64 {
+    // SQX OptProfile DistributionUp/Down = 30%.
     crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION
 }
 
 fn default_minimum_neighborhood_survival_fraction() -> f64 {
-    // Joint ±20% jitter of every numeric gene; a real plateau lands near 0.5–0.6.
-    // Orig Ret/DD 0.85–1.25 of the neighbourhood median is the overfitting veto.
-    0.55
+    // SQX ProfitOptPct (your Retest project uses 25%).
+    crate::robustness::OPT_PROFILE_PROFIT_OPT_PCT
+}
+
+fn default_allow_market_entries() -> bool {
+    true
 }
 
 fn default_calendar_year_folds() -> bool {
@@ -956,6 +964,10 @@ pub fn default_history_start_year() -> u16 {
     quantforge_data::DEFAULT_HISTORY_START_YEAR
 }
 
+fn default_search_ranges() -> SearchRangeProfile {
+    SearchRangeProfile::sqx_wide()
+}
+
 fn default_island_count() -> usize {
     1
 }
@@ -969,6 +981,7 @@ fn default_migration_elites() -> usize {
 impl Default for DiscoverConfig {
     fn default() -> Self {
         Self {
+            search_families: default_search_families(),
             initial_candidates: 500,
             batch_size: 200,
             // Pack densely just under 0.85 produced cousin stacks with the
@@ -986,16 +999,12 @@ impl Default for DiscoverConfig {
             gates: GateConfig::default(),
             deposit_gates: GateConfig::deposit_defaults(),
             precision: PrecisionGateConfig::default(),
-            search_ranges: SearchRangeProfile::default(),
+            search_ranges: default_search_ranges(),
+            scout_fitness_mode: ScoutFitnessMode::default(),
             oos1_expectancy_retention: default_oos1_expectancy_retention(),
             minimum_development_expectancy_r: 0.0,
             require_m1_precision: default_require_m1_precision(),
             simple_exits: default_simple_exits(),
-            sl_tp_only_exits: default_sl_tp_only_exits(),
-            allow_fixed_pip_stops: false,
-            fixed_pip_size_points: default_fixed_pip_size_points(),
-            allow_indicator_exit_rules: false,
-            allow_time_stops: false,
             allow_break_even: false,
             allow_trailing_stops: false,
             allow_partial_exits: false,
@@ -1047,6 +1056,13 @@ impl Default for DiscoverConfig {
     }
 }
 
+pub fn default_search_families() -> Vec<SearchFamily> {
+    SearchFamily::ALL
+        .into_iter()
+        .filter(|family| *family != SearchFamily::Universal)
+        .collect()
+}
+
 impl DiscoverConfig {
     /// Apply Fast Scout, Full Harvest, or Quota Harvest presets.
     pub fn apply_run_mode(&mut self) {
@@ -1055,9 +1071,7 @@ impl DiscoverConfig {
                 self.initial_candidates = self.initial_candidates.clamp(40, 80);
                 self.batch_size = self.batch_size.clamp(20, 40);
                 // Pot-only scout: stop before breeding so M1/databank never starts.
-                if self.has_complex_execution() {
-                    self.simple_exits = false;
-                }
+                self.simple_exits = !self.has_complex_execution();
                 if self.early_stop_pot_elites.is_none() {
                     self.early_stop_pot_elites = Some(8);
                 }
@@ -1066,14 +1080,17 @@ impl DiscoverConfig {
             DiscoverRunMode::FullHarvest => {
                 // Do not silently erase an explicitly selected execution module.
                 // A run with no modules retains the selected-TF high-parity shape.
-                if self.has_complex_execution() {
+                if !self.has_complex_execution() {
+                    self.simple_exits = true;
+                } else {
                     self.simple_exits = false;
                 }
             }
             DiscoverRunMode::QuotaHarvest => {
-                // Overnight Holding fill: cheap M1 80/130 + fold-R. Plateau /
-                // CPCV / MC stay on the Holding → Databank battery.
-                if self.has_complex_execution() {
+                // Volume scout → M1 Holding → OptProfile + Monte Carlo → Databank.
+                if !self.has_complex_execution() {
+                    self.simple_exits = true;
+                } else {
                     self.simple_exits = false;
                 }
                 self.require_m1_precision = true;
@@ -1083,37 +1100,37 @@ impl DiscoverConfig {
                 self.batch_size = self.batch_size.max(300);
                 self.random_fill_fraction = self.random_fill_fraction.max(0.75);
                 self.mutate_after_elites = self.mutate_after_elites.min(25);
-                // Do not early-stop on pot size — that freezes before Holding fills.
-                // Only the Holding/databank quota stops the run.
+                // Do not early-stop on pot size — only the databank quota stops.
                 self.early_stop_pot_elites = None;
                 self.target_databank_elites =
                     Some(self.target_databank_elites.unwrap_or(400).clamp(40, 10_000));
-                self.max_holding_elites = self.max_holding_elites.max(2_000);
                 self.max_databank_elites = self.max_databank_elites.max(2_000);
                 // 6-of-N pack replays belong to Full Harvest. Quota is a
                 // single-symbol volume scout; leftover pack defaults made
                 // Looked-at crawl versus the previous ~3M evals/hour runs.
                 self.multi_symbol_minimum_pass = 0;
-                // Holding/Databank ignore family, niche, and correlation inventory.
                 // Niches stay on the breeding pot, scoped per island.
                 // MC resamples the trade-profit vector instead of replaying bars, so
                 // trials are nearly free; ~1k paths make the P95 drawdown stable.
                 self.robustness_monte_carlo_trials = self.robustness_monte_carlo_trials.max(1_000);
-                // Ten deterministic one-axis neighbors run before the randomized
-                // joint draw perturbs entry indicator periods; 200 H1-cached
-                // samples make the ret/DD histogram usable.
-                self.robustness_neighborhood_samples =
-                    self.robustness_neighborhood_samples.max(200);
-                self.minimum_neighborhood_survival_fraction =
-                    self.minimum_neighborhood_survival_fraction.max(0.55);
-                self.max_elites_per_niche = self.max_elites_per_niche.max(8);
+                // SQX OptProfile: ±30% one-param grid, ProfitOptPct ≥ 25%.
+                self.robustness_neighborhood_samples = self
+                    .robustness_neighborhood_samples
+                    .max(crate::robustness::OPT_PROFILE_MAX_TESTS);
+                self.robustness_perturbation_fraction = self
+                    .robustness_perturbation_fraction
+                    .max(crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION);
+                self.minimum_neighborhood_survival_fraction = self
+                    .minimum_neighborhood_survival_fraction
+                    .max(crate::robustness::OPT_PROFILE_PROFIT_OPT_PCT)
+                    .min(1.0);
+                // SQX databank style: fingerprint + correlation, not niche bags.
+                self.max_elites_per_niche = 0;
             }
             DiscoverRunMode::HighPerformanceIslands => {
                 // Identical balanced populations with deterministic migration.
                 // Asymmetric refinement/exploration roles encouraged overfitting.
-                if self.has_complex_execution() {
-                    self.simple_exits = false;
-                }
+                self.simple_exits = !self.has_complex_execution();
                 self.refinement_island_count = 0;
                 self.exploration_island_count = 0;
                 if self.general_island_count == 0 {
@@ -1127,12 +1144,22 @@ impl DiscoverConfig {
                 self.batch_size = self.batch_size.max(500);
                 self.early_stop_pot_elites = None;
                 self.target_databank_elites = None;
-                self.max_holding_elites = self.max_holding_elites.max(10_000);
                 self.max_databank_elites = self.max_databank_elites.max(10_000);
                 self.require_m1_precision = true;
                 self.require_m1_robustness = true;
                 self.build_to_holding = true;
                 self.multi_symbol_minimum_pass = 0;
+                self.robustness_neighborhood_samples = self
+                    .robustness_neighborhood_samples
+                    .max(crate::robustness::OPT_PROFILE_MAX_TESTS);
+                self.robustness_perturbation_fraction = self
+                    .robustness_perturbation_fraction
+                    .max(crate::robustness::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION);
+                self.minimum_neighborhood_survival_fraction = self
+                    .minimum_neighborhood_survival_fraction
+                    .max(crate::robustness::OPT_PROFILE_PROFIT_OPT_PCT)
+                    .min(1.0);
+                self.max_elites_per_niche = 0;
             }
         }
     }
@@ -1151,9 +1178,7 @@ impl DiscoverConfig {
     }
 
     pub const fn has_complex_execution(&self) -> bool {
-        self.allow_indicator_exit_rules
-            || self.allow_time_stops
-            || self.allow_break_even
+        self.allow_break_even
             || self.allow_trailing_stops
             || self.allow_partial_exits
             || self.allow_stop_entries
@@ -1181,13 +1206,6 @@ impl DiscoverConfig {
         if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
             return Err(DiscoverError::InvalidConfig(
                 "enable at least one entry order kind: market, stop or limit".into(),
-            ));
-        }
-        if self.allow_fixed_pip_stops
-            && (!self.fixed_pip_size_points.is_finite() || self.fixed_pip_size_points <= 0.0)
-        {
-            return Err(DiscoverError::InvalidConfig(
-                "fixed pip stops require a positive broker pip size".into(),
             ));
         }
         if self.island_count == 0 {
@@ -1581,7 +1599,7 @@ pub struct ParameterNeighborhoodEvidence {
     /// Original unperturbed Selected-TF metrics for Orig. reference markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_metrics: Option<BacktestMetrics>,
-    /// Neighbourhood-median recovery factor used by the 0.85–1.25 orig/median gate.
+    /// Neighbourhood-median recovery factor used by the 0.75–1.50 orig/median gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_recovery_factor: Option<f64>,
     /// `original recovery / median recovery` when both are finite.
@@ -1863,9 +1881,8 @@ pub struct Databank {
     pub holding: Vec<Elite>,
     #[serde(default)]
     pub holding_coverage_map: BTreeMap<String, ContentHash>,
-    /// Promotion databank. Normal entries passed Development M1/CPCV/MC/parameter
-    /// robustness; explicit desktop bypass entries carry a failed
-    /// `robustness_bypass` gate marker. OOS2 is absent.
+    /// Promotion databank: elites that passed Development M1/CPCV/MC/parameter
+    /// robustness and the subsequent OOS1 validation gate. OOS2 is absent.
     pub elites: Vec<Elite>,
     /// Stable niche string to elite fingerprint, convenient for UI coverage maps.
     pub coverage_map: BTreeMap<String, ContentHash>,

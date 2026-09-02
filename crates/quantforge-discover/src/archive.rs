@@ -282,7 +282,8 @@ fn deposit_into_stack(
             .iter()
             .enumerate()
             .filter(|(_, elite)| {
-                elite.niche == niche && (!niche_per_island || elite.island_id == island_id)
+                elite.niche == niche
+                    && (!niche_per_island || elite.island_id == island_id)
             })
             .map(|(index, _)| index)
             .collect();
@@ -462,10 +463,7 @@ pub fn entry_family_key(strategy: &StrategyIr) -> String {
     }
 }
 
-fn collect_indicator_ops(
-    expr: &quantforge_ir::BoolExpr,
-    out: &mut std::collections::BTreeSet<String>,
-) {
+fn collect_indicator_ops(expr: &quantforge_ir::BoolExpr, out: &mut std::collections::BTreeSet<String>) {
     use quantforge_ir::BoolExpr;
     match expr {
         BoolExpr::Compare { left, right, .. }
@@ -492,10 +490,7 @@ fn collect_indicator_ops(
     }
 }
 
-fn collect_numeric_ops(
-    expr: &quantforge_ir::NumericExpr,
-    out: &mut std::collections::BTreeSet<String>,
-) {
+fn collect_numeric_ops(expr: &quantforge_ir::NumericExpr, out: &mut std::collections::BTreeSet<String>) {
     use quantforge_ir::NumericExpr;
     if let NumericExpr::Indicator { value } = expr {
         out.insert(indicator_operator_name(value));
@@ -1058,11 +1053,7 @@ mod tests {
         .unwrap();
         assert_eq!(accepted, DepositDecision::AcceptedToPot);
         assert_eq!(bank.accepted_pool.len(), 2);
-        let islands: Vec<u16> = bank
-            .accepted_pool
-            .iter()
-            .map(|elite| elite.island_id)
-            .collect();
+        let islands: Vec<u16> = bank.accepted_pool.iter().map(|elite| elite.island_id).collect();
         assert!(islands.contains(&0) && islands.contains(&1));
     }
 
@@ -1160,9 +1151,7 @@ mod tests {
             .map(|offset| generate_seed(7, offset))
             .find(|strategy| {
                 entry_family_key(strategy) == family
-                    && strategy
-                        .structural_fingerprint(quantforge_core::FloatPolicy::default())
-                        .ok()
+                    && strategy.structural_fingerprint(quantforge_core::FloatPolicy::default()).ok()
                         != generate_seed(7, 0)
                             .structural_fingerprint(quantforge_core::FloatPolicy::default())
                             .ok()

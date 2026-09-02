@@ -1,23 +1,18 @@
 use crate::data_lab::{
     apply_history_start_year, build_decision_from_m1, build_decision_from_m1_quotes, display_path,
     load_bound_broker, load_data_source, load_quote_sidecar, trim_market_history_to_year,
+    trim_market_history_to_dates,
 };
 use crate::databank::{
     DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
 };
 use quantforge_data::{
-    BarDataset, bar_content_hash, build_timeframe_from_m1, build_timeframe_from_m1_with_quotes,
-    infer_median_interval_ms,
+    BarDataset, bar_content_hash, build_timeframe_from_m1, infer_median_interval_ms,
 };
 use quantforge_discover::{
     ConditionBakeoffConfig, ConditionBakeoffReport, DEFAULT_FX_PACK, Databank, DiscoverConfig,
-    DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, TimeframeAblationConfig,
-    TimeframeAblationReport, TimeframeBakeoffConfig, TimeframeBakeoffReport, TimeframeGateConfig,
-    TimeframeRollingWindow, UniversalGrammarConfig, new_databank,
-    run_condition_bakeoff as evolve_condition_bakeoff,
-    run_timeframe_ablation as evolve_timeframe_ablation,
-    run_timeframe_bakeoff as evolve_timeframe_bakeoff,
-    run_timeframe_rolling_ablation as evolve_timeframe_rolling_ablation,
+    DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, UniversalGrammarConfig,
+    new_databank, run_condition_bakeoff as evolve_condition_bakeoff,
 };
 use quantforge_eval::{CostModel, SameBarPolicy, ScoutConfig};
 use quantforge_storage::{RunManifest, RunRecipe, write_json_new, write_json_replacing};
@@ -34,8 +29,6 @@ use tauri::State;
 
 const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const ROLLING_THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
-const HOLDING_STALL_GENERATIONS: u64 = 25;
-const HOLDING_STALL_MIN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,7 +42,6 @@ pub enum DiscoverMode {
 enum DecisionTimeframe {
     H1,
     M15,
-    H4,
 }
 
 impl DecisionTimeframe {
@@ -57,7 +49,6 @@ impl DecisionTimeframe {
         match self {
             Self::H1 => 3_600_000,
             Self::M15 => 900_000,
-            Self::H4 => 14_400_000,
         }
     }
 }
@@ -110,13 +101,6 @@ pub struct DiscoverRequest {
     /// Legacy selected-TF compatibility profile. Explicit feature toggles below
     /// take precedence; they widen search without forcing M1 during Discover.
     simple_exits: Option<bool>,
-    /// Constrained profile: only SL, TP and end-of-day close can exit.
-    sl_tp_only_exits: Option<bool>,
-    /// Add a fixed-pip SL/TP family beside the ATR/R protective family.
-    allow_fixed_pip_stops: Option<bool>,
-    /// Explicit research-only exit genes. They are off in the constrained recipe.
-    allow_indicator_exit_rules: Option<bool>,
-    allow_time_stops: Option<bool>,
     allow_break_even: Option<bool>,
     allow_trailing_stops: Option<bool>,
     allow_partial_exits: Option<bool>,
@@ -143,9 +127,9 @@ pub struct DiscoverRequest {
     /// artifact before the operating system is forced to kill it.
     max_memory_mb: Option<u64>,
     require_m1_robustness: Option<bool>,
-    /// When true, Discover fills Holding instead of Databank. Default false:
-    /// overnight Discover grows Databank after H1 permutation/folds/MC.
+    /// Stage M1-fidelity survivors in Holding before the full robustness battery.
     build_to_holding: Option<bool>,
+    /// Sequential Development walk-forward fold count (hard deposit selector).
     robustness_folds: Option<usize>,
     robustness_monte_carlo_trials: Option<usize>,
     robustness_monte_carlo_block_length: Option<usize>,
@@ -155,9 +139,9 @@ pub struct DiscoverRequest {
     robustness_neighborhood_samples: Option<usize>,
     /// Size of the ±% jitter applied to every numeric gene (default 0.20).
     robustness_perturbation_fraction: Option<f64>,
-    /// Fraction of ±param neighbors that must survive (default 0.55).
+    /// SQX ProfitOptPct fraction of one-param neighbours that must be profitable (default 0.25).
     minimum_neighborhood_survival_fraction: Option<f64>,
-    /// Broker-local calendar-year folds; every year must pass (strict opt-in).
+    /// Legacy: calendar-year folds are diagnostics only (never a hard kill).
     calendar_year_folds: Option<bool>,
     /// Hard deflated-Sharpe floor; omit for report-only.
     minimum_deflated_trade_sharpe: Option<f64>,
@@ -168,6 +152,8 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
+    /// Optional allow-list of named production families selected in the UI.
+    selected_search_families: Option<Vec<quantforge_discover::SearchFamily>>,
     /// `fast_scout`, `full_harvest`, `quota_harvest`, or `high_performance_islands`.
     run_mode: Option<String>,
     general_island_count: Option<usize>,
@@ -180,6 +166,7 @@ pub struct DiscoverRequest {
     /// Early-stop when databank reaches this many elites (Quota Harvest default 100).
     target_databank_elites: Option<usize>,
     search_ranges: Option<SearchRangeProfile>,
+    scout_fitness_mode: Option<quantforge_discover::ScoutFitnessMode>,
     commission_per_lot_round_turn: Option<f64>,
     slippage_points_per_side: Option<f64>,
     fallback_spread_points: Option<f64>,
@@ -190,6 +177,14 @@ pub struct DiscoverRequest {
     sealed_fraction: Option<f64>,
     /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
     history_start_year: Option<u16>,
+    /// Optional broker-local inclusive date bounds. These take precedence over
+    /// the legacy year shortcut for new runs.
+    history_start_date: Option<String>,
+    history_end_date: Option<String>,
+    /// Optional SQX-style ordered range parts. The current evaluator uses the
+    /// outer bounds and preserves the labels for the run contract.
+    #[serde(default)]
+    data_range_parts: Vec<DataRangePartRequest>,
     /// After Discover checkpoints, shrink Holding and battery remaining names.
     #[serde(default)]
     factory_after_discover: Option<bool>,
@@ -199,6 +194,15 @@ pub struct DiscoverRequest {
     factory_target_databank: Option<usize>,
     #[serde(default)]
     factory_max_correlation: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataRangePartRequest {
+    id: String,
+    kind: String,
+    start_date: String,
+    end_date: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -305,84 +309,6 @@ pub struct DiscoverState {
     stop: Arc<AtomicBool>,
 }
 
-/// One independently-bound market lane inside a shared Portfolio Discover
-/// campaign. A lane has its own data, broker, split, seed and Databank; the
-/// campaign only shares the bounded CPU budget and user-facing status.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortfolioDiscoverAsset {
-    symbol: String,
-    data_path: String,
-    metadata_path: Option<String>,
-    source_timezone: Option<String>,
-    m1_data_path: String,
-    m1_metadata_path: Option<String>,
-    m1_source_timezone: Option<String>,
-    broker_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortfolioDiscoverRequest {
-    /// The shared search recipe. Asset paths are replaced by each selected lane.
-    recipe: DiscoverRequest,
-    assets: Vec<PortfolioDiscoverAsset>,
-    /// Total Scout workers for the whole campaign, not per asset. Zero uses
-    /// available logical CPUs and is divided fairly between lanes.
-    global_worker_threads: usize,
-    /// Full M1 imports are memory-heavy. Limit how many lanes load and evolve
-    /// concurrently; queued lanes retain the same frozen recipe and start as
-    /// an earlier lane finishes. Two is the safe desktop default.
-    concurrent_lanes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortfolioDiscoverLaneView {
-    symbol: String,
-    output_path: String,
-    status: String,
-    phase: String,
-    evaluation_count: u64,
-    holding_elites: usize,
-    databank_elites: usize,
-    evaluations_per_hour: f64,
-    worker_threads: usize,
-    message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortfolioDiscoverJobView {
-    job_id: Option<String>,
-    status: String,
-    phase: String,
-    global_worker_threads: usize,
-    concurrent_lanes: usize,
-    active_lanes: usize,
-    completed_lanes: usize,
-    total_lanes: usize,
-    total_evaluation_count: u64,
-    total_holding_elites: usize,
-    total_databank_elites: usize,
-    started_at_ms: Option<u64>,
-    stop_requested: bool,
-    message: String,
-    lanes: Vec<PortfolioDiscoverLaneView>,
-}
-
-#[derive(Clone)]
-struct PortfolioLiveLane {
-    output_path: String,
-    artifact: Arc<RwLock<Option<EvolveArtifact>>>,
-}
-
-pub struct PortfolioDiscoverState {
-    job: Arc<RwLock<PortfolioDiscoverJobView>>,
-    stop: Arc<AtomicBool>,
-    live_lanes: Arc<RwLock<BTreeMap<String, PortfolioLiveLane>>>,
-}
-
 impl Default for DiscoverState {
     fn default() -> Self {
         Self {
@@ -390,38 +316,6 @@ impl Default for DiscoverState {
             live_artifact: Arc::new(RwLock::new(None)),
             paused: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
-impl Default for PortfolioDiscoverState {
-    fn default() -> Self {
-        Self {
-            job: Arc::new(RwLock::new(PortfolioDiscoverJobView::idle())),
-            stop: Arc::new(AtomicBool::new(false)),
-            live_lanes: Arc::new(RwLock::new(BTreeMap::new())),
-        }
-    }
-}
-
-impl PortfolioDiscoverJobView {
-    fn idle() -> Self {
-        Self {
-            job_id: None,
-            status: "idle".into(),
-            phase: "Ready".into(),
-            global_worker_threads: 0,
-            concurrent_lanes: 0,
-            active_lanes: 0,
-            completed_lanes: 0,
-            total_lanes: 0,
-            total_evaluation_count: 0,
-            total_holding_elites: 0,
-            total_databank_elites: 0,
-            started_at_ms: None,
-            stop_requested: false,
-            message: "Choose 2–7 complete symbols and start a shared recipe.".into(),
-            lanes: Vec::new(),
         }
     }
 }
@@ -520,158 +414,6 @@ pub struct ConditionBakeoffRequest {
     history_start_year: Option<u16>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimeframeBakeoffRequest {
-    data_path: String,
-    metadata_path: Option<String>,
-    source_timezone: Option<String>,
-    m1_data_path: String,
-    m1_metadata_path: Option<String>,
-    m1_source_timezone: Option<String>,
-    broker_path: String,
-    draws_per_cell: usize,
-    seed: u64,
-    minimum_trades: usize,
-    minimum_return_percent: f64,
-    minimum_profit_factor: f64,
-    maximum_drawdown_percent: f64,
-    oos1_retention: f64,
-    commission_per_lot_round_turn: f64,
-    slippage_points_per_side: f64,
-    fallback_spread_points: Option<f64>,
-    validation_fraction: f64,
-    sealed_fraction: f64,
-    minimum_entry_conditions: usize,
-    maximum_entry_conditions: usize,
-    minimum_exit_conditions: usize,
-    maximum_exit_conditions: usize,
-    #[serde(default)]
-    history_start_year: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimeframeAblationRequest {
-    #[serde(flatten)]
-    base: TimeframeBakeoffRequest,
-    #[serde(default)]
-    h1_gates: Option<TimeframeGateConfig>,
-    #[serde(default)]
-    h4_gates: Option<TimeframeGateConfig>,
-}
-
-struct TimeframeComparisonData {
-    h1_is: BarDataset,
-    h1_oos1: BarDataset,
-    h1_sealed: BarDataset,
-    h4_is: BarDataset,
-    h4_oos1: BarDataset,
-    h4_sealed: BarDataset,
-    broker: quantforge_broker::SymbolSpecification,
-}
-
-fn load_timeframe_comparison_data(
-    request: &TimeframeBakeoffRequest,
-) -> Result<TimeframeComparisonData, String> {
-    if request.minimum_entry_conditions > request.maximum_entry_conditions
-        || request.minimum_exit_conditions > request.maximum_exit_conditions
-    {
-        return Err(
-            "timeframe bakeoff minimum grammar bounds must not exceed maximum bounds".into(),
-        );
-    }
-    if request.validation_fraction <= 0.0 {
-        return Err("timeframe bakeoff requires a non-zero OOS1 reserve".into());
-    }
-    let mut loaded = load_data_source(
-        &request.data_path,
-        request.metadata_path.as_deref(),
-        request.source_timezone.as_deref(),
-    )
-    .map_err(|error| error.to_string())?;
-    let mut m1_loaded = load_data_source(
-        &request.m1_data_path,
-        request.m1_metadata_path.as_deref(),
-        request.m1_source_timezone.as_deref(),
-    )
-    .map_err(|error| error.to_string())?;
-    let history_start_year = request
-        .history_start_year
-        .unwrap_or(quantforge_data::DEFAULT_HISTORY_START_YEAR);
-    let quote_path = infer_quote_path(&request.m1_data_path);
-    let mut quote_dataset = quote_path
-        .as_ref()
-        .map(|path| load_quote_sidecar(path, m1_loaded.metadata.as_ref()))
-        .transpose()
-        .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
-    trim_market_history_to_year(
-        &mut loaded.dataset,
-        &mut m1_loaded.dataset,
-        quote_dataset.as_mut(),
-        history_start_year,
-    )?;
-    let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
-    load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
-    let (validation_fraction, sealed_fraction) =
-        normalize_split_fractions(request.validation_fraction, request.sealed_fraction)?;
-    let h1_decision = match quote_dataset.as_ref() {
-        Some(quotes) => build_decision_from_m1_quotes(
-            &m1_loaded.dataset,
-            Some(&loaded.dataset),
-            quotes,
-            broker.point,
-        )?,
-        None => build_decision_from_m1(&m1_loaded.dataset, Some(&loaded.dataset))?,
-    };
-    let h4_decision = match quote_dataset.as_ref() {
-        Some(quotes) => build_timeframe_from_m1_with_quotes(
-            &m1_loaded.dataset,
-            quotes,
-            broker.point,
-            DecisionTimeframe::H4.interval_ms(),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
-        None => build_timeframe_from_m1(
-            &m1_loaded.dataset,
-            DecisionTimeframe::H4.interval_ms(),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
-    };
-    Ok(TimeframeComparisonData {
-        h1_is: development_partition(&h1_decision, validation_fraction, sealed_fraction)?,
-        h1_oos1: oos1_partition(&h1_decision, validation_fraction, sealed_fraction)?,
-        h1_sealed: sealed_partition(&h1_decision, validation_fraction, sealed_fraction)?,
-        h4_is: development_partition(&h4_decision, validation_fraction, sealed_fraction)?,
-        h4_oos1: oos1_partition(&h4_decision, validation_fraction, sealed_fraction)?,
-        h4_sealed: sealed_partition(&h4_decision, validation_fraction, sealed_fraction)?,
-        broker,
-    })
-}
-
-fn timeframe_scout(request: &TimeframeBakeoffRequest) -> ScoutConfig {
-    let mut scout = ScoutConfig::default();
-    scout.costs = CostModel {
-        commission_per_lot_round_turn: request.commission_per_lot_round_turn,
-        adverse_slippage_points_per_side: request.slippage_points_per_side,
-        fallback_spread_points: request.fallback_spread_points,
-        ..scout.costs
-    };
-    scout
-}
-
-fn timeframe_gate_from_request(request: &TimeframeBakeoffRequest) -> TimeframeGateConfig {
-    TimeframeGateConfig {
-        minimum_trades: request.minimum_trades,
-        minimum_return_percent: request.minimum_return_percent,
-        minimum_profit_factor: request.minimum_profit_factor,
-        maximum_drawdown_percent: request.maximum_drawdown_percent,
-        oos1_retention: request.oos1_retention,
-    }
-}
-
 #[tauri::command]
 pub fn run_condition_bakeoff(
     request: ConditionBakeoffRequest,
@@ -700,11 +442,11 @@ pub fn run_condition_bakeoff(
     )?;
     let broker = load_bound_broker(&request.broker_path, loaded.metadata.as_ref())?;
     load_bound_broker(&request.broker_path, m1_loaded.metadata.as_ref())?;
-    let validation_fraction = request.validation_fraction.clamp(0.0, 0.5);
+    let validation_fraction = request.validation_fraction.clamp(0.0, 0.4);
     let sealed_fraction = request.sealed_fraction.clamp(0.05, 0.4);
     if validation_fraction + sealed_fraction >= 0.9 {
         return Err(format!(
-            "OOS1 ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for Development"
+            "validation ({validation_fraction:.2}) + sealed ({sealed_fraction:.2}) leaves less than 10% for IS"
         ));
     }
     let search_h1 = development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?;
@@ -740,93 +482,23 @@ pub fn run_condition_bakeoff(
 }
 
 #[tauri::command]
-pub fn run_timeframe_bakeoff(
-    request: TimeframeBakeoffRequest,
-) -> Result<TimeframeBakeoffReport, String> {
-    let data = load_timeframe_comparison_data(&request)?;
-    let config = TimeframeBakeoffConfig {
-        seed: request.seed,
-        draws_per_cell: request.draws_per_cell.max(1),
-        entry_condition_counts: (request.minimum_entry_conditions
-            ..=request.maximum_entry_conditions)
-            .collect(),
-        exit_condition_counts: (request.minimum_exit_conditions..=request.maximum_exit_conditions)
-            .collect(),
-        scout: timeframe_scout(&request),
-        minimum_trades: request.minimum_trades,
-        minimum_return_percent: request.minimum_return_percent,
-        minimum_profit_factor: request.minimum_profit_factor,
-        maximum_drawdown_percent: request.maximum_drawdown_percent,
-        oos1_retention: request.oos1_retention,
-    };
-    evolve_timeframe_bakeoff(
-        &data.h1_is,
-        &data.h1_oos1,
-        &data.h4_is,
-        &data.h4_oos1,
-        &data.broker,
-        config,
-    )
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn run_timeframe_ablation(
-    request: TimeframeAblationRequest,
-) -> Result<TimeframeAblationReport, String> {
-    let data = load_timeframe_comparison_data(&request.base)?;
-    let shared_gates = timeframe_gate_from_request(&request.base);
-    let config = TimeframeAblationConfig {
-        seed: request.base.seed,
-        draws_per_cell: request.base.draws_per_cell.max(1),
-        entry_condition_counts: (request.base.minimum_entry_conditions
-            ..=request.base.maximum_entry_conditions)
-            .collect(),
-        exit_condition_counts: (request.base.minimum_exit_conditions
-            ..=request.base.maximum_exit_conditions)
-            .collect(),
-        scout: timeframe_scout(&request.base),
-        h1_gates: request
-            .h1_gates
-            .clone()
-            .unwrap_or_else(|| shared_gates.clone()),
-        h4_gates: request
-            .h4_gates
-            .clone()
-            .unwrap_or_else(|| shared_gates.clone()),
-        shared_gates,
-    };
-    evolve_timeframe_ablation(
-        &data.h1_is,
-        &data.h1_oos1,
-        &data.h4_is,
-        &data.h4_oos1,
-        &data.broker,
-        config,
-    )
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub fn start_discover(
     mut request: DiscoverRequest,
     state: State<'_, DiscoverState>,
     battery: State<'_, crate::holding_battery::BatteryJobState>,
-    portfolio: State<'_, PortfolioDiscoverState>,
 ) -> Result<DiscoverJobView, String> {
     if request.mode == DiscoverMode::New && request.databank_path.trim().is_empty() {
         request.databank_path = automatic_databank_path(&request)?;
     }
     validate_request(&request)?;
-    if request.run_mode.as_deref().and_then(parse_run_mode)
+    if request
+        .run_mode
+        .as_deref()
+        .and_then(parse_run_mode)
         == Some(quantforge_discover::DiscoverRunMode::QuotaHarvest)
     {
-        request.target_databank_elites = Some(
-            request
-                .target_databank_elites
-                .unwrap_or(400)
-                .clamp(40, 10_000),
-        );
+        request.target_databank_elites =
+            Some(request.target_databank_elites.unwrap_or(400).clamp(40, 10_000));
     }
     {
         let current = state
@@ -836,18 +508,6 @@ pub fn start_discover(
         if matches!(current.status, "running" | "paused") {
             return Err("a discovery job is already active".into());
         }
-    }
-    if portfolio
-        .job
-        .read()
-        .map_err(|_| "multi-asset campaign state is unavailable")?
-        .status
-        == "running"
-    {
-        return Err(
-            "a multi-asset Discover campaign is active; stop it before starting a single-asset job"
-                .into(),
-        );
     }
 
     state.paused.store(false, Ordering::SeqCst);
@@ -948,77 +608,41 @@ pub fn start_discover(
                 }
             }
             Ok(()) => {
-                if request.factory_after_discover.unwrap_or(false) {
+                // Holding is the explicit M1-passed staging queue.  At the
+                // end of a Discover batch, automatically drain that queue
+                // through the heavy battery when the user enabled the factory.
+                // This keeps overnight work hands-off while the checkpoint
+                // written by run_discovery remains a recoverable boundary.
+                if request.factory_after_discover.unwrap_or(true) {
                     let factory_queue = request.factory_queue_limit.filter(|&n| n > 0);
-                    // An open-ended Discover is allowed to hand off only
-                    // after the user explicitly stops it. When it does, the
-                    // factory must examine the whole frozen Holding cohort,
-                    // not silently stop after an old target such as `1`.
-                    let factory_target = automatic_factory_target(
-                        request.run_until_stopped.unwrap_or(true),
-                        request.factory_target_databank,
-                    );
+                    let factory_target = request.factory_target_databank.filter(|&n| n > 0);
                     let factory = crate::databank::HoldingBatteryRequest {
                         fingerprints: Vec::new(),
                         ranked: true,
-                        // Correlation shrinking is a separate, explicit
-                        // Holding action. An automatic full battery must not
-                        // silently reduce the cohort before testing it.
-                        shrink_first: false,
-                        max_correlation: None,
+                        shrink_first: true,
+                        max_correlation: request.factory_max_correlation,
                         queue_limit: factory_queue,
                         target_databank: factory_target,
-                        audit_and_graduate: false,
                     };
-                    // Discover has already completed by this point, but the
-                    // factory can promote a Holding candidate seconds later.
-                    // Keep the finished dashboard's live snapshot in lockstep
-                    // with each durable factory checkpoint; otherwise it can
-                    // misleadingly keep showing zero Databank strategies.
-                    let factory_live_artifact = Arc::clone(&live_artifact);
-                    let factory_discover_job = Arc::clone(&job);
-                    let factory_checkpoint: crate::holding_battery::FactoryCheckpoint =
-                        Arc::new(move |artifact| {
-                            if let Ok(mut live) = factory_live_artifact.write() {
-                                *live = Some(artifact.clone());
-                            }
-                            if let Ok(mut view) = factory_discover_job.write() {
-                                view.holding_elites = artifact.databank.holding.len();
-                                view.databank_elites = artifact.databank.elites.len();
-                                view.coverage = artifact.databank.coverage();
-                                view.qd_score = artifact.databank.qd_score();
-                                view.live_databank_revision =
-                                    view.live_databank_revision.saturating_add(1);
-                                view.message = format!(
-                                    "Factory checkpoint: {} Holding · {} Databank. {}",
-                                    view.holding_elites, view.databank_elites, view.message
-                                );
-                            }
-                        });
                     match crate::holding_battery::spawn_factory_from_archive(
                         request.databank_path.clone(),
                         factory,
                         &battery_state,
-                        Some(factory_checkpoint),
                     ) {
                         Ok(_) => {
                             if let Ok(mut view) = job.write() {
-                                let factory_note = match factory_target {
-                                    Some(n) => format!(
-                                        "Factory started: battery the Holding queue until {n} Databank names."
-                                    ),
-                                    None => {
-                                        "Factory started: battery everyone in the current Holding queue."
-                                            .to_owned()
-                                    }
-                                };
-                                view.message = format!("{}. {factory_note}", view.message);
+                                view.message = format!(
+                                    "{}. Holding battery started: M1 survivors are now running CPCV/walk-forward, parameter and Monte Carlo tests.",
+                                    view.message
+                                );
                             }
                         }
                         Err(error) => {
                             if let Ok(mut view) = job.write() {
-                                view.message =
-                                    format!("{}. Factory did not start: {error}", view.message);
+                                view.message = format!(
+                                    "{}. Holding was saved safely; automatic battery did not start: {error}",
+                                    view.message
+                                );
                             }
                         }
                     }
@@ -1027,399 +651,6 @@ pub fn start_discover(
         }
     });
     Ok(started)
-}
-
-/// Start independent Discover lanes under one shared CPU budget. Assets never
-/// share bars, candidates, Databanks, OOS1 results or sealed OOS2 data.
-#[tauri::command]
-pub fn start_portfolio_discover(
-    request: PortfolioDiscoverRequest,
-    state: State<'_, PortfolioDiscoverState>,
-    single_discover: State<'_, DiscoverState>,
-) -> Result<PortfolioDiscoverJobView, String> {
-    if request.assets.len() < 2 || request.assets.len() > 7 {
-        return Err("Portfolio Discover requires between 2 and 7 assets".into());
-    }
-    if request.recipe.mode != DiscoverMode::New {
-        return Err(
-            "Portfolio Discover starts new isolated Databanks; continue each lane separately"
-                .into(),
-        );
-    }
-    if single_discover
-        .job
-        .read()
-        .map_err(|_| "discover job state is unavailable")?
-        .status
-        == "running"
-    {
-        return Err(
-            "stop the single-asset Discover job before starting a portfolio campaign".into(),
-        );
-    }
-    {
-        let current = state
-            .job
-            .read()
-            .map_err(|_| "portfolio campaign state is unavailable")?;
-        if current.status == "running" {
-            return Err("a Portfolio Discover campaign is already active".into());
-        }
-    }
-
-    let mut seen = std::collections::BTreeSet::new();
-    for asset in &request.assets {
-        let symbol = asset.symbol.trim().to_ascii_uppercase();
-        if symbol.is_empty() || !seen.insert(symbol) {
-            return Err("select each Portfolio Discover symbol once".into());
-        }
-    }
-
-    let available = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1);
-    let lane_count = request.assets.len();
-    let global_workers = if request.global_worker_threads == 0 {
-        available.max(lane_count)
-    } else {
-        request
-            .global_worker_threads
-            .max(lane_count)
-            .min(available.max(lane_count))
-    };
-    // Starting seven full H1/M1 loads at once can exhaust file handles and
-    // memory long before Scout CPU becomes the constraint. Keep the CPU budget
-    // fully used, but stage the high-memory lanes. Users can raise this when
-    // they have ample RAM; two is deliberately the default.
-    let concurrent_lanes = request.concurrent_lanes.clamp(1, lane_count);
-    let lane_workers = (global_workers / concurrent_lanes).max(1);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_millis() as u64;
-
-    let mut lanes = Vec::with_capacity(lane_count);
-    for (index, asset) in request.assets.iter().enumerate() {
-        let mut lane_request = request.recipe.clone();
-        lane_request.mode = DiscoverMode::New;
-        lane_request.selected_symbol = Some(asset.symbol.trim().to_ascii_uppercase());
-        lane_request.data_path = asset.data_path.clone();
-        lane_request.metadata_path = asset.metadata_path.clone();
-        lane_request.source_timezone = asset.source_timezone.clone();
-        lane_request.m1_data_path = asset.m1_data_path.clone();
-        lane_request.m1_metadata_path = asset.m1_metadata_path.clone();
-        lane_request.m1_source_timezone = asset.m1_source_timezone.clone();
-        lane_request.broker_path = asset.broker_path.clone();
-        lane_request.databank_path = automatic_databank_path(&lane_request)?;
-        lane_request.seed = Some(lane_request.seed.unwrap_or(42).wrapping_add(index as u64));
-        lane_request.worker_threads = Some(lane_workers);
-        // Holding work is deliberately not allowed to monopolise all cores on
-        // each lane. The user can later run batteries per asset.
-        lane_request.promotion_worker_threads = Some(1);
-        lane_request.pack_data_dir = None;
-        lane_request.multi_symbol_minimum_pass = Some(0);
-        lane_request.factory_after_discover = Some(false);
-        validate_request(&lane_request)?;
-        lanes.push((
-            asset.symbol.trim().to_ascii_uppercase(),
-            lane_request,
-            lane_workers,
-            Arc::new(RwLock::new(None)),
-        ));
-    }
-
-    state.stop.store(false, Ordering::SeqCst);
-    {
-        let mut live_lanes = state
-            .live_lanes
-            .write()
-            .map_err(|_| "portfolio live Databank state is unavailable")?;
-        live_lanes.clear();
-        for (symbol, request, _, artifact) in &lanes {
-            live_lanes.insert(
-                symbol.clone(),
-                PortfolioLiveLane {
-                    output_path: request.databank_path.clone(),
-                    artifact: Arc::clone(artifact),
-                },
-            );
-        }
-    }
-    let initial_lanes = lanes
-        .iter()
-        .map(|(symbol, request, workers, _)| {
-            portfolio_lane_view(symbol, &portfolio_lane_job(request, *workers))
-        })
-        .collect::<Vec<_>>();
-    let started = PortfolioDiscoverJobView {
-        job_id: Some(format!("portfolio-{now_ms}")),
-        status: "running".into(),
-        phase: "Preparing isolated asset lanes".into(),
-        global_worker_threads: global_workers,
-        concurrent_lanes,
-        active_lanes: 0,
-        completed_lanes: 0,
-        total_lanes: lane_count,
-        total_evaluation_count: 0,
-        total_holding_elites: 0,
-        total_databank_elites: 0,
-        started_at_ms: Some(now_ms),
-        stop_requested: false,
-        message: format!(
-            "{lane_count} isolated lanes share {global_workers} Scout worker{}; up to {concurrent_lanes} high-memory lane{} run at once. Each asset keeps its own Development, OOS1 and sealed OOS2 partitions.",
-            if global_workers == 1 { "" } else { "s" },
-            if concurrent_lanes == 1 { "" } else { "s" },
-        ),
-        lanes: initial_lanes,
-    };
-    *state
-        .job
-        .write()
-        .map_err(|_| "portfolio campaign state is unavailable")? = started.clone();
-
-    let campaign_job = Arc::clone(&state.job);
-    let campaign_stop = Arc::clone(&state.stop);
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut pending = lanes
-            .into_iter()
-            .map(|(symbol, request, workers, artifact)| {
-                let job = Arc::new(RwLock::new(portfolio_lane_job(&request, workers)));
-                (symbol, request, workers, job, artifact)
-            })
-            .collect::<VecDeque<_>>();
-        let all_lanes = pending
-            .iter()
-            .map(|(symbol, _, _, job, _)| (symbol.clone(), Arc::clone(job)))
-            .collect::<Vec<_>>();
-        let mut running: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
-
-        loop {
-            if campaign_stop.load(Ordering::SeqCst) && !pending.is_empty() {
-                for (_, _, _, job, _) in pending.drain(..) {
-                    if let Ok(mut view) = job.write() {
-                        view.status = "stopped";
-                        view.phase = "Not started".into();
-                        view.message =
-                            "The campaign was stopped before this queued lane began.".into();
-                    }
-                }
-            }
-
-            while !campaign_stop.load(Ordering::SeqCst) && running.len() < concurrent_lanes {
-                let Some((symbol, lane_request, _, lane_job, lane_live_artifact)) =
-                    pending.pop_front()
-                else {
-                    break;
-                };
-                if let Ok(mut view) = lane_job.write() {
-                    view.status = "running";
-                    view.phase = "Loading and validating inputs".into();
-                    view.message = "This isolated lane is starting.".into();
-                }
-                let lane_paused = Arc::new(AtomicBool::new(false));
-                let lane_stop = Arc::clone(&campaign_stop);
-                let lane_job_for_thread = Arc::clone(&lane_job);
-                let handle = thread::spawn(move || {
-                    if let Err(error) = run_discovery(
-                        lane_request,
-                        &lane_job_for_thread,
-                        &lane_live_artifact,
-                        &lane_paused,
-                        &lane_stop,
-                    ) {
-                        if let Ok(mut view) = lane_job_for_thread.write() {
-                            view.status = "failed";
-                            view.phase = "Stopped with an error".into();
-                            view.message = error;
-                        }
-                    } else if let Ok(mut view) = lane_job_for_thread.write() {
-                        if view.status != "failed" {
-                            view.status = if lane_stop.load(Ordering::SeqCst) {
-                                "stopped"
-                            } else {
-                                "completed"
-                            };
-                            view.phase = "Discover finished".into();
-                        }
-                    }
-                });
-                running.push((symbol, handle));
-            }
-
-            let lanes = all_lanes
-                .iter()
-                .filter_map(|(symbol, job)| {
-                    job.read()
-                        .ok()
-                        .map(|view| portfolio_lane_view(symbol, &view))
-                })
-                .collect::<Vec<_>>();
-            let active_lanes = lanes.iter().filter(|lane| lane.status == "running").count();
-            let completed_lanes = lanes
-                .iter()
-                .filter(|lane| matches!(lane.status.as_str(), "completed" | "stopped" | "failed"))
-                .count();
-            let any_failed = lanes.iter().any(|lane| lane.status == "failed");
-            let all_finished = pending.is_empty() && running.is_empty();
-            if let Ok(mut view) = campaign_job.write() {
-                view.active_lanes = active_lanes;
-                view.completed_lanes = completed_lanes;
-                view.total_evaluation_count = lanes.iter().map(|lane| lane.evaluation_count).sum();
-                view.total_holding_elites = lanes.iter().map(|lane| lane.holding_elites).sum();
-                view.total_databank_elites = lanes.iter().map(|lane| lane.databank_elites).sum();
-                view.stop_requested = campaign_stop.load(Ordering::SeqCst);
-                view.lanes = lanes;
-                view.phase = if all_finished {
-                    if any_failed {
-                        "Campaign finished with lane errors"
-                    } else if view.stop_requested {
-                        "Campaign stopped"
-                    } else {
-                        "Campaign complete"
-                    }
-                    .into()
-                } else if view.stop_requested {
-                    "Stopping after each lane's current generation".into()
-                } else {
-                    format!(
-                        "{active_lanes}/{} lanes active · {} queued",
-                        view.total_lanes,
-                        pending.len()
-                    )
-                };
-                if all_finished {
-                    view.status = if any_failed {
-                        "failed"
-                    } else if view.stop_requested {
-                        "stopped"
-                    } else {
-                        "completed"
-                    }
-                    .into();
-                    view.message = format!(
-                        "{} lanes finished: {} Holding, {} Databank, {} candidates evaluated.",
-                        view.total_lanes,
-                        view.total_holding_elites,
-                        view.total_databank_elites,
-                        view.total_evaluation_count,
-                    );
-                }
-            }
-            if all_finished {
-                break;
-            }
-            let mut finished = Vec::new();
-            for (index, (_, handle)) in running.iter().enumerate() {
-                if handle.is_finished() {
-                    finished.push(index);
-                }
-            }
-            for index in finished.into_iter().rev() {
-                let (_, handle) = running.remove(index);
-                let _ = handle.join();
-            }
-            thread::sleep(Duration::from_millis(350));
-        }
-        for (_, handle) in running {
-            let _ = handle.join();
-        }
-    });
-    Ok(started)
-}
-
-#[tauri::command]
-pub fn get_portfolio_discover_job(
-    state: State<'_, PortfolioDiscoverState>,
-) -> Result<PortfolioDiscoverJobView, String> {
-    state
-        .job
-        .read()
-        .map(|view| view.clone())
-        .map_err(|_| "portfolio campaign state is unavailable".into())
-}
-
-/// Opens the selected campaign lane's in-memory Holding/Databank snapshot.
-/// Unlike the on-disk final archive, this updates while Discover is running.
-#[tauri::command]
-pub fn get_portfolio_live_databank(
-    symbol: String,
-    state: State<'_, PortfolioDiscoverState>,
-    databank_state: State<'_, DesktopState>,
-) -> Result<crate::databank::DatabankWorkspace, String> {
-    let symbol = symbol.trim().to_ascii_uppercase();
-    let lane = state
-        .live_lanes
-        .read()
-        .map_err(|_| "portfolio live Databank state is unavailable")?
-        .get(&symbol)
-        .cloned()
-        .ok_or_else(|| format!("{symbol} is not part of the current multi-asset campaign"))?;
-    let artifact = lane
-        .artifact
-        .read()
-        .map_err(|_| "portfolio live lane state is unavailable")?
-        .clone()
-        .ok_or_else(|| format!("{symbol} has no Holding or Databank strategies yet"))?;
-    install_live_databank_artifact(artifact, PathBuf::from(lane.output_path), &databank_state)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn stop_portfolio_discover(
-    state: State<'_, PortfolioDiscoverState>,
-) -> Result<PortfolioDiscoverJobView, String> {
-    let mut view = state
-        .job
-        .write()
-        .map_err(|_| "portfolio campaign state is unavailable")?;
-    if view.status != "running" {
-        return Err("no active Portfolio Discover campaign can be stopped".into());
-    }
-    state.stop.store(true, Ordering::SeqCst);
-    view.stop_requested = true;
-    view.phase = "Stopping after each lane's current generation".into();
-    view.message = "Every lane will checkpoint its own immutable Databank before it exits.".into();
-    Ok(view.clone())
-}
-
-fn portfolio_lane_job(request: &DiscoverRequest, worker_threads: usize) -> DiscoverJobView {
-    let mut job = DiscoverJobView::idle();
-    job.job_id = Some(format!(
-        "portfolio-{}",
-        request.selected_symbol.as_deref().unwrap_or("lane")
-    ));
-    job.status = "queued";
-    job.mode = Some(DiscoverModeView::New);
-    job.phase = "Waiting for campaign worker".into();
-    job.output_path = Some(request.databank_path.clone());
-    job.requested_generations = request.generations;
-    job.run_until_stopped = request.run_until_stopped.unwrap_or(true);
-    job.worker_threads = worker_threads;
-    job.promotion_worker_threads = 1;
-    job.message = "Isolated Development search is starting.".into();
-    job
-}
-
-fn portfolio_lane_view(symbol: &str, job: &DiscoverJobView) -> PortfolioDiscoverLaneView {
-    PortfolioDiscoverLaneView {
-        symbol: symbol.into(),
-        // A stopped or completed open-ended Discover writes an immutable
-        // snapshot beside the working archive. The campaign UI must reopen
-        // that snapshot, not the transient working path which may not exist.
-        output_path: job
-            .latest_immutable_snapshot_path
-            .clone()
-            .or_else(|| job.output_path.clone())
-            .unwrap_or_default(),
-        status: job.status.into(),
-        phase: job.phase.clone(),
-        evaluation_count: job.evaluation_count,
-        holding_elites: job.holding_elites,
-        databank_elites: job.databank_elites,
-        evaluations_per_hour: job.rolling_evaluations_per_hour,
-        worker_threads: job.worker_threads,
-        message: job.message.clone(),
-    }
 }
 
 #[tauri::command]
@@ -1432,7 +663,7 @@ pub fn get_discover_live_databank(
         .read()
         .map_err(|_| "discover live databank state is unavailable")?
         .clone()
-        .ok_or_else(|| "the live archive has no Holding or Databank strategies yet".to_owned())?;
+        .ok_or_else(|| "the live archive has no Databank strategies yet".to_owned())?;
     let source_path = state
         .job
         .read()
@@ -1471,7 +702,6 @@ fn automatic_databank_path(request: &DiscoverRequest) -> Result<String, String> 
     let timeframe = match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
         DecisionTimeframe::H1 => "H1",
         DecisionTimeframe::M15 => "M15",
-        DecisionTimeframe::H4 => "H4",
     };
     let history_year = request
         .history_start_year
@@ -1555,8 +785,11 @@ pub fn stop_discover(state: State<'_, DiscoverState>) -> Result<DiscoverJobView,
 }
 
 fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
-    if request.data_path.trim().is_empty()
-        || request.m1_data_path.trim().is_empty()
+    validate_range_parts(&request.data_range_parts)?;
+    let m15_without_decision_file = request.decision_timeframe == Some(DecisionTimeframe::M15)
+        && !request.m1_data_path.trim().is_empty();
+    if ((!m15_without_decision_file && request.data_path.trim().is_empty())
+        || request.m1_data_path.trim().is_empty())
         || request.broker_path.trim().is_empty()
         || request.databank_path.trim().is_empty()
     {
@@ -1574,15 +807,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         let broker = load_bound_broker(&request.broker_path, None)?;
         validate_selected_symbol(request.selected_symbol.as_deref(), &broker.symbol)?;
     }
-    if request.mode == DiscoverMode::New {
+        if request.mode == DiscoverMode::New {
         if let Some(grammar) = request.universal_grammar.as_ref() {
             validate_universal_grammar(grammar)?;
-            if request.sl_tp_only_exits.unwrap_or(true) && grammar.minimum_entry_conditions > 3 {
-                return Err(
-                    "SL/TP-only exits allow 2–3 entry conditions; lower the minimum entry conditions or switch that profile off"
-                        .into(),
-                );
-            }
         }
         if let Some(mode) = request.run_mode.as_deref() {
             if parse_run_mode(mode).is_none() {
@@ -1592,15 +819,17 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             }
         }
         if let Some(year) = request.history_start_year {
-            quantforge_data::normalize_history_start_year(year)
-                .map_err(|error| error.to_string())?;
+            quantforge_data::normalize_history_start_year(year).map_err(|error| error.to_string())?;
         }
-        let validation = request
-            .validation_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
-        let sealed = request
-            .sealed_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
+        // A fully dated timeline is authoritative. Ignore stale legacy
+        // reserve fields when the editor has supplied a valid schedule.
+        let (validation, sealed) = match range_schedule_contract(&request.data_range_parts)? {
+            Some(schedule) => (schedule.validation_fraction, schedule.sealed_fraction),
+            None => (
+                request.validation_fraction.unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION),
+                request.sealed_fraction.unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION),
+            ),
+        };
         normalize_split_fractions(validation, sealed)?;
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
@@ -1641,10 +870,6 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.minimum_development_expectancy_r.is_some(),
             request.require_m1_precision.is_some(),
             request.simple_exits.is_some(),
-            request.sl_tp_only_exits.is_some(),
-            request.allow_fixed_pip_stops.is_some(),
-            request.allow_indicator_exit_rules.is_some(),
-            request.allow_time_stops.is_some(),
             request.allow_break_even.is_some(),
             request.allow_trailing_stops.is_some(),
             request.allow_partial_exits.is_some(),
@@ -1694,8 +919,90 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_range_parts(parts: &[DataRangePartRequest]) -> Result<(), String> {
+    let mut previous_end: Option<i64> = None;
+    for part in parts {
+        if part.start_date.trim().is_empty() && part.end_date.trim().is_empty() { continue; }
+        if part.start_date.trim().is_empty() || part.end_date.trim().is_empty() {
+            return Err(format!("range '{}' needs both a start and end date", part.id));
+        }
+        if !matches!(part.kind.as_str(), "training" | "validation" | "holdout") {
+            return Err(format!("unknown data range kind '{}'", part.kind));
+        }
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|e| e.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|e| e.to_string())?;
+        if start >= end { return Err(format!("range '{}' has an invalid date order", part.id)); }
+        if previous_end.is_some_and(|previous| start < previous) {
+            return Err("data range parts must be ordered and non-overlapping".into());
+        }
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+struct RangeScheduleContract {
+    start_date: String,
+    end_date: String,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+}
+
+/// Turn the visible ordered schedule into the engine's actual research
+/// contract. Multiple adjacent OOS parts remain separately named in the
+/// artifact, but their combined duration is excluded from Discover.
+fn range_schedule_contract(parts: &[DataRangePartRequest]) -> Result<Option<RangeScheduleContract>, String> {
+    let dated = parts
+        .iter()
+        .filter(|part| !part.start_date.trim().is_empty() || !part.end_date.trim().is_empty())
+        .collect::<Vec<_>>();
+    if dated.is_empty() {
+        return Ok(None);
+    }
+    validate_range_parts(parts)?;
+    if dated.iter().any(|part| part.start_date.trim().is_empty() || part.end_date.trim().is_empty()) {
+        return Err("every active data range part needs a start and end date".into());
+    }
+
+    let mut validation_ms = 0i64;
+    let mut sealed_ms = 0i64;
+    let mut total_ms = 0i64;
+    let mut previous_end = None;
+    for part in &dated {
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|error| error.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|error| error.to_string())?;
+        if previous_end.is_some_and(|previous| start != previous) {
+            return Err("active data range parts must be adjacent; close gaps or remove unused parts".into());
+        }
+        previous_end = Some(end);
+        let duration = end - start;
+        total_ms += duration;
+        match part.kind.as_str() {
+            // SQX permits walk-forward schedules such as ISV1 → IST → ISV2
+            // → OOS. Keep the rows in their calendar order and aggregate the
+            // two in-sample kinds independently; the chart retains every row.
+            "training" => {}
+            "validation" => validation_ms += duration,
+            "holdout" => sealed_ms += duration,
+            _ => unreachable!("range kinds were validated above"),
+        }
+    }
+    if validation_ms == 0 || sealed_ms == 0 || total_ms <= validation_ms + sealed_ms {
+        return Err("schedule needs IST training, ISV validation, and at least one sealed OOS part".into());
+    }
+    Ok(Some(RangeScheduleContract {
+        start_date: dated.first().expect("not empty").start_date.clone(),
+        end_date: dated.last().expect("not empty").end_date.clone(),
+        validation_fraction: validation_ms as f64 / total_ms as f64,
+        sealed_fraction: sealed_ms as f64 / total_ms as f64,
+    }))
+}
+
 /// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
-/// pack. Decision-timeframe paths are allowed here because H1/M15/H4 packs are
+/// pack. Decision-timeframe paths are allowed here because H1/M15 packs are
 /// derived from the same M1 stream and therefore share its sibling sidecar.
 pub fn infer_quote_path_public(m1_path: &str) -> Option<PathBuf> {
     infer_quote_path(m1_path)
@@ -1705,7 +1012,7 @@ fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
     let path = Path::new(m1_path);
     let stem = path.file_stem()?.to_str()?;
     let mut candidates = vec![path.with_file_name(format!("{stem}.quotes.csv"))];
-    for suffix in ["_H1", "_M15", "_H4"] {
+    for suffix in ["_H1", "_M15"] {
         if let Some(base) = stem.strip_suffix(suffix) {
             candidates.push(path.with_file_name(format!("{base}_M1.quotes.csv")));
         }
@@ -1715,18 +1022,6 @@ fn infer_quote_path(m1_path: &str) -> Option<PathBuf> {
         candidates.push(path.with_file_name(format!("{symbol}_M1.quotes.csv")));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
-}
-
-fn requested_multi_symbol_minimum_pass(
-    request: &DiscoverRequest,
-    continued_artifact: Option<&EvolveArtifact>,
-) -> usize {
-    match (&request.mode, continued_artifact) {
-        (DiscoverMode::Continue, Some(artifact)) => {
-            artifact.databank.config.multi_symbol_minimum_pass
-        }
-        _ => request.multi_symbol_minimum_pass.unwrap_or(0),
-    }
 }
 
 fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMetadata>) -> bool {
@@ -1740,7 +1035,7 @@ fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMet
 }
 
 fn run_discovery(
-    request: DiscoverRequest,
+    mut request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
     live_artifact: &Arc<RwLock<Option<EvolveArtifact>>>,
     paused: &Arc<AtomicBool>,
@@ -1748,14 +1043,25 @@ fn run_discovery(
 ) -> Result<(), String> {
     let clock = ActiveClock::new();
     clock.begin_evaluation_session(0);
+    if request.mode == DiscoverMode::New {
+        if let Some(schedule) = range_schedule_contract(&request.data_range_parts)? {
+            request.history_start_date = Some(schedule.start_date);
+            request.history_end_date = Some(schedule.end_date);
+            request.validation_fraction = Some(schedule.validation_fraction);
+            request.sealed_fraction = Some(schedule.sealed_fraction);
+        }
+    }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
-    let mut loaded = load_data_source(
-        &request.data_path,
-        request.metadata_path.as_deref(),
-        request.source_timezone.as_deref(),
-    )?;
+    let decision_timeframe = request.decision_timeframe.unwrap_or(DecisionTimeframe::H1);
+    let mut loaded = if decision_timeframe == DecisionTimeframe::M15 && request.data_path.trim().is_empty() {
+        // M15 is derived from the canonical M1 stream; no separate decision
+        // file is required.
+        load_data_source(&request.m1_data_path, request.m1_metadata_path.as_deref(), request.m1_source_timezone.as_deref())?
+    } else {
+        load_data_source(&request.data_path, request.metadata_path.as_deref(), request.source_timezone.as_deref())?
+    };
     let mut m1 = load_data_source(
         &request.m1_data_path,
         request.m1_metadata_path.as_deref(),
@@ -1793,6 +1099,15 @@ fn run_discovery(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
+    if request.history_start_date.is_some() || request.history_end_date.is_some() {
+        trim_market_history_to_dates(
+            &mut loaded.dataset,
+            &mut m1.dataset,
+            quote_dataset.as_mut(),
+            request.history_start_date.as_deref(),
+            request.history_end_date.as_deref(),
+        )?;
+    }
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1843,17 +1158,17 @@ fn run_discovery(
                 )?,
                 None => build_decision_from_m1(&m1.dataset, Some(&loaded.dataset))?,
             },
-            DecisionTimeframe::M15 | DecisionTimeframe::H4 => match quote_dataset.as_ref() {
+            DecisionTimeframe::M15 => match quote_dataset.as_ref() {
                 Some(quotes) => quantforge_data::build_timeframe_from_m1_with_quotes(
                     &m1.dataset,
                     quotes,
                     broker.point,
-                    decision_timeframe.interval_ms(),
+                    DecisionTimeframe::M15.interval_ms(),
                     None,
                 )
                 .map_err(|error| error.to_string())?,
                 None => {
-                    build_timeframe_from_m1(&m1.dataset, decision_timeframe.interval_ms(), None)
+                    build_timeframe_from_m1(&m1.dataset, DecisionTimeframe::M15.interval_ms(), None)
                         .map_err(|error| error.to_string())?
                 }
             },
@@ -1900,82 +1215,45 @@ fn run_discovery(
     };
     let (validation_fraction, sealed_fraction) =
         normalize_split_fractions(validation_fraction, sealed_fraction)?;
-    if validation_fraction > 0.0 && !promotion_split {
-        return Err(
-            "OOS1 validation requires promotion split so Development, OOS1 and sealed OOS2 remain separate"
-                .into(),
-        );
-    }
-    let oos1_enabled = validation_fraction > 0.0;
-    if request.mode == DiscoverMode::Continue
-        && oos1_enabled
-        && continued_artifact.as_ref().is_some_and(|artifact| {
-            artifact
-                .manifest
-                .recipe
-                .config
-                .get("oos1_pick_enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-        })
-    {
-        return Err(
-            "this archive was created while OOS1 validation was disabled; start a new run to reserve and validate OOS1 without changing the historical experiment".into(),
-        );
-    }
     let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| {
-            if oos1_enabled {
-                development_partition(&search_decision, validation_fraction, sealed_fraction)
-            } else {
-                unsealed_partition(&search_decision, validation_fraction, sealed_fraction)
-            }
-        })
+        .then(|| unsealed_partition(&search_decision, validation_fraction, sealed_fraction))
         .transpose()?;
-    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then_some(())
-        .filter(|_| oos1_enabled)
-        .map(|_| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
-        .transpose()?;
+    let oos1_dataset = None;
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
-    // Development alone drives search and breeding. When reserved, OOS1 is
-    // opened only after the full Development battery; OOS2 is never materialized.
+    // Search uses every bar except the sealed holdout. OOS1 is not a pick gate.
     let m1_eval = &m1.dataset;
-    // A pack is deliberately opt-in. Merely selecting a pack directory must
-    // not add several extra full strategy replays to every scout candidate.
-    // Continuations retain the immutable gate stored in the databank.
-    let multi_symbol_minimum_pass =
-        requested_multi_symbol_minimum_pass(&request, continued_artifact.as_ref());
-    let pack = if multi_symbol_minimum_pass > 0 {
-        load_fx_pack(
-            request.pack_data_dir.as_deref(),
-            &broker.symbol,
-            validation_fraction,
-            sealed_fraction,
-            promotion_split || request.mode == DiscoverMode::Continue,
-            oos1_enabled,
-            &decision_timeframe,
-            history_start_year,
-        )?
-    } else {
-        Vec::new()
-    };
+    let pack = load_fx_pack(
+        request.pack_data_dir.as_deref(),
+        &broker.symbol,
+        validation_fraction,
+        sealed_fraction,
+        promotion_split || request.mode == DiscoverMode::Continue,
+        &decision_timeframe,
+        history_start_year,
+    )?;
 
     let (mut bank, continuation_recipe_hash, starting_generation) = match request.mode {
         DiscoverMode::New => {
             update_phase(
                 job,
                 "Evaluating initial grammar population",
-                if oos1_enabled {
-                    "Development fills Holding. The full battery then validates OOS1; sealed OOS2 is never loaded."
-                } else {
-                    "Fold-stable Development R fills Holding. Sealed holdout is never loaded."
-                },
+                &format!(
+                    "Development R fills the pot; M1 fidelity admits to Holding, then walk-forward + OptProfile + Monte Carlo promote to Databank. Sealed holdout is never loaded."
+                ),
             )?;
             let mut config = new_config(&request)?;
             if !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
                 // Indices, oil, crypto and metals cannot pass the FX identical-parameter screen.
                 config.multi_symbol_minimum_pass = 0;
+            } else if !pack.is_empty()
+                && config.multi_symbol_minimum_pass == 0
+                && request.multi_symbol_minimum_pass.is_none()
+                && config.run_mode != quantforge_discover::DiscoverRunMode::QuotaHarvest
+            {
+                // Default to 6-of-N when a pack is supplied and the UI left the gate unset.
+                // Quota Harvest skips this: six extra H1 replays per candidate is why
+                // Looked-at crawls versus a single-symbol scout.
+                config.multi_symbol_minimum_pass = 6.min(pack.len() + 1);
             }
             let bank = new_databank(new_dataset, m1_eval, &broker, config)
                 .map_err(|error| error.to_string())?;
@@ -1985,8 +1263,15 @@ fn run_discovery(
             let artifact = continued_artifact
                 .expect("continuation always loads the databank before partitioning");
             let starting_generation = artifact.databank.completed_generations;
+            let mut bank = artifact.databank;
+            // Preserve the configured M1 → Holding → battery pipeline when a
+            // session is resumed.  Holding is a visible staging area, never a
+            // certification bypass: its candidates still require the full
+            // battery before they can enter the Databank.
+            bank.config.build_to_holding = request.build_to_holding.unwrap_or(true);
+            bank.config.require_m1_robustness = true;
             (
-                artifact.databank,
+                bank,
                 Some(artifact.manifest.recipe_hash),
                 starting_generation,
             )
@@ -2019,21 +1304,11 @@ fn run_discovery(
 
     let mut completed_now = 0u64;
     let mut last_checkpoint_active_seconds = clock.active_seconds();
-    let mut last_holding_count = bank.holding.len();
-    let mut holding_stall_generations = 0u64;
 
     let quota_met = |bank: &Databank| -> bool {
         bank.config
             .target_databank_elites
             .is_some_and(|target| bank.quota_progress_count() >= target)
-    };
-    let holding_plateaued = |bank: &Databank, stall: u64| -> bool {
-        holding_plateau_should_stop(
-            run_until_stopped,
-            bank.config.build_to_holding,
-            bank.holding.len(),
-            stall,
-        )
     };
 
     // Dataset selection is fixed for the run: `validate_resume` requires the
@@ -2058,12 +1333,11 @@ fn run_discovery(
             .map_err(|error| error.to_string())?;
 
     if request.mode == DiscoverMode::New && bank.evaluation_count == 0 {
-        let mut on_progress =
-            |evaluated: &Databank| -> Result<bool, quantforge_discover::DiscoverError> {
-                update_bank(job, evaluated, 0, soft_budget, run_until_stopped, &clock)
-                    .map_err(quantforge_discover::DiscoverError::InvalidConfig)?;
-                Ok(!stop.load(Ordering::SeqCst))
-            };
+        let mut on_progress = |evaluated: &Databank| -> Result<bool, quantforge_discover::DiscoverError> {
+            update_bank(job, evaluated, 0, soft_budget, run_until_stopped, &clock)
+                .map_err(quantforge_discover::DiscoverError::InvalidConfig)?;
+            Ok(!stop.load(Ordering::SeqCst))
+        };
         session
             .seed_initial_population(
                 &mut bank,
@@ -2200,19 +1474,6 @@ fn run_discovery(
         if quota_met(&bank) {
             break;
         }
-        // A Holding plateau is useful evidence for a finite quota recipe, but
-        // it is not a valid reason to stop an explicitly open-ended Discover
-        // run. The old behaviour silently handed open-ended runs to the
-        // factory after 25 flat generations.
-        if holding_plateaued(&bank, holding_stall_generations) {
-            if let Ok(mut view) = job.write() {
-                view.message = format!(
-                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
-                    bank.holding.len()
-                );
-            }
-            break;
-        }
         if !run_until_stopped && completed_now >= soft_budget {
             break;
         }
@@ -2231,9 +1492,9 @@ fn run_discovery(
         };
         let breeding = bank.pot_size() >= bank.config.mutate_after_elites;
         let status_message = if breeding {
-            "Scout keeps breeding. Side workers run M1 80/130 into Holding. Fold-R, plateau, CPCV, and Monte Carlo wait for the Holding battery. OOS2 is untouched."
+            "Scout keeps breeding. Side workers admit M1 survivors to Holding; the full robustness battery promotes Holding into Databank. OOS2 is untouched."
         } else {
-            "Candidates enter the Development reservoir only. After breeding unlocks: M1 80/130 → Holding. Databank tests run from the Holding tab."
+            "Candidates enter the Development reservoir only. After breeding unlocks: M1 → Holding → walk-forward + OptProfile + Monte Carlo → Databank."
         };
         update_phase(job, &phase_label, status_message)?;
 
@@ -2251,15 +1512,6 @@ fn run_discovery(
             )
             .map_err(|error| error.to_string())?;
         completed_now += 1;
-        if bank.config.build_to_holding {
-            let holding_now = bank.holding.len();
-            if holding_now > last_holding_count {
-                last_holding_count = holding_now;
-                holding_stall_generations = 0;
-            } else {
-                holding_stall_generations += 1;
-            }
-        }
         publish_live_databank(
             live_artifact,
             &request,
@@ -2340,21 +1592,10 @@ fn run_discovery(
             }
         }
 
-        // Deposited Holding is enough to stop. Waiting out the M1 queue after
+        // Databank quota is enough to stop. Waiting out the promotion queue after
         // every generation serialized scout behind promotion and is why
-        // Looked-at crawled versus the old pipelined runs. A Holding plateau
-        // (no new names for many generations) also stops so thin symbols can
-        // factory instead of waiting on a quota they will never fill.
+        // Looked-at crawled versus the old pipelined runs.
         if quota_met(&bank) {
-            break;
-        }
-        if holding_plateaued(&bank, holding_stall_generations) {
-            if let Ok(mut view) = job.write() {
-                view.message = format!(
-                    "Holding plateaued at {} names for {HOLDING_STALL_GENERATIONS} generations — stopping Discover so factory can run.",
-                    bank.holding.len()
-                );
-            }
             break;
         }
     }
@@ -2439,7 +1680,7 @@ fn finish_discovery(
         clock,
     )?;
 
-    if bank.elites.is_empty() && bank.accepted_pool.is_empty() {
+    if bank.elites.is_empty() && bank.accepted_pool.is_empty() && bank.holding.is_empty() {
         let funnel = funnel_summary(&bank);
         let mut view = job
             .write()
@@ -2447,7 +1688,7 @@ fn finish_discovery(
         view.status = "completed";
         view.phase = "Completed with an empty bank".into();
         view.message = format!(
-            "No elites passed the post-breed pipeline (Development CPCV/robustness → M1 → OOS1 validation) after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
+            "No candidates passed M1 into Holding after {} evaluations across {} generations. {funnel} Keep searching until breeding unlocks, loosen gates, or check data.",
             bank.evaluation_count, completed_now
         );
         view.output_path = None;
@@ -2530,13 +1771,8 @@ fn finish_discovery(
         .is_some_and(|target| bank.quota_progress_count() >= target);
     view.phase = if quota_complete {
         format!(
-            "Quota complete · {} {}",
-            bank.quota_progress_count(),
-            if bank.config.build_to_holding {
-                "holding"
-            } else {
-                "databank elites"
-            }
+            "Quota complete · {} databank elites",
+            bank.quota_progress_count()
         )
     } else if stop_was_early(completed_now, soft_budget, run_until_stopped) {
         "Stopped and checkpointed".into()
@@ -2547,12 +1783,7 @@ fn finish_discovery(
     view.latest_immutable_snapshot_path = Some(display_path(&snapshot));
     view.message = if quota_complete {
         format!(
-            "Reached {} quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
-            if bank.config.build_to_holding {
-                "Holding"
-            } else {
-                "databank"
-            },
+            "Reached databank quota ({}/{}). Saved after {} evaluations. Start a new Discover for the next family or asset.",
             bank.quota_progress_count(),
             bank.config.target_databank_elites.unwrap_or(0),
             view.evaluation_count
@@ -2574,27 +1805,6 @@ fn stop_was_early(completed_now: u64, soft_budget: u64, run_until_stopped: bool)
     } else {
         soft_budget > 0 && completed_now < soft_budget
     }
-}
-
-fn automatic_factory_target(
-    run_until_stopped: bool,
-    configured_target: Option<usize>,
-) -> Option<usize> {
-    (!run_until_stopped)
-        .then_some(configured_target.filter(|&target| target > 0))
-        .flatten()
-}
-
-fn holding_plateau_should_stop(
-    run_until_stopped: bool,
-    build_to_holding: bool,
-    holding_count: usize,
-    stall_generations: u64,
-) -> bool {
-    !run_until_stopped
-        && build_to_holding
-        && stall_generations >= HOLDING_STALL_GENERATIONS
-        && holding_count >= HOLDING_STALL_MIN
 }
 
 fn funnel_summary(bank: &Databank) -> String {
@@ -2699,16 +1909,6 @@ fn build_discover_artifact(
             "m1_source".into(),
             json!(display_path(Path::new(&request.m1_data_path))),
         ),
-        (
-            "decision_timeframe".into(),
-            json!(
-                match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
-                    DecisionTimeframe::H1 => "H1",
-                    DecisionTimeframe::M15 => "M15",
-                    DecisionTimeframe::H4 => "H4",
-                }
-            ),
-        ),
         ("databank".into(), json!(display_path(output_path))),
         ("engine_tier".into(), json!(quantforge_tick::ENGINE_TIER)),
         (
@@ -2727,9 +1927,27 @@ fn build_discover_artifact(
         ("m1_quality_grade".into(), json!(m1_quality.grade)),
         ("m1_quality_score".into(), json!(m1_quality.score)),
         ("desktop_job".into(), json!(true)),
+        // Results must replay the identical market window and decision bars
+        // that Discover used. Without this contract, an M15 strategy could be
+        // redrawn as H1 across a longer history and look unrelated to its row.
+        (
+            "decision_timeframe".into(),
+            json!(match request.decision_timeframe.unwrap_or(DecisionTimeframe::H1) {
+                DecisionTimeframe::H1 => "H1",
+                DecisionTimeframe::M15 => "M15",
+            }),
+        ),
+        ("history_start_date".into(), json!(request.history_start_date)),
+        ("history_end_date".into(), json!(request.history_end_date)),
+        // Keep every named calendar region, not merely the two aggregate
+        // fractions. Results uses this immutable schedule to draw the same
+        // IST/ISV/OOS boundaries the search actually used.
+        (
+            "data_range_parts".into(),
+            serde_json::to_value(&request.data_range_parts).map_err(|error| error.to_string())?,
+        ),
         ("promotion_split".into(), json!(true)),
         ("validation_fraction".into(), json!(validation_fraction)),
-        ("oos1_pick_enabled".into(), json!(validation_fraction > 0.0)),
         ("sealed_fraction".into(), json!(sealed_fraction)),
         (
             "stopped_early".into(),
@@ -2910,7 +2128,6 @@ fn load_fx_pack(
     validation_fraction: f64,
     sealed_fraction: f64,
     apply_promotion_split: bool,
-    reserve_oos1: bool,
     decision_timeframe: &str,
     history_start_year: u16,
 ) -> Result<Vec<PackSymbol>, String> {
@@ -2959,11 +2176,7 @@ fn load_fx_pack(
             load_bound_broker(&display_path(&broker_path), loaded.metadata.as_ref())?;
         apply_history_start_year(&mut loaded.dataset, history_start_year)?;
         let dataset = if apply_promotion_split {
-            if reserve_oos1 {
-                development_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
-            } else {
-                unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
-            }
+            unsealed_partition(&loaded.dataset, validation_fraction, sealed_fraction)?
         } else {
             loaded.dataset
         };
@@ -3055,16 +2268,18 @@ fn normalize_split_fractions(
     // sample.  Reject invalid input explicitly instead.
     if !validation_fraction.is_finite()
         || !sealed_fraction.is_finite()
-        || !(0.0..=0.5).contains(&validation_fraction)
+        || !(0.0..=0.4).contains(&validation_fraction)
         || !(0.05..=0.4).contains(&sealed_fraction)
     {
-        return Err("OOS1 reserve must be 0–50% and sealed holdout must be 5–40%".into());
+        return Err(
+            "OOS1 reserve must be 0–40% and sealed holdout must be 5–40%".into(),
+        );
     }
     let validation = validation_fraction;
     let sealed = sealed_fraction;
     if validation + sealed >= 0.9 {
         return Err(format!(
-            "OOS1 ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for Development"
+            "validation ({validation:.2}) + sealed ({sealed:.2}) leaves less than 10% for IS"
         ));
     }
     Ok((validation, sealed))
@@ -3114,21 +2329,6 @@ fn oos1_partition(
     let start = plan.development.bar_count;
     let end = start + plan.validation.bar_count;
     slice_partition(dataset, start, end)
-}
-
-fn sealed_partition(
-    dataset: &BarDataset,
-    validation_fraction: f64,
-    sealed_fraction: f64,
-) -> Result<BarDataset, String> {
-    let plan = quantforge_quality::DataSplitPlan::chronological(
-        dataset,
-        validation_fraction,
-        sealed_fraction,
-    )
-    .map_err(|error| error.to_string())?;
-    let start = plan.development.bar_count + plan.validation.bar_count;
-    slice_partition(dataset, start, dataset.bars.len())
 }
 
 fn slice_partition(dataset: &BarDataset, start: usize, end: usize) -> Result<BarDataset, String> {
@@ -3257,30 +2457,6 @@ fn broker_symbol_from_path(path: &str) -> Option<String> {
 }
 
 fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
-    let sl_tp_only_exits = request.sl_tp_only_exits.unwrap_or(true);
-    let allow_fixed_pip_stops = request.allow_fixed_pip_stops.unwrap_or(false);
-    let broker = load_bound_broker(&request.broker_path, None)?;
-    if allow_fixed_pip_stops && !quantforge_broker::fx_multi_symbol_primary(&broker.symbol) {
-        return Err(format!(
-            "fixed pip SL/TP is currently available for FX symbols only; {} should use ATR/R protection",
-            broker.symbol
-        ));
-    }
-    let fixed_pip_size_points = if matches!(broker.digits, 3 | 5) {
-        10.0
-    } else {
-        1.0
-    };
-    let mut universal_grammar = request.universal_grammar.clone().unwrap_or_default();
-    if sl_tp_only_exits {
-        // The constrained production lane intentionally leaves at most three
-        // entry conditions. Exit bounds remain part of the legacy grammar
-        // contract but are erased before evaluation.
-        universal_grammar.maximum_entry_conditions =
-            universal_grammar.maximum_entry_conditions.min(3);
-        universal_grammar.maximum_exit_conditions =
-            universal_grammar.maximum_exit_conditions.min(2);
-    }
     let mut commission = request
         .commission_per_lot_round_turn
         .ok_or_else(|| "commission is required for a new databank".to_owned())?;
@@ -3299,7 +2475,8 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         tournament_size: 4,
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
-        universal_grammar,
+        search_families: request.selected_search_families.clone().unwrap_or_default(),
+        universal_grammar: request.universal_grammar.clone().unwrap_or_default(),
         run_mode: request
             .run_mode
             .as_deref()
@@ -3326,22 +2503,20 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             minimum_return_retention: request.minimum_m1_return_retention.unwrap_or(0.80),
         },
         search_ranges: request.search_ranges.clone().unwrap_or_default(),
+        scout_fitness_mode: request.scout_fitness_mode.unwrap_or_default(),
         oos1_expectancy_retention: request.oos1_expectancy_retention.unwrap_or(0.7),
-        minimum_development_expectancy_r: request.minimum_development_expectancy_r.unwrap_or(0.25),
+        minimum_development_expectancy_r: request
+            .minimum_development_expectancy_r
+            .unwrap_or(0.25),
         require_m1_precision: request.require_m1_precision.unwrap_or(true),
         simple_exits: request.simple_exits.unwrap_or(true),
-        sl_tp_only_exits,
-        allow_fixed_pip_stops,
-        fixed_pip_size_points,
-        allow_indicator_exit_rules: request.allow_indicator_exit_rules.unwrap_or(false),
-        allow_time_stops: request.allow_time_stops.unwrap_or(false),
         allow_break_even: request.allow_break_even.unwrap_or(false),
         allow_trailing_stops: request.allow_trailing_stops.unwrap_or(false),
         allow_partial_exits: request.allow_partial_exits.unwrap_or(false),
         allow_market_entries: request.allow_market_entries.unwrap_or(true),
         allow_stop_entries: request.allow_stop_entries.unwrap_or(false),
         allow_limit_entries: request.allow_limit_entries.unwrap_or(false),
-        flatten_at_22: request.flatten_at_22.unwrap_or(false) || sl_tp_only_exits,
+        flatten_at_22: request.flatten_at_22.unwrap_or(false),
         end_of_day_hour: request.end_of_day_hour.unwrap_or(23),
         max_one_entry_per_day: request.max_one_entry_per_day.unwrap_or(true),
         mutate_after_elites: request.mutate_after_elites.unwrap_or(300),
@@ -3356,6 +2531,9 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         max_elites_per_niche: 8,
         max_promoted_per_niche: 4,
         max_per_entry_family: 24,
+        // M1 fidelity is deliberately isolated from the heavier tests. This
+        // keeps fast Discover throughput while giving the user a real Holding
+        // queue to inspect or send through CPCV/WF, parameter and MC tests.
         build_to_holding: request.build_to_holding.unwrap_or(true),
         require_m1_robustness: request.require_m1_robustness.unwrap_or(true),
         robustness_folds: request.robustness_folds.unwrap_or(8),
@@ -3372,13 +2550,15 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         robustness_monte_carlo_max_drawdown_ratio: request
             .robustness_monte_carlo_max_drawdown_ratio
             .unwrap_or(quantforge_discover::MONTE_CARLO_MAX_DRAWDOWN_RATIO),
-        robustness_neighborhood_samples: request.robustness_neighborhood_samples.unwrap_or(200),
+        robustness_neighborhood_samples: request
+            .robustness_neighborhood_samples
+            .unwrap_or(quantforge_discover::OPT_PROFILE_MAX_TESTS),
         robustness_perturbation_fraction: request
             .robustness_perturbation_fraction
             .unwrap_or(quantforge_discover::PARAMETER_NEIGHBORHOOD_PERTURBATION_FRACTION),
         minimum_neighborhood_survival_fraction: request
             .minimum_neighborhood_survival_fraction
-            .unwrap_or(0.55),
+            .unwrap_or(quantforge_discover::OPT_PROFILE_PROFIT_OPT_PCT),
         calendar_year_folds: request.calendar_year_folds.unwrap_or(false),
         minimum_deflated_trade_sharpe: request.minimum_deflated_trade_sharpe,
         multi_symbol_minimum_pass: request.multi_symbol_minimum_pass.unwrap_or(0),
@@ -3617,37 +2797,32 @@ fn update_bank(
     let breeding_active = pot_elites >= mutate_after && !bank.accepted_pool.is_empty();
     let queue_depth = telemetry.promotion_queue_depth;
     let inflight = telemetry.promotion_inflight;
-    let holding_label = if bank.config.build_to_holding {
-        "holding"
-    } else {
-        "databank"
-    };
     let phase = if let Some(target) = target_databank {
         format!(
-            "Quota · {holding_label} {quota_count}/{target} · pot {pot_elites} · gen {completed_now}"
+            "Quota · databank {quota_count}/{target} · pot {pot_elites} · gen {completed_now}"
         )
     } else if breeding_active {
         format!(
-            "Breeding · pot {pot_elites} · holding {holding_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
+            "Breeding · pot {pot_elites} · databank {databank_elites} · promo queue {queue_depth} · gen {completed_now}"
         )
     } else {
         format!(
-            "Filling initial pot · {pot_elites}/{mutate_after} · holding {holding_elites} · gen {completed_now}"
+            "Filling initial pot · {pot_elites}/{mutate_after} · databank {databank_elites} · gen {completed_now}"
         )
     };
     let pot_message = if let Some(target) = target_databank {
         format!(
-            "Quota Harvest: {holding_label} {quota_count}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
+            "Quota Harvest: databank {quota_count}/{target} (stop at {target}). Pot {pot_elites} is only a breeding bag — not the goal. {}",
             funnel_summary(bank)
         )
     } else if breeding_active {
         format!(
-            "Build continues; Holding pipeline on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · holding {holding_elites} · databank {databank_elites}. {}",
+            "Build continues; walk-forward + OptProfile + Monte Carlo on side workers (queue {queue_depth}, {inflight} in flight). Pot {pot_elites} · databank {databank_elites}. {}",
             funnel_summary(bank)
         )
     } else {
         format!(
-            "Development reservoir {pot_elites} (breed at {mutate_after}). Holding {holding_elites} after breeding (H1+M1; battery deferred). {} more reservoir members until breeding. {}",
+            "Development reservoir {pot_elites} (breed at {mutate_after}). Databank admits after H1 gates + sequential walk-forward + OptProfile + Monte Carlo. {} more reservoir members until breeding. {}",
             mutate_after.saturating_sub(pot_elites),
             funnel_summary(bank)
         )
@@ -3723,46 +2898,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn open_ended_discover_never_stops_for_a_holding_plateau_or_factory_target() {
-        assert!(!holding_plateau_should_stop(true, true, 111, 25));
-        assert_eq!(automatic_factory_target(true, Some(1)), None);
-    }
-
-    #[test]
-    fn portfolio_lane_is_always_a_new_isolated_discover_job() {
-        let mut lane = request("/tmp/portfolio-lane.json".into());
-        lane.selected_symbol = Some("EURUSD".into());
-        lane.worker_threads = Some(2);
-        let view = portfolio_lane_job(&lane, 2);
-
-        assert_eq!(view.mode, Some(DiscoverModeView::New));
-        assert_eq!(view.status, "queued");
-        assert_eq!(view.worker_threads, 2);
-        assert_eq!(
-            view.output_path.as_deref(),
-            Some("/tmp/portfolio-lane.json")
-        );
-    }
-
-    #[test]
-    fn portfolio_lane_prefers_its_immutable_checkpoint_for_reopening() {
-        let lane = request("/tmp/portfolio-working.json".into());
-        let mut job = portfolio_lane_job(&lane, 2);
-        job.latest_immutable_snapshot_path = Some("/tmp/portfolio-stopped.json".into());
-
-        let view = portfolio_lane_view("EURUSD", &job);
-
-        assert_eq!(view.output_path, "/tmp/portfolio-stopped.json");
-    }
-
-    #[test]
-    fn finite_discover_can_use_an_explicit_plateau_or_factory_target() {
-        assert!(holding_plateau_should_stop(false, true, 40, 25));
-        assert_eq!(automatic_factory_target(false, Some(1)), Some(1));
-        assert_eq!(automatic_factory_target(false, Some(0)), None);
-    }
-
     fn fixture(name: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
@@ -3807,10 +2942,6 @@ mod tests {
             oos1_expectancy_retention: Some(0.7),
             require_m1_precision: Some(false),
             simple_exits: Some(true),
-            sl_tp_only_exits: Some(true),
-            allow_fixed_pip_stops: Some(false),
-            allow_indicator_exit_rules: Some(false),
-            allow_time_stops: Some(false),
             allow_break_even: Some(false),
             allow_trailing_stops: Some(false),
             allow_partial_exits: Some(false),
@@ -3844,6 +2975,7 @@ mod tests {
             multi_symbol_minimum_pass: Some(0),
             pack_data_dir: None,
             universal_grammar: None,
+            selected_search_families: None,
             run_mode: Some("full_harvest".into()),
             general_island_count: None,
             refinement_island_count: None,
@@ -3853,6 +2985,7 @@ mod tests {
             early_stop_pot_elites: None,
             target_databank_elites: None,
             search_ranges: None,
+            scout_fitness_mode: None,
             commission_per_lot_round_turn: Some(0.0),
             slippage_points_per_side: Some(0.0),
             fallback_spread_points: None,
@@ -3862,23 +2995,14 @@ mod tests {
             validation_fraction: None,
             sealed_fraction: None,
             history_start_year: None,
+            history_start_date: None,
+            history_end_date: None,
+            data_range_parts: Vec::new(),
             factory_after_discover: None,
             factory_queue_limit: None,
             factory_target_databank: None,
             factory_max_correlation: None,
         }
-    }
-
-    #[test]
-    fn cross_symbol_screen_is_opt_in_for_new_jobs() {
-        let directory = tempdir().expect("temp directory");
-        let mut request = request(directory.path().join("bank.json").display().to_string());
-        request.pack_data_dir = Some("/unused-pack-directory".into());
-        request.multi_symbol_minimum_pass = None;
-        assert_eq!(requested_multi_symbol_minimum_pass(&request, None), 0);
-
-        request.multi_symbol_minimum_pass = Some(6);
-        assert_eq!(requested_multi_symbol_minimum_pass(&request, None), 6);
     }
 
     #[test]
@@ -3921,14 +3045,6 @@ mod tests {
         });
         let error = validate_request(&request).expect_err("inverted range must fail");
         assert!(error.contains("entry conditions"));
-
-        request.universal_grammar = Some(UniversalGrammarConfig {
-            minimum_entry_conditions: 4,
-            maximum_entry_conditions: 4,
-            ..UniversalGrammarConfig::default()
-        });
-        let error = validate_request(&request).expect_err("constrained profile caps at three");
-        assert!(error.contains("SL/TP-only"));
     }
 
     #[test]
@@ -4002,8 +3118,6 @@ mod tests {
         assert!(normalize_split_fractions(0.2, 0.2).is_ok());
         assert!(normalize_split_fractions(0.0, 1.0 / 3.0).is_ok());
         assert!(normalize_split_fractions(0.2, 0.1).is_ok());
-        assert!(normalize_split_fractions(0.5, 0.33).is_ok());
-        assert!(normalize_split_fractions(0.51, 0.2).is_err());
         let error = normalize_split_fractions(0.5, 0.45).expect_err("IS must remain");
         assert!(error.contains("less than 10%"));
     }
@@ -4016,9 +3130,10 @@ mod tests {
             None,
         )
         .expect("fixture should load");
-        let unsealed = unsealed_partition(&loaded.dataset, 0.0, 1.0 / 3.0).expect("unsealed");
-        let development =
-            development_partition(&loaded.dataset, 0.0, 1.0 / 3.0).expect("development");
+        let unsealed = unsealed_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
+            .expect("unsealed");
+        let development = development_partition(&loaded.dataset, 0.0, 1.0 / 3.0)
+            .expect("development");
         assert_eq!(unsealed.data_hash, development.data_hash);
         assert_eq!(unsealed.bars.len(), development.bars.len());
     }
@@ -4186,734 +3301,30 @@ mod tests {
     }
 
     #[test]
-    fn h4_is_a_four_hour_decision_lane() {
-        use quantforge_data::Bar;
-        let bars = vec![
-            Bar {
-                timestamp_ms: 0,
-                open: 1.0,
-                high: 1.1,
-                low: 0.9,
-                close: 1.05,
-                tick_volume: 1,
-                real_volume: 0,
-                spread_points: None,
-            },
-            Bar {
-                timestamp_ms: DecisionTimeframe::H4.interval_ms(),
-                open: 1.05,
-                high: 1.15,
-                low: 1.0,
-                close: 1.1,
-                tick_volume: 1,
-                real_volume: 0,
-                spread_points: None,
-            },
+    fn dated_schedule_becomes_the_holdout_contract() {
+        let parts = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2022-01-01".into(), end_date: "2022-06-29".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2022-06-30".into(), end_date: "2022-08-28".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2022-08-29".into(), end_date: "2022-10-27".into() },
+            DataRangePartRequest { id: "OOS2".into(), kind: "holdout".into(), start_date: "2022-10-28".into(), end_date: "2022-12-26".into() },
         ];
-        let dataset = BarDataset {
-            data_hash: bar_content_hash(&bars),
-            source_rows: bars.len(),
-            duplicate_rows_removed: 0,
-            input_was_sorted: true,
-            delimiter: '\t',
-            source_timezone: "Etc/UTC".into(),
-            bars,
-        };
-
-        assert_eq!(DecisionTimeframe::H4.interval_ms(), 14_400_000);
-        assert_eq!(decision_timeframe_label(&dataset).unwrap(), "H4");
+        let contract = range_schedule_contract(&parts).expect("valid schedule").expect("dated");
+        assert_eq!(contract.start_date, "2022-01-01");
+        assert_eq!(contract.end_date, "2022-12-26");
+        assert!((contract.validation_fraction - (60.0 / 360.0)).abs() < 1e-9);
+        assert!((contract.sealed_fraction - (120.0 / 360.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn real_pack_timeframe_bakeoff_smoke_when_requested() {
-        let Ok(root) = std::env::var("QF_TIMEFRAME_BAKEOFF_PACK") else {
-            return;
-        };
-        let root = Path::new(&root);
-        let request = TimeframeBakeoffRequest {
-            data_path: root
-                .join("ICMarketsSC-Demo_EURUSD_H1_2016_present.tsv")
-                .display()
-                .to_string(),
-            metadata_path: Some(
-                root.join("ICMarketsSC-Demo_EURUSD_H1_2016_present.metadata.csv")
-                    .display()
-                    .to_string(),
-            ),
-            source_timezone: None,
-            m1_data_path: root
-                .join("ICMarketsSC-Demo_EURUSD_M1_2016_present.tsv")
-                .display()
-                .to_string(),
-            m1_metadata_path: Some(
-                root.join("ICMarketsSC-Demo_EURUSD_M1_2016_present.metadata.csv")
-                    .display()
-                    .to_string(),
-            ),
-            m1_source_timezone: None,
-            broker_path: root.join("EURUSD.broker.json").display().to_string(),
-            draws_per_cell: 20,
-            seed: 42,
-            minimum_trades: 10,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 40.0,
-            oos1_retention: 0.7,
-            commission_per_lot_round_turn: 7.0,
-            slippage_points_per_side: 0.0,
-            fallback_spread_points: None,
-            validation_fraction: 0.2,
-            sealed_fraction: 1.0 / 3.0,
-            minimum_entry_conditions: 2,
-            maximum_entry_conditions: 2,
-            minimum_exit_conditions: 1,
-            maximum_exit_conditions: 1,
-            history_start_year: Some(2016),
-        };
-        let report = run_timeframe_bakeoff(request).expect("real pack bakeoff should run");
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        assert_eq!(report.rows.len(), 2);
-        assert_eq!(report.pair.paired_comparisons, 20);
-    }
-
-    #[test]
-    fn real_pack_timeframe_ablation_smoke_when_requested() {
-        let Ok(root) = std::env::var("QF_TIMEFRAME_ABLATION_PACK") else {
-            return;
-        };
-        let root = Path::new(&root);
-        let request = TimeframeBakeoffRequest {
-            data_path: root
-                .join("ICMarketsSC-Demo_EURUSD_H1_2016_present.tsv")
-                .display()
-                .to_string(),
-            metadata_path: Some(
-                root.join("ICMarketsSC-Demo_EURUSD_H1_2016_present.metadata.csv")
-                    .display()
-                    .to_string(),
-            ),
-            source_timezone: None,
-            m1_data_path: root
-                .join("ICMarketsSC-Demo_EURUSD_M1_2016_present.tsv")
-                .display()
-                .to_string(),
-            m1_metadata_path: Some(
-                root.join("ICMarketsSC-Demo_EURUSD_M1_2016_present.metadata.csv")
-                    .display()
-                    .to_string(),
-            ),
-            m1_source_timezone: None,
-            broker_path: root.join("EURUSD.broker.json").display().to_string(),
-            draws_per_cell: 100,
-            seed: 42,
-            minimum_trades: 10,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 40.0,
-            oos1_retention: 0.7,
-            commission_per_lot_round_turn: 7.0,
-            slippage_points_per_side: 0.0,
-            fallback_spread_points: None,
-            validation_fraction: 0.2,
-            sealed_fraction: 1.0 / 3.0,
-            minimum_entry_conditions: 2,
-            maximum_entry_conditions: 2,
-            minimum_exit_conditions: 1,
-            maximum_exit_conditions: 1,
-            history_start_year: Some(2016),
-        };
-        let report = run_timeframe_ablation(TimeframeAblationRequest {
-            base: request,
-            h1_gates: None,
-            h4_gates: Some(TimeframeGateConfig {
-                minimum_trades: 20,
-                minimum_return_percent: 0.0,
-                minimum_profit_factor: 1.0,
-                maximum_drawdown_percent: 25.0,
-                oos1_retention: 0.7,
-            }),
-        })
-        .expect("real pack timeframe ablation should run");
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        assert_eq!(report.rows.len(), 26);
-        assert_eq!(report.comparisons.len(), 13);
-        assert!(
-            report
-                .comparisons
-                .iter()
-                .all(|comparison| comparison.paired_comparisons == 100)
-        );
-    }
-
-    #[test]
-    fn real_pack_timeframe_walk_forward_selection_smoke_when_requested() {
-        let Ok(root) = std::env::var("QF_TIMEFRAME_WALK_FORWARD_PACK") else {
-            return;
-        };
-        let root = Path::new(&root);
-        let symbol = std::env::var("QF_TIMEFRAME_WALK_FORWARD_SYMBOL")
-            .unwrap_or_else(|_| "EURUSD".into())
-            .to_ascii_uppercase();
-        let seed = std::env::var("QF_TIMEFRAME_WALK_FORWARD_SEED")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(42);
-        let request = TimeframeBakeoffRequest {
-            data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            source_timezone: None,
-            m1_data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            m1_metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            m1_source_timezone: None,
-            broker_path: root
-                .join(format!("{symbol}.broker.json"))
-                .display()
-                .to_string(),
-            draws_per_cell: 100,
-            seed,
-            minimum_trades: 10,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 40.0,
-            oos1_retention: 0.7,
-            commission_per_lot_round_turn: 7.0,
-            slippage_points_per_side: 0.0,
-            fallback_spread_points: None,
-            validation_fraction: 0.2,
-            sealed_fraction: 1.0 / 3.0,
-            minimum_entry_conditions: 2,
-            maximum_entry_conditions: 2,
-            minimum_exit_conditions: 1,
-            maximum_exit_conditions: 1,
-            history_start_year: Some(2016),
-        };
-        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
-        let shared_gates = timeframe_gate_from_request(&request);
-        let h4_gates = TimeframeGateConfig {
-            minimum_trades: 20,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 25.0,
-            oos1_retention: 0.7,
-        };
-        let config = TimeframeAblationConfig {
-            seed: request.seed,
-            draws_per_cell: request.draws_per_cell,
-            entry_condition_counts: vec![2],
-            exit_condition_counts: vec![1],
-            scout: timeframe_scout(&request),
-            h1_gates: shared_gates.clone(),
-            h4_gates: h4_gates.clone(),
-            shared_gates,
-        };
-        let h1_start = data
-            .h1_is
-            .bars
-            .first()
-            .expect("H1 development bars")
-            .timestamp_ms;
-        let h1_len = data.h1_is.bars.len();
-        let origins = [
-            ("origin_1", 0.45_f64, 0.60_f64),
-            ("origin_2", 0.55_f64, 0.70_f64),
-            ("origin_3", 0.65_f64, 0.80_f64),
+    fn segmented_schedule_can_interleave_validation_and_training() {
+        let parts = vec![
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2022-01-01".into(), end_date: "2022-10-02".into() },
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2022-10-03".into(), end_date: "2023-07-05".into() },
+            DataRangePartRequest { id: "ISV2".into(), kind: "validation".into(), start_date: "2023-07-06".into(), end_date: "2024-04-07".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2024-04-08".into(), end_date: "2025-01-07".into() },
         ];
-        let mut summary = Vec::new();
-        for (label, train_fraction, validation_end_fraction) in origins {
-            let train_end_index = (h1_len as f64 * train_fraction).round() as usize;
-            let validation_end_index = (h1_len as f64 * validation_end_fraction).round() as usize;
-            let validation_start = data.h1_is.bars[train_end_index].timestamp_ms;
-            let validation_end = data.h1_is.bars[validation_end_index].timestamp_ms;
-            let h1_train = slice_timestamp_window(&data.h1_is, h1_start, validation_start);
-            let h1_validation =
-                slice_timestamp_window(&data.h1_is, validation_start, validation_end);
-            let h4_train = slice_timestamp_window(&data.h4_is, h1_start, validation_start);
-            let h4_validation =
-                slice_timestamp_window(&data.h4_is, validation_start, validation_end);
-            let report = evolve_timeframe_ablation(
-                &h1_train,
-                &h1_validation,
-                &h4_train,
-                &h4_validation,
-                &data.broker,
-                config.clone(),
-            )
-            .expect("inner walk-forward ablation should run");
-            let row = |mode: quantforge_discover::TimeframeSelectionMode, timeframe: &str| {
-                report
-                    .rows
-                    .iter()
-                    .find(|row| row.selection_mode == mode && row.timeframe == timeframe)
-                    .expect("walk-forward row exists")
-            };
-            let h4_drawdown = row(
-                quantforge_discover::TimeframeSelectionMode::DrawdownOnly,
-                "H4",
-            );
-            let h4_drawdown_top_k = row(
-                quantforge_discover::TimeframeSelectionMode::DrawdownTopK,
-                "H4",
-            );
-            let h4_fold = row(
-                quantforge_discover::TimeframeSelectionMode::MedianFoldExpectancyTopK,
-                "H4",
-            );
-            let h4_expectancy = row(
-                quantforge_discover::TimeframeSelectionMode::ExpectancyTopK,
-                "H4",
-            );
-            let h4_shared = row(
-                quantforge_discover::TimeframeSelectionMode::SharedGates,
-                "H4",
-            );
-            let h4_random = row(
-                quantforge_discover::TimeframeSelectionMode::RandomTopK,
-                "H4",
-            );
-            summary.push(json!({
-                "seed": request.seed,
-                "origin": label,
-                "trainBarsH1": h1_train.bars.len(),
-                "validationBarsH1": h1_validation.bars.len(),
-                "h4SharedLiftR": h4_shared.selected_future_expectancy_lift_r,
-                "h4DrawdownLiftR": h4_drawdown.selected_future_expectancy_lift_r,
-                "h4DrawdownTopKLiftR": h4_drawdown_top_k.selected_future_expectancy_lift_r,
-                "h4FoldExpectancyTopKLiftR": h4_fold.selected_future_expectancy_lift_r,
-                "h4ExpectancyTopKLiftR": h4_expectancy.selected_future_expectancy_lift_r,
-                "h4RandomTopKLiftR": h4_random.selected_future_expectancy_lift_r,
-                "h4DrawdownSelected": h4_drawdown.selected,
-                "h4DrawdownTopKSelected": h4_drawdown_top_k.selected,
-                "h4FoldSelected": h4_fold.selected,
-                "h4RandomTopKSelected": h4_random.selected,
-            }));
-        }
-        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
-        assert_eq!(summary.len(), 3);
-    }
-
-    #[test]
-    fn real_pack_timeframe_sealed_evaluation_smoke_when_requested() {
-        let Ok(root) = std::env::var("QF_TIMEFRAME_SEALED_EVAL_PACK") else {
-            return;
-        };
-        let root = Path::new(&root);
-        let symbol = std::env::var("QF_TIMEFRAME_SEALED_EVAL_SYMBOL")
-            .unwrap_or_else(|_| "EURUSD".into())
-            .to_ascii_uppercase();
-        let seed = std::env::var("QF_TIMEFRAME_SEALED_EVAL_SEED")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(42);
-        let request = TimeframeBakeoffRequest {
-            data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            source_timezone: None,
-            m1_data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            m1_metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            m1_source_timezone: None,
-            broker_path: root
-                .join(format!("{symbol}.broker.json"))
-                .display()
-                .to_string(),
-            draws_per_cell: 100,
-            seed,
-            minimum_trades: 10,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 40.0,
-            oos1_retention: 0.7,
-            commission_per_lot_round_turn: 7.0,
-            slippage_points_per_side: 0.0,
-            fallback_spread_points: None,
-            validation_fraction: 0.2,
-            sealed_fraction: 1.0 / 3.0,
-            minimum_entry_conditions: 2,
-            maximum_entry_conditions: 2,
-            minimum_exit_conditions: 1,
-            maximum_exit_conditions: 1,
-            history_start_year: Some(2016),
-        };
-        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
-        let shared_gates = timeframe_gate_from_request(&request);
-        let h4_gates = TimeframeGateConfig {
-            minimum_trades: 20,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 25.0,
-            oos1_retention: 0.7,
-        };
-        let config = TimeframeAblationConfig {
-            seed: request.seed,
-            draws_per_cell: request.draws_per_cell,
-            entry_condition_counts: vec![2],
-            exit_condition_counts: vec![1],
-            scout: timeframe_scout(&request),
-            h1_gates: shared_gates.clone(),
-            h4_gates,
-            shared_gates,
-        };
-        let report = evolve_timeframe_ablation(
-            &data.h1_is,
-            &data.h1_sealed,
-            &data.h4_is,
-            &data.h4_sealed,
-            &data.broker,
-            config,
-        )
-        .expect("sealed evaluation should run");
-        let row = |mode: quantforge_discover::TimeframeSelectionMode| {
-            report
-                .rows
-                .iter()
-                .find(|row| row.selection_mode == mode && row.timeframe == "H4")
-                .expect("sealed H4 row exists")
-        };
-        let shared = row(quantforge_discover::TimeframeSelectionMode::SharedGates);
-        let drawdown = row(quantforge_discover::TimeframeSelectionMode::DrawdownTopK);
-        let random = row(quantforge_discover::TimeframeSelectionMode::RandomTopK);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "symbol": symbol,
-                "seed": request.seed,
-                "sealedBarsH1": data.h1_sealed.bars.len(),
-                "sealedBarsH4": data.h4_sealed.bars.len(),
-                "sharedSelected": shared.selected,
-                "sharedSelectedSealedExpectancyR": shared.selected_oos1_expectancy_r,
-                "sharedUnselectedSealedExpectancyR": shared.unselected_oos1_expectancy_r,
-                "sharedSealedLiftR": shared.selected_future_expectancy_lift_r,
-                "drawdownTopKSelected": drawdown.selected,
-                "drawdownTopKSelectedSealedExpectancyR": drawdown.selected_oos1_expectancy_r,
-                "drawdownTopKUnselectedSealedExpectancyR": drawdown.unselected_oos1_expectancy_r,
-                "drawdownTopKSealedLiftR": drawdown.selected_future_expectancy_lift_r,
-                "randomTopKSelected": random.selected,
-                "randomTopKSelectedSealedExpectancyR": random.selected_oos1_expectancy_r,
-                "randomTopKUnselectedSealedExpectancyR": random.unselected_oos1_expectancy_r,
-                "randomTopKSealedLiftR": random.selected_future_expectancy_lift_r,
-            }))
-            .unwrap()
-        );
-        assert!(drawdown.selected <= shared.selected);
-        assert!(random.selected <= shared.selected);
-    }
-
-    #[test]
-    fn real_pack_timeframe_rolling_benchmark_smoke_when_requested() {
-        let Ok(root) = std::env::var("QF_TIMEFRAME_ROLLING_PACK") else {
-            return;
-        };
-        let root = Path::new(&root);
-        let symbol = std::env::var("QF_TIMEFRAME_ROLLING_SYMBOL")
-            .unwrap_or_else(|_| "EURUSD".into())
-            .to_ascii_uppercase();
-        let seed = std::env::var("QF_TIMEFRAME_ROLLING_SEED")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(7);
-        let draws_per_cell = std::env::var("QF_TIMEFRAME_ROLLING_DRAWS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(50);
-        let request = TimeframeBakeoffRequest {
-            data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_H1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_H1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            source_timezone: None,
-            m1_data_path: root
-                .join(format!("ICMarketsSC-Demo_{symbol}_M1_2016_present.tsv"))
-                .display()
-                .to_string(),
-            m1_metadata_path: Some(
-                root.join(format!(
-                    "ICMarketsSC-Demo_{symbol}_M1_2016_present.metadata.csv"
-                ))
-                .display()
-                .to_string(),
-            ),
-            m1_source_timezone: None,
-            broker_path: root
-                .join(format!("{symbol}.broker.json"))
-                .display()
-                .to_string(),
-            draws_per_cell,
-            seed,
-            minimum_trades: 10,
-            minimum_return_percent: 0.0,
-            minimum_profit_factor: 1.0,
-            maximum_drawdown_percent: 40.0,
-            oos1_retention: 0.7,
-            commission_per_lot_round_turn: 7.0,
-            slippage_points_per_side: 0.0,
-            fallback_spread_points: None,
-            validation_fraction: 0.2,
-            sealed_fraction: 1.0 / 3.0,
-            minimum_entry_conditions: 2,
-            maximum_entry_conditions: 2,
-            minimum_exit_conditions: 1,
-            maximum_exit_conditions: 1,
-            history_start_year: Some(2016),
-        };
-        let data = load_timeframe_comparison_data(&request).expect("real pack should load");
-        let shared_gates = timeframe_gate_from_request(&request);
-        let config = TimeframeAblationConfig {
-            seed: request.seed,
-            draws_per_cell: request.draws_per_cell,
-            entry_condition_counts: vec![2],
-            exit_condition_counts: vec![1],
-            scout: timeframe_scout(&request),
-            h1_gates: shared_gates.clone(),
-            h4_gates: TimeframeGateConfig {
-                minimum_trades: 20,
-                minimum_return_percent: 0.0,
-                minimum_profit_factor: 1.0,
-                maximum_drawdown_percent: 25.0,
-                oos1_retention: 0.7,
-            },
-            shared_gates,
-        };
-        let h1_start = data
-            .h1_is
-            .bars
-            .first()
-            .expect("development bars")
-            .timestamp_ms;
-        let h1_len = data.h1_is.bars.len();
-        let origins = [
-            ("origin_1", 0.25_f64),
-            ("origin_2", 0.35_f64),
-            ("origin_3", 0.45_f64),
-            ("origin_4", 0.55_f64),
-            ("origin_5", 0.65_f64),
-        ];
-        let horizons = [("3m", 3_u32), ("6m", 6_u32), ("12m", 12_u32)];
-        let mut all_rows = Vec::new();
-        for (origin, train_fraction) in origins {
-            let train_end_index = (h1_len as f64 * train_fraction).round() as usize;
-            let validation_start = data.h1_is.bars[train_end_index].timestamp_ms;
-            let h4_train = slice_timestamp_window(&data.h4_is, h1_start, validation_start);
-            let mut validation_sets = Vec::new();
-            for (horizon, horizon_months) in horizons {
-                let validation_end_timestamp =
-                    add_calendar_months(validation_start, horizon_months);
-                let validation_end_index = data
-                    .h1_is
-                    .bars
-                    .partition_point(|bar| bar.timestamp_ms < validation_end_timestamp);
-                assert!(
-                    validation_end_index > train_end_index,
-                    "rolling validation window must contain bars"
-                );
-                let validation_end = if validation_end_index < h1_len {
-                    data.h1_is.bars[validation_end_index].timestamp_ms
-                } else {
-                    data.h1_is.bars.last().unwrap().timestamp_ms + 1
-                };
-                let h1_validation =
-                    slice_timestamp_window(&data.h1_is, validation_start, validation_end);
-                let h4_validation =
-                    slice_timestamp_window(&data.h4_is, validation_start, validation_end);
-                validation_sets.push((format!("{origin}_{horizon}"), h1_validation, h4_validation));
-            }
-            let windows = validation_sets
-                .iter()
-                .map(|(label, h1, h4)| TimeframeRollingWindow {
-                    label: label.clone(),
-                    h1,
-                    h4,
-                })
-                .collect::<Vec<_>>();
-            let report = evolve_timeframe_rolling_ablation(
-                &h4_train,
-                &windows,
-                &data.broker,
-                config.clone(),
-            )
-            .expect("rolling benchmark should run");
-            all_rows.extend(report.rows);
-        }
-
-        let modes = [
-            quantforge_discover::TimeframeSelectionMode::SharedGates,
-            quantforge_discover::TimeframeSelectionMode::RandomTopK,
-            quantforge_discover::TimeframeSelectionMode::DrawdownTopK,
-            quantforge_discover::TimeframeSelectionMode::RecoveryFactorTopK,
-            quantforge_discover::TimeframeSelectionMode::TradesTopK,
-            quantforge_discover::TimeframeSelectionMode::ReturnTopK,
-            quantforge_discover::TimeframeSelectionMode::ProfitFactorTopK,
-            quantforge_discover::TimeframeSelectionMode::SharpeTopK,
-            quantforge_discover::TimeframeSelectionMode::ExpectancyTopK,
-            quantforge_discover::TimeframeSelectionMode::MedianFoldExpectancyTopK,
-            quantforge_discover::TimeframeSelectionMode::ExpectancyTimesTradesTopK,
-            quantforge_discover::TimeframeSelectionMode::ExpectancyTimesSqrtTradesTopK,
-        ];
-        let mean = |values: Vec<f64>| {
-            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
-        };
-        let mut horizon_summary = Vec::new();
-        for (horizon, _) in horizons {
-            let mut mode_summary = Vec::new();
-            for mode in modes {
-                let rows = all_rows
-                    .iter()
-                    .filter(|row| row.window.ends_with(horizon) && row.selection_mode == mode)
-                    .collect::<Vec<_>>();
-                let lifts = rows
-                    .iter()
-                    .filter_map(|row| row.selected_future_expectancy_lift_r)
-                    .collect::<Vec<_>>();
-                let selected_future = rows
-                    .iter()
-                    .filter_map(|row| row.selected_future_expectancy_r)
-                    .collect::<Vec<_>>();
-                mode_summary.push(json!({
-                    "mode": format!("{mode:?}"),
-                    "windows": rows.len(),
-                    "meanEligible": mean(rows.iter().map(|row| row.eligible as f64).collect()),
-                    "meanLiftR": mean(lifts.clone()),
-                    "positiveLiftWindows": lifts.iter().filter(|value| **value > 0.0).count(),
-                    "minimumLiftR": lifts.iter().copied().reduce(f64::min),
-                    "meanSelectedFutureExpectancyR": mean(selected_future),
-                    "meanSelectedFutureTrades": mean(rows.iter().filter_map(|row| row.selected_future_trade_count).collect()),
-                }));
-            }
-            let dd_rows = all_rows
-                .iter()
-                .filter(|row| {
-                    row.window.ends_with(horizon)
-                        && row.selection_mode
-                            == quantforge_discover::TimeframeSelectionMode::DrawdownTopK
-                })
-                .collect::<Vec<_>>();
-            let random_rows = all_rows
-                .iter()
-                .filter(|row| {
-                    row.window.ends_with(horizon)
-                        && row.selection_mode
-                            == quantforge_discover::TimeframeSelectionMode::RandomTopK
-                })
-                .collect::<Vec<_>>();
-            let dd_beats_random = dd_rows
-                .iter()
-                .zip(random_rows.iter())
-                .filter(|(dd, random)| {
-                    dd.selected_future_expectancy_lift_r
-                        .unwrap_or(f64::NEG_INFINITY)
-                        > random
-                            .selected_future_expectancy_lift_r
-                            .unwrap_or(f64::NEG_INFINITY)
-                })
-                .count();
-            horizon_summary.push(json!({
-                "horizon": horizon,
-                "ddBeatsRandomWindows": dd_beats_random,
-                "totalWindows": dd_rows.len(),
-                "modes": mode_summary,
-            }));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "symbol": symbol,
-                "seed": request.seed,
-                "drawsPerCell": request.draws_per_cell,
-                "origins": origins.len(),
-                "horizons": horizons.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
-                "summary": horizon_summary,
-            }))
-            .unwrap()
-        );
-        assert_eq!(all_rows.len(), origins.len() * horizons.len() * modes.len());
-    }
-
-    fn add_calendar_months(timestamp_ms: i64, months: u32) -> i64 {
-        use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
-        let timestamp = Utc
-            .timestamp_millis_opt(timestamp_ms)
-            .single()
-            .expect("valid rolling timestamp");
-        let total_month = timestamp.year() * 12 + timestamp.month0() as i32 + months as i32;
-        let year = total_month.div_euclid(12);
-        let month = total_month.rem_euclid(12) as u32 + 1;
-        let next_month = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
-        };
-        let day = timestamp.day().min(next_month.pred_opt().unwrap().day());
-        let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
-        Utc.from_utc_datetime(
-            &date
-                .and_hms_milli_opt(
-                    timestamp.hour(),
-                    timestamp.minute(),
-                    timestamp.second(),
-                    timestamp.timestamp_subsec_millis(),
-                )
-                .unwrap(),
-        )
-        .timestamp_millis()
-    }
-
-    fn slice_timestamp_window(dataset: &BarDataset, start_ms: i64, end_ms: i64) -> BarDataset {
-        let bars = dataset
-            .bars
-            .iter()
-            .filter(|bar| bar.timestamp_ms >= start_ms && bar.timestamp_ms < end_ms)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(bars.len() >= 2, "walk-forward window must contain bars");
-        BarDataset {
-            data_hash: bar_content_hash(&bars),
-            source_rows: bars.len(),
-            duplicate_rows_removed: 0,
-            input_was_sorted: true,
-            delimiter: dataset.delimiter,
-            source_timezone: dataset.source_timezone.clone(),
-            bars,
-        }
+        let contract = range_schedule_contract(&parts).expect("mixed schedule should be valid").expect("dated");
+        assert!(contract.validation_fraction > 0.5);
+        assert!(contract.sealed_fraction > 0.2);
     }
 }

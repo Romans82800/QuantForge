@@ -5,6 +5,7 @@ mod databank;
 mod deploy;
 mod discover;
 mod evidence;
+#[allow(dead_code)]
 mod holding_battery;
 mod parity_lab;
 mod portfolio;
@@ -13,7 +14,7 @@ mod vault;
 mod workflow;
 
 use databank::DesktopState;
-use discover::{DiscoverState, PortfolioDiscoverState};
+use discover::DiscoverState;
 use holding_battery::BatteryJobState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -22,7 +23,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopState::default())
         .manage(DiscoverState::default())
-        .manage(PortfolioDiscoverState::default())
         .manage(BatteryJobState::default())
         .invoke_handler(tauri::generate_handler![
             assets::list_assets,
@@ -45,29 +45,16 @@ pub fn run() {
             databank::export_elite_eas,
             databank::export_elite_trade_csvs,
             databank::promote_elite_to_vault,
-            databank::run_holding_battery,
-            holding_battery::start_holding_battery_job,
-            holding_battery::start_production_lane_job,
-            holding_battery::get_holding_battery_job,
-            holding_battery::stop_holding_battery,
-            holding_battery::promote_holding_without_robustness,
-            holding_battery::shrink_holding_by_daily_corr,
             databank::run_fidelity_demo,
             data_lab::inspect_data,
             data_lab::import_market_folder,
             discover::start_discover,
-            discover::start_portfolio_discover,
             discover::run_condition_bakeoff,
-            discover::run_timeframe_bakeoff,
-            discover::run_timeframe_ablation,
             discover::get_discover_job,
-            discover::get_portfolio_discover_job,
             discover::get_discover_live_databank,
-            discover::get_portfolio_live_databank,
             discover::pause_discover,
             discover::resume_discover,
             discover::stop_discover,
-            discover::stop_portfolio_discover,
             challenge::run_challenge_workflow,
             promotion_ledger::run_sealed_final,
             promotion_ledger::start_incubation,

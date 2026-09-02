@@ -24,8 +24,6 @@ import {
   exportEliteEas,
   exportEliteTradeCsvs,
   getDiscoverJob,
-  getPortfolioDiscoverJob,
-  getPortfolioLiveDatabank,
   getDiscoverLiveDatabank,
   getElitePartitionEquity,
   getEliteMql5Source,
@@ -40,19 +38,12 @@ import {
   deleteDiscoverProfile,
   deleteSearchRangeProfile,
   loadDatabankPath,
-  startHoldingBatteryJob,
-  startProductionLaneJob,
-  getHoldingBatteryJob,
-  stopHoldingBattery,
-  shrinkHoldingByDailyCorr,
   loadElite,
   pauseDiscover,
   recordIncubation,
   resumeDiscover,
   runConditionBakeoff,
-  runTimeframeBakeoff,
   promoteEliteToVault,
-  promoteHoldingWithoutRobustness,
   runFidelityDemo,
   runEliteRobustness,
   runM1Judge,
@@ -60,9 +51,7 @@ import {
   startIncubation,
   finalizeIncubation,
   startDiscover,
-  startPortfolioDiscover,
   stopDiscover,
-  stopPortfolioDiscover,
 } from "./api";
 import type {
   AssembleEvidenceRequest,
@@ -74,7 +63,6 @@ import type {
   DiscoverJobView,
   DiscoverRequest,
   DiscoverRunModeId,
-  BatteryJobView,
   EliteDetail,
   EliteMql5SourceView,
   EliteRow,
@@ -84,7 +72,6 @@ import type {
   ExportView,
   EvidenceView,
   ConditionBakeoffReport,
-  TimeframeBakeoffReport,
   ConditionCoverage,
   JudgeRequest,
   JudgeView,
@@ -100,17 +87,17 @@ import type {
   ResultsRobustnessView,
   TradeRowView,
   PortfolioRequest,
-  PortfolioDiscoverAsset,
-  PortfolioDiscoverJobView,
-  PortfolioDiscoverRequest,
   PortfolioView,
   SearchRange,
   SearchRangeProfile,
   SavedDiscoverProfile,
   SavedSearchRangeProfile,
+  ScoutFitnessModeId,
   SealedRequest,
   SealedView,
   SymbolPack,
+  UniversalGrammarConfig,
+  DataRangePart,
   VaultView,
   WorkspaceName,
 } from "./types";
@@ -183,7 +170,7 @@ const navigation: { name: WorkspaceName; label: string; icon: NavIcon }[] = [
 const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
   indicatorPeriod: { minimum: 10, maximum: 20, step: 1 }, atrPeriod: { minimum: 10, maximum: 20, step: 1 },
   atrStopMultiple: { minimum: 1, maximum: 4, step: .25 }, atrTargetMultiple: { minimum: 1, maximum: 6, step: .5 },
-  riskTargetMultiple: { minimum: .75, maximum: 4.5, step: .25 }, fixedStopPips: { minimum: 10, maximum: 80, step: 5 }, fixedTargetPips: { minimum: 15, maximum: 120, step: 5 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
+  riskTargetMultiple: { minimum: .75, maximum: 4.5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 2, step: .25 },
   pendingExpiryBars: { minimum: 2, maximum: 8, step: 1 }, timeStopBars: { minimum: 4, maximum: 16, step: 1 },
   rsiUpper: { minimum: 52, maximum: 65, step: 1 }, rsiLower: { minimum: 20, maximum: 40, step: 1 }, adxThreshold: { minimum: 20, maximum: 35, step: 1 },
   rocThreshold: { minimum: .1, maximum: 2.5, step: .1 }, percentileLow: { minimum: 5, maximum: 25, step: 1 },
@@ -198,7 +185,7 @@ const H1_COMPACT_SEARCH_RANGES: SearchRangeProfile = {
 const SQX_RANDOM_SEARCH_RANGES: SearchRangeProfile = {
   indicatorPeriod: { minimum: 10, maximum: 50, step: 1 }, atrPeriod: { minimum: 7, maximum: 28, step: 1 },
   atrStopMultiple: { minimum: 1, maximum: 5, step: .25 }, atrTargetMultiple: { minimum: 1.5, maximum: 8, step: .5 },
-  riskTargetMultiple: { minimum: 1, maximum: 5, step: .25 }, fixedStopPips: { minimum: 10, maximum: 100, step: 5 }, fixedTargetPips: { minimum: 15, maximum: 150, step: 5 }, pendingDistanceAtr: { minimum: .25, maximum: 3, step: .25 },
+  riskTargetMultiple: { minimum: 1, maximum: 5, step: .25 }, pendingDistanceAtr: { minimum: .25, maximum: 3, step: .25 },
   pendingExpiryBars: { minimum: 1, maximum: 12, step: 1 }, timeStopBars: { minimum: 2, maximum: 48, step: 1 },
   rsiUpper: { minimum: 55, maximum: 80, step: 1 }, rsiLower: { minimum: 20, maximum: 45, step: 1 }, adxThreshold: { minimum: 15, maximum: 40, step: 1 },
   rocThreshold: { minimum: .05, maximum: 5, step: .05 }, percentileLow: { minimum: 5, maximum: 30, step: 1 },
@@ -209,30 +196,114 @@ const SQX_RANDOM_SEARCH_RANGES: SearchRangeProfile = {
   swingBars: { minimum: 2, maximum: 8, step: 1 }, baseBars: { minimum: 2, maximum: 8, step: 1 }, liquiditySweepThreshold: { minimum: 0, maximum: 1, step: .25 },
 };
 
-const DEFAULT_SEARCH_RANGES = H1_COMPACT_SEARCH_RANGES;
+/** Widest SQX-style gene space for multi-year H1 discovery. */
+const SQX_WIDE_SEARCH_RANGES: SearchRangeProfile = {
+  indicatorPeriod: { minimum: 5, maximum: 100, step: 1 }, atrPeriod: { minimum: 5, maximum: 50, step: 1 },
+  atrStopMultiple: { minimum: .5, maximum: 8, step: .5 }, atrTargetMultiple: { minimum: 1, maximum: 12, step: .5 },
+  riskTargetMultiple: { minimum: .5, maximum: 8, step: .5 }, pendingDistanceAtr: { minimum: .25, maximum: 4, step: .25 },
+  pendingExpiryBars: { minimum: 1, maximum: 24, step: 1 }, timeStopBars: { minimum: 2, maximum: 96, step: 1 },
+  rsiUpper: { minimum: 50, maximum: 85, step: 1 }, rsiLower: { minimum: 15, maximum: 50, step: 1 }, adxThreshold: { minimum: 10, maximum: 45, step: 1 },
+  rocThreshold: { minimum: .05, maximum: 8, step: .05 }, percentileLow: { minimum: 3, maximum: 35, step: 1 },
+  zscoreThreshold: { minimum: .5, maximum: 4, step: .1 }, impulseBodyRatio: { minimum: .45, maximum: .9, step: .05 },
+  impulseCloseLocation: { minimum: .55, maximum: .95, step: .05 }, atrPercentileMax: { minimum: 5, maximum: 60, step: 1 },
+  atrPercentileLookback: { minimum: 10, maximum: 120, step: 10 },
+  sessionStartHour: { minimum: 0, maximum: 22, step: 1 }, sessionRangeBars: { minimum: 1, maximum: 8, step: 1 },
+  swingBars: { minimum: 2, maximum: 12, step: 1 }, baseBars: { minimum: 2, maximum: 12, step: 1 }, liquiditySweepThreshold: { minimum: 0, maximum: 1, step: .25 },
+};
 
-type BuiltInSearchPresetId = "h1_compact" | "sqx_random" | "custom";
+const DEFAULT_SEARCH_RANGES = SQX_WIDE_SEARCH_RANGES;
+
+const H1_COMPACT_UNIVERSAL_GRAMMAR: UniversalGrammarConfig = {
+  minimumEntryConditions: 2,
+  maximumEntryConditions: 2,
+  minimumExitConditions: 1,
+  maximumExitConditions: 3,
+  minimumShift: 1,
+  maximumShift: 3,
+};
+
+const SQX_WIDE_UNIVERSAL_GRAMMAR: UniversalGrammarConfig = {
+  minimumEntryConditions: 2,
+  maximumEntryConditions: 4,
+  minimumExitConditions: 1,
+  maximumExitConditions: 3,
+  minimumShift: 1,
+  maximumShift: 8,
+};
+
+const DEFAULT_UNIVERSAL_GRAMMAR = SQX_WIDE_UNIVERSAL_GRAMMAR;
+
+const SEARCH_FAMILIES = [
+  ["trend_pullback", "Trend following / pullback"],
+  ["momentum_burst", "Momentum burst"],
+  ["donchian_breakout", "Channel breakout"],
+  ["mean_reversion_band", "Mean reversion bands"],
+  ["z_score_reversion", "Z-score reversion"],
+  ["session_orb", "Session opening range"],
+  ["impulse_candle", "Impulse candle"],
+  ["vol_squeeze_break", "Volatility squeeze"],
+  ["supply_demand_reclaim", "Supply / demand reclaim"],
+  ["sweep_reclaim", "Liquidity sweep reclaim"],
+] as const;
+
+function timelineDay(value: string): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function timelineDate(value: number): string {
+  return new Date(value).toISOString().slice(0, 10);
+}
+function timelineWeight(part: DataRangePart): number {
+  const start = timelineDay(part.startDate);
+  const end = timelineDay(part.endDate);
+  return start !== null && end !== null && end > start ? Math.max(1, Math.round((end - start) / 86400000)) : 1;
+}
+function timelinePercent(part: DataRangePart, all: DataRangePart[]): number {
+  const total = all.reduce((sum, item) => sum + timelineWeight(item), 0);
+  return total > 0 ? Math.round((timelineWeight(part) / total) * 100) : 0;
+}
+function automaticRangeNames(parts: DataRangePart[]): DataRangePart[] {
+  let training = 0; let validation = 0; let holdout = 0;
+  return parts.map((part) => ({
+    ...part,
+    id: part.kind === "training" ? (training++ === 0 ? "IST" : `IST${training}`) : part.kind === "validation" ? `ISV${++validation}` : `OOS${++holdout}`,
+  }));
+}
+
+type BuiltInSearchPresetId = "h1_compact" | "sqx_random" | "sqx_wide" | "custom";
 
 const BUILT_IN_SEARCH_PRESETS: Array<{
   id: Exclude<BuiltInSearchPresetId, "custom">;
   label: string;
   note: string;
   ranges: SearchRangeProfile;
-  maximumShift: number;
+  universalGrammar: UniversalGrammarConfig;
+  scoutFitnessMode: ScoutFitnessModeId;
 }> = [
+  {
+    id: "sqx_wide",
+    label: "SQX wide",
+    note: "Default · periods 5–100 · 2–4 entry blocks · shift 1–8 · raw IS scout fitness",
+    ranges: SQX_WIDE_SEARCH_RANGES,
+    universalGrammar: SQX_WIDE_UNIVERSAL_GRAMMAR,
+    scoutFitnessMode: "raw_is",
+  },
   {
     id: "h1_compact",
     label: "H1 compact",
-    note: "Tight periods 10–20 · ATR14 fixed · current QuantForge default",
+    note: "Tight periods 10–20 · two entry atoms · fold-stable scout fitness",
     ranges: H1_COMPACT_SEARCH_RANGES,
-    maximumShift: 3,
+    universalGrammar: H1_COMPACT_UNIVERSAL_GRAMMAR,
+    scoutFitnessMode: "stable_fold",
   },
   {
     id: "sqx_random",
     label: "SQX random",
     note: "Periods 10–50 · free ATR 7–28 · wider stops/targets within reason",
     ranges: SQX_RANDOM_SEARCH_RANGES,
-    maximumShift: 5,
+    universalGrammar: SQX_WIDE_UNIVERSAL_GRAMMAR,
+    scoutFitnessMode: "raw_is",
   },
 ];
 
@@ -303,15 +374,6 @@ function NavGlyph({ icon }: { icon: NavIcon }) {
   );
 }
 
-const DEFAULT_UNIVERSAL_GRAMMAR = {
-  minimumEntryConditions: 2,
-  maximumEntryConditions: 3,
-  minimumExitConditions: 1,
-  maximumExitConditions: 2,
-  minimumShift: 1,
-  maximumShift: 3,
-};
-
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceName>("Home");
   const [workspace, setWorkspace] = useState<DatabankWorkspace | null>(null);
@@ -335,15 +397,7 @@ function App() {
   const [eliteModalOpen, setEliteModalOpen] = useState(false);
   const [resultsDetailFp, setResultsDetailFp] = useState<string | null>(null);
   const [resultsOrigin, setResultsOrigin] = useState<WorkspaceName>("Databank");
-  const [databankTab, setDatabankTab] = useState<"holding" | "databank" | "certified">("holding");
-  const [holdingControlsOpen, setHoldingControlsOpen] = useState(false);
-  const [batteryJob, setBatteryJob] = useState<BatteryJobView | null>(null);
-  const [batteryBusy, setBatteryBusy] = useState(false);
-  const [holdingCorrCap, setHoldingCorrCap] = useState(0.5);
-  const [holdingShrinkBusy, setHoldingShrinkBusy] = useState(false);
-  const [factoryQueueLimit, setFactoryQueueLimit] = useState(0);
-  const [factoryTargetDatabank, setFactoryTargetDatabank] = useState(0);
-  const lastBatteryRevision = useRef(0);
+  const [databankTab, setDatabankTab] = useState<"databank" | "certified">("databank");
   const [discoverResultsOpen, setDiscoverResultsOpen] = useState(false);
   const [stripMessage, setStripMessage] = useState<string | null>(null);
   const detailRequest = useRef(0);
@@ -585,269 +639,8 @@ function App() {
 
   const archiveRows = useMemo(() => {
     if (!workspace) return [];
-    if (databankTab === "holding") return workspace.holding ?? [];
     return workspace.elites;
-  }, [workspace, databankTab]);
-
-  const batteryActive =
-    batteryJob?.status === "running"
-    && (batteryJob.total === 0
-      || batteryJob.completed < batteryJob.total
-      || batteryJob.running > 0);
-
-  // Long Holding batteries can be thousands of rows — keep a short live feed.
-  const batteryActivity = useMemo(() => {
-    const items = batteryJob?.items ?? [];
-    const running = items.filter((item) => item.status === "running");
-    const finished = items.filter(
-      (item) => item.status === "passed"
-        || item.status === "rejected"
-        || item.status === "selected"
-        || item.status === "eligible",
-    );
-    const limit = 12;
-    const recentFinished = finished.slice(-limit).reverse();
-    const queuedCount = items.filter((item) => item.status === "queued").length;
-    return {
-      rows: [...running, ...recentFinished],
-      queuedCount,
-      finishedCount: finished.length,
-      hiddenFinished: Math.max(0, finished.length - recentFinished.length),
-    };
-  }, [batteryJob?.items, batteryJob?.revision]);
-
-  useEffect(() => {
-    const pull = () => {
-      void getHoldingBatteryJob()
-        .then(setBatteryJob)
-        .catch(() => undefined);
-    };
-    pull();
-    const timer = window.setInterval(pull, 2000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    if (!batteryActive && batteryJob?.status !== "running") return;
-    const timer = window.setInterval(() => {
-      void getHoldingBatteryJob()
-        .then((view) => {
-          const done =
-            view.status === "completed"
-            || view.status === "stopped"
-            || view.status === "failed"
-            || (view.total > 0 && view.completed >= view.total && view.running === 0);
-          setBatteryJob(
-            done && view.status === "running"
-              ? {
-                  ...view,
-                  status: "completed",
-                  phase: "Battery complete",
-                  running: 0,
-                  queued: 0,
-                  etaSeconds: 0,
-                }
-              : view,
-          );
-          // A battery checkpoint includes a fresh workspace after every pass,
-          // so Databank updates strategy-by-strategy rather than only when the
-          // complete queue finishes.
-          if (view.workspace && view.revision !== lastBatteryRevision.current) {
-            setWorkspace(view.workspace);
-            lastBatteryRevision.current = view.revision;
-            if (done && view.jobKind === "production_lane") {
-              setDatabankTab("databank");
-              setQuery("");
-              setEntryFilter("all");
-              setBatchSelection(new Set());
-              setDetail(null);
-            }
-          }
-          const shouldReloadArchive =
-            !!view.databankPath
-            && !view.workspace
-            && view.revision !== lastBatteryRevision.current
-            && done;
-          if (shouldReloadArchive && view.databankPath) {
-            lastBatteryRevision.current = view.revision;
-            void loadDatabankPath(view.databankPath)
-              .then(setWorkspace)
-              .catch((reason) => setError(String(reason)));
-          } else if (view.revision !== lastBatteryRevision.current) {
-            lastBatteryRevision.current = view.revision;
-          }
-        })
-        .catch((reason) => setError(String(reason)));
-    }, 350);
-    return () => window.clearInterval(timer);
-  }, [batteryActive, batteryJob?.status]);
-
-  useEffect(() => {
-    if (!batteryJob) return;
-    if (batteryJob.status !== "completed" && batteryJob.status !== "stopped") return;
-    if (batteryJob.workspace) {
-      setWorkspace(batteryJob.workspace);
-      if (batteryJob.jobKind === "production_lane") {
-        switchDatabankTab("databank");
-        setDetail(null);
-      }
-      return;
-    }
-    if (!batteryJob.databankPath) return;
-    void loadDatabankPath(batteryJob.databankPath)
-      .then(setWorkspace)
-      .catch((reason) => setError(String(reason)));
-  }, [batteryJob?.status, batteryJob?.databankPath, batteryJob?.workspace]);
-
-  async function startBatteryOnSelection() {
-    const fingerprints = [...batchSelection];
-    if (fingerprints.length === 0) return;
-    setBatteryBusy(true);
-    setError(null);
-    try {
-      const started = await startHoldingBatteryJob(fingerprints);
-      lastBatteryRevision.current = started.revision;
-      setBatteryJob(started);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  async function startHoldingFactory() {
-    if ((workspace?.holding?.length ?? 0) === 0) return;
-    setBatteryBusy(true);
-    setError(null);
-    try {
-      const started = await startHoldingBatteryJob([], {
-        ranked: true,
-        // Full battery works from the visible Holding cohort. Correlation
-        // shrinking is a separate, deliberate action; it must not silently
-        // remove names when the user starts the battery.
-        shrinkFirst: false,
-        queueLimit: factoryQueueLimit,
-        targetDatabank: factoryTargetDatabank,
-      });
-      lastBatteryRevision.current = started.revision;
-      setBatteryJob(started);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  async function auditAndGraduateHolding() {
-    const holdingCount = workspace?.holding?.length ?? 0;
-    if (holdingCount === 0) return;
-    const confirmed = window.confirm(
-      `Run the full Development/M1 battery on all ${holdingCount} Holding strategies, then move every one to Databank?\n\nPasses and failures will both be retained with their recorded battery result. This does not use OOS2 and does not change Discover search or ranking.`,
-    );
-    if (!confirmed) return;
-    setBatteryBusy(true);
-    setError(null);
-    try {
-      const started = await startHoldingBatteryJob([], {
-        ranked: true,
-        shrinkFirst: false,
-        auditAndGraduate: true,
-      });
-      lastBatteryRevision.current = started.revision;
-      setBatteryJob(started);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  async function runProductionLane() {
-    const holdingCount = workspace?.holding?.length ?? 0;
-    if (holdingCount === 0) return;
-    const confirmed = window.confirm(
-      `Run Production Lane v1 on all ${holdingCount} frozen Holding strategies?\n\nOnly H4 Development data will be used for 3/6/12-month stability and expectancy × √trades ranking. The sealed final partition will stay unopened. Selected strategies will move to Databank; the rest remain in Holding.`,
-    );
-    if (!confirmed) return;
-    setBatteryBusy(true);
-    setError(null);
-    try {
-      const started = await startProductionLaneJob();
-      lastBatteryRevision.current = started.revision;
-      setBatteryJob(started);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  async function graduateAllHoldingWithoutRobustness() {
-    const holdingCount = workspace?.holding?.length ?? 0;
-    if (holdingCount === 0) return;
-    const confirmed = window.confirm(
-      `Graduate all ${holdingCount} Holding strategies into Databank without running calendar folds, walk-forward/CPCV, Monte Carlo or parameter-neighborhood tests?\n\nThey keep the basic and M1-fidelity checks already completed during Holding admission. This changes the archive and cannot be described as robustness-passed.`,
-    );
-    if (!confirmed) return;
-    setBatteryBusy(true);
-    setError(null);
-    try {
-      const result = await promoteHoldingWithoutRobustness();
-      setWorkspace(result.workspace);
-      setBatchSelection(new Set());
-      setBatchMessage(
-        `Graduated ${result.promoted + result.replaced} Holding strategies without the robustness battery. ${result.promoted} added and ${result.replaced} replaced matching Databank entries.`,
-      );
-      setDatabankTab("databank");
-      setQuery("");
-      setEntryFilter("all");
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  function switchDatabankTab(tab: "holding" | "databank" | "certified") {
-    setDatabankTab(tab);
-    setQuery("");
-    setEntryFilter("all");
-    setBatchSelection(new Set());
-  }
-
-  async function stopBatteryJob() {
-    setBatteryBusy(true);
-    try {
-      setBatteryJob(await stopHoldingBattery());
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBatteryBusy(false);
-    }
-  }
-
-  async function shrinkHoldingByCorr() {
-    const holdingCount = workspace?.holding?.length ?? 0;
-    if (holdingCount === 0) return;
-    const confirmed = window.confirm(
-      `Replay Holding on Development H1, keep the stronger name of each pair whose daily P/L correlation is above ${holdingCorrCap}, and write the archive?\n\n${holdingCount} names in Holding now. This is not a Discover setting and does not run the battery.`,
-    );
-    if (!confirmed) return;
-    setHoldingShrinkBusy(true);
-    setError(null);
-    try {
-      const result = await shrinkHoldingByDailyCorr(holdingCorrCap);
-      setWorkspace(result.workspace);
-      setBatchSelection(new Set());
-      setBatchMessage(
-        `Holding shrink at max daily P/L corr ${holdingCorrCap}: kept ${result.kept}, dropped ${result.dropped} (${result.replayed} H1 replays).`,
-      );
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setHoldingShrinkBusy(false);
-    }
-  }
+  }, [workspace]);
 
   const filtered = useMemo(
     () => filterAndSortElites(archiveRows, query, entryFilter, sort),
@@ -924,7 +717,7 @@ function App() {
           <div className="topbar-actions">
             {workspace && (
               <span className="topbar-chip" title={workspace.sourcePath}>
-                {formatNumber((workspace.holding?.length ?? 0) + workspace.elites.length)} strategies · {workspace.sourcePath.split("/").at(-1)}
+                {formatNumber(workspace.elites.length)} strategies · {workspace.sourcePath.split("/").at(-1)}
               </span>
             )}
             {activeWorkspace === "Databank" && (
@@ -1019,18 +812,9 @@ function App() {
               <button
                 type="button"
                 role="tab"
-                aria-selected={databankTab === "holding"}
-                className={databankTab === "holding" ? "active" : ""}
-                onClick={() => switchDatabankTab("holding")}
-              >
-                Holding{workspace ? ` (${workspace.holding?.length ?? 0})` : ""}
-              </button>
-              <button
-                type="button"
-                role="tab"
                 aria-selected={databankTab === "databank"}
                 className={databankTab === "databank" ? "active" : ""}
-                onClick={() => switchDatabankTab("databank")}
+                onClick={() => setDatabankTab("databank")}
               >
                 Databank{workspace ? ` (${workspace.elites.length})` : ""}
               </button>
@@ -1039,7 +823,7 @@ function App() {
                 role="tab"
                 aria-selected={databankTab === "certified"}
                 className={databankTab === "certified" ? "active" : ""}
-                onClick={() => switchDatabankTab("certified")}
+                onClick={() => setDatabankTab("certified")}
               >
                 Certified
               </button>
@@ -1176,301 +960,14 @@ function App() {
                   m1FidelityVerified={workspace.m1FidelityVerified}
                 />
 
-                {(batteryJob && batteryJob.status !== "idle") && (
-                  <section className="panel" aria-label="Holding job progress">
-                    <div className="panel-heading">
-                      <div>
-                        <p className="eyebrow">
-                          {batteryJob.jobKind === "production_lane"
-                            ? "H4 Production Lane v1"
-                            : batteryJob.auditAndGraduate
-                              ? "Full robustness audit"
-                            : "Holding battery"}
-                        </p>
-                        <h2>{batteryJob.phase}</h2>
-                      </div>
-                      <span className="read-only-badge">{batteryJob.status}</span>
-                    </div>
-                    <p>{batteryJob.message}</p>
-                    {(batteryJob.holdingBeforeShrink ?? 0) > 0 && batteryJob.jobKind !== "production_lane" && (
-                      <p className="muted">
-                        Funnel {formatNumber(batteryJob.holdingBeforeShrink ?? 0)} Holding
-                        → {formatNumber(batteryJob.holdingAfterShrink ?? batteryJob.holdingBeforeShrink ?? 0)} ready
-                        → {formatNumber(batteryJob.total)} queued
-                        → {formatNumber(batteryJob.passed)} {batteryJob.auditAndGraduate ? "passed tests" : "Databank"}
-                        {batteryJob.targetDatabank
-                          ? ` (stop at ${formatNumber(batteryJob.targetDatabank)})`
-                          : ""}
-                      </p>
-                    )}
-                    <div className="kpi-grid" aria-label="Battery counters">
-                      <Kpi
-                        label="Progress"
-                        value={`${formatNumber(batteryJob.completed)}/${formatNumber(batteryJob.total)}`}
-                        note={`${formatNumber(batteryJob.queued)} queued · ${formatNumber(batteryJob.running)} running`}
-                      />
-                      <Kpi
-                        label={batteryJob.jobKind === "production_lane" ? "Selected → Databank" : batteryJob.auditAndGraduate ? "Passed tests" : "Passed → Databank"}
-                        value={formatNumber(batteryJob.passed)}
-                        note={`${formatNumber(batteryJob.databankElites)} databank elites`}
-                      />
-                      <Kpi
-                        label={batteryJob.auditAndGraduate ? "Failed tests" : "Rejected"}
-                        value={formatNumber(batteryJob.rejected)}
-                        note={batteryJob.auditAndGraduate ? "All tested strategies graduate" : `${formatNumber(batteryJob.holdingRemaining)} still in Holding`}
-                      />
-                      <Kpi
-                        label={batteryJob.jobKind === "production_lane" ? "Replays / hour" : "Batteries / hour"}
-                        value={formatNumber(batteryJob.batteriesPerHour, 1)}
-                        note={
-                          batteryJob.etaSeconds != null && batteryJob.status === "running"
-                            ? `ETA ~${Math.max(1, Math.round(batteryJob.etaSeconds / 60))} min`
-                            : `${formatNumber(batteryJob.elapsedSeconds, 0)}s elapsed`
-                        }
-                      />
-                    </div>
-                    {batteryJob.jobKind !== "production_lane" && batteryJob.killMix && batteryJob.rejected > 0 && (
-                      <div className="kpi-grid" aria-label="Battery kill mix">
-                        <Kpi label="Neighborhood / RetDD" value={formatNumber(batteryJob.killMix.neighborhood)} note="0.85–1.25 of median" />
-                        <Kpi label="Monte Carlo" value={formatNumber(batteryJob.killMix.monteCarlo)} note="P80 profit retention" />
-                        <Kpi label="Folds" value={formatNumber(batteryJob.killMix.folds)} note="CPCV / walk-forward / years" />
-                        <Kpi
-                          label="Other kills"
-                          value={formatNumber(
-                            batteryJob.killMix.m1
-                              + batteryJob.killMix.deposit
-                              + batteryJob.killMix.expectancy
-                              + batteryJob.killMix.oos1
-                              + batteryJob.killMix.other,
-                          )}
-                          note={`M1 ${batteryJob.killMix.m1} · deposit ${batteryJob.killMix.deposit}`}
-                        />
-                      </div>
-                    )}
-                    {batteryActive && (
-                      <div className="form-footer">
-                        <button
-                          type="button"
-                          className="secondary"
-                          disabled={batteryBusy || batteryJob?.stopRequested}
-                          onClick={() => void stopBatteryJob()}
-                        >
-                          {batteryJob?.stopRequested ? "Stopping…" : "Stop safely"}
-                        </button>
-                      </div>
-                    )}
-                    {batteryJob.reportPath && (
-                      <p className="muted" title={batteryJob.reportPath}>
-                        Immutable report: {batteryJob.reportPath}
-                      </p>
-                    )}
-                    {batteryActivity.rows.length > 0 && (
-                      <div className="family-tester-results">
-                        <p className="muted" style={{ marginBottom: "0.5rem" }}>
-                          Latest activity
-                          {batteryActivity.hiddenFinished > 0
-                            ? ` · ${formatNumber(batteryActivity.hiddenFinished)} earlier finishes hidden`
-                            : ""}
-                          {batteryActivity.queuedCount > 0
-                            ? ` · ${formatNumber(batteryActivity.queuedCount)} queued`
-                            : ""}
-                        </p>
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>Status</th>
-                              <th>Strategy</th>
-                              <th>Evidence</th>
-                              <th>Trades</th>
-                              <th>Reason</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {batteryActivity.rows.map((item) => (
-                              <tr key={item.fingerprint}>
-                                <td>{item.status}</td>
-                                <td title={item.fingerprint}>{item.strategyId}</td>
-                                <td>{formatNumber(item.evidence, 1)}</td>
-                                <td>{formatNumber(item.trades)}</td>
-                                <td>{item.reason ?? "—"}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </section>
-                )}
 
                 <section className="panel elites-panel">
                   <div className="panel-heading table-heading">
                     <div>
-                      <p className="eyebrow">
-                        {databankTab === "holding"
-                          ? "Untested M1 survivors"
-                          : "Selected research elites"}
-                      </p>
-                      <h2>
-                        {filtered.length === archiveRows.length
-                          ? formatNumber(archiveRows.length)
-                          : `${formatNumber(filtered.length)} of ${formatNumber(archiveRows.length)}`}{" "}
-                        {databankTab === "holding" ? "holding" : "elites"}
-                      </h2>
+                      <p className="eyebrow">Promoted elites</p>
+                      <h2>{filtered.length} elites</h2>
                     </div>
                     <div className="table-controls">
-                      {databankTab === "holding" && (
-                        <>
-                          {workspace?.decisionTimeframe === "H4" && <button
-                            type="button"
-                            className="primary"
-                            disabled={
-                              loading
-                              || batteryBusy
-                              || batteryActive
-                              || holdingShrinkBusy
-                              || (workspace?.holding?.length ?? 0) === 0
-                            }
-                            onClick={() => void runProductionLane()}
-                            title="Fixed H4 Development-only recipe: require 6/12-month stability, rank by expectancy × √trades, and promote the top 20% under diversity limits. Sealed final stays unopened."
-                          >
-                            {batteryActive && batteryJob?.jobKind === "production_lane"
-                              ? "Production Lane running…"
-                              : `Run Production Lane v1 (${workspace?.holding?.length ?? 0})`}
-                          </button>}
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={
-                              loading
-                              || batteryBusy
-                              || batteryActive
-                              || holdingShrinkBusy
-                              || (workspace?.holding?.length ?? 0) === 0
-                            }
-                            onClick={() => void startHoldingFactory()}
-                            title="Keep the current Holding cohort, rank by trades × R-expectancy, then run the full battery. Each pass moves to Databank immediately; failed strategies remain in Holding."
-                          >
-                            {batteryActive && batteryJob?.jobKind !== "production_lane"
-                              ? "Factory running…"
-                              : "Run full robustness battery"}
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={
-                              loading
-                              || batteryBusy
-                              || batteryActive
-                              || holdingShrinkBusy
-                              || (workspace?.holding?.length ?? 0) === 0
-                            }
-                            onClick={() => void auditAndGraduateHolding()}
-                            title="Run the complete Development/M1 battery and save its pass or fail result, then graduate every tested strategy to Databank."
-                          >
-                            {batteryActive && batteryJob?.auditAndGraduate
-                              ? "Auditing and graduating…"
-                              : `Run battery · keep all (${workspace?.holding?.length ?? 0})`}
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary"
-                            disabled={
-                              loading
-                              || batteryBusy
-                              || batteryActive
-                              || holdingShrinkBusy
-                              || workspace?.legacyReadOnly
-                              || (workspace?.holding?.length ?? 0) === 0
-                            }
-                            onClick={() => void graduateAllHoldingWithoutRobustness()}
-                            title="Move every current Holding strategy to Databank without the deferred robustness battery."
-                          >
-                            {batteryBusy
-                              ? "Working…"
-                              : `Graduate all · skip robustness (${workspace?.holding?.length ?? 0})`}
-                          </button>
-                          <button
-                            type="button"
-                            className={holdingControlsOpen ? "secondary active" : "secondary"}
-                            onClick={() => setHoldingControlsOpen((current) => !current)}
-                          >
-                            {holdingControlsOpen ? "Hide advanced controls" : "Advanced controls"}
-                          </button>
-                          {holdingControlsOpen && (
-                            <div className="holding-advanced-controls">
-                              <label>
-                                Max daily P/L corr
-                                <select
-                                  aria-label="Maximum daily P/L correlation"
-                                  disabled={loading || holdingShrinkBusy || batteryBusy || batteryActive}
-                                  onChange={(event) => setHoldingCorrCap(Number(event.target.value))}
-                                  value={holdingCorrCap}
-                                >
-                                  <option value={0.3}>0.3</option>
-                                  <option value={0.4}>0.4</option>
-                                  <option value={0.5}>0.5</option>
-                                  <option value={0.6}>0.6</option>
-                                </select>
-                              </label>
-                              <button
-                                type="button"
-                                className="secondary"
-                                disabled={
-                                  loading
-                                  || holdingShrinkBusy
-                                  || batteryBusy
-                                  || batteryActive
-                                  || (workspace?.holding?.length ?? 0) === 0
-                                }
-                                onClick={() => void shrinkHoldingByCorr()}
-                                title="Drop correlated Holding clones using Development H1 daily P/L. Not a Discover start setting."
-                              >
-                                {holdingShrinkBusy ? "Shrinking…" : "Shrink Holding"}
-                              </button>
-                              <label>
-                                Queue
-                                <input
-                                  aria-label="Factory queue limit"
-                                  min={0}
-                                  max={10000}
-                                  onChange={(event) => setFactoryQueueLimit(Math.max(0, Number(event.target.value) || 0))}
-                                  type="number"
-                                  value={factoryQueueLimit}
-                                />
-                              </label>
-                              <label>
-                                Databank target
-                                <input
-                                  aria-label="Factory Databank target"
-                                  min={0}
-                                  max={10000}
-                                  onChange={(event) => setFactoryTargetDatabank(Math.max(0, Number(event.target.value) || 0))}
-                                  type="number"
-                                  value={factoryTargetDatabank}
-                                />
-                              </label>
-                              <button
-                                type="button"
-                                className="secondary"
-                                disabled={
-                                  loading
-                                  || batteryBusy
-                                  || batteryActive
-                                  || holdingShrinkBusy
-                                  || batchSelection.size === 0
-                                }
-                                onClick={() => void startBatteryOnSelection()}
-                              >
-                                {batteryActive
-                                  ? "Battery running…"
-                                  : batteryBusy
-                                    ? "Starting…"
-                                    : `Run battery (${batchSelection.size})`}
-                              </button>
-                            </div>
-                          )}
-                        </>
-                      )}
                       <input
                         aria-label="Search elites"
                         onChange={(event) => setQuery(event.target.value)}
@@ -1503,18 +1000,6 @@ function App() {
                         <option value="entryConditions">Entry conditions</option>
                         <option value="grade">Grade A–Z</option>
                       </select>
-                      {filtered.length !== archiveRows.length && (
-                        <button
-                          type="button"
-                          className="text-action"
-                          onClick={() => {
-                            setQuery("");
-                            setEntryFilter("all");
-                          }}
-                        >
-                          Clear filters
-                        </button>
-                      )}
                     </div>
                     <div className="batch-controls">
                       <label>
@@ -1868,11 +1353,6 @@ function ResultsDetailPage({
   };
 
   useEffect(() => {
-    if (!detail || detail.fingerprint !== fingerprint || detail.sealedProtected) {
-      setPartition(null);
-      setPartitionBusy(false);
-      return;
-    }
     let cancelled = false;
     setPartition(null);
     setPartitionBusy(true);
@@ -1889,7 +1369,7 @@ function ResultsDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [fingerprint, detail?.sealedProtected]);
+  }, [fingerprint]);
 
   const initialBalance = partition?.initialBalance ?? workspace?.initialBalance ?? 100_000;
   const storedMetrics = detail?.metrics ?? {};
@@ -2082,7 +1562,7 @@ function ResultsDetailPage({
             disabled={robustnessBusy || loading || !detail}
             onClick={() => void runRobustness()}
           >
-            {robustnessBusy ? "Running and saving audit…" : robustnessRun ? "Run again" : "Run and save detailed audit"}
+            {robustnessBusy ? "Running battery…" : robustnessRun ? "Run again" : "Run robustness battery"}
           </button>
         </div>
         <div className="results-robustness-note">
@@ -2100,7 +1580,7 @@ function ResultsDetailPage({
           ) : (
             <span>
               {robustnessMode === "standard"
-                ? "Standard runs every independent promotion check, saves the detailed panels into this Databank, and does not change selection."
+                ? "Standard repeats the promotion battery already sealed into the databank."
                 : "Deep raises compute depth without changing thresholds or searching for a better seed."}
             </span>
           )}
@@ -2114,8 +1594,8 @@ function ResultsDetailPage({
           retention={evidence?.m1_retention ?? null}
           fallback={detail?.robustness?.paramPermutation ?? null}
         />
-        <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Development CPCV analysis" />
-        <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential walk-forward analysis" />
+        <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential Development walk-forward" />
+        <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Calendar-year diagnostic (not a hard gate)" />
       </div>
 
       {detail?.thesis && (
@@ -2132,7 +1612,7 @@ function ResultsDetailPage({
             <div><p className="eyebrow">Equity chart</p><h2>IS with distinct OOS evidence overlays</h2></div>
             <span className="read-only-badge">M1 chronology · full history</span>
           </div>
-          {usesReplay || partitionBusy ? (
+          {usesReplay ? (
             <PartitionEquityChart
               view={partition}
               busy={partitionBusy}
@@ -2141,19 +1621,22 @@ function ResultsDetailPage({
               large
             />
           ) : (
-            <StoredSignatureChart
-              initialBalance={initialBalance}
-              returnPercent={returnPercent}
-              values={detail?.equitySignature ?? row?.equitySignature ?? []}
-            />
+            <>
+              <StoredSignatureChart
+                initialBalance={initialBalance}
+                returnPercent={returnPercent}
+                values={detail?.equitySignature ?? row?.equitySignature ?? []}
+              />
+              {partitionBusy && <p className="equity-cache-note">Stored Development curve shown instantly · preparing full M1/OOS overlays in the background…</p>}
+            </>
           )}
         </section>
       )}
 
       {analysisTab === "walkForward" && (
         <section className="results-analysis-single">
-          <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Development CPCV analysis" expanded />
-          <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential walk-forward analysis" expanded />
+          <WalkForwardPanel evidence={evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential Development walk-forward" expanded />
+          <WalkForwardPanel evidence={evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Calendar-year diagnostic (not a hard gate)" expanded />
         </section>
       )}
 
@@ -2254,7 +1737,7 @@ function ResultsAnalysisTabs({
   const tabs: Array<[typeof active, string]> = [
     ["overview", "Overview"],
     ["equity", "Equity"],
-    ["walkForward", "Development CPCV"],
+    ["walkForward", "Sequential walk-forward"],
     ["monteCarlo", "Monte Carlo"],
     ["parameters", "Parameters"],
     ["trades", "Trades"],
@@ -2885,7 +2368,7 @@ function MetricHistogram({
 function WalkForwardPanel({
   evidence,
   fallback,
-  title = "Development CPCV analysis",
+  title = "Sequential Development walk-forward",
   expanded = false,
 }: {
   evidence: RobustnessEvidence["walk_forward"] | null;
@@ -3105,8 +2588,8 @@ function HomeWorkspace({
           <div className="overview-status-kpis">
             <KpiCell label="Evaluated" value={formatNumber(job?.evaluationCount ?? 0)} note="candidates looked at" />
             <KpiCell label="Initial pot" value={formatNumber(job?.potElites ?? 0)} note={job?.breedingActive ? "breeding" : `fill → ${formatNumber(job?.mutateAfterElites ?? 0)}`} />
-            <KpiCell label="Holding" value={formatNumber(job?.holdingElites ?? 0)} note="M1 80/130" />
-            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="after Holding battery" />
+            <KpiCell label="Holding" value={formatNumber(job?.holdingElites ?? 0)} note="M1 passed · awaiting tests" />
+            <KpiCell label="Databank" value={formatNumber(job?.databankElites ?? 0)} note="WF + OptProfile + MC passed" />
             <KpiCell
               label="Evals / hour · rolling"
               value={formatNumber(job?.rollingEvaluationsPerHour ?? 0)}
@@ -3671,6 +3154,7 @@ function DiscoverWorkspace({
     noveltyWeight: 10,
     seed: 42,
     universalGrammar: { ...DEFAULT_UNIVERSAL_GRAMMAR },
+    selectedSearchFamilies: SEARCH_FAMILIES.map(([id]) => id),
     runMode: "full_harvest" as DiscoverRunModeId,
     generalIslandCount: 0,
     refinementIslandCount: 0,
@@ -3680,6 +3164,7 @@ function DiscoverWorkspace({
     earlyStopPotElites: null,
     targetDatabankElites: null,
     searchRanges: DEFAULT_SEARCH_RANGES,
+    scoutFitnessMode: "raw_is",
     minimumTrades: 10,
     maximumDrawdownPercent: 40,
     minimumReturnPercent: 0,
@@ -3695,10 +3180,6 @@ function DiscoverWorkspace({
     oos1ExpectancyRetention: 0.7,
     requireM1Precision: true,
     simpleExits: true,
-    slTpOnlyExits: true,
-    allowFixedPipStops: false,
-    allowIndicatorExitRules: false,
-    allowTimeStops: false,
     allowBreakEven: false,
     allowTrailingStops: false,
     allowPartialExits: false,
@@ -3718,18 +3199,18 @@ function DiscoverWorkspace({
     maxMemoryMb: 8192,
     requireM1Robustness: true,
     buildToHolding: true,
-    robustnessFolds: 3,
+    robustnessFolds: 8,
     robustnessMonteCarloTrials: 250,
     robustnessMonteCarloBlockLength: 5,
     robustnessMonteCarloSkipTradeProbability: 0.10,
     robustnessMonteCarloP80ProfitRetention: 0.60,
     robustnessMonteCarloMaxDrawdownRatio: 1.75,
-    robustnessNeighborhoodSamples: 200,
-    robustnessPerturbationFraction: 0.2,
-    minimumNeighborhoodSurvivalFraction: 0.55,
+    robustnessNeighborhoodSamples: 1000,
+    robustnessPerturbationFraction: 0.3,
+    minimumNeighborhoodSurvivalFraction: 0.25,
     calendarYearFolds: false,
     minimumDeflatedTradeSharpe: null,
-    multiSymbolMinimumPass: 0,
+    multiSymbolMinimumPass: null,
     packDataDir: null,
     commissionPerLotRoundTurn: 7,
     slippagePointsPerSide: 0,
@@ -3740,12 +3221,20 @@ function DiscoverWorkspace({
     validationFraction: 0,
     sealedFraction: 1 / 3,
     historyStartYear: 2016,
-    factoryAfterDiscover: false,
+    factoryAfterDiscover: true,
     factoryQueueLimit: 0,
     factoryTargetDatabank: 0,
     factoryMaxCorrelation: 0.5,
     ...preset,
+    historyStartDate: preset.historyStartDate ?? null,
+    historyEndDate: preset.historyEndDate ?? null,
+    dataRangeParts: preset.dataRangeParts ?? [
+      { id: "IST", kind: "training", startDate: "", endDate: "" },
+      { id: "ISV1", kind: "validation", startDate: "", endDate: "" },
+      { id: "OOS1", kind: "holdout", startDate: "", endDate: "" },
+    ],
   }));
+  const [timelineDrag, setTimelineDrag] = useState<number | null>(null);
   const [discoverProfiles, setDiscoverProfiles] = useState<SavedDiscoverProfile[]>([]);
   const [selectedDiscoverProfileId, setSelectedDiscoverProfileId] = useState("");
   const [discoverProfileName, setDiscoverProfileName] = useState("My Discover profile");
@@ -3758,9 +3247,6 @@ function DiscoverWorkspace({
   const [testerSeed, setTesterSeed] = useState(42);
   const [testerBusy, setTesterBusy] = useState(false);
   const [testerReport, setTesterReport] = useState<ConditionBakeoffReport | null>(null);
-  const [timeframeBakeoffDraws, setTimeframeBakeoffDraws] = useState(20);
-  const [timeframeBakeoffBusy, setTimeframeBakeoffBusy] = useState(false);
-  const [timeframeBakeoffReport, setTimeframeBakeoffReport] = useState<TimeframeBakeoffReport | null>(null);
   const [resultsViewFp, setResultsViewFp] = useState<string | null>(null);
   const [liveWorkspace, setLiveWorkspace] = useState<DatabankWorkspace | null>(null);
   const [liveSelected, setLiveSelected] = useState<string | null>(null);
@@ -3768,9 +3254,7 @@ function DiscoverWorkspace({
   const [liveDetailOpen, setLiveDetailOpen] = useState(false);
   const [liveDetailLoading, setLiveDetailLoading] = useState(false);
   const [discoverTab, setDiscoverTab] = useState<"progress" | "settings" | "results">("settings");
-  const [expertMode, setExpertMode] = useState(false);
   const [liveInspectorTab, setLiveInspectorTab] = useState<"overview" | "ir" | "mq5">("overview");
-  const [discoverScope, setDiscoverScope] = useState<"single" | "campaign">("single");
   const lastDatabankCountRef = useRef(0);
   const lastLiveRevisionRef = useRef(0);
   const liveReloadBusyRef = useRef(false);
@@ -3805,7 +3289,7 @@ function DiscoverWorkspace({
 
   useEffect(() => {
     if (!job?.outputPath) return;
-    const eliteCount = (job.holdingElites ?? 0) + (job.databankElites ?? 0);
+    const eliteCount = job.databankElites ?? 0;
     const liveRevision = job.liveDatabankRevision ?? eliteCount;
     const shouldReload =
       job.status === "completed"
@@ -3830,11 +3314,11 @@ function DiscoverWorkspace({
         });
     }, active ? 1800 : 0);
     return () => window.clearInterval(timer);
-  }, [active, job?.outputPath, job?.holdingElites, job?.databankElites, job?.liveDatabankRevision, job?.status]);
+  }, [active, job?.outputPath, job?.databankElites, job?.liveDatabankRevision, job?.status]);
 
   const liveEliteRows = useMemo(() => {
     if (!liveWorkspace) return [];
-    return [...(liveWorkspace.holding ?? []), ...liveWorkspace.elites].sort(
+    return [...liveWorkspace.elites].sort(
       (left, right) => (right.foldMedianR ?? right.evidence) - (left.foldMedianR ?? left.evidence),
     );
   }, [liveWorkspace]);
@@ -3953,9 +3437,6 @@ function DiscoverWorkspace({
         promotionSplit: true,
         // Generations 0 means SQX-style run-until-stopped, never a hard start block.
         runUntilStopped: (form.runUntilStopped ?? true) || form.generations < 1,
-        // Open-ended Discover never inherits a factory cap. When you press
-        // Stop, its battery examines every frozen Holding strategy.
-        factoryTargetDatabank: (form.runUntilStopped ?? true) ? 0 : form.factoryTargetDatabank,
       });
       const request = form.mode === "continue"
           ? {
@@ -3990,10 +3471,6 @@ function DiscoverWorkspace({
             oos1ExpectancyRetention: null,
             requireM1Precision: null,
             simpleExits: null,
-            slTpOnlyExits: null,
-            allowFixedPipStops: null,
-            allowIndicatorExitRules: null,
-            allowTimeStops: null,
             allowBreakEven: null,
             allowTrailingStops: null,
             allowPartialExits: null,
@@ -4029,6 +3506,8 @@ function DiscoverWorkspace({
             validationFraction: null,
             sealedFraction: null,
             historyStartYear: null,
+            historyStartDate: null,
+            historyEndDate: null,
           }
         : sourceBoundForm;
       const started = await startDiscover(request);
@@ -4090,57 +3569,13 @@ function DiscoverWorkspace({
         validationFraction: form.validationFraction ?? 0,
         sealedFraction: form.sealedFraction ?? 1 / 3,
         entryConditionCounts: testerCounts,
-        historyStartYear: form.historyStartYear ?? 2016,
+            historyStartYear: form.historyStartYear ?? 2016,
       });
       setTesterReport(report);
     } catch (reason) {
       onError(String(reason));
     } finally {
       setTesterBusy(false);
-    }
-  }
-
-  async function runTimeframeComparison() {
-    if (!form.dataPath || !form.m1DataPath || !form.brokerPath) {
-      onError("Choose a symbol (H1 source, M1, broker) before running the timeframe bakeoff.");
-      return;
-    }
-    setTimeframeBakeoffBusy(true);
-    onError(null);
-    try {
-      const bound = bindDiscoverTimezone(form);
-      const grammar = form.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR;
-      const report = await runTimeframeBakeoff({
-        dataPath: bound.dataPath,
-        metadataPath: bound.metadataPath,
-        sourceTimezone: bound.sourceTimezone,
-        m1DataPath: bound.m1DataPath,
-        m1MetadataPath: bound.m1MetadataPath,
-        m1SourceTimezone: bound.m1SourceTimezone,
-        brokerPath: bound.brokerPath,
-        drawsPerCell: Math.max(1, timeframeBakeoffDraws),
-        seed: form.seed ?? 42,
-        minimumTrades: form.minimumTrades ?? 10,
-        minimumReturnPercent: form.minimumReturnPercent ?? 0,
-        minimumProfitFactor: form.minimumProfitFactor ?? 1,
-        maximumDrawdownPercent: form.maximumDrawdownPercent ?? 40,
-        oos1Retention: form.oos1ExpectancyRetention ?? 0.7,
-        commissionPerLotRoundTurn: form.commissionPerLotRoundTurn ?? 7,
-        slippagePointsPerSide: form.slippagePointsPerSide ?? 0,
-        fallbackSpreadPoints: form.fallbackSpreadPoints,
-        validationFraction: (form.validationFraction ?? 0) > 0 ? form.validationFraction! : 0.2,
-        sealedFraction: form.sealedFraction ?? 1 / 3,
-        minimumEntryConditions: grammar.minimumEntryConditions,
-        maximumEntryConditions: grammar.maximumEntryConditions,
-        minimumExitConditions: grammar.minimumExitConditions,
-        maximumExitConditions: grammar.maximumExitConditions,
-        historyStartYear: form.historyStartYear ?? 2016,
-      });
-      setTimeframeBakeoffReport(report);
-    } catch (reason) {
-      onError(String(reason));
-    } finally {
-      setTimeframeBakeoffBusy(false);
     }
   }
 
@@ -4169,6 +3604,55 @@ function DiscoverWorkspace({
     }));
   }
 
+  function moveTimelineBoundary(event: React.PointerEvent<HTMLElement>) {
+    if (timelineDrag === null) return;
+    const parts = form.dataRangeParts ?? [];
+    const bounds = parts.flatMap((part) => [timelineDay(part.startDate), timelineDay(part.endDate)]).filter((value): value is number => value !== null);
+    const fallbackMin = Date.UTC(form.historyStartYear ?? 2016, 0, 1);
+    const fallbackMax = Date.now();
+    const min = bounds.length ? Math.min(...bounds, fallbackMin) : fallbackMin;
+    const max = bounds.length ? Math.max(...bounds, fallbackMax) : fallbackMax;
+    if (max <= min) return;
+    const timeline = event.currentTarget.classList.contains("range-timeline")
+      ? event.currentTarget
+      : event.currentTarget.closest(".range-timeline");
+    if (!timeline) return;
+    const rect = timeline.getBoundingClientRect();
+    const ratio = Math.max(0.01, Math.min(0.99, (event.clientX - rect.left) / rect.width));
+    const requestedBoundary = Math.round((min + ratio * (max - min)) / 86400000) * 86400000;
+    const leftStart = timelineDay(parts[timelineDrag].startDate) ?? min;
+    const rightEnd = timelineDay(parts[timelineDrag + 1]?.endDate ?? "") ?? max;
+    const boundary = Math.max(leftStart + 86400000, Math.min(rightEnd, requestedBoundary));
+    // End dates are inclusive. A shared calendar date would put the same bars
+    // in both parts, so the following range starts on the next day.
+    setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts.map((part, index) => index === timelineDrag ? { ...part, endDate: timelineDate(boundary - 86400000) } : index === timelineDrag + 1 ? { ...part, startDate: timelineDate(boundary) } : part) }));
+  }
+
+  function applyRangePreset(preset: "60/20/20" | "50/20/10/20") {
+    const weights = preset === "60/20/20" ? [60, 20, 20] : [50, 20, 10, 20];
+    const start = Date.UTC(form.historyStartYear ?? 2016, 0, 1);
+    const end = Date.now();
+    let cursor = start;
+    const kinds: DataRangePart["kind"][] = preset === "60/20/20" ? ["training", "validation", "holdout"] : ["training", "validation", "holdout", "holdout"];
+    const ids = preset === "60/20/20" ? ["IST", "ISV1", "OOS1"] : ["IST", "ISV1", "OOS1", "OOS2"];
+    const parts = weights.map((weight, index) => {
+      const next = index === weights.length - 1 ? end : cursor + ((end - start) * weight / 100);
+      // End is inclusive; reserve the boundary day for the following part.
+      const partEnd = index === weights.length - 1 ? next : next - 86400000;
+      const part = { id: ids[index], kind: kinds[index], startDate: timelineDate(cursor), endDate: timelineDate(partEnd) };
+      cursor = next;
+      return part;
+    });
+    // Keep the legacy numeric fields in sync for saved profiles, while the
+    // backend seals the explicit dates as the authoritative contract.
+    setForm((current) => ({
+      ...current,
+      dataRangeParts: automaticRangeNames(parts),
+      validationFraction: weights[1] / 100,
+      sealedFraction: weights.slice(2).reduce((sum, weight) => sum + weight, 0) / 100,
+    }));
+  }
+
   const progress = discoverProgress(
     job?.completedGenerations ?? 0,
     job?.requestedGenerations ?? 0,
@@ -4181,6 +3665,7 @@ function DiscoverWorkspace({
   );
   const lookedAt = job?.evaluationCount ?? 0;
   const rejected = job?.rejectedTotal ?? 0;
+  const hasDatedRangeSchedule = (form.dataRangeParts ?? []).some((part) => part.startDate.trim() && part.endDate.trim());
   const resolvedSymbol =
     form.selectedSymbol
     || symbolFromDataPath(form.brokerPath)
@@ -4196,21 +3681,13 @@ function DiscoverWorkspace({
           : form.mode === "continue" && !form.databankPath
             ? "Continuation needs an existing databank path."
             : form.mode === "new" && !form.universalGrammar
-              ? "Universal grammar is missing."
+              ? "Family grammar bounds are missing."
               : entryWindowError(form)
                 ?? entryOrderError(form)
                 ?? perturbationError(form);
   const canStart = !startBlocker;
 
   return (
-    <div className="discover-workspace">
-      <div className="workspace-tabs" role="tablist" aria-label="Discover mode">
-        <button type="button" role="tab" aria-selected={discoverScope === "single"} className={discoverScope === "single" ? "active" : ""} onClick={() => setDiscoverScope("single")}>Single asset</button>
-        <button type="button" role="tab" aria-selected={discoverScope === "campaign"} className={discoverScope === "campaign" ? "active" : ""} onClick={() => setDiscoverScope("campaign")}>Multi-asset campaign</button>
-      </div>
-      {discoverScope === "campaign" ? (
-        <MultiAssetDiscoverCampaign onError={onError} onOpenDatabank={onOpenDatabank} />
-      ) : (
     <div className="discover-layout">
       <div className="discover-dashboard">
         <div className="discover-tabs" role="tablist" aria-label="Discover dashboard">
@@ -4245,19 +3722,10 @@ function DiscoverWorkspace({
 
       {discoverTab === "settings" && (
       <div className="discover-main discover-settings-pane">
-      <section className={`panel discover-form ${expertMode ? "expert-mode" : "simple-mode"}`}>
+      <section className="panel discover-form">
         <div className="panel-heading">
-          <div><p className="eyebrow">Discover</p><h2>{expertMode ? "Configure deterministic evolution" : "Choose a research recipe"}</h2></div>
+          <div><p className="eyebrow">Discover</p><h2>Configure deterministic evolution</h2></div>
           <div className="mode-toggle">
-            <button
-              type="button"
-              className={expertMode ? "active" : ""}
-              disabled={active || busy}
-              onClick={() => setExpertMode((current) => !current)}
-              title="Show worker, gate, robustness and search-range controls"
-            >
-              {expertMode ? "Hide technical settings" : "Technical settings"}
-            </button>
             <button type="button" className={form.mode === "new" ? "active" : ""} disabled={active} onClick={() => update("mode", "new")}>New</button>
             <button type="button" className={form.mode === "continue" ? "active" : ""} disabled={active} onClick={() => update("mode", "continue")}>Continue</button>
             <button
@@ -4277,45 +3745,43 @@ function DiscoverWorkspace({
         <fieldset disabled={active || busy}>
           {form.mode === "new" ? (
             <>
-              <section className="production-recipe-card">
-                <div className="production-recipe-heading"><div><p className="eyebrow">Saved production recipe</p><h3>Choose your full Discover setup</h3></div><span className="recipe-badge">restores everything</span></div>
-                <p className="recipe-summary">A profile restores the symbol paths, timeframe, entry and exit recipe, gates, costs, robustness and search ranges. Pick one and start; use technical settings only when you deliberately want to change the recipe.</p>
+              <details className="advanced-settings" open>
+                <summary>Discover profile — save this whole new-job setup</summary>
+                <p className="immutable-note">Profiles are saved locally and restore the symbol paths, timeframe, gates, costs, robustness and search ranges. A new databank location is always required, so an old archive cannot be overwritten by accident.</p>
                 <div className="form-stack compact">
                   <label className="field-row"><span>Saved Discover profile</span><select value={selectedDiscoverProfileId} onChange={(event) => { const profile = discoverProfiles.find((item) => item.id === event.target.value); if (profile) applyDiscoverProfile(profile); else setSelectedDiscoverProfileId(""); }}><option value="">Current unsaved form</option>{discoverProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{selectedDiscoverProfileId ? "Loaded profile is applied. Save to update it." : "Save this form once, then select it here next time."}</small></label>
                   <label className="field-row"><span>Profile name</span><input value={discoverProfileName} onChange={(event) => setDiscoverProfileName(event.target.value)} placeholder="e.g. AUDUSD H1 conservative" /></label>
                 </div>
                 <div className="form-footer"><p>{discoverProfileBusy ? "Saving profile…" : selectedDiscoverProfileId ? "This profile can be updated without affecting any existing databank." : "New profiles start from the form currently on screen."}</p><div className="button-row"><button type="button" className="secondary" disabled={discoverProfileBusy} onClick={() => { setSelectedDiscoverProfileId(""); setDiscoverProfileName("My Discover profile"); }}>Save as new</button><button type="button" className="primary" disabled={discoverProfileBusy || !discoverProfileName.trim()} onClick={() => void saveCurrentDiscoverProfile()}>{discoverProfileBusy ? "Saving…" : selectedDiscoverProfileId ? "Update profile" : "Save profile"}</button>{selectedDiscoverProfileId && <button type="button" className="danger" disabled={discoverProfileBusy} onClick={() => void removeCurrentDiscoverProfile()}>Delete</button>}</div></div>
-              </section>
-              <section className="production-recipe-card production-exits-card">
-                <div className="production-recipe-heading"><div><p className="eyebrow">Production recipe</p><h3>Exit modules</h3></div><span className="recipe-badge">used by next run</span></div>
-                <p className="recipe-summary">The constrained SL/TP-only lane is the default because it removes the exit degrees of freedom most likely to overfit a particular period. These choices are saved in the profile above.</p>
-                <div className="production-module-grid">
-                  <label className="check-field discover-split"><input type="checkbox" checked={form.slTpOnlyExits ?? true} onChange={(event) => setForm((current) => event.target.checked ? ({ ...current, slTpOnlyExits: true, simpleExits: true, allowIndicatorExitRules: false, allowTimeStops: false, allowBreakEven: false, allowTrailingStops: false, allowPartialExits: false, flattenAt22: true, universalGrammar: { ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR), maximumEntryConditions: Math.min(3, current.universalGrammar?.maximumEntryConditions ?? 3) } }) : ({ ...current, slTpOnlyExits: false, simpleExits: false }))} /><span>SL/TP-only exits <small>(recommended: end-of-day close only if neither protective exit fires)</small></span></label>
-                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowFixedPipStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowFixedPipStops: event.target.checked }))} /><span>Fixed-pip SL/TP pair <small>(FX only; sampled alongside ATR/R using the bound symbol’s pip size)</small></span></label>
-                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowIndicatorExitRules ?? false} onChange={(event) => setForm((current) => ({ ...current, allowIndicatorExitRules: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Indicator exit rule <small>(research only; turning it on leaves the constrained lane)</small></span></label>
-                  <label className="check-field discover-split"><input type="checkbox" checked={form.allowTimeStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTimeStops: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Exit after N bars <small>(research only; turning it on leaves the constrained lane)</small></span></label>
-                </div>
-              </section>
+              </details>
               <div className="hypothesis-strip">
                 <div className="hypothesis-heading">
                   <p className="eyebrow">Hypothesis</p>
-                  <h3>{expertMode ? "Universal grammar + run mode" : "Research recipe"}</h3>
+                  <h3>Coherent strategy families + run mode</h3>
                 </div>
                 <p className="recipe-summary">
-                  {expertMode
-                    ? form.slTpOnlyExits
-                      ? "Constrained production lane: 2–3 mirrored entry conditions plus ATR/R stop-loss and take-profit. No indicator exit, time stop, break-even, trailing or partial exit is searchable; every trade closes at end of day if SL/TP has not fired."
-                      : "Family-free search: mirrored entry AND blocks and side-specific exit OR blocks with closed-bar shifts. Entry conditions 2 by default (3–4 remain available). Exit conditions 1–3."
-                    : "Pick a saved recipe above, then choose how much of the pipeline to run. QuantForge keeps the grammar, gates and validation firewall on safe defaults."}
+                  Balanced, family-locked search across trend following, momentum, breakout, mean reversion,
+                  volatility, session and price-action catalogs. Each strategy uses one primary trigger plus
+                  compatible confirmations; families never cross-breed. Legacy Universal databanks remain readable.
                 </p>
-                {expertMode && <div className="form-grid universal-grammar-grid">
+                <div className="form-grid universal-grammar-grid">
                   <NumberField label="Entry conditions min" value={form.universalGrammar?.minimumEntryConditions ?? 2} onChange={(value) => updateGrammar("minimumEntryConditions", value ?? 2)} min={2} max={4} />
                   <NumberField label="Entry conditions max" value={form.universalGrammar?.maximumEntryConditions ?? 2} onChange={(value) => updateGrammar("maximumEntryConditions", value ?? 2)} min={2} max={4} />
                   <NumberField label="Exit conditions min" value={form.universalGrammar?.minimumExitConditions ?? 1} onChange={(value) => updateGrammar("minimumExitConditions", value ?? 1)} min={1} max={3} />
                   <NumberField label="Exit conditions max" value={form.universalGrammar?.maximumExitConditions ?? 3} onChange={(value) => updateGrammar("maximumExitConditions", value ?? 3)} min={1} max={3} />
                   <NumberField label="Closed-bar shift min" value={form.universalGrammar?.minimumShift ?? 1} onChange={(value) => updateGrammar("minimumShift", value ?? 1)} min={1} />
-                  <NumberField label="Closed-bar shift max" value={form.universalGrammar?.maximumShift ?? 3} onChange={(value) => updateGrammar("maximumShift", value ?? 3)} min={1} />
-                </div>}
+                  <NumberField label="Closed-bar shift max" value={form.universalGrammar?.maximumShift ?? 8} onChange={(value) => updateGrammar("maximumShift", value ?? 8)} min={1} />
+                </div>
+                <div className="family-picker" role="group" aria-label="Search families">
+                  <div className="field-row"><span>Search families <small>choose the playbooks to evolve</small></span></div>
+                  <div className="family-picker-grid">
+                    {SEARCH_FAMILIES.map(([id, label]) => {
+                      const selected = (form.selectedSearchFamilies ?? []).includes(id);
+                      return <label className={`family-choice ${selected ? "selected" : ""}`} key={id}><input type="checkbox" checked={selected} onChange={() => setForm((current) => { const values = current.selectedSearchFamilies ?? []; const next = values.includes(id) ? values.filter((value) => value !== id) : [...values, id]; return { ...current, selectedSearchFamilies: next.length ? next : values }; })} /><span>{label}</span></label>;
+                    })}
+                  </div>
+                  <small>Families are kept separate during breeding. Start with 2–4 related families for a focused run, or leave all selected for diversified discovery.</small>
+                </div>
                 <div className="mode-toggle run-mode-toggle">
                   <button
                     type="button"
@@ -4343,8 +3809,8 @@ function DiscoverWorkspace({
                         earlyStopPotElites: null,
                         targetDatabankElites: null,
                         robustnessMonteCarloTrials: 1000,
-                        robustnessNeighborhoodSamples: 200,
-                        minimumNeighborhoodSurvivalFraction: 0.55,
+                        robustnessNeighborhoodSamples: 1000,
+                        minimumNeighborhoodSurvivalFraction: 0.25,
                         requireM1Robustness: true,
                         buildToHolding: true,
                       }))
@@ -4366,24 +3832,20 @@ function DiscoverWorkspace({
                         batchSize: Math.max(current.batchSize ?? 200, 300),
                         randomFillFraction: Math.max(current.randomFillFraction ?? 0.75, 0.75),
                         robustnessMonteCarloTrials: 1000,
-                        robustnessNeighborhoodSamples: 200,
-                        minimumNeighborhoodSurvivalFraction: 0.55,
+                        robustnessNeighborhoodSamples: 1000,
+                        minimumNeighborhoodSurvivalFraction: 0.25,
                         minimumDevelopmentExpectancyR: 0.25,
                         requireM1Robustness: true,
                         buildToHolding: true,
                         requireM1Precision: true,
                         simpleExits: true,
                         multiSymbolMinimumPass: 0,
-                        factoryAfterDiscover: false,
-                        factoryQueueLimit: current.factoryQueueLimit ?? 0,
-                        factoryTargetDatabank: current.factoryTargetDatabank ?? 0,
-                        factoryMaxCorrelation: current.factoryMaxCorrelation ?? 0.5,
                       }))
                     }
                   >
-                    Quota (grow Holding overnight)
+                    Quota Harvest
                   </button>
-                  {expertMode && <button
+                  <button
                     type="button"
                     className={form.runMode === "high_performance_islands" ? "active" : ""}
                     onClick={() =>
@@ -4407,38 +3869,22 @@ function DiscoverWorkspace({
                     }
                   >
                     High-Performance Islands
-                  </button>}
+                  </button>
                 </div>
                 {form.runMode === "quota_harvest" && (
                   <div className="form-stack compact">
                     <p className="recipe-summary">
-                      Grows Holding overnight: H1 scout on the pot, then a cheap side queue (M1 80/130 only). Fold-R, plateau, CPCV, and Monte Carlo wait for the Holding tab. Stops at {formatNumber(form.targetDatabankElites ?? 400)} Holding names. Sealed holdout is unused to pick.
+                      Volume scout on the pot, then sequential Development walk-forward (≥60% positive folds) + OptProfile + Monte Carlo into Databank. Stops at {formatNumber(form.targetDatabankElites ?? 400)} databank names. Sealed holdout is unused to pick.
                     </p>
-                    <label className="field-row">
-                      <span>Overnight factory</span>
-                      <input
-                        type="checkbox"
-                        checked={form.factoryAfterDiscover === true}
-                        disabled={active || busy}
-                        onChange={(event) => setForm((current) => ({ ...current, factoryAfterDiscover: event.target.checked }))}
-                      />
-                      <small>
-                        {form.runUntilStopped ?? true
-                          ? "Open-ended mode keeps Discover running until you press Stop. Then it ranks and tests every frozen Holding strategy; it has no Databank cap."
-                          : `When Discover completes, rank the current Holding cohort by trades × R-expectancy, then run the battery ${(form.factoryQueueLimit ?? 0) > 0 ? `on the top ${formatNumber(form.factoryQueueLimit ?? 0)}` : "on everyone in Holding"}. Each pass moves to Databank immediately; failures stay in Holding. Correlation shrinking remains a separate manual action. ${(form.factoryTargetDatabank ?? 0) > 0 ? `Stop once Databank has ${formatNumber(form.factoryTargetDatabank ?? 0)} names.` : "Keep every passer — do not stop at a Databank count."}`}
-                      </small>
-                    </label>
                     <div className="form-grid universal-grammar-grid">
-                      <NumberField label="Holding quota" value={form.targetDatabankElites ?? 400} onChange={(value) => setForm((current) => ({ ...current, targetDatabankElites: value ?? 400 }))} min={40} max={10000} />
-                      <NumberField label="Factory queue (0 = all)" value={form.factoryQueueLimit ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryQueueLimit: value ?? 0 }))} min={0} max={10000} />
-                      {!(form.runUntilStopped ?? true) && <NumberField label="Databank target (0 = all passers)" value={form.factoryTargetDatabank ?? 0} onChange={(value) => setForm((current) => ({ ...current, factoryTargetDatabank: value ?? 0 }))} min={0} max={10000} />}
+                      <NumberField label="Databank quota" value={form.targetDatabankElites ?? 400} onChange={(value) => setForm((current) => ({ ...current, targetDatabankElites: value ?? 400 }))} min={40} max={10000} />
                     </div>
                   </div>
                 )}
                 {form.runMode === "high_performance_islands" && (
                   <div className="form-stack compact">
                     <p className="recipe-summary">
-                      Four islands, large batches, no quota stop. Scout breeds; side workers admit M1 80/130 into Holding. Run fold-R, plateau, CPCV, and Monte Carlo from the Holding tab when you want Databank names.
+                      Four islands, large batches, no quota stop. Scout breeds; side workers run sequential Development walk-forward + OptProfile + Monte Carlo into Databank.
                     </p>
                     <div className="form-grid universal-grammar-grid">
                       <NumberField label="General islands" value={form.generalIslandCount ?? 4} onChange={(value) => setForm((current) => ({ ...current, generalIslandCount: value ?? 4 }))} min={1} max={32} />
@@ -4450,11 +3896,36 @@ function DiscoverWorkspace({
               </div>
             </>
           ) : (
+            <>
             <p className="immutable-note">
               Continuation loads search grammar, run mode, seed, gates and cost model from the
               verified databank. Only the generation count can change.
             </p>
+            </>
           )}
+          <div className="form-grid date-range-grid">
+            <label className="field-row"><span>History start date <small>optional</small></span><input type="date" value={form.historyStartDate ?? ""} onChange={(event) => update("historyStartDate", event.target.value || null)} /></label>
+            <label className="field-row"><span>History end date <small>optional, inclusive</small></span><input type="date" value={form.historyEndDate ?? ""} onChange={(event) => update("historyEndDate", event.target.value || null)} /></label>
+          </div>
+          <p className="immutable-note">IST = in-sample training used to evolve rules. ISV = in-sample validation used to select/validate without breeding. OOS1, OOS2 and any later OOS parts are sealed holdouts and never feed search.</p>
+          <section className="range-parts-editor">
+            <div className="section-heading"><p className="eyebrow">▣ &nbsp; Data range parts</p><span>Ordered, non-overlapping broker-local windows</span></div>
+            <div className="range-presets"><button type="button" className="preset-active" onClick={() => applyRangePreset("60/20/20")}>60 / 20 / 20</button><button type="button" onClick={() => applyRangePreset("50/20/10/20")}>50 / 20 / 10 / 20</button><button type="button" onClick={() => setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts }))}>Custom</button><span className="show-chart">▥ &nbsp; Show chart</span></div>
+            <div className="range-timeline" aria-label="Research schedule timeline" onPointerDown={(event) => { if ((event.target as HTMLElement).closest(".timeline-handle")) return; event.currentTarget.setPointerCapture(event.pointerId); const count = form.dataRangeParts?.length ?? 1; const index = Math.max(0, Math.min(count - 2, Math.round(((event.clientX - event.currentTarget.getBoundingClientRect().left) / event.currentTarget.getBoundingClientRect().width) * (count - 1)))); setTimelineDrag(index); }} onPointerMove={moveTimelineBoundary} onPointerUp={() => setTimelineDrag(null)}>
+              {(form.dataRangeParts ?? []).map((part, index) => <div className={`range-timeline-segment ${part.kind}`} style={{ flexGrow: timelineWeight(part) }} key={`timeline-${part.id}-${index}`}><strong>{part.id}</strong>{index < (form.dataRangeParts?.length ?? 0) - 1 && <button type="button" className="timeline-handle" aria-label={`Drag boundary after ${part.id}`} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setTimelineDrag(index); }} onPointerMove={moveTimelineBoundary} onPointerUp={() => setTimelineDrag(null)} title="Drag to resize this phase" />}</div>)}
+            </div>
+            <div className="range-timeline-legend"><span><i className="training-dot" /> IST · training</span><span><i className="validation-dot" /> ISV · validation</span><span><i className="holdout-dot" /> OOS · sealed</span></div>
+            <div className="range-column-headings"><span>Part</span><span>Type</span><span>Start</span><span>End</span><span>%</span><span /></div>
+            {(form.dataRangeParts ?? []).map((part, index) => <div className="range-part-row" key={part.id + index}>
+              <span className="range-part-id">{part.id}</span>
+              <select value={part.kind} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames(current.dataRangeParts.map((item, i) => i === index ? { ...item, kind: event.target.value as DataRangePart["kind"] } : item)) }))}><option value="training">IST · Training</option><option value="validation">ISV · Validation</option><option value="holdout">OOS · Sealed holdout</option></select>
+              <input type="date" min={index > 0 && form.dataRangeParts[index - 1].endDate ? timelineDate((timelineDay(form.dataRangeParts[index - 1].endDate) ?? 0) + 86400000) : undefined} max={part.endDate || undefined} value={part.startDate} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts.map((item, i) => i === index ? { ...item, startDate: event.target.value } : item) }))} />
+              <input type="date" min={part.startDate || undefined} max={index < form.dataRangeParts.length - 1 && form.dataRangeParts[index + 1].startDate ? timelineDate((timelineDay(form.dataRangeParts[index + 1].startDate) ?? 0) - 86400000) : undefined} value={part.endDate} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts.map((item, i) => i === index ? { ...item, endDate: event.target.value } : item) }))} />
+              <span className="range-percent">{timelinePercent(part, form.dataRangeParts ?? [])}%</span><button type="button" className="range-delete" aria-label={`Remove ${part.id}`} onClick={() => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames(current.dataRangeParts.filter((_, i) => i !== index)) }))}>×</button>
+            </div>)}
+            <button type="button" className="secondary" onClick={() => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames([...current.dataRangeParts, { id: "", kind: "holdout", startDate: "", endDate: "" }]) }))}>+ Add range part</button>
+            <small>Use multiple ISV validation and OOS sealed parts when needed. The current evaluator uses the overall selected date window; segmented scoring is kept for the schedule pipeline.</small>
+          </section>
           <div className="form-stack compact">
             <SymbolSelect
               disabled={active || busy}
@@ -4498,7 +3969,6 @@ function DiscoverWorkspace({
               <div className="mode-toggle">
                 <button type="button" className={form.decisionTimeframe === "H1" ? "active" : ""} onClick={() => update("decisionTimeframe", "H1")}>H1</button>
                 <button type="button" className={form.decisionTimeframe === "M15" ? "active" : ""} onClick={() => update("decisionTimeframe", "M15")}>M15</button>
-                <button type="button" className={form.decisionTimeframe === "H4" ? "active" : ""} onClick={() => update("decisionTimeframe", "H4")}>H4</button>
               </div>
             </div>
             <div className="field-row">
@@ -4527,11 +3997,11 @@ function DiscoverWorkspace({
                 ? "Drops bars before 1 Jan 2020 broker time from the 2016 pack. IS and sealed OOS fractions are taken on the remaining history."
                 : "Uses the full ICMarkets 2016–present pack. Continue runs keep the year sealed in the databank."}
             </p>
-            <p className="immutable-note">M15 and H4 are built directly from the selected M1 export, keeping decision candles aligned with execution chronology. Orders are still checked against M1 for fidelity.</p>
+            <p className="immutable-note">M15 is built directly from the selected M1 export, keeping decision candles aligned with execution chronology.</p>
             <details className="advanced-settings">
               <summary>Bound paths (auto-filled from symbol)</summary>
               <div className="form-stack compact">
-                <label className="field-row"><span>Decision source ({form.decisionTimeframe})</span><code>{form.decisionTimeframe === "H1" ? form.dataPath || "—" : "Built from the M1 path below"}</code></label>
+                <label className="field-row"><span>Decision source ({form.decisionTimeframe})</span><code>{form.decisionTimeframe === "M15" ? "Built from the M1 path below" : form.dataPath || "—"}</code></label>
                 <label className="field-row"><span>Decision metadata</span><code>{form.metadataPath || "—"}</code></label>
                 <label className="field-row"><span>M1</span><code>{form.m1DataPath || "—"}</code></label>
                 <label className="field-row"><span>M1 metadata</span><code>{form.m1MetadataPath || "—"}</code></label>
@@ -4545,11 +4015,7 @@ function DiscoverWorkspace({
               <input
                 type="checkbox"
                 checked={form.runUntilStopped ?? true}
-                onChange={(event) => setForm((current) => ({
-                  ...current,
-                  runUntilStopped: event.target.checked,
-                  factoryTargetDatabank: event.target.checked ? 0 : current.factoryTargetDatabank,
-                }))}
+                onChange={(event) => update("runUntilStopped", event.target.checked)}
               />
               <span>Run until stopped (SQX-style continuous bank growth)</span>
             </label>
@@ -4559,7 +4025,7 @@ function DiscoverWorkspace({
               onChange={(value) => update("generations", value ?? 0)}
               min={0}
             />
-            {expertMode && form.mode === "new" && <>
+            {form.mode === "new" && <>
               <NumberField label="Initial candidates" value={form.initialCandidates} onChange={(value) => update("initialCandidates", value)} min={1} />
               <NumberField label="Batch / generation" value={form.batchSize} onChange={(value) => update("batchSize", value)} min={1} />
               <NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value)} min={0} />
@@ -4569,8 +4035,11 @@ function DiscoverWorkspace({
               <NumberField label="Maximum RAM (MB)" value={form.maxMemoryMb} onChange={(value) => update("maxMemoryMb", value)} min={1024} step={1024} />
               <NumberField label="Breed after pot elites" value={form.mutateAfterElites} onChange={(value) => update("mutateAfterElites", value)} min={0} />
               <NumberField label="Random fill fraction" value={form.randomFillFraction} onChange={(value) => update("randomFillFraction", value)} step={0.05} min={0} />
-              <NumberField label="OOS1 validation reserve (0 = off)" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} min={0} max={0.5} />
-              <NumberField label="Sealed holdout" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              {!hasDatedRangeSchedule && <div className="immutable-note">Split percentages are controlled by the timeline above. Until dates are entered, the legacy percentage fallback is used.</div>}
+              {!hasDatedRangeSchedule && <>
+                <NumberField label="Fallback ISV validation reserve" value={form.validationFraction} onChange={(value) => update("validationFraction", value)} step={0.05} min={0} />
+                <NumberField label="Fallback OOS sealed holdout" value={form.sealedFraction} onChange={(value) => update("sealedFraction", value)} step={0.05} />
+              </>}
               <label className="field-row pack-directory-field">
                 <span>FX pack directory (matching-timeframe screen)</span>
                 <input
@@ -4586,6 +4055,32 @@ function DiscoverWorkspace({
               <details className="advanced-settings" open>
                 <summary>Scout gates — random search screen</summary>
                 <p className="immutable-note">Cheap Selected-TF filter. Keep these loose so the databank pot can fill before breeding.</p>
+                <div className="field-row">
+                  <span>Scout fitness</span>
+                  <div className="mode-toggle">
+                    <button
+                      type="button"
+                      disabled={active || busy || form.mode !== "new"}
+                      className={(form.scoutFitnessMode ?? "raw_is") === "raw_is" ? "active" : ""}
+                      onClick={() => update("scoutFitnessMode", "raw_is")}
+                    >
+                      Raw IS
+                    </button>
+                    <button
+                      type="button"
+                      disabled={active || busy || form.mode !== "new"}
+                      className={form.scoutFitnessMode === "stable_fold" ? "active" : ""}
+                      onClick={() => update("scoutFitnessMode", "stable_fold")}
+                    >
+                      Stable fold
+                    </button>
+                  </div>
+                </div>
+                <p className="immutable-note">
+                  {(form.scoutFitnessMode ?? "raw_is") === "raw_is"
+                    ? "SQX-style: rank parents on pooled IS expectancy, return, PF, and depth. Fold stability is a light tie-break only."
+                    : "QuantForge classic: median calendar-year fold-R minus spread; penalises one lucky IS year."}
+                </p>
                 <div className="numeric-grid">
                   <NumberField label="Minimum trades" value={form.minimumTrades} onChange={(value) => update("minimumTrades", value)} min={0} />
                   <NumberField label="Maximum drawdown %" value={form.maximumDrawdownPercent} onChange={(value) => update("maximumDrawdownPercent", value)} step={0.1} />
@@ -4614,25 +4109,22 @@ function DiscoverWorkspace({
                     setForm((current) => ({
                       ...current,
                       searchRanges: { ...preset.ranges },
-                      universalGrammar: {
-                        ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR),
-                        maximumShift: preset.maximumShift,
-                      },
+                      universalGrammar: { ...preset.universalGrammar },
+                      scoutFitnessMode: preset.scoutFitnessMode,
                     }));
                   }}
                 />
                 <SavedRangeProfilePicker value={form.searchRanges ?? DEFAULT_SEARCH_RANGES} onChange={(searchRanges) => update("searchRanges", searchRanges)} onError={onError} />
               </details>
               <details className="advanced-settings" open>
-                <summary>Holding admission — cheap path after breeding</summary>
-                <p className="immutable-note">Discover deposits to Holding after H1 gates + M1 80/130 only. Fold-R, permutation (Ret/DD 0.85–1.25, 55% neighbours), CPCV, and Monte Carlo wait until you run the battery from the Holding tab.</p>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.buildToHolding ?? true} onChange={(event) => update("buildToHolding", event.target.checked)} /><span>Build to Holding (recommended). Uncheck only to send the full battery during Discover</span></label>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Keep battery settings for later Holding → Databank (CPCV / Monte Carlo / param plateau)</span></label>
+                <summary>Databank admission — after breeding</summary>
+                <p className="immutable-note">Discover deposits after H1 gates + M1 fidelity + sequential Development walk-forward (≥60% positive chronological folds) + SQX OptProfile (±30%, ≥25% profitable, Ret/DD 0.75–1.50) + Monte Carlo. Calendar-year folds are diagnostics only — never a hard kill. Sealed holdout is never used to pick.</p>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Robustness ?? true} onChange={(event) => update("requireM1Robustness", event.target.checked)} /><span>Require walk-forward + OptProfile + Monte Carlo before Databank (recommended)</span></label>
                 <label className="check-field discover-split"><input type="checkbox" checked={form.requireM1Precision ?? true} onChange={(event) => update("requireM1Precision", event.target.checked)} /><span>M1 80% trades / 130% DD retention vs Selected-TF (required)</span></label>
-                <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Strict calendar-year folds (every IS year must pass)</span></label>
+                <label className="check-field discover-split"><input type="checkbox" checked={form.calendarYearFolds ?? false} onChange={(event) => update("calendarYearFolds", event.target.checked)} /><span>Record calendar-year diagnostics (never a hard deposit kill)</span></label>
                 <div className="numeric-grid">
                   <NumberField label="Minimum Development expectancy (R)" value={form.minimumDevelopmentExpectancyR} onChange={(value) => update("minimumDevelopmentExpectancyR", value)} min={0} step={0.05} />
-                  <NumberField label="Legacy fold setting" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={2} />
+                  <NumberField label="Sequential walk-forward folds" value={form.robustnessFolds} onChange={(value) => update("robustnessFolds", value)} min={3} max={12} />
                   <NumberField label="MC trials" value={form.robustnessMonteCarloTrials} onChange={(value) => update("robustnessMonteCarloTrials", value)} min={1} />
                   <NumberField label="MC block length" value={form.robustnessMonteCarloBlockLength} onChange={(value) => update("robustnessMonteCarloBlockLength", value)} min={1} />
                   <NumberField
@@ -4660,14 +4152,14 @@ function DiscoverWorkspace({
                   />
                   <NumberField label="Param samples" value={form.robustnessNeighborhoodSamples} onChange={(value) => update("robustnessNeighborhoodSamples", value)} min={1} />
                   <NumberField
-                    label="Param jitter ±% (SQX default 20)"
+                    label="Param jitter ±% (SQX OptProfile 30)"
                     value={perturbationPercent(form)}
                     onChange={(value) => update("robustnessPerturbationFraction", value === null ? null : Math.min(100, Math.max(1, value)) / 100)}
                     min={1}
                     max={100}
                     step={1}
                   />
-                  <NumberField label="Optional cross-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
+                  <NumberField label="Multi-symbol min pass (0=off)" value={form.multiSymbolMinimumPass} onChange={(value) => update("multiSymbolMinimumPass", value)} min={0} />
                 </div>
                 <p className="immutable-note">Monte Carlo settings seal into the databank with the rest of Discover config. Stop/limit search requires a bid/ask <code>.quotes.csv</code> sidecar beside M1.</p>
                 {perturbationError(form) && <p className="field-error">{perturbationError(form)}</p>}
@@ -4678,7 +4170,7 @@ function DiscoverWorkspace({
                   <NumberField label="Correlation ceiling" value={form.correlationThreshold} onChange={(value) => update("correlationThreshold", value)} step={0.01} />
                   <NumberField label="Novelty weight" value={form.noveltyWeight} onChange={(value) => update("noveltyWeight", value)} step={0.1} />
                   <NumberField label="M1 fidelity min return retention" value={form.minimumM1ReturnRetention} onChange={(value) => update("minimumM1ReturnRetention", value)} step={0.01} />
-                  <NumberField label="OOS1 retention vs Development (0–2×)" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} min={0} max={2} />
+                  <NumberField label="OOS1 certification retention" value={form.oos1ExpectancyRetention} onChange={(value) => update("oos1ExpectancyRetention", value)} step={0.05} />
                   <NumberField label="Commission / lot RT" value={form.commissionPerLotRoundTurn} onChange={(value) => update("commissionPerLotRoundTurn", value)} step={0.01} />
                   <NumberField label="Slippage points / side" value={form.slippagePointsPerSide} onChange={(value) => update("slippagePointsPerSide", value)} step={0.1} />
                   <NumberField label="Fallback spread points" value={form.fallbackSpreadPoints} onChange={(value) => update("fallbackSpreadPoints", value)} step={0.1} optional />
@@ -4689,13 +4181,13 @@ function DiscoverWorkspace({
             </>
           ) : null}
           {form.mode === "new" && <>
-            <p className="immutable-note simple-mode-note">Development drives search and breeding. Holding receives the cheap M1 fidelity screen; the full robustness battery runs later from the Holding tab. Sealed holdout is never loaded by Discover. Open Technical settings only to deliberately tune gates, robustness, additional execution modules or search ranges.</p>
-              <details className="advanced-settings" open>
-              <summary>Additional execution research modules</summary>
-              <p className="immutable-note">The core exit recipe is at the top of this page. These additional modules deliberately widen the search and are only for a specific research experiment.</p>
-              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
-              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
-              <label className="check-field discover-split"><input type="checkbox" disabled={form.slTpOnlyExits ?? true} checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
+            <p className="immutable-note">Development alone drives search and breeding. Databank admits require sequential walk-forward + OptProfile + Monte Carlo. Sealed holdout is never loaded by Discover.</p>
+            <details className="advanced-settings" open>
+              <summary>Execution modules — search genes (pot only until breeding)</summary>
+              <p className="immutable-note">Disabled is the high-parity baseline. Enabling a module widens the H1 search pot. Databank admission still requires the post-breed M1 pipeline.</p>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowBreakEven ?? false} onChange={(event) => setForm((current) => ({ ...current, allowBreakEven: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Break-even stop move</span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowTrailingStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTrailingStops: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Trailing stop</span></label>
+              <label className="check-field discover-split"><input type="checkbox" checked={form.allowPartialExits ?? false} onChange={(event) => setForm((current) => ({ ...current, allowPartialExits: event.target.checked, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Partial exit</span></label>
             </details>
             <details className="advanced-settings" open>
               <summary>Entry order types — sampled in equal shares</summary>
@@ -4736,7 +4228,7 @@ function DiscoverWorkspace({
           <p>
             {startBlocker
               ? startBlocker
-              : "Pipeline: Development gates → reservoir → breed → Holding (M1 80/130) → on-demand battery → Databank. OOS2 remains sealed."}
+              : "Pipeline: Development gates → reservoir → breed → sequential walk-forward → OptProfile + Monte Carlo → Databank. OOS2 remains sealed."}
           </p>
           <button
             type="button"
@@ -4769,25 +4261,25 @@ function DiscoverWorkspace({
             />
             <Kpi
               label="Holding"
-              value={
-                job?.targetDatabankElites
-                  ? `${formatNumber((job?.holdingElites ?? 0) + (job?.databankElites ?? 0))}/${job.targetDatabankElites}`
-                  : formatNumber(job?.holdingElites ?? 0)
-              }
-              note={
-                job?.targetDatabankElites
-                  ? "Quota · M1 80/130"
-                  : job?.breedingActive
-                    ? "Post-breed M1 80/130"
-                    : "Empty until breeding unlocks"
-              }
+              value={formatNumber(job?.holdingElites ?? 0)}
+              note={job?.breedingActive ? "M1 passed · awaiting WF + OptProfile + MC" : "M1 staging begins after breeding"}
             />
             <Kpi
               label="Databank"
-              value={formatNumber(job?.databankElites ?? job?.coverage ?? 0)}
-              note="After Holding battery"
+              value={
+                job?.targetDatabankElites
+                  ? `${formatNumber(job?.databankElites ?? 0)}/${job.targetDatabankElites}`
+                  : formatNumber(job?.databankElites ?? job?.coverage ?? 0)
+              }
+              note={
+                job?.targetDatabankElites
+                    ? "Quota · passed full battery"
+                  : job?.breedingActive
+                    ? "Passed full battery"
+                    : "Empty until breeding unlocks"
+              }
             />
-            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "Queued for Holding pipeline" : "Breeding stock only"} />
+            <Kpi label="Pot admissions" value={formatNumber(job?.potNewNiches ?? 0)} note={job?.breedingActive ? "M1 → Holding → battery" : "Breeding stock only"} />
             <Kpi label="Rejected" value={formatNumber(rejected)} note="Did not stay" />
             <Kpi
               label="Evals / hour · rolling"
@@ -4821,12 +4313,12 @@ function DiscoverWorkspace({
               <li><span>Correlation</span><strong>{formatNumber(job?.rejectedCorrelated ?? 0)}</strong></li>
               <li><span>Eval error</span><strong>{formatNumber(job?.rejectedEvaluation ?? 0)}</strong></li>
             </ul>
-            <p className="funnel-group-label">Post-breed Holding pipeline — after breeding unlocks</p>
+            <p className="funnel-group-label">Post-breed Databank pipeline — after breeding unlocks</p>
             <ul>
-              <li><span>{(form.validationFraction ?? 0) > 0 ? "OOS1 validation rejects" : "OOS1 validation (off)"}</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
+              <li><span>OOS1 leakage guard (must remain 0)</span><strong>{formatNumber(job?.rejectedOos1 ?? 0)}</strong></li>
               <li><span>Development expectancy floor</span><strong>{formatNumber(job?.rejectedDevelopmentExpectancy ?? 0)}</strong></li>
               <li><span>M1 fidelity</span><strong>{formatNumber(job?.rejectedM1Fidelity ?? 0)}</strong></li>
-              <li><span>Development CPCV</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
+              <li><span>Sequential walk-forward</span><strong>{formatNumber(job?.rejectedWalkForward ?? 0)}</strong></li>
               <li><span>Monte Carlo</span><strong>{formatNumber(job?.rejectedMonteCarlo ?? 0)}</strong></li>
               <li><span>Param plateau</span><strong>{formatNumber(job?.rejectedParamNeighborhood ?? 0)}</strong></li>
               <li><span>Niche not improved</span><strong>{formatNumber(job?.rejectedNicheNotImproved ?? 0)}</strong></li>
@@ -4890,7 +4382,7 @@ function DiscoverWorkspace({
                   <p className="eyebrow">Results</p>
                   <h2>
                     {liveEliteRows.length
-                      ? `${liveEliteRows.length} holding + databank`
+                      ? `${liveEliteRows.length} databank elites`
                       : "No strategies yet"}
                   </h2>
                 </div>
@@ -4915,78 +4407,6 @@ function DiscoverWorkspace({
                   Run Discover until elites pass M1 robustness, or open a databank. Results appear here as promotions land.
                 </p>
               )}
-            </section>
-
-            <section className="panel family-tester-panel condition-bakeoff-panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">Timeframe comparison</p>
-                  <h2>H1 vs H4 bakeoff</h2>
-                </div>
-                <span className="read-only-badge">Paired candidates · OOS1 diagnostic</span>
-              </div>
-              <div className="family-tester-body">
-                <p className="immutable-note">
-                  Evaluates the same deterministic candidates on H1 and H4. Development gates select candidates;
-                  OOS1 measures survival. The sealed holdout is never loaded. If the current recipe has OOS1 off,
-                  this diagnostic uses a temporary 20% OOS1 reserve.
-                </p>
-                <div className="numeric-grid family-tester-numbers">
-                  <NumberField
-                    label="Draws / grammar cell"
-                    value={timeframeBakeoffDraws}
-                    onChange={(value) => setTimeframeBakeoffDraws(value ?? 20)}
-                    min={1}
-                  />
-                </div>
-                <div className="family-tester-actions">
-                  <button
-                    className="primary"
-                    disabled={active || timeframeBakeoffBusy || !form.dataPath || !form.m1DataPath || !form.brokerPath}
-                    onClick={() => void runTimeframeComparison()}
-                  >
-                    {timeframeBakeoffBusy ? "Running H1 vs H4…" : "Run H1 vs H4 bakeoff"}
-                  </button>
-                </div>
-                {timeframeBakeoffReport && (
-                  <>
-                    <div className="family-tester-results">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Lane</th>
-                            <th>IS screen</th>
-                            <th>OOS1 survival</th>
-                            <th>Retention</th>
-                            <th>Trades</th>
-                            <th>DD</th>
-                            <th>Selected future lift</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {timeframeBakeoffReport.rows.map((row) => (
-                            <tr key={row.timeframe}>
-                              <td>{row.timeframe}</td>
-                              <td>{formatNumber(row.screened)} / {formatNumber(row.draws)}</td>
-                              <td>{(row.oos1SurvivalRate * 100).toFixed(1)}%</td>
-                              <td>{row.medianRetention == null ? "—" : formatNumber(row.medianRetention, 3)}</td>
-                              <td>{row.medianTradeCount == null ? "—" : formatNumber(row.medianTradeCount, 0)}</td>
-                              <td>{row.medianDrawdownPercent == null ? "—" : `${formatNumber(row.medianDrawdownPercent, 1)}%`}</td>
-                              <td>{row.selectedFutureExpectancyLiftR == null ? "—" : `${formatNumber(row.selectedFutureExpectancyLiftR, 3)}R`}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <p className="immutable-note">
-                      {timeframeBakeoffReport.pair.recommendation}
-                      {" "}
-                      H4 pass-rate lift: {(timeframeBakeoffReport.pair.h4PassRateLift * 100).toFixed(1)}pp;
-                      paired OOS1 wins H1/H4: {formatNumber(timeframeBakeoffReport.pair.h1Oos1Wins)}/{formatNumber(timeframeBakeoffReport.pair.h4Oos1Wins)}.
-                    </p>
-                  </>
-                )}
-              </div>
             </section>
 
             <section className="panel family-tester-panel condition-bakeoff-panel">
@@ -5111,15 +4531,15 @@ function DiscoverWorkspace({
       )}
       </div>
 
-      {(active || (job?.holdingElites ?? 0) > 0 || (job?.databankElites ?? 0) > 0) && (
+      {(active || (job?.databankElites ?? 0) > 0) && (
         <section className={`panel discover-live-databank ${liveEliteRows.length ? "" : "empty"}`}>
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">Live Holding / Databank</p>
+              <p className="eyebrow">Live Databank</p>
               <h2>
                 {liveEliteRows.length
                   ? `${formatNumber(liveEliteRows.length)} strategies`
-                  : "Waiting for first Holding deposit"}
+                  : "Waiting for first Databank deposit"}
               </h2>
             </div>
             <span className="read-only-badge">
@@ -5172,8 +4592,6 @@ function DiscoverWorkspace({
         />
       )}
     </div>
-      )}
-    </div>
   );
 }
 
@@ -5192,9 +4610,6 @@ function DiscoverContractSummary({
     form.allowBreakEven ? "Break-even" : null,
     form.allowTrailingStops ? "Trailing stop" : null,
     form.allowPartialExits ? "Partial exits" : null,
-    form.allowFixedPipStops ? "Fixed-pip SL/TP" : null,
-    form.allowIndicatorExitRules ? "Indicator exit" : null,
-    form.allowTimeStops ? "Exit after N bars" : null,
     form.flattenAt22 ? `EOD exit ${String(form.endOfDayHour ?? 23).padStart(2, "0")}:00` : null,
     entryWindowSummary(form).replace("Entries allowed ", "Entries "),
     form.maxOneEntryPerDay ? "One fill / day" : null,
@@ -5229,11 +4644,16 @@ function DiscoverContractSummary({
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
         <SummaryLine label="Closed-bar shifts" value={grammar ? `${grammar.minimumShift}–${grammar.maximumShift}` : "—"} />
         <SummaryLine
+          label="Scout fitness"
+          value={(form.scoutFitnessMode ?? "raw_is") === "raw_is" ? "Raw IS (SQX-style)" : "Stable fold"}
+        />
+        <SummaryLine
           label="Parameter ranges"
           value={(() => {
             const preset = detectBuiltInSearchPreset(form.searchRanges ?? DEFAULT_SEARCH_RANGES);
             if (preset === "h1_compact") return "H1 compact · periods 10–20";
             if (preset === "sqx_random") return "SQX random · periods 10–50";
+            if (preset === "sqx_wide") return "SQX wide · periods 5–100 · raw IS fitness";
             return "Custom / saved profile";
           })()}
         />
@@ -5255,8 +4675,8 @@ function DiscoverContractSummary({
         <SummaryLine label="Development / Holdout" value={splitCaption(form.validationFraction ?? 0, form.sealedFraction ?? 1 / 3)} />
         <SummaryLine label="M1 return retention" value={`${formatNumber((form.minimumM1ReturnRetention ?? .9) * 100, 0)}%`} />
         <SummaryLine label="Minimum Development expectancy" value={`≥ ${formatNumber(form.minimumDevelopmentExpectancyR ?? 0, 2)}R`} />
-        <SummaryLine label="OOS1 validation" value={(form.validationFraction ?? 0) > 0 ? `${formatNumber((form.validationFraction ?? 0) * 100, 0)}% reserve · ≥${formatNumber(form.oos1ExpectancyRetention ?? 0.7, 2)}× Development` : "Off · 0% reserve"} />
-        <SummaryLine label="Robustness" value={`6C2 Development CPCV · ${form.robustnessMonteCarloTrials ?? 0} MC · block ${form.robustnessMonteCarloBlockLength ?? 5} · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}% · ${form.robustnessNeighborhoodSamples ?? 0} params`} />
+        <SummaryLine label="OOS1 pick" value="Off · fold-stable Development R replaces it" />
+        <SummaryLine label="Robustness" value={`SQX OptProfile (±${Math.round((form.robustnessPerturbationFraction ?? 0.3) * 100)}%, ≥${Math.round((form.minimumNeighborhoodSurvivalFraction ?? 0.25) * 100)}% profitable) · ${form.robustnessMonteCarloTrials ?? 0} MC · P80 ${(form.robustnessMonteCarloP80ProfitRetention ?? 0.6) * 100}%`} />
         <SummaryLine label="Sealed holdout" value="Display only · not a Discover gate" accent />
       </div>
 
@@ -5439,239 +4859,12 @@ function IndicatorParityPanel({ onError }: { onError: (message: string | null) =
   return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Buffer-level reconciliation</p><h2>Compare Rust indicators with MT5</h2></div></div><div className="form-stack"><PathField label="Indicator probe CSV" path={form.referencePath} choose={() => chooseTesterCsv("Choose MT5 indicator probe export")} onChange={(value) => setForm((current) => ({ ...current, referencePath: value }))} required /><PathField label="New indicator parity artifact" path={form.outputPath} choose={() => chooseOutputJson("Save indicator parity artifact", "indicator-parity.json")} onChange={(value) => setForm((current) => ({ ...current, outputPath: value }))} required /></div><div className="numeric-grid"><NumberField label="Warmup rows" value={form.warmupRows} onChange={(value) => setForm((current) => ({ ...current, warmupRows: value ?? 1000 }))} min={0} /><NumberField label="Absolute epsilon" value={form.absoluteEpsilon} onChange={(value) => setForm((current) => ({ ...current, absoluteEpsilon: value ?? 1e-10 }))} step={1e-10} /><NumberField label="Relative epsilon" value={form.relativeEpsilon} onChange={(value) => setForm((current) => ({ ...current, relativeEpsilon: value ?? 1e-9 }))} step={1e-9} /></div><div className="form-footer"><p>All thirteen supported indicator buffers must match after warmup before certification.</p><button className="primary" disabled={busy || !form.referencePath || !form.outputPath} onClick={run}>{busy ? "Comparing buffers…" : "Compare indicators"}</button></div></section>{result ? <section className={`panel result-panel result-${result.passed ? "pass" : "fail"}`}><div className="result-hero"><div><p className="eyebrow">Indicator parity</p><h2>{result.symbol} · {result.timeframe}</h2></div><span className="grade-pill">{result.passed ? "passed" : "failed"}</span></div><div className="job-kpis"><Kpi label="Fields" value={formatNumber(result.fieldCount)} note="Required buffers" /><Kpi label="Compared rows" value={formatNumber(result.comparedRows)} note={`${formatNumber(result.sourceRows)} source rows`} /><Kpi label="Mismatches" value={formatNumber(result.mismatchCount)} note="Across all fields" /></div><ArtifactPath label="Indicator parity artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No indicator probe compared" copy="Run the bundled QuantForge indicator probe EA in MT5, export its CSV, then verify SMA, EMA, WMA, RSI, ATR, ranges, z-score, percentile and rate-of-change buffers here." />}</div>;
 }
 
-function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (message: string | null) => void; onOpenDatabank: (path: string) => void }) {
-  const [symbols, setSymbols] = useState<SymbolPack[]>([]);
-  const [profiles, setProfiles] = useState<SavedDiscoverProfile[]>([]);
-  const [profileId, setProfileId] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [globalWorkers, setGlobalWorkers] = useState(0);
-  const [concurrentLanes, setConcurrentLanes] = useState(2);
-  const [job, setJob] = useState<PortfolioDiscoverJobView | null>(null);
-  const [activeAsset, setActiveAsset] = useState("");
-  const [assetWorkspace, setAssetWorkspace] = useState<DatabankWorkspace | null>(null);
-  const [assetLoading, setAssetLoading] = useState(false);
-  const [assetSelected, setAssetSelected] = useState<string | null>(null);
-  const [assetDetail, setAssetDetail] = useState<EliteDetail | null>(null);
-  const [assetDetailLoading, setAssetDetailLoading] = useState(false);
-  const [assetDetailOpen, setAssetDetailOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const active = job?.status === "running";
-
-  useEffect(() => {
-    void Promise.all([listSymbols(), listDiscoverProfiles()])
-      .then(([available, saved]) => {
-        setSymbols(available);
-        setProfiles(saved);
-      })
-      .catch((reason) => onError(String(reason)));
-    void getPortfolioDiscoverJob().then(setJob).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => {
-      void getPortfolioDiscoverJob().then(setJob).catch((reason) => onError(String(reason)));
-    }, 700);
-    return () => window.clearInterval(timer);
-  }, [active]);
-
-  const selectedProfile = profiles.find((profile) => profile.id === profileId);
-  const recipe = selectedProfile?.settings;
-  const recommendedSymbols = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY", "AUDUSD", "USDCAD"];
-  const displaySymbols = useMemo(() => [...symbols].sort((left, right) => {
-    const leftRank = recommendedSymbols.indexOf(left.symbol);
-    const rightRank = recommendedSymbols.indexOf(right.symbol);
-    return (leftRank < 0 ? 99 : leftRank) - (rightRank < 0 ? 99 : rightRank) || left.symbol.localeCompare(right.symbol);
-  }), [symbols]);
-  const selectedSymbols = symbols.filter((symbol) => selected.has(symbol.symbol));
-  const activeLane = job?.lanes.find((lane) => lane.symbol === activeAsset) ?? job?.lanes[0] ?? null;
-  function toggle(symbol: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(symbol)) next.delete(symbol); else if (next.size < 7) next.add(symbol);
-      return next;
-    });
-  }
-  function useLiquidSix() {
-    const preferred = new Set(recommendedSymbols);
-    setSelected(new Set(symbols.filter((symbol) => preferred.has(symbol.symbol)).map((symbol) => symbol.symbol)));
-  }
-  function bindAsset(symbol: SymbolPack): PortfolioDiscoverAsset {
-    return {
-      symbol: symbol.symbol,
-      dataPath: symbol.dataPath,
-      metadataPath: symbol.metadataPath,
-      // A scanned data pack already has its immutable timezone metadata. The
-      // importer intentionally rejects a second manual timezone override.
-      sourceTimezone: null,
-      m1DataPath: symbol.m1DataPath,
-      m1MetadataPath: symbol.m1MetadataPath,
-      m1SourceTimezone: null,
-      brokerPath: symbol.brokerPath,
-    };
-  }
-  async function start() {
-    if (!recipe) { onError("Choose a saved Discover profile. Its frozen recipe will be copied to every selected asset."); return; }
-    if (selectedSymbols.length < 2) { onError("Select at least two complete assets for the campaign."); return; }
-    setBusy(true); onError(null);
-    try {
-      const request: PortfolioDiscoverRequest = {
-        recipe: {
-          ...recipe,
-          mode: "new",
-          selectedSymbol: null,
-          dataPath: "",
-          metadataPath: null,
-          m1DataPath: "",
-          m1MetadataPath: null,
-          brokerPath: "",
-          databankPath: "",
-          promotionSplit: true,
-          packDataDir: null,
-          multiSymbolMinimumPass: 0,
-          factoryAfterDiscover: false,
-        },
-        assets: selectedSymbols.map(bindAsset),
-        globalWorkerThreads: globalWorkers,
-        concurrentLanes,
-      };
-      const started = await startPortfolioDiscover(request);
-      setJob(started);
-      setActiveAsset(started.lanes[0]?.symbol ?? "");
-      setAssetWorkspace(null);
-    } catch (reason) { onError(String(reason)); }
-    finally { setBusy(false); }
-  }
-  async function stop() {
-    try { setJob(await stopPortfolioDiscover()); }
-    catch (reason) { onError(String(reason)); }
-  }
-
-  async function inspectAssetElite(fingerprint: string) {
-    if (!activeLane) return;
-    setAssetSelected(fingerprint);
-    setAssetDetail(null);
-    setAssetDetailLoading(true);
-    setAssetDetailOpen(true);
-    onError(null);
-    try {
-      if (activeLane.status === "running") {
-        await getPortfolioLiveDatabank(activeLane.symbol);
-      } else {
-        await loadDatabankPath(activeLane.outputPath);
-      }
-      setAssetDetail(await loadElite(fingerprint));
-    } catch (reason) {
-      onError(`Could not open ${activeLane.symbol} strategy: ${String(reason)}`);
-      setAssetDetailOpen(false);
-    } finally {
-      setAssetDetailLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!job?.lanes.length) return;
-    if (!job.lanes.some((lane) => lane.symbol === activeAsset)) {
-      setActiveAsset(job.lanes[0].symbol);
-    }
-  }, [job?.jobId, job?.lanes, activeAsset]);
-
-  useEffect(() => {
-    if (!activeLane) return;
-    const hasRows = activeLane.holdingElites + activeLane.databankElites > 0;
-    if (!hasRows) {
-      setAssetWorkspace(null);
-      return;
-    }
-    let cancelled = false;
-    setAssetLoading(true);
-    const load = activeLane.status === "running"
-      ? getPortfolioLiveDatabank(activeLane.symbol)
-      : loadDatabankPath(activeLane.outputPath);
-    void load
-      .then((workspace) => { if (!cancelled) setAssetWorkspace(workspace); })
-      .catch((reason) => { if (!cancelled) onError(`Could not refresh ${activeLane.symbol}: ${String(reason)}`); })
-      .finally(() => { if (!cancelled) setAssetLoading(false); });
-    return () => { cancelled = true; };
-  }, [activeLane?.symbol, activeLane?.status, activeLane?.holdingElites, activeLane?.databankElites]);
-
-  const assetRows = useMemo(
-    () => assetWorkspace
-      ? [...(assetWorkspace.holding ?? []), ...assetWorkspace.elites].sort((left, right) => (right.foldMedianR ?? right.evidence) - (left.foldMedianR ?? left.evidence))
-      : [],
-    [assetWorkspace],
-  );
-
-  return <div className="tool-content multi-discover-workspace">
-    <section className="panel campaign-intro">
-      <div className="campaign-intro-copy">
-        <p className="eyebrow">Multi-asset Discover</p>
-        <h2>Build separate strategy pools, together.</h2>
-        <p>Choose one proven recipe and the markets to search. Every market keeps its own development data, validation and sealed final holdout.</p>
-      </div>
-      <div className="campaign-assurance"><span>Independent research lanes</span><strong>OOS is never shared</strong></div>
-    </section>
-    <section className="panel campaign-launcher">
-      <div className="campaign-section-head"><div><p className="eyebrow">1 · Recipe</p><h2>Choose your search recipe</h2></div><span className={recipe ? "campaign-ready" : "campaign-pending"}>{recipe ? "Ready" : "Required"}</span></div>
-      <label className="campaign-recipe"><span>Saved Discover recipe</span><select disabled={active} value={profileId} onChange={(event) => setProfileId(event.target.value)}><option value="">Choose a saved recipe…</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><small>{recipe ? "The same rules are copied to every selected market. Seeds, paths and holdouts stay separate." : "Save a simple low-complexity recipe in Single asset Discover, then return here."}</small></label>
-      <div className="campaign-controls"><NumberField label="Scout CPU workers" value={globalWorkers} onChange={(value) => setGlobalWorkers(value ?? 0)} min={0} /><NumberField label="Markets at once" value={concurrentLanes} onChange={(value) => setConcurrentLanes(Math.min(7, Math.max(1, value ?? 2)))} min={1} max={7} /></div>
-      <p className="campaign-cpu-note">Leave CPU workers at 0 for automatic. Two markets at once is the safer starting point.</p>
-    </section>
-    <section className="panel campaign-assets">
-      <div className="campaign-section-head"><div><p className="eyebrow">2 · Markets</p><h2>Choose 2–7 independent lanes</h2></div><button type="button" className="quiet-action" disabled={active || symbols.length === 0} onClick={useLiquidSix}>Select liquid six</button></div>
-      <div className="campaign-selection-summary"><strong>{selectedSymbols.length}</strong><span>markets selected</span><small>{selectedSymbols.length < 2 ? "Choose at least two to begin" : "Ready to run as separate research lanes"}</small></div>
-      <div className="campaign-asset-grid">{displaySymbols.map((symbol) => {
-        const isSelected = selected.has(symbol.symbol);
-        return <label key={symbol.symbol} className={`campaign-asset-card ${isSelected ? "selected" : ""}`}>
-          <input type="checkbox" disabled={active || (!isSelected && selected.size >= 7)} checked={isSelected} onChange={() => toggle(symbol.symbol)} />
-          <span className="asset-check" aria-hidden="true">{isSelected ? "✓" : ""}</span>
-          <strong>{symbol.symbol}</strong>
-          <small>H1 + M1 data ready</small>
-          <span className="asset-lane-label">Independent lane</span>
-        </label>;
-      })}</div>
-      <div className="campaign-start"><div><strong>{selectedProfile?.name ?? "Choose a recipe to continue"}</strong><span>Recommended first set: EURUSD, GBPUSD, USDJPY, EURJPY, AUDUSD and USDCAD.</span></div><button type="button" className="primary" disabled={active || busy || !recipe || selectedSymbols.length < 2} onClick={() => void start()}>{busy ? "Starting…" : "Start multi-asset Discover"}</button></div>
-    </section>
-    {job && job.totalLanes > 0 && <section className={job.status === "failed" ? "panel result-panel result-fail" : "panel result-panel result-pass"}>
-      <div className="result-hero"><div><p className="eyebrow">Multi-asset campaign</p><h2>{job.phase}</h2></div><span className="grade-pill">{job.status}</span></div>
-      <p>{job.message}</p><div className="job-kpis"><Kpi label="Lanes" value={`${job.completedLanes}/${job.totalLanes}`} note={`${job.activeLanes} active · ${job.concurrentLanes} at once`} /><Kpi label="Evaluated" value={formatNumber(job.totalEvaluationCount)} note="all isolated lanes" /><Kpi label="Holding" value={formatNumber(job.totalHoldingElites)} note="ready for per-asset battery" /><Kpi label="Databank" value={formatNumber(job.totalDatabankElites)} note="across assets" /></div>
-      <div className="campaign-lane-grid">{job.lanes.map((lane) => <article key={lane.symbol} className={`campaign-lane-card ${lane.status}`}>
-        <header><div><strong>{lane.symbol}</strong><span>{lane.status === "running" ? "Running" : lane.status}</span></div><small>{lane.workerThreads} scout</small></header>
-        <p>{lane.phase}</p>
-        <div className="campaign-lane-metrics"><span><strong>{formatNumber(lane.evaluationCount)}</strong> tested</span><span><strong>{formatNumber(lane.holdingElites)}</strong> Holding</span><span><strong>{formatNumber(lane.databankElites)}</strong> Databank</span></div>
-        {lane.status === "failed" && <small className="lane-error" title={lane.message}>{lane.message}</small>}
-      </article>)}</div>
-      {active && <div className="form-footer"><p>Stopping preserves a checkpoint for every lane after its current generation.</p><button type="button" className="danger" disabled={job.stopRequested} onClick={() => void stop()}>{job.stopRequested ? "Stopping…" : "Stop campaign safely"}</button></div>}
-    </section>}
-    {job && job.totalLanes > 0 && <section className={`panel discover-live-databank ${assetRows.length ? "" : "empty"}`}>
-      <div className="panel-heading"><div><p className="eyebrow">Individual live Databanks</p><h2>{activeLane ? `${activeLane.symbol} Databank` : "Choose an asset"}</h2></div><span className="read-only-badge">click an asset tab</span></div>
-      <div className="workspace-tabs campaign-asset-tabs" role="tablist" aria-label="Campaign assets">{job.lanes.map((lane) => <button key={lane.symbol} type="button" role="tab" aria-selected={lane.symbol === activeAsset} className={lane.symbol === activeAsset ? "active" : ""} onClick={() => setActiveAsset(lane.symbol)}>{lane.symbol} <small>{lane.holdingElites + lane.databankElites}</small></button>)}</div>
-      {activeLane?.status === "failed" ? <div className="job-error"><strong>{activeLane.symbol} failed</strong><span>{activeLane.message}</span></div> : assetLoading ? <p>Refreshing {activeLane?.symbol}…</p> : assetRows.length > 0 ? <><p className="live-strip-hint">Click a strategy for its full partitioned M1 curve and recorded IS/OOS expectancy. This is inspection only; it never changes Discover, ranking, or promotion.</p><EliteTable batchSelection={new Set()} compact onSelect={(fingerprint) => void inspectAssetElite(fingerprint)} onToggle={() => {}} rows={assetRows} selected={assetSelected} showBatch={false} /><div className="form-footer"><p>{formatNumber(assetRows.length)} {activeLane?.symbol} strategies in Holding and Databank.</p><button type="button" className="secondary" onClick={() => activeLane && onOpenDatabank(activeLane.outputPath)}>Open full {activeLane?.symbol} Databank</button></div></> : <p>{activeLane?.status === "queued" ? `${activeLane.symbol} is queued. It will start when a running lane finishes.` : `${activeLane?.symbol ?? "This asset"} has no Holding deposits yet.`}</p>}
-    </section>}
-    {assetDetailOpen && activeLane && <CampaignStrategyPreviewModal
-      detail={assetDetail}
-      loading={assetDetailLoading}
-      row={assetRows.find((row) => row.fingerprint === assetSelected) ?? null}
-      symbol={activeLane.symbol}
-      workspace={assetWorkspace}
-      onClose={() => setAssetDetailOpen(false)}
-    />}
-  </div>;
-}
-
-// Kept only so existing Portfolio navigation does not dead-end. Campaigns now
-// live in Discover, where their per-asset Databank tabs are available.
-function PortfolioDiscoverCampaign({ onError }: { onError: (message: string | null) => void }) {
-  return <WorkspacePrimer title="Multi-asset Discover moved" copy="Open Discover, then choose Multi-asset campaign. That workspace keeps every asset's live Holding and Databank separate behind its own tab." />;
-}
-
 function PortfolioWorkspace({ onError, workspace }: { onError: (message: string | null) => void; workspace: DatabankWorkspace | null }) {
-  const [tab, setTab] = useState<"discover" | "pack">("discover");
   const [form, setForm] = useState<PortfolioRequest>({ databankPath: workspace?.sourcePath ?? "", brokerPath: "", outputPath: "", objective: "risk_adjusted_return", maximumPairwiseCorrelation: .7, maximumWeightPerStrategy: .25, maximumSymbolExposure: 1, maximumCohortExposure: .5, maximumStrategies: 10, minimumReturnPercent: 0, cvarTailFraction: .05, stressTrials: 1000, stressBlockLength: 5, seed: 42 });
   const [result, setResult] = useState<PortfolioView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof PortfolioRequest>(key: K, value: PortfolioRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await buildPortfolio(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="wide-tool-content"><div className="workspace-tabs"><button className={tab === "discover" ? "active" : ""} onClick={() => setTab("discover")}>Portfolio Discover</button><button className={tab === "pack" ? "active" : ""} onClick={() => setTab("pack")}>Pack Databank</button></div>{tab === "discover" ? <PortfolioDiscoverCampaign onError={onError} /> : <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>}</div>;
+  return <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>;
 }
 
 function VaultWorkspace({ onError }: { onError: (message: string | null) => void }) {
@@ -5740,7 +4933,7 @@ function PathField({
 function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onChange: (next: SearchRangeProfile) => void }) {
   const groups: Array<[string, Array<[keyof SearchRangeProfile, string]>]> = [
     ["Indicators", [["indicatorPeriod", "General indicator period"], ["atrPeriod", "ATR period"], ["rsiUpper", "RSI upper"], ["rsiLower", "RSI lower"], ["adxThreshold", "ADX strength threshold"], ["rocThreshold", "ROC threshold"], ["percentileLow", "Percentile low"], ["zscoreThreshold", "Z-score threshold"]]],
-    ["Stops and orders", [["atrStopMultiple", "ATR stop"], ["atrTargetMultiple", "ATR target"], ["riskTargetMultiple", "R target"], ["fixedStopPips", "Fixed pip stop (FX)"], ["fixedTargetPips", "Fixed pip target (FX)"], ["pendingDistanceAtr", "Pending distance (ATR)"], ["pendingExpiryBars", "Pending expiry bars"], ["timeStopBars", "Time-stop bars"]]],
+    ["Stops and orders", [["atrStopMultiple", "ATR stop"], ["atrTargetMultiple", "ATR target"], ["riskTargetMultiple", "R target"], ["pendingDistanceAtr", "Pending distance (ATR)"], ["pendingExpiryBars", "Pending expiry bars"], ["timeStopBars", "Time-stop bars"]]],
     ["Price action and sessions", [["impulseBodyRatio", "Impulse body ratio"], ["impulseCloseLocation", "Impulse close location"], ["atrPercentileMax", "ATR percentile maximum"], ["atrPercentileLookback", "ATR percentile lookback"], ["sessionStartHour", "Session start hour"], ["sessionRangeBars", "Session range bars"], ["swingBars", "Swing bars"], ["baseBars", "Base bars"], ["liquiditySweepThreshold", "Liquidity sweep score"]]],
   ];
   function set(key: keyof SearchRangeProfile, field: "minimum" | "maximum" | "step", next: number) {
@@ -5752,10 +4945,7 @@ function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onCh
         <div className="range-group" key={title}>
           <div className="range-group-head">
             <p className="eyebrow">{title}</p>
-            <span>{rows.filter(([key]) => {
-              const range = value[key];
-              return !(range.minimum === 0 && range.maximum === 0 && range.step === 0);
-            }).length} active · {rows.length} available</span>
+            <span>{rows.length} genes</span>
           </div>
           <div className="range-group-body">
             <div className="range-row range-row-head">
@@ -5766,14 +4956,10 @@ function SearchRangesWall({ value, onChange }: { value: SearchRangeProfile; onCh
             </div>
             {rows.map(([key, label]) => {
               const range = value[key];
-              // A zeroed range is an intentional opt-out for an optional gene,
-              // not a malformed numeric range. This is how the constrained
-              // SL/TP-only recipe records time stops and pending expiry.
-              const disabled = range.minimum === 0 && range.maximum === 0 && range.step === 0;
-              const invalid = !disabled && (!(range.minimum <= range.maximum) || !(range.step > 0));
+              const invalid = !(range.minimum <= range.maximum) || !(range.step > 0);
               return (
-                <div className={invalid ? "range-row invalid" : disabled ? "range-row disabled" : "range-row"} key={key}>
-                  <span>{label}{disabled && <small>Off — not searched</small>}</span>
+                <div className={invalid ? "range-row invalid" : "range-row"} key={key}>
+                  <span>{label}</span>
                   <label>
                     <input aria-label={`${label} minimum`} type="number" value={range.minimum} step="any" onChange={(event) => set(key, "minimum", Number(event.target.value))} />
                   </label>
@@ -6239,9 +5425,8 @@ function EliteInspector({
   }
 
   useEffect(() => {
-    if (!detail || tab !== "overview" || detail.sealedProtected) {
+    if (!detail || tab !== "overview") {
       setPartitionView(null);
-      setPartitionBusy(false);
       return;
     }
     let cancelled = false;
@@ -6260,7 +5445,7 @@ function EliteInspector({
     return () => {
       cancelled = true;
     };
-  }, [detail?.fingerprint, detail?.sealedProtected, tab, onError]);
+  }, [detail?.fingerprint, tab, onError]);
 
   useEffect(() => {
     if (!detail || tab !== "mq5") {
@@ -6285,27 +5470,20 @@ function EliteInspector({
     };
   }, [detail?.fingerprint, tab, mq5Timeframe, onError]);
 
-  const displayMetrics = partitionView
-    ? {
-        returnPercent: partitionView.fullRunReturnPercent,
-        maxDrawdownPercent: partitionView.fullRunMaxDrawdownPercent,
-        tradeCount: partitionView.fullRunTrades,
-        winRate: partitionView.fullRunWinRate,
-        profitFactor: partitionView.fullRunProfitFactor,
-        sharpeRatio: partitionView.fullRunSharpeRatio,
-        source: "m1-full-run" as const,
-      }
-    : {
-        returnPercent: Number(detail?.metrics.return_percent ?? 0),
-        maxDrawdownPercent: Number(detail?.metrics.max_drawdown_percent ?? 0),
-        tradeCount: Number(detail?.metrics.trade_count ?? 0),
-        winRate: Number(detail?.metrics.win_rate ?? 0),
-        profitFactor: detail?.metrics.profit_factor === null || detail?.metrics.profit_factor === undefined
-          ? null
-          : Number(detail.metrics.profit_factor),
-        sharpeRatio: detail ? effectiveDetailSharpe(detail) : null,
-        source: m1FidelityVerified ? "stored-is" as const : "stored-scout" as const,
-      };
+  // Keep the headline cards tied to the exact Development result that put this
+  // strategy in the Databank. The chart can then explicitly compare that run
+  // with OOS/full history without silently replacing the row's statistics.
+  const displayMetrics = {
+    returnPercent: Number(detail?.metrics.return_percent ?? 0),
+    maxDrawdownPercent: Number(detail?.metrics.max_drawdown_percent ?? 0),
+    tradeCount: Number(detail?.metrics.trade_count ?? 0),
+    winRate: Number(detail?.metrics.win_rate ?? 0),
+    profitFactor: detail?.metrics.profit_factor === null || detail?.metrics.profit_factor === undefined
+      ? null
+      : Number(detail.metrics.profit_factor),
+    sharpeRatio: detail ? effectiveDetailSharpe(detail) : null,
+    source: m1FidelityVerified ? "stored-is" as const : "stored-scout" as const,
+  };
 
   return (
     <aside className="panel inspector inspector-wide">
@@ -6345,21 +5523,22 @@ function EliteInspector({
                   </p>
                 </section>
               )}
-              {detail.sealedProtected ? (
-                <section className="legacy-metrics-warning">
-                  <p className="eyebrow">Sealed final protected</p>
-                  <p>
-                    Production Lane used Development only. Future M1 equity and expectancy are hidden here;
-                    reveal them once through the explicit Sealed Final workflow after the shortlist is frozen.
-                  </p>
-                </section>
-              ) : (
+              {partitionView ? (
                 <PartitionEquityChart
                   view={partitionView}
-                  busy={partitionBusy}
+                  busy={false}
                   researchGrade={researchGrade}
                   m1FidelityVerified={m1FidelityVerified}
                 />
+              ) : (
+                <>
+                  <StoredSignatureChart
+                    initialBalance={100_000}
+                    returnPercent={displayMetrics.returnPercent}
+                    values={detail.equitySignature}
+                  />
+                  {partitionBusy && <p className="equity-cache-note">Stored Development curve shown instantly · preparing full M1/OOS overlays in the background…</p>}
+                </>
               )}
               <section className="metric-list">
                 <Metric label="Mean R" value={(Number(detail.metrics.expectancy_r) || 0).toFixed(3)} />
@@ -6370,22 +5549,21 @@ function EliteInspector({
                 <Metric label="Fold spread" value={detail.foldUsable ? detail.foldSpread.toFixed(3) : "—"} />
                 <Metric label="Evidence (rank mix)" value={Number(detail.evidence.total).toFixed(2)} />
                 <Metric
-                  label={displayMetrics.source === "m1-full-run" ? "Return (M1 full run)" : m1FidelityVerified ? "Return (IS stored)" : "Selected-TF return"}
+                  label={m1FidelityVerified ? "Return (IS stored)" : "Selected-TF return"}
                   value={`${displayMetrics.returnPercent.toFixed(2)}%`}
                 />
                 <Metric
-                  label={displayMetrics.source === "m1-full-run" ? "Max drawdown (M1)" : "Max drawdown"}
+                  label="Max drawdown (IS stored)"
                   value={`${displayMetrics.maxDrawdownPercent.toFixed(2)}%`}
                 />
                 <Metric
                   label="Recovery factor"
                   value={formatRecoveryFactor({
-                    recoveryFactor: partitionView?.fullRunRecoveryFactor
-                      ?? finiteRecoveryFromMetrics(detail?.metrics ?? {}),
+                    recoveryFactor: finiteRecoveryFromMetrics(detail?.metrics ?? {}),
                   })}
                 />
                 <Metric
-                  label={displayMetrics.source === "m1-full-run" ? "Trades (M1 full run)" : "Trades"}
+                  label="Trades (IS stored)"
                   value={formatNumber(displayMetrics.tradeCount)}
                 />
                 <Metric label="Win rate" value={`${displayMetrics.winRate.toFixed(1)}%`} />
@@ -6414,7 +5592,7 @@ function EliteInspector({
                 <code className="niche-code">{detail.niche}</code>
               </section>
               <div className="gate-stack">
-                <span className="gate-pass">Development CPCV research</span>
+                <span className="gate-pass">Sequential walk-forward research</span>
                 {detail.oos1ExpectancyRatio === null
                   ? <span className="gate-pending">OOS1 validation unavailable on this legacy elite</span>
                   : <span className="gate-pass">OOS1 validated · {detail.oos1ExpectancyRatio.toFixed(2)}× Development</span>}
@@ -6480,7 +5658,10 @@ function PartitionEquityChart({
   /** Results detail uses the full-width, taller chart from the reference layout. */
   large?: boolean;
 }) {
-  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("full");
+  // Databank rows are selected on Development/IS evidence. Start the chart on
+  // that same sample so the first curve and the row describe the same run;
+  // full chronology is an explicit comparison, never an implicit substitute.
+  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("is");
   if (busy && !view) {
     return <div className="partition-equity loading">Replaying full Development / OOS1 / OOS2 equity…</div>;
   }
@@ -6519,6 +5700,13 @@ function PartitionEquityChart({
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
   const isX = xAt(view.isEndTimestampMs);
   const oos1X = xAt(view.oos1EndTimestampMs);
+  const partitions = view.partitions?.length
+    ? view.partitions
+    : [
+      { id: "IST", kind: "training" as const, startTimestampMs: t0, endTimestampMs: view.isEndTimestampMs },
+      { id: "ISV1", kind: "validation" as const, startTimestampMs: view.isEndTimestampMs, endTimestampMs: view.oos1EndTimestampMs },
+      { id: "OOS1", kind: "holdout" as const, startTimestampMs: view.oos1EndTimestampMs, endTimestampMs: t1 },
+    ];
   const gradientId = large ? "equity-area-large" : "equity-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
@@ -6535,7 +5723,7 @@ function PartitionEquityChart({
     <section className={large ? "partition-equity large" : "partition-equity"}>
       <div className="partition-equity-head">
         <div>
-          <p className="eyebrow">M1-chronology full-run equity</p>
+          <p className="eyebrow">{sample === "is" ? "M1-chronology Development equity" : "M1-chronology full-run equity"}</p>
           <small>
             {splitNote}
             {researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}
@@ -6544,8 +5732,8 @@ function PartitionEquityChart({
         <div className="partition-equity-scale">
           <label className="partition-sample-select">Sample
             <select value={sample} onChange={(event) => setSample(event.target.value as typeof sample)}>
+              <option value="is">Development (matches Databank)</option>
               <option value="full">Full (IS + OOS)</option>
-              <option value="is">Development</option>
               {!twoWay && <option value="oos1">OOS 1</option>}
               <option value="oos2">{twoWay ? "Holdout" : "OOS 2"}</option>
             </select>
@@ -6584,20 +5772,20 @@ function PartitionEquityChart({
           );
         })}
         {sample === "full" && <>
-          <rect x={pad} y={pad} width={isX - pad} height={height - pad * 2} className="region-is" />
-          <rect x={isX} y={pad} width={Math.max(0, oos1X - isX)} height={height - pad * 2} className="region-oos1" />
-          <rect x={oos1X} y={pad} width={Math.max(0, width - pad - oos1X)} height={height - pad * 2} className="region-oos2" />
-          <line x1={isX} y1={pad} x2={isX} y2={height - pad} className="divider" />
-          <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} className="divider" />
+          {partitions.map((part, index) => {
+            const start = Math.max(pad, xAt(part.startTimestampMs));
+            const end = Math.min(width - pad, xAt(part.endTimestampMs));
+            return <g key={`${part.id}-${index}`}>
+              <rect x={start} y={pad} width={Math.max(0, end - start)} height={height - pad * 2} className={part.kind === "training" ? "region-is" : part.kind === "validation" ? "region-oos1" : "region-oos2"} />
+              {index > 0 && <line x1={start} y1={pad} x2={start} y2={height - pad} className="divider" />}
+              <text x={start + 6} y={pad + 14} className="region-label">{part.id}</text>
+            </g>;
+          })}
         </>}
         <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
         <path d={path} className="equity-path" />
         <circle cx={lastX} cy={yAt(chartPoints.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
-        {sample === "full" ? <>
-          <text x={pad + 6} y={pad + 14} className="region-label">IS</text>
-          {!twoWay && <text x={isX + 6} y={pad + 14} className="region-label">OOS1</text>}
-          <text x={(twoWay ? isX : oos1X) + 6} y={pad + 14} className="region-label">{twoWay ? "Holdout" : "OOS2"}</text>
-        </> : <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
+        {sample !== "full" && <text x={pad + 6} y={pad + 14} className="region-label">{sample === "is" ? "IS" : sample.toUpperCase()}</text>}
       </svg>
       <div className="partition-kpis">
         <Kpi label="IS expectancy (R)" value={formatNumber(view.isExpectancy / 1000, 2)} note={`${formatNumber(view.isTrades)} trades · ${formatNumber(view.isReturnPercent, 2)}% return`} />
@@ -6609,78 +5797,6 @@ function PartitionEquityChart({
       </div>
     </section>
   );
-}
-
-function CampaignStrategyPreviewModal({
-  detail,
-  loading,
-  row,
-  symbol,
-  workspace,
-  onClose,
-}: {
-  detail: EliteDetail | null;
-  loading: boolean;
-  row: EliteRow | null;
-  symbol: string;
-  workspace: DatabankWorkspace | null;
-  onClose: () => void;
-}) {
-  const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
-  const [partitionBusy, setPartitionBusy] = useState(false);
-  const [partitionError, setPartitionError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!detail) {
-      setPartitionView(null);
-      setPartitionBusy(false);
-      return;
-    }
-    let cancelled = false;
-    setPartitionView(null);
-    setPartitionError(null);
-    setPartitionBusy(true);
-    void getElitePartitionEquity(detail.fingerprint)
-      .then((next) => {
-        if (!cancelled) setPartitionView(next);
-      })
-      .catch((reason) => {
-        if (!cancelled) setPartitionError(String(reason));
-      })
-      .finally(() => {
-        if (!cancelled) setPartitionBusy(false);
-      });
-    return () => { cancelled = true; };
-  }, [detail?.fingerprint]);
-
-  return <div className="elite-detail-modal-backdrop" onClick={onClose} role="presentation">
-    <div className="campaign-strategy-preview" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label={`${symbol} strategy preview`}>
-      <header className="campaign-preview-head">
-        <div><p className="eyebrow">{symbol} · strategy preview</p><h2>{row?.strategyId ?? "Loading strategy…"}</h2><small>{detail?.thesis ?? "Stored Development performance and validation record."}</small><span className="inspected-holdout-badge">Inspected holdout · reporting only</span></div>
-        <button className="secondary" type="button" onClick={onClose}>Close</button>
-      </header>
-      {loading || !row ? <div className="inspector-loading">Preparing the stored strategy preview…</div> : <div className="campaign-preview-body">
-        <section className="campaign-preview-equity full-partition">
-          <div className="campaign-preview-disclosure"><span>Exact M1 replay, partitioned at this run's stored IS / OOS boundaries.</span><small>Displayed results are not read by Discover, ranking, Holding, or promotion.</small></div>
-          <PartitionEquityChart
-            view={partitionView}
-            busy={partitionBusy}
-            researchGrade={workspace?.researchGrade ?? false}
-            m1FidelityVerified={workspace?.m1FidelityVerified ?? true}
-          />
-          {partitionError && <p className="negative">Could not replay the full partitioned curve: {partitionError}</p>}
-        </section>
-        <section className="campaign-preview-stats" aria-label="Strategy statistics">
-          <div><span>Trades</span><strong>{formatNumber(row.trades)}</strong></div>
-          <div><span>Return</span><strong className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</strong></div>
-          <div><span>Drawdown</span><strong>{row.drawdownPercent.toFixed(2)}%</strong></div>
-          <div><span>Recovery</span><strong>{formatRecoveryFactor(row)}</strong></div>
-          <div><span>Sharpe</span><strong>{row.sharpeRatio?.toFixed(2) ?? "—"}</strong></div>
-          <div><span>Fold R</span><strong>{row.foldMedianR.toFixed(3)}</strong></div>
-        </section>
-      </div>}
-    </div>
-  </div>;
 }
 
 function EliteDetailModal({
@@ -6708,9 +5824,8 @@ function EliteDetailModal({
   const [partitionBusy, setPartitionBusy] = useState(false);
 
   useEffect(() => {
-    if (!detail || tab !== "overview" || detail.sealedProtected) {
+    if (!detail || tab !== "overview") {
       setPartitionView(null);
-      setPartitionBusy(false);
       return;
     }
     let cancelled = false;
@@ -6729,7 +5844,7 @@ function EliteDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [detail?.fingerprint, detail?.sealedProtected, tab, onError]);
+  }, [detail?.fingerprint, tab, onError]);
 
   return (
     <div
