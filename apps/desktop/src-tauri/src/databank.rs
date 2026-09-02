@@ -1423,28 +1423,11 @@ fn partition_equity_for_elite(
     let oos1_end = plan.validation.end_timestamp_ms_exclusive;
     let oos2_end = plan.sealed_final.end_timestamp_ms_exclusive;
 
-    let is_trades: Vec<_> = result
-        .trades
-        .iter()
-        .filter(|trade| trade.entry_timestamp_ms < is_end)
-        .collect();
-    let oos1_trades: Vec<_> = result
-        .trades
-        .iter()
-        .filter(|trade| trade.entry_timestamp_ms >= is_end && trade.entry_timestamp_ms < oos1_end)
-        .collect();
-    let oos2_trades: Vec<_> = result
-        .trades
-        .iter()
-        .filter(|trade| trade.entry_timestamp_ms >= oos1_end && trade.entry_timestamp_ms < oos2_end)
-        .collect();
-
-    let is_expectancy = mean_expectancy(&is_trades);
-    let oos1_expectancy = mean_expectancy(&oos1_trades);
-    let oos2_expectancy = mean_expectancy(&oos2_trades);
-    let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
-        .then_some(oos1_expectancy / is_expectancy);
-
+    // A dated SQX-style schedule is authoritative for display and metrics.
+    // Unlike the legacy three-way split, its parts may alternate validation
+    // and training (for example ISV1 → IST → ISV2 → OOS1). Preserve every
+    // boundary and classify trades/bars by the part that contains their entry
+    // timestamp instead of collapsing the schedule into calendar thirds.
     let partitions = if range_parts.is_empty() {
         vec![
             PartitionEquityPartition { id: "IST".into(), kind: "training".into(), start_timestamp_ms: decision_dataset.bars.first().map(|bar| bar.timestamp_ms).unwrap_or(0), end_timestamp_ms: is_end },
@@ -1458,6 +1441,78 @@ fn partition_equity_for_elite(
             Some(PartitionEquityPartition { id: part.id.clone(), kind: part.kind.clone(), start_timestamp_ms: start, end_timestamp_ms: end })
         }).collect()
     };
+    let explicit_schedule = !range_parts.is_empty() && !partitions.is_empty();
+    let part_for_timestamp = |timestamp_ms: i64| {
+        partitions
+            .iter()
+            .find(|part| timestamp_ms >= part.start_timestamp_ms && timestamp_ms < part.end_timestamp_ms)
+    };
+
+    let is_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| {
+            if explicit_schedule {
+                part_for_timestamp(trade.entry_timestamp_ms).is_some_and(|part| part.kind == "training")
+            } else {
+                trade.entry_timestamp_ms < is_end
+            }
+        })
+        .collect();
+    let oos1_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| {
+            if explicit_schedule {
+                part_for_timestamp(trade.entry_timestamp_ms).is_some_and(|part| part.kind == "validation")
+            } else {
+                trade.entry_timestamp_ms >= is_end && trade.entry_timestamp_ms < oos1_end
+            }
+        })
+        .collect();
+    let oos2_trades: Vec<_> = result
+        .trades
+        .iter()
+        .filter(|trade| {
+            if explicit_schedule {
+                part_for_timestamp(trade.entry_timestamp_ms).is_some_and(|part| part.kind == "holdout")
+            } else {
+                trade.entry_timestamp_ms >= oos1_end && trade.entry_timestamp_ms < oos2_end
+            }
+        })
+        .collect();
+
+    let (is_bars, oos1_bars, oos2_bars) = if explicit_schedule {
+        decision_dataset.bars.iter().fold((0usize, 0usize, 0usize), |mut counts, bar| {
+            if let Some(part) = part_for_timestamp(bar.timestamp_ms) {
+                match part.kind.as_str() {
+                    "training" => counts.0 += 1,
+                    "validation" => counts.1 += 1,
+                    "holdout" => counts.2 += 1,
+                    _ => {}
+                }
+            }
+            counts
+        })
+    } else {
+        (plan.development.bar_count, plan.validation.bar_count, plan.sealed_final.bar_count)
+    };
+
+    let is_expectancy = mean_expectancy(&is_trades);
+    let oos1_expectancy = mean_expectancy(&oos1_trades);
+    let oos2_expectancy = mean_expectancy(&oos2_trades);
+    let category_return = |trades: &[&quantforge_eval::Trade]| {
+        if scout.initial_balance.abs() < 1e-12 {
+            0.0
+        } else {
+            trades.iter().map(|trade| trade.net_profit).sum::<f64>()
+                / scout.initial_balance
+                * 100.0
+        }
+    };
+    let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
+        .then_some(oos1_expectancy / is_expectancy);
+
     let boundaries = partitions.iter().skip(1).map(|part| part.start_timestamp_ms).collect::<Vec<_>>();
     let points = downsample_equity(&result.equity, 480, &boundaries);
     let trades: Vec<TradeRowView> = result
@@ -1487,31 +1542,28 @@ fn partition_equity_for_elite(
         is_end_timestamp_ms: is_end,
         oos1_end_timestamp_ms: oos1_end,
         oos2_end_timestamp_ms: oos2_end,
-        is_bars: plan.development.bar_count,
-        oos1_bars: plan.validation.bar_count,
-        oos2_bars: plan.sealed_final.bar_count,
+        is_bars,
+        oos1_bars,
+        oos2_bars,
         is_expectancy,
         oos1_expectancy,
         oos1_expectancy_ratio: oos1_ratio,
         oos2_expectancy,
-        is_return_percent: segment_return(
-            &result.equity,
-            scout.initial_balance,
-            None,
-            Some(is_end),
-        ),
-        oos1_return_percent: segment_return(
-            &result.equity,
-            scout.initial_balance,
-            Some(is_end),
-            Some(oos1_end),
-        ),
-        oos2_return_percent: segment_return(
-            &result.equity,
-            scout.initial_balance,
-            Some(oos1_end),
-            Some(oos2_end),
-        ),
+        is_return_percent: if explicit_schedule {
+            category_return(&is_trades)
+        } else {
+            segment_return(&result.equity, scout.initial_balance, None, Some(is_end))
+        },
+        oos1_return_percent: if explicit_schedule {
+            category_return(&oos1_trades)
+        } else {
+            segment_return(&result.equity, scout.initial_balance, Some(is_end), Some(oos1_end))
+        },
+        oos2_return_percent: if explicit_schedule {
+            category_return(&oos2_trades)
+        } else {
+            segment_return(&result.equity, scout.initial_balance, Some(oos1_end), Some(oos2_end))
+        },
         is_trades: is_trades.len(),
         oos1_trades: oos1_trades.len(),
         oos2_trades: oos2_trades.len(),

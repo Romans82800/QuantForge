@@ -5669,15 +5669,19 @@ function PartitionEquityChart({
     return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
   }
 
+  const partitions = view.partitions?.length
+    ? view.partitions
+    : [
+      { id: "IST", kind: "training" as const, startTimestampMs: view.points[0]?.timestampMs ?? 0, endTimestampMs: view.isEndTimestampMs },
+      { id: "ISV1", kind: "validation" as const, startTimestampMs: view.isEndTimestampMs, endTimestampMs: view.oos1EndTimestampMs },
+      { id: "OOS1", kind: "holdout" as const, startTimestampMs: view.oos1EndTimestampMs, endTimestampMs: view.oos2EndTimestampMs },
+    ];
   const points = sample === "full"
     ? view.points
-    : view.points.filter((point) => (
-      sample === "is"
-        ? point.timestampMs < view.isEndTimestampMs
-        : sample === "oos1"
-          ? point.timestampMs >= view.isEndTimestampMs && point.timestampMs < view.oos1EndTimestampMs
-          : point.timestampMs >= view.oos1EndTimestampMs
-    ));
+    : view.points.filter((point) => {
+      const part = partitions.find((candidate) => point.timestampMs >= candidate.startTimestampMs && point.timestampMs < candidate.endTimestampMs);
+      return sample === "is" ? part?.kind === "training" : sample === "oos1" ? part?.kind === "validation" : part?.kind === "holdout";
+    });
   const chartPoints = points.length >= 2 ? points : view.points;
   const width = large ? 1000 : 520;
   const height = large ? 340 : 300;
@@ -5700,13 +5704,6 @@ function PartitionEquityChart({
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
   const isX = xAt(view.isEndTimestampMs);
   const oos1X = xAt(view.oos1EndTimestampMs);
-  const partitions = view.partitions?.length
-    ? view.partitions
-    : [
-      { id: "IST", kind: "training" as const, startTimestampMs: t0, endTimestampMs: view.isEndTimestampMs },
-      { id: "ISV1", kind: "validation" as const, startTimestampMs: view.isEndTimestampMs, endTimestampMs: view.oos1EndTimestampMs },
-      { id: "OOS1", kind: "holdout" as const, startTimestampMs: view.oos1EndTimestampMs, endTimestampMs: t1 },
-    ];
   const gradientId = large ? "equity-area-large" : "equity-area-small";
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
@@ -5715,9 +5712,15 @@ function PartitionEquityChart({
   const oos1Pct = totalBars > 0 ? Math.round((view.oos1Bars / totalBars) * 100) : 0;
   const oos2Pct = totalBars > 0 ? Math.round((view.oos2Bars / totalBars) * 100) : 0;
   const twoWay = view.oos1Bars === 0;
-  const splitNote = twoWay
-    ? `${view.executionEngine} · Development ${isPct}% · Holdout ${oos2Pct}% (display only)`
-    : `${view.executionEngine} · Development ${isPct}% · OOS1 ${oos1Pct}% · OOS2 ${oos2Pct}% (display only)`;
+  const splitNote = partitions.length > 3
+    ? `${view.executionEngine} · ${partitions.map((part) => {
+      const duration = Math.max(0, part.endTimestampMs - part.startTimestampMs);
+      const totalDuration = partitions.reduce((sum, item) => sum + Math.max(0, item.endTimestampMs - item.startTimestampMs), 0);
+      return `${part.id} ${totalDuration > 0 ? Math.round((duration / totalDuration) * 100) : 0}%`;
+    }).join(" · ")} (display only)`
+    : twoWay
+      ? `${view.executionEngine} · Development ${isPct}% · Holdout ${oos2Pct}% (display only)`
+      : `${view.executionEngine} · Development ${isPct}% · OOS1 ${oos1Pct}% · OOS2 ${oos2Pct}% (display only)`;
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
