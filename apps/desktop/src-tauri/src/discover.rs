@@ -1047,6 +1047,11 @@ fn run_discovery(
     clock.begin_evaluation_session(0);
     if request.mode == DiscoverMode::New {
         if let Some(schedule) = range_schedule_contract(&request.data_range_parts)? {
+            // A dated SQX-style schedule is authoritative.  Do not let the
+            // legacy 2016/2020 shortcut clip the first scheduled part before
+            // its dates are applied (that silently dropped early ISV/IST
+            // windows from interleaved timelines).
+            request.history_start_year = None;
             request.history_start_date = Some(schedule.start_date);
             request.history_end_date = Some(schedule.end_date);
             request.validation_fraction = Some(schedule.validation_fraction);
@@ -1231,6 +1236,7 @@ fn run_discovery(
         !part.start_date.trim().is_empty() && !part.end_date.trim().is_empty()
     });
     let (development_dataset, oos1_dataset) = if has_dated_timeline {
+        validate_schedule_coverage(&search_decision, &timeline_parts)?;
         // Only IST training bars drive breeding and ranking. All ISV bars are
         // supplied as a separate validation sample; OOS bars are never loaded
         // by Discover. This keeps an interleaved ISV → IST → ISV → OOS plan
@@ -2381,6 +2387,33 @@ fn schedule_partition_dataset(
     })
 }
 
+fn validate_schedule_coverage(
+    dataset: &BarDataset,
+    parts: &[DataRangePartRequest],
+) -> Result<(), String> {
+    let first = dataset.bars.first().map(|bar| bar.timestamp_ms).unwrap_or(0);
+    let last = dataset.bars.last().map(|bar| bar.timestamp_ms).unwrap_or(0);
+    for part in parts.iter().filter(|part| {
+        !part.start_date.trim().is_empty() || !part.end_date.trim().is_empty()
+    }) {
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|error| error.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|error| error.to_string())?;
+        let covered = dataset
+            .bars
+            .iter()
+            .any(|bar| bar.timestamp_ms >= start && bar.timestamp_ms < end);
+        if !covered {
+            return Err(format!(
+                "timeline part '{}' has no decision bars in the selected data window (available timestamps {}..{}); adjust the range or import earlier history",
+                part.id, first, last
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn oos1_partition(
     dataset: &BarDataset,
@@ -3398,5 +3431,38 @@ mod tests {
         let contract = range_schedule_contract(&parts).expect("mixed schedule should be valid").expect("dated");
         assert!(contract.validation_fraction > 0.5);
         assert!(contract.sealed_fraction > 0.2);
+    }
+
+    #[test]
+    fn dated_schedule_rejects_a_part_outside_loaded_history() {
+        use quantforge_data::Bar;
+        let dataset = BarDataset {
+            data_hash: bar_content_hash(&[]),
+            source_rows: 1,
+            duplicate_rows_removed: 0,
+            input_was_sorted: true,
+            delimiter: '\t',
+            source_timezone: "Etc/UTC".into(),
+            bars: vec![Bar {
+                timestamp_ms: quantforge_data::history_date_cutoff_ms("UTC", "2024-01-01")
+                    .expect("date"),
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                tick_volume: 1,
+                real_volume: 0,
+                spread_points: Some(1),
+            }],
+        };
+        let parts = vec![DataRangePartRequest {
+            id: "ISV1".into(),
+            kind: "validation".into(),
+            start_date: "2022-01-01".into(),
+            end_date: "2022-12-31".into(),
+        }];
+        let error = validate_schedule_coverage(&dataset, &parts).expect_err("uncovered part");
+        assert!(error.contains("ISV1"));
+        assert!(error.contains("no decision bars"));
     }
 }
