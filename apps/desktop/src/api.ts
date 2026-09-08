@@ -281,6 +281,18 @@ export function getPortfolioDiscoverJob(): Promise<PortfolioDiscoverJobView> {
   return invoke<PortfolioDiscoverJobView>("get_portfolio_discover_job");
 }
 
+export function listPortfolioCampaigns(): Promise<PortfolioDiscoverJobView[]> {
+  return invoke("list_portfolio_campaigns");
+}
+
+export function openPortfolioCampaign(jobId: string): Promise<PortfolioDiscoverJobView> {
+  return invoke("open_portfolio_campaign", { jobId });
+}
+
+export function resumePortfolioCampaign(jobId: string): Promise<PortfolioDiscoverJobView> {
+  return invoke("resume_portfolio_campaign", { jobId });
+}
+
 export function getPortfolioLiveDatabank(symbol: string): Promise<DatabankWorkspace> {
   return invoke<DatabankWorkspace>("get_portfolio_live_databank", { symbol });
 }

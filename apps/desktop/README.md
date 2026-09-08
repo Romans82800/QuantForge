@@ -1,5 +1,50 @@
 # QuantForge Desktop
 
+## Campaign recovery and portfolio research
+
+Multi-asset Discover saves campaign recipes and status in the app configuration
+directory under `campaigns/`. Reopen a saved campaign to inspect its Databanks,
+or Resume to continue each lane from its last recovery/final archive. Resuming
+copies existing checkpoints to fresh working files and inherits their verified
+trading configuration. Missing checkpoints with recorded evaluations are an
+error, not permission to silently replace a cohort. New lanes that never began
+may start from the saved recipe. Recovery checkpoints are attempted at generation
+boundaries every five active minutes; a crash can lose work since the last one.
+Existing campaigns created before this version have no campaign journal and
+must still be opened individually.
+
+Campaign strategy previews expose the full partitioned M1 replay, matching
+full-period statistics, stored robustness panels, trades and the strategy IR.
+Holding strategies can also be replayed. Missing historical test evidence is
+shown as missing, never as a passing result. Battery runs now save an immutable
+per-candidate JSON record beside the Databank in `<bank>_battery_results/`,
+including failed outcomes, configuration, data/broker hashes and available
+test evidence. Strict batteries may stop at a failed gate; use the existing
+audit-and-graduate mode when every test must run regardless of prior failures.
+
+Portfolio → Multi-asset portfolio accepts multiple saved Databanks. It loads
+one market at a time and replays every Databank elite on hash-verified
+Development data, then aligns daily marked-to-market changes on the common
+UTC calendar period. At least 30 common days are required. A new immutable
+report records the source hashes, selected identities, allocation configuration,
+daily portfolio path, correlation groups and seeded bootstrap results.
+Correlation groups are connected components, not a claim that every member
+is strongly correlated with every other; portfolio selection independently
+enforces its pairwise limit. Duplicate rules on the same market across banks
+are rejected. Strategies with identical rules on different markets remain
+distinct. The portfolio uses equal capital weights, not equal volatility or
+equal trade risk. Drawdown is measured at daily closes and can understate
+intraday drawdown. Currency participation counts capital allocated to both
+legs of FX strategies; it is not net notional currency exposure. Maximum
+simultaneous positions is calculated from the selected trades' actual intervals.
+
+This release does not establish which filters predict future profitability.
+That requires historical development episodes with later validation outcomes;
+the per-candidate records provide inputs for that further research. The existing
+SL/TP-only recipe controls and MT5 parity workflow remain available. Full
+pairwise trade-overlap diagnostics, net currency risk limits and a filter-value
+research interface are still outstanding.
+
 The desktop shell is a Tauri 2 + React/TypeScript research cockpit over the
 same Rust engines and artifacts used by the CLI. Home links the active workflow;
 Data Lab parses, hashes, grades and broker-binds real OHLC sources; Discover

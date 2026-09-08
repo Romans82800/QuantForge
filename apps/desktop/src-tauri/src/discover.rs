@@ -30,21 +30,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
-const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ROLLING_THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
 const HOLDING_STALL_GENERATIONS: u64 = 25;
 const HOLDING_STALL_MIN: usize = 40;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverMode {
     New,
     Continue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 enum DecisionTimeframe {
     H1,
@@ -62,7 +62,7 @@ impl DecisionTimeframe {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverRequest {
     mode: DiscoverMode,
@@ -308,7 +308,7 @@ pub struct DiscoverState {
 /// One independently-bound market lane inside a shared Portfolio Discover
 /// campaign. A lane has its own data, broker, split, seed and Databank; the
 /// campaign only shares the bounded CPU budget and user-facing status.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortfolioDiscoverAsset {
     symbol: String,
@@ -321,7 +321,7 @@ pub struct PortfolioDiscoverAsset {
     broker_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortfolioDiscoverRequest {
     /// The shared search recipe. Asset paths are replaced by each selected lane.
@@ -336,7 +336,7 @@ pub struct PortfolioDiscoverRequest {
     concurrent_lanes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortfolioDiscoverLaneView {
     symbol: String,
@@ -351,7 +351,7 @@ pub struct PortfolioDiscoverLaneView {
     message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortfolioDiscoverJobView {
     job_id: Option<String>,
@@ -381,6 +381,91 @@ pub struct PortfolioDiscoverState {
     job: Arc<RwLock<PortfolioDiscoverJobView>>,
     stop: Arc<AtomicBool>,
     live_lanes: Arc<RwLock<BTreeMap<String, PortfolioLiveLane>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedCampaign {
+    schema_version: u32,
+    request: PortfolioDiscoverRequest,
+    view: PortfolioDiscoverJobView,
+}
+
+fn campaign_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("campaigns"))
+}
+
+fn campaign_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    if !id.starts_with("portfolio-") || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("invalid campaign ID".into());
+    }
+    Ok(campaign_directory(app)?.join(format!("{id}.json")))
+}
+
+fn read_campaign(path: &Path) -> Result<SavedCampaign, String> {
+    let record: SavedCampaign = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("cannot read saved campaign: {e}"))?;
+    if record.schema_version != 1 { return Err("unsupported campaign version".into()); }
+    Ok(record)
+}
+
+fn interrupted_campaign(mut view: PortfolioDiscoverJobView) -> PortfolioDiscoverJobView {
+    if view.status == "running" {
+        view.status = "interrupted".into();
+        view.phase = "Ready to recover".into();
+        view.active_lanes = 0;
+        view.message = "Resume from each asset's last saved checkpoint. Work since that checkpoint may need to be repeated.".into();
+        for lane in &mut view.lanes {
+            if lane.status == "running" || lane.status == "queued" {
+                lane.status = "interrupted".into();
+                lane.phase = "Awaiting resume".into();
+            }
+        }
+    }
+    view
+}
+
+#[tauri::command]
+pub fn list_portfolio_campaigns(app: AppHandle) -> Result<Vec<PortfolioDiscoverJobView>, String> {
+    let directory = campaign_directory(&app)?;
+    if !directory.exists() { return Ok(Vec::new()); }
+    let mut result = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            result.push(interrupted_campaign(read_campaign(&path)?.view));
+        }
+    }
+    result.sort_by_key(|view| std::cmp::Reverse(view.started_at_ms));
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn open_portfolio_campaign(app: AppHandle, job_id: String, state: State<'_, PortfolioDiscoverState>) -> Result<PortfolioDiscoverJobView, String> {
+    let mut current = state.job.write().map_err(|_| "campaign state unavailable")?;
+    if current.status == "running" { return Err("Stop the active campaign before opening another.".into()); }
+    let view = interrupted_campaign(read_campaign(&campaign_path(&app, &job_id)?)?.view);
+    *current = view.clone();
+    Ok(view)
+}
+
+// Continuations inherit trading settings from the verified archive, rather than
+// resending saved form overrides. Only runtime controls and bound paths remain.
+fn campaign_continuation(original: &DiscoverRequest, path: &str) -> Result<DiscoverRequest, String> {
+    serde_json::from_value(json!({
+        "mode": "continue", "selectedSymbol": original.selected_symbol,
+        "dataPath": original.data_path, "metadataPath": original.metadata_path,
+        "sourceTimezone": original.source_timezone, "m1DataPath": original.m1_data_path,
+        "m1MetadataPath": original.m1_metadata_path, "m1SourceTimezone": original.m1_source_timezone,
+        "brokerPath": original.broker_path, "databankPath": path,
+        "generations": original.generations, "runUntilStopped": original.run_until_stopped,
+        "maxMemoryMb": original.max_memory_mb
+    })).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn resume_portfolio_campaign(app: AppHandle, job_id: String, state: State<'_, PortfolioDiscoverState>, single_discover: State<'_, DiscoverState>) -> Result<PortfolioDiscoverJobView, String> {
+    let saved = read_campaign(&campaign_path(&app, &job_id)?)?;
+    start_campaign(saved.request.clone(), state, single_discover, app, Some(saved))
 }
 
 impl Default for DiscoverState {
@@ -1036,6 +1121,17 @@ pub fn start_portfolio_discover(
     request: PortfolioDiscoverRequest,
     state: State<'_, PortfolioDiscoverState>,
     single_discover: State<'_, DiscoverState>,
+    app: AppHandle,
+) -> Result<PortfolioDiscoverJobView, String> {
+    start_campaign(request, state, single_discover, app, None)
+}
+
+fn start_campaign(
+    request: PortfolioDiscoverRequest,
+    state: State<'_, PortfolioDiscoverState>,
+    single_discover: State<'_, DiscoverState>,
+    app: AppHandle,
+    recovery: Option<SavedCampaign>,
 ) -> Result<PortfolioDiscoverJobView, String> {
     if request.assets.len() < 2 || request.assets.len() > 7 {
         return Err("Portfolio Discover requires between 2 and 7 assets".into());
@@ -1119,6 +1215,21 @@ pub fn start_portfolio_discover(
         lane_request.pack_data_dir = None;
         lane_request.multi_symbol_minimum_pass = Some(0);
         lane_request.factory_after_discover = Some(false);
+        if let Some(saved) = recovery.as_ref() {
+            let previous = saved.view.lanes.iter().find(|lane| lane.symbol == asset.symbol.trim().to_ascii_uppercase())
+                .ok_or("saved campaign is missing an asset lane")?;
+            if Path::new(&previous.output_path).is_file() {
+                let archive: EvolveArtifact = serde_json::from_slice(&fs::read(&previous.output_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("invalid {} checkpoint: {e}", previous.symbol))?;
+                archive.databank.validate_integrity().map_err(|e| e.to_string())?;
+                // Continue into a fresh recovery file: preserve the prior final
+                // snapshot byte-for-byte for audit and recovery rollback.
+                write_json_new(&lane_request.databank_path, &archive).map_err(|e| e.to_string())?;
+                lane_request = campaign_continuation(&lane_request, &lane_request.databank_path)?;
+            } else if previous.evaluation_count > 0 {
+                return Err(format!("{} checkpoint is missing: {}. Restore it before resuming.", previous.symbol, previous.output_path));
+            }
+        }
         validate_request(&lane_request)?;
         lanes.push((
             asset.symbol.trim().to_ascii_uppercase(),
@@ -1152,7 +1263,7 @@ pub fn start_portfolio_discover(
         })
         .collect::<Vec<_>>();
     let started = PortfolioDiscoverJobView {
-        job_id: Some(format!("portfolio-{now_ms}")),
+        job_id: recovery.as_ref().and_then(|saved| saved.view.job_id.clone()).or_else(|| Some(format!("portfolio-{now_ms}"))),
         status: "running".into(),
         phase: "Preparing isolated asset lanes".into(),
         global_worker_threads: global_workers,
@@ -1172,6 +1283,9 @@ pub fn start_portfolio_discover(
         ),
         lanes: initial_lanes,
     };
+    let journal_path = campaign_path(&app, started.job_id.as_deref().unwrap())?;
+    let mut saved_campaign = SavedCampaign { schema_version: 1, request, view: started.clone() };
+    write_json_replacing(&journal_path, &saved_campaign).map_err(|e| format!("cannot save campaign: {e}"))?;
     *state
         .job
         .write()
@@ -1192,6 +1306,7 @@ pub fn start_portfolio_discover(
             .map(|(symbol, _, _, job, _)| (symbol.clone(), Arc::clone(job)))
             .collect::<Vec<_>>();
         let mut running: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
+        let mut last_journal = Instant::now();
 
         loop {
             if campaign_stop.load(Ordering::SeqCst) && !pending.is_empty() {
@@ -1305,6 +1420,18 @@ pub fn start_portfolio_discover(
                     );
                 }
             }
+            if all_finished || last_journal.elapsed() >= Duration::from_secs(5) {
+                if let Ok(view) = campaign_job.read() {
+                    saved_campaign.view = view.clone();
+                }
+                if let Err(error) = write_json_replacing(&journal_path, &saved_campaign) {
+                    campaign_stop.store(true, Ordering::SeqCst);
+                    if let Ok(mut view) = campaign_job.write() {
+                        view.message = format!("Campaign recovery record could not be saved: {error}. Stopping safely.");
+                    }
+                }
+                last_journal = Instant::now();
+            }
             if all_finished {
                 break;
             }
@@ -1315,8 +1442,16 @@ pub fn start_portfolio_discover(
                 }
             }
             for index in finished.into_iter().rev() {
-                let (_, handle) = running.remove(index);
-                let _ = handle.join();
+                let (symbol, handle) = running.remove(index);
+                if handle.join().is_err() {
+                    if let Some((_, job)) = all_lanes.iter().find(|(name, _)| name == &symbol) {
+                        if let Ok(mut view) = job.write() {
+                            view.status = "failed";
+                            view.phase = "Worker interrupted".into();
+                            view.message = "The worker panicked. Resume from the last saved checkpoint.".into();
+                        }
+                    }
+                }
             }
             thread::sleep(Duration::from_millis(350));
         }
@@ -1389,7 +1524,7 @@ fn portfolio_lane_job(request: &DiscoverRequest, worker_threads: usize) -> Disco
         request.selected_symbol.as_deref().unwrap_or("lane")
     ));
     job.status = "queued";
-    job.mode = Some(DiscoverModeView::New);
+    job.mode = Some(request.mode.into());
     job.phase = "Waiting for campaign worker".into();
     job.output_path = Some(request.databank_path.clone());
     job.requested_generations = request.generations;
@@ -3757,6 +3892,56 @@ mod tests {
     }
 
     #[test]
+    fn campaign_resume_discards_form_overrides_and_keeps_source_bindings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        fs::write(&path, "{}").unwrap();
+        let original = request(path.display().to_string());
+        let continued = campaign_continuation(&original, path.to_str().unwrap()).unwrap();
+        assert_eq!(continued.mode, DiscoverMode::Continue);
+        assert_eq!(continued.data_path, original.data_path);
+        assert_eq!(continued.m1_metadata_path, original.m1_metadata_path);
+        assert_eq!(continued.seed, None);
+        assert_eq!(continued.minimum_trades, None);
+        assert_eq!(continued.validation_fraction, None);
+        assert_eq!(continued.worker_threads, None);
+        validate_request(&continued).unwrap();
+    }
+
+    #[test]
+    fn campaign_restart_never_claims_workers_are_still_running() {
+        let mut view = PortfolioDiscoverJobView::idle();
+        view.status = "running".into();
+        view.active_lanes = 1;
+        let mut job = portfolio_lane_job(&request("checkpoint.json".into()), 2);
+        job.status = "running";
+        view.lanes.push(portfolio_lane_view("EURUSD", &job));
+        let recovered = interrupted_campaign(view);
+        assert_eq!(recovered.status, "interrupted");
+        assert_eq!(recovered.active_lanes, 0);
+        assert_eq!(recovered.lanes[0].status, "interrupted");
+        assert_eq!(recovered.lanes[0].output_path, "checkpoint.json");
+    }
+
+    #[test]
+    fn campaign_journal_round_trip_retains_recipe_and_all_lanes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("campaign.json");
+        let saved = SavedCampaign {
+            schema_version: 1,
+            request: PortfolioDiscoverRequest {
+                recipe: request("working.json".into()), assets: vec![],
+                global_worker_threads: 4, concurrent_lanes: 2,
+            },
+            view: PortfolioDiscoverJobView::idle(),
+        };
+        write_json_replacing(&path, &saved).unwrap();
+        let loaded = read_campaign(&path).unwrap();
+        assert_eq!(loaded.request, saved.request);
+        assert_eq!(loaded.view, saved.view);
+    }
+
+    #[test]
     fn finite_discover_can_use_an_explicit_plateau_or_factory_target() {
         assert!(holding_plateau_should_stop(false, true, 40, 25));
         assert_eq!(automatic_factory_target(false, Some(1)), Some(1));
@@ -4028,6 +4213,7 @@ mod tests {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("bank.json");
         let request = request(path.display().to_string());
+        let resume_recipe = request.clone();
         let job = Arc::new(RwLock::new(DiscoverJobView::idle()));
         run_discovery(
             request,
@@ -4044,6 +4230,19 @@ mod tests {
         verify_artifact(&artifact).expect("desktop must accept its own artifact");
         assert_eq!(artifact.databank.completed_generations, 1);
         assert_eq!(job.read().expect("job state").status, "completed");
+
+        let original_bytes = fs::read(&path).unwrap();
+        let next_path = directory.path().join("continued.json");
+        write_json_new(&next_path, &artifact).unwrap();
+        let continued = campaign_continuation(&resume_recipe, next_path.to_str().unwrap()).unwrap();
+        validate_request(&continued).unwrap();
+        run_discovery(continued, &job, &Arc::new(RwLock::new(None)),
+            &Arc::new(AtomicBool::new(false)), &Arc::new(AtomicBool::new(false))).unwrap();
+        let resumed: EvolveArtifact = serde_json::from_slice(&fs::read(next_path).unwrap()).unwrap();
+        verify_artifact(&resumed).unwrap();
+        assert_eq!(resumed.databank.completed_generations, 2);
+        assert_eq!(resumed.databank.config, artifact.databank.config);
+        assert_eq!(fs::read(path).unwrap(), original_bytes);
     }
 
     #[test]
@@ -4067,6 +4266,27 @@ mod tests {
         assert!(view.phase.contains("empty"));
         assert!(!path.exists());
         assert!(view.rejected_total > 0 || view.evaluation_count > 0);
+    }
+
+    #[test]
+    fn portfolio_replay_uses_only_hash_bound_development_days() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("development.json");
+        let mut recipe = request(path.display().to_string());
+        recipe.promotion_split = Some(true);
+        recipe.validation_fraction = Some(0.0);
+        recipe.sealed_fraction = Some(0.25);
+        let job = Arc::new(RwLock::new(DiscoverJobView::idle()));
+        run_discovery(recipe, &job, &Arc::new(RwLock::new(None)),
+            &Arc::new(AtomicBool::new(false)), &Arc::new(AtomicBool::new(false))).unwrap();
+        let state = DesktopState::default();
+        crate::databank::reload_workspace_from_path(&path, &state).unwrap();
+        let rows = crate::databank::replay_development_daily(&state).unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert!(row.daily_returns.keys().all(|day| *day <= row.end_day + 1));
+            assert!(row.daily_returns.values().all(|value| value.is_finite()));
+        }
     }
 
     #[test]

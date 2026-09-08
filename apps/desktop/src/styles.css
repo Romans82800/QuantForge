@@ -3190,6 +3190,10 @@ section.results-analysis-single > article.robustness-panel {
 .multi-discover-workspace > .result-panel .allocation-list > div { min-height: 105px; padding: 12px; border: 1px solid #22313a; border-radius: 6px; background: #0b1218; }
 .multi-discover-workspace > .result-panel .allocation-list code { display: none; }
 .campaign-lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin-top: 12px; }
+.multi-discover-workspace > .campaign-history { grid-column: 1 / -1; }
+.campaign-history-row { display: flex; align-items: center; gap: 12px; padding: 16px; border-top: 1px solid #22313a; flex-wrap: wrap; }
+.campaign-history-row > div { display: grid; gap: 6px; flex: 1; min-width: 220px; }
+.campaign-history-row small { color: #91a2ad; }
 .campaign-lane-card { min-height: 128px; padding: 12px; display: grid; gap: 10px; border: 1px solid #233440; border-radius: 7px; background: linear-gradient(145deg, #0d151b, #0a1015); }
 .campaign-lane-card.running { border-color: #245d57; background: linear-gradient(145deg, #0d201f, #0a1217); }
 .campaign-lane-card.failed { border-color: #6b3a3a; }
@@ -3211,6 +3215,9 @@ section.results-analysis-single > article.robustness-panel {
 .campaign-preview-body { padding: 18px 22px 22px; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(285px, .8fr); gap: 14px; }
 .campaign-preview-equity { padding: 14px; border: 1px solid #22323a; border-radius: 7px; background: #0a1117; }
 .campaign-preview-equity.full-partition { grid-column: 1 / -1; padding: 0; overflow: hidden; }
+.campaign-preview-tabs, .campaign-preview-results { grid-column: 1 / -1; min-width: 0; }
+.campaign-preview-results { display: grid; gap: 12px; }
+.campaign-preview-body > .campaign-preview-stats { grid-column: 1 / -1; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
 .campaign-preview-disclosure { padding: 11px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #27363c; color: #9db0b8; font-size: 9px; line-height: 1.4; }
 .campaign-preview-disclosure small { color: #beaa78; font-size: 8px; text-align: right; }
 .campaign-preview-equity.full-partition .partition-equity { border: 0; border-radius: 0; }

@@ -818,11 +818,7 @@ pub async fn get_elite_partition_equity(
         let loaded = loaded
             .as_ref()
             .ok_or_else(|| DesktopError::NoDatabank.to_string())?;
-        let elite = loaded
-            .bank
-            .elites
-            .iter()
-            .find(|elite| elite.structural_fingerprint.as_str() == fingerprint)
+        let elite = find_elite_in_bank(&loaded.bank, &fingerprint)
             .ok_or_else(|| DesktopError::MissingElite(fingerprint.clone()).to_string())?
             .clone();
         // Full partition replays are an explicit, read-only inspection action.
@@ -1289,6 +1285,63 @@ fn robustness_depth(config: &DiscoverConfig, mode: ResultsRobustnessMode) -> (us
             config.robustness_neighborhood_samples.max(400),
         ),
     }
+}
+
+pub(crate) fn replay_development_daily(state: &DesktopState) -> Result<Vec<crate::research_portfolio::DailyReplay>, String> {
+    let guard = state.loaded.read().map_err(|_| "Databank state unavailable")?;
+    let loaded = guard.as_ref().ok_or("No Databank loaded")?;
+    let m1_path = loaded.m1_source.as_deref().ok_or("Databank has no bound M1 data")?;
+    let mut decision = crate::data_lab::load_data_source(&loaded.source, loaded.metadata_path.as_deref(), None)?;
+    let mut m1 = crate::data_lab::load_data_source(m1_path, loaded.m1_metadata_path.as_deref(), None)?;
+    let broker = load_bound_broker(&loaded.broker, decision.metadata.as_ref())?;
+    if broker.content_hash().map_err(|e| e.to_string())? != loaded.bank.broker_spec_hash { return Err("Broker specification differs from the Databank.".into()); }
+    load_bound_broker(&loaded.broker, m1.metadata.as_ref())?;
+    let mut quotes = infer_quote_sidecar_path(m1_path).filter(|p| p.is_file())
+        .map(|p| load_quote_sidecar(&p, m1.metadata.as_ref())).transpose().map_err(|e| e.to_string())?;
+    if quotes.is_none() && metadata_is_canonical_bid_ask(m1.metadata.as_ref()) { return Err("Bound bid/ask quote sidecar is missing.".into()); }
+    trim_market_history_to_year(&mut decision.dataset, &mut m1.dataset, quotes.as_mut(), loaded.bank.config.history_start_year)?;
+    if let Some(q) = &quotes { q.validate_against(&m1.dataset).map_err(|e| e.to_string())?; }
+    let mut development = None;
+    // Resolve the timeframe by the archive's actual Development hash. Never
+    // assume that an H1-named source means an H1 strategy.
+    for interval in [3_600_000, 14_400_000, 900_000] {
+        let full = if let Some(q) = &quotes {
+            quantforge_data::build_timeframe_from_m1_with_quotes(&m1.dataset, q, broker.point, interval, None)
+        } else { quantforge_data::build_timeframe_from_m1(&m1.dataset, interval, None) }.map_err(|e| e.to_string())?;
+        if full.bars.len() < 3 { continue; }
+        let plan = DataSplitPlan::chronological(&full, loaded.validation_fraction, loaded.sealed_fraction).map_err(|e| e.to_string())?;
+        let bars = full.bars[..plan.development.bar_count].to_vec();
+        if bar_content_hash(&bars) == loaded.bank.data_hash {
+            development = Some((BarDataset { data_hash: loaded.bank.data_hash.clone(), source_rows: bars.len(), bars, ..full }, plan.development.end_timestamp_ms_exclusive));
+            break;
+        }
+    }
+    let (development, end) = development.ok_or("Cannot reproduce this Databank's Development hash; refusing a different sample.")?;
+    let start = development.bars.first().ok_or("Empty Development data")?.timestamp_ms;
+    m1.dataset.bars.retain(|bar| bar.timestamp_ms >= start && bar.timestamp_ms < end);
+    m1.dataset.data_hash = bar_content_hash(&m1.dataset.bars);
+    m1.dataset.source_rows = m1.dataset.bars.len();
+    if let Some(q) = &mut quotes {
+        q.bars.retain(|bar| bar.timestamp_ms >= start && bar.timestamp_ms < end);
+        q.data_hash = quantforge_data::quote_bar_content_hash(&q.bars);
+        q.source_rows = q.bars.len();
+    }
+    let config = &loaded.bank.config.scout;
+    let judge = quantforge_tick::JudgeConfig { initial_balance: config.initial_balance, costs: config.costs.clone(), allow_execution_gaps: false, indicator_engine: config.indicator_engine, entry_window: config.entry_window };
+    let mut rows = Vec::new();
+    for elite in &loaded.bank.elites {
+        let replay = if let Some(q) = &quotes {
+            quantforge_tick::evaluate_strategy_m1_with_quotes(&elite.strategy, &development, &m1.dataset, q, &broker, &judge)
+        } else { quantforge_tick::evaluate_strategy_m1(&elite.strategy, &development, &m1.dataset, &broker, &judge) }.map_err(|e| format!("{}: {e}", elite.strategy.id))?;
+        let mut closes = BTreeMap::new();
+        for point in &replay.equity { closes.insert(point.timestamp_ms.div_euclid(86_400_000), point.equity); }
+        let mut previous = config.initial_balance;
+        let daily_returns = closes.into_iter().map(|(day, equity)| { let change = (equity - previous) / config.initial_balance; previous = equity; (day, change) }).collect();
+        rows.push(crate::research_portfolio::DailyReplay { fingerprint: elite.structural_fingerprint.to_string(), strategy_id: elite.strategy.id.clone(), symbol: broker.symbol.clone(), cohort: format!("e{}/{:?}/{:?}", elite.niche.entry_conditions, elite.niche.trade_frequency, elite.niche.hold_time), expectancy_r: replay.metrics.expectancy_r,
+            start_day: start.div_euclid(86_400_000) + 1, end_day: end.div_euclid(86_400_000) - 1, daily_returns,
+            trade_windows: replay.trades.iter().map(|trade| (trade.entry_timestamp_ms, trade.exit_timestamp_ms)).collect() });
+    }
+    Ok(rows)
 }
 
 fn partition_equity_for_elite(

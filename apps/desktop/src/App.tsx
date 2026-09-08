@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ResearchPortfolio } from "./ResearchPortfolio";
 import {
   assembleEvidence,
   buildDeploymentPack,
@@ -25,6 +26,9 @@ import {
   exportEliteTradeCsvs,
   getDiscoverJob,
   getPortfolioDiscoverJob,
+  listPortfolioCampaigns,
+  openPortfolioCampaign,
+  resumePortfolioCampaign,
   getPortfolioLiveDatabank,
   getDiscoverLiveDatabank,
   getElitePartitionEquity,
@@ -5440,6 +5444,7 @@ function IndicatorParityPanel({ onError }: { onError: (message: string | null) =
 }
 
 function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (message: string | null) => void; onOpenDatabank: (path: string) => void }) {
+  const [history, setHistory] = useState<PortfolioDiscoverJobView[]>([]);
   const [symbols, setSymbols] = useState<SymbolPack[]>([]);
   const [profiles, setProfiles] = useState<SavedDiscoverProfile[]>([]);
   const [profileId, setProfileId] = useState("");
@@ -5464,7 +5469,8 @@ function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (mes
         setProfiles(saved);
       })
       .catch((reason) => onError(String(reason)));
-    void getPortfolioDiscoverJob().then(setJob).catch(() => {});
+    void getPortfolioDiscoverJob().then(setJob).catch((reason) => onError(String(reason)));
+    void listPortfolioCampaigns().then(setHistory).catch((reason) => onError(String(reason)));
   }, []);
 
   useEffect(() => {
@@ -5547,6 +5553,20 @@ function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (mes
     catch (reason) { onError(String(reason)); }
   }
 
+  async function recoverCampaign(id: string, resume: boolean) {
+    setBusy(true);
+    onError(null);
+    try {
+      const restored = await (resume ? resumePortfolioCampaign(id) : openPortfolioCampaign(id));
+      setJob(restored);
+      setActiveAsset(restored.lanes[0]?.symbol ?? "");
+      setAssetWorkspace(null);
+      setAssetDetailOpen(false);
+      setHistory(await listPortfolioCampaigns());
+    } catch (reason) { onError(String(reason)); }
+    finally { setBusy(false); }
+  }
+
   async function inspectAssetElite(fingerprint: string) {
     if (!activeLane) return;
     setAssetSelected(fingerprint);
@@ -5603,6 +5623,14 @@ function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (mes
   );
 
   return <div className="tool-content multi-discover-workspace">
+    {!active && history.length > 0 && <section className="panel campaign-history">
+      <div className="panel-heading"><div><p className="eyebrow">Saved work</p><h2>Continue a campaign</h2></div><span className="read-only-badge">Recovery checkpoints · every 5 minutes</span></div>
+      {history.map((saved) => <div className="campaign-history-row" key={saved.jobId}>
+        <div><strong>{saved.lanes.map((lane) => lane.symbol).join(" · ")}</strong><small>{saved.startedAtMs ? new Date(saved.startedAtMs).toLocaleString() : saved.jobId} · {saved.status} · {formatNumber(saved.totalEvaluationCount)} evaluated</small></div>
+        <button className="secondary" disabled={busy} onClick={() => saved.jobId && void recoverCampaign(saved.jobId, false)}>Open Databanks</button>
+        <button className="primary" disabled={busy} onClick={() => saved.jobId && void recoverCampaign(saved.jobId, true)}>Resume</button>
+      </div>)}
+    </section>}
     <section className="panel campaign-intro">
       <div className="campaign-intro-copy">
         <p className="eyebrow">Multi-asset Discover</p>
@@ -5662,7 +5690,7 @@ function MultiAssetDiscoverCampaign({ onError, onOpenDatabank }: { onError: (mes
 // Kept only so existing Portfolio navigation does not dead-end. Campaigns now
 // live in Discover, where their per-asset Databank tabs are available.
 function PortfolioDiscoverCampaign({ onError }: { onError: (message: string | null) => void }) {
-  return <WorkspacePrimer title="Multi-asset Discover moved" copy="Open Discover, then choose Multi-asset campaign. That workspace keeps every asset's live Holding and Databank separate behind its own tab." />;
+  return <ResearchPortfolio onError={onError} />;
 }
 
 function PortfolioWorkspace({ onError, workspace }: { onError: (message: string | null) => void; workspace: DatabankWorkspace | null }) {
@@ -5671,7 +5699,7 @@ function PortfolioWorkspace({ onError, workspace }: { onError: (message: string 
   const [result, setResult] = useState<PortfolioView | null>(null); const [busy, setBusy] = useState(false);
   function update<K extends keyof PortfolioRequest>(key: K, value: PortfolioRequest[K]) { setForm((current) => ({ ...current, [key]: value })); }
   async function run() { setBusy(true); setResult(null); onError(null); try { setResult(await buildPortfolio(form)); } catch (reason) { onError(String(reason)); } finally { setBusy(false); } }
-  return <div className="wide-tool-content"><div className="workspace-tabs"><button className={tab === "discover" ? "active" : ""} onClick={() => setTab("discover")}>Portfolio Discover</button><button className={tab === "pack" ? "active" : ""} onClick={() => setTab("pack")}>Pack Databank</button></div>{tab === "discover" ? <PortfolioDiscoverCampaign onError={onError} /> : <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>}</div>;
+  return <div className="wide-tool-content"><div className="workspace-tabs"><button className={tab === "discover" ? "active" : ""} onClick={() => setTab("discover")}>Multi-asset portfolio</button><button className={tab === "pack" ? "active" : ""} onClick={() => setTab("pack")}>Legacy single Databank</button></div>{tab === "discover" ? <PortfolioDiscoverCampaign onError={onError} /> : <div className="tool-content"><section className="panel setup-panel"><div className="panel-heading"><div><p className="eyebrow">Hard exposure caps</p><h2>Pack a correlation-constrained portfolio</h2></div></div><div className="form-stack compact"><PathField label="Promotion-grade databank" path={form.databankPath} choose={chooseDatabank} onChange={(value) => update("databankPath", value)} required /><PathField label="Broker profile" path={form.brokerPath} choose={chooseBrokerFile} onChange={(value) => update("brokerPath", value)} required /><PathField label="New portfolio artifact" path={form.outputPath} choose={() => chooseOutputJson("Save portfolio artifact", "portfolio.json")} onChange={(value) => update("outputPath", value)} required /><label className="field-row"><span>Objective</span><select value={form.objective} onChange={(event) => update("objective", event.target.value as PortfolioRequest["objective"])}><option value="risk_adjusted_return">Risk-adjusted return</option><option value="cvar">CVaR</option><option value="minimize_drawdown">Minimize drawdown</option></select></label></div><div className="numeric-grid"><NumberField label="Correlation ceiling" value={form.maximumPairwiseCorrelation} onChange={(value) => update("maximumPairwiseCorrelation", value ?? .7)} step={.01} /><NumberField label="Max strategy weight" value={form.maximumWeightPerStrategy} onChange={(value) => update("maximumWeightPerStrategy", value ?? .25)} step={.01} /><NumberField label="Max cohort exposure" value={form.maximumCohortExposure} onChange={(value) => update("maximumCohortExposure", value ?? .5)} step={.01} /><NumberField label="Strategy cap" value={form.maximumStrategies} onChange={(value) => update("maximumStrategies", value ?? 10)} min={1} /><NumberField label="Stress trials" value={form.stressTrials} onChange={(value) => update("stressTrials", value ?? 1000)} min={1} /><NumberField label="Seed" value={form.seed} onChange={(value) => update("seed", value ?? 42)} min={0} /></div><div className="form-footer"><p>Weights, symbol exposure, cohort exposure and correlation ceilings are hard constraints—not suggestions.</p><button className="primary" disabled={busy || !form.databankPath || !form.brokerPath || !form.outputPath} onClick={run}>{busy ? "Stress packing…" : "Build portfolio"}</button></div></section>{result ? <section className="panel result-panel result-pass"><div className="result-hero"><div><p className="eyebrow">Portfolio pack</p><h2>{result.selectedStrategies} strategies selected</h2></div><span className="grade-pill">audited</span></div><div className="job-kpis"><Kpi label="Expected return" value={`${formatNumber(result.expectedReturnPercent, 2)}%`} note={`${result.sourceCandidates} source candidates`} /><Kpi label="Path drawdown" value={`${formatNumber(result.maximumDrawdownPercent, 2)}%`} note="Combined path" /><Kpi label="Max correlation" value={formatNumber(result.maximumPairwiseCorrelation, 3)} note="Observed pair" /><Kpi label="Stress CVaR" value={`${formatNumber(result.cvarReturnPercent, 2)}%`} note={`P95 DD ${formatNumber(result.p95DrawdownPercent, 2)}%`} /></div><div className="allocation-list">{result.allocations.map((item) => <div key={item.fingerprint}><code>{item.fingerprint.slice(0, 12)}</code><span>{item.cohort}</span><strong>{formatNumber(item.weight * 100, 1)}%</strong></div>)}</div><ArtifactPath label="Portfolio artifact" value={result.outputPath} /></section> : <WorkspacePrimer title="No portfolio packed" copy="The packer selects complementary elites from one immutable databank and stress-tests the combined return path with block bootstrap trials." />}</div>}</div>;
 }
 
 function VaultWorkspace({ onError }: { onError: (message: string | null) => void }) {
@@ -6629,6 +6657,7 @@ function CampaignStrategyPreviewModal({
   const [partitionView, setPartitionView] = useState<PartitionEquityView | null>(null);
   const [partitionBusy, setPartitionBusy] = useState(false);
   const [partitionError, setPartitionError] = useState<string | null>(null);
+  const [previewTab, setPreviewTab] = useState<"equity" | "tests" | "trades" | "rules">("equity");
 
   useEffect(() => {
     if (!detail) {
@@ -6660,6 +6689,13 @@ function CampaignStrategyPreviewModal({
         <button className="secondary" type="button" onClick={onClose}>Close</button>
       </header>
       {loading || !row ? <div className="inspector-loading">Preparing the stored strategy preview…</div> : <div className="campaign-preview-body">
+        <div className="workspace-tabs campaign-preview-tabs">
+          <button className={previewTab === "equity" ? "active" : ""} onClick={() => setPreviewTab("equity")}>Equity & statistics</button>
+          <button className={previewTab === "tests" ? "active" : ""} onClick={() => setPreviewTab("tests")}>Robustness results</button>
+          <button className={previewTab === "trades" ? "active" : ""} onClick={() => setPreviewTab("trades")}>Trades</button>
+          <button className={previewTab === "rules" ? "active" : ""} onClick={() => setPreviewTab("rules")}>Trading rules</button>
+        </div>
+        {previewTab === "equity" && <>
         <section className="campaign-preview-equity full-partition">
           <div className="campaign-preview-disclosure"><span>Exact M1 replay, partitioned at this run's stored IS / OOS boundaries.</span><small>Displayed results are not read by Discover, ranking, Holding, or promotion.</small></div>
           <PartitionEquityChart
@@ -6667,17 +6703,27 @@ function CampaignStrategyPreviewModal({
             busy={partitionBusy}
             researchGrade={workspace?.researchGrade ?? false}
             m1FidelityVerified={workspace?.m1FidelityVerified ?? true}
+            large
           />
           {partitionError && <p className="negative">Could not replay the full partitioned curve: {partitionError}</p>}
         </section>
         <section className="campaign-preview-stats" aria-label="Strategy statistics">
-          <div><span>Trades</span><strong>{formatNumber(row.trades)}</strong></div>
-          <div><span>Return</span><strong className={row.returnPercent >= 0 ? "positive" : "negative"}>{row.returnPercent.toFixed(2)}%</strong></div>
-          <div><span>Drawdown</span><strong>{row.drawdownPercent.toFixed(2)}%</strong></div>
-          <div><span>Recovery</span><strong>{formatRecoveryFactor(row)}</strong></div>
-          <div><span>Sharpe</span><strong>{row.sharpeRatio?.toFixed(2) ?? "—"}</strong></div>
-          <div><span>Fold R</span><strong>{row.foldMedianR.toFixed(3)}</strong></div>
+          <div><span>{partitionView ? "Full-period trades" : "Stored development trades"}</span><strong>{formatNumber(partitionView?.fullRunTrades ?? row.trades)}</strong></div>
+          <div><span>{partitionView ? "Full-period return" : "Development return"}</span><strong>{(partitionView?.fullRunReturnPercent ?? row.returnPercent).toFixed(2)}%</strong></div>
+          <div><span>{partitionView ? "Full-period drawdown" : "Development drawdown"}</span><strong>{(partitionView?.fullRunMaxDrawdownPercent ?? row.drawdownPercent).toFixed(2)}%</strong></div>
+          <div><span>Recovery</span><strong>{partitionView ? partitionView.fullRunRecoveryFactor?.toFixed(2) ?? "—" : formatRecoveryFactor(row)}</strong></div>
+          <div><span>Sharpe</span><strong>{(partitionView ? partitionView.fullRunSharpeRatio : row.sharpeRatio)?.toFixed(2) ?? "—"}</strong></div>
+          <div><span>Development fold R</span><strong>{row.foldMedianR.toFixed(3)}</strong></div>
         </section>
+        </>}
+        {previewTab === "tests" && <div className="campaign-preview-results">
+          <MonteCarloPanel evidence={detail?.robustness?.evidence?.monte_carlo ?? null} fallback={detail?.robustness?.monteCarlo ?? null} />
+          <ParameterNeighborhoodPanel evidence={detail?.robustness?.evidence?.parameter_neighborhood ?? null} retention={detail?.robustness?.evidence?.m1_retention ?? null} fallback={detail?.robustness?.paramPermutation ?? null} />
+          <WalkForwardPanel evidence={detail?.robustness?.evidence?.walk_forward ?? null} fallback={detail?.robustness?.walkForward ?? null} title="Development CPCV" />
+          <WalkForwardPanel evidence={detail?.robustness?.evidence?.sequential_walk_forward ?? null} fallback={null} title="Sequential walk-forward" />
+        </div>}
+        {previewTab === "trades" && <div className="campaign-preview-results"><TradeListPanel busy={partitionBusy} trades={partitionView?.trades ?? []} /></div>}
+        {previewTab === "rules" && <div className="campaign-preview-results"><pre className="ir-tree">{JSON.stringify(detail?.strategyIr ?? {}, null, 2)}</pre></div>}
       </div>}
     </div>
   </div>;

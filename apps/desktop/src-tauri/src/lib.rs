@@ -8,6 +8,7 @@ mod evidence;
 mod holding_battery;
 mod parity_lab;
 mod portfolio;
+mod research_portfolio;
 mod promotion_ledger;
 mod vault;
 mod workflow;
@@ -57,6 +58,10 @@ pub fn run() {
             data_lab::import_market_folder,
             discover::start_discover,
             discover::start_portfolio_discover,
+            research_portfolio::build_research_portfolio,
+            discover::list_portfolio_campaigns,
+            discover::open_portfolio_campaign,
+            discover::resume_portfolio_campaign,
             discover::run_condition_bakeoff,
             discover::run_timeframe_bakeoff,
             discover::run_timeframe_ablation,

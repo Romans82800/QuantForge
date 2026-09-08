@@ -1420,15 +1420,38 @@ fn run_battery_job(
                 .databank
                 .elites
                 .iter()
+                .chain(snapshot.artifact.databank.holding.iter())
                 .find(|row| row.structural_fingerprint.as_str() == fingerprint)
                 .and_then(|row| row.robustness.clone());
-            let _ = write_battery_csv_row(
+            let report_time = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+            let archive_path = Path::new(&snapshot.databank_path);
+            let report_path = archive_path.with_file_name(format!("{}_battery_results", archive_path.file_stem().unwrap_or_default().to_string_lossy()))
+                .join(format!("{fingerprint}-{report_time}.json"));
+            let record = serde_json::json!({
+                "schema_version": 1, "fingerprint": fingerprint,
+                "strategy": elite.strategy, "source_databank": snapshot.databank_path,
+                "development_data_hash": snapshot.artifact.databank.data_hash,
+                "broker_hash": snapshot.artifact.databank.broker_spec_hash,
+                "config": snapshot.artifact.databank.config,
+                "status": status, "reason": reason, "audit_and_graduate": audit_and_graduate,
+                "development_metrics": elite.metrics, "robustness": robustness,
+                "note": "Missing evidence means not recorded or not reached; it does not mean passed."
+            });
+            let saved = quantforge_storage::write_json_new(&report_path, &record).map_err(|e| e.to_string());
+            if let Err(error) = saved {
+                persist_snapshot(&mut snapshot)?;
+                return Err(format!("Strategy state saved, but battery result could not be recorded: {error}"));
+            }
+            if let Err(error) = write_battery_csv_row(
                 &snapshot.databank_path,
                 elite,
                 robustness.as_ref(),
                 status,
                 reason.as_deref(),
-            );
+            ) {
+                persist_snapshot(&mut snapshot)?;
+                return Err(format!("Strategy and JSON result saved, but CSV summary failed: {error}"));
+            }
         }
 
         let elapsed = started.elapsed().as_secs_f64().max(1e-6);
