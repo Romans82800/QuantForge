@@ -1,6 +1,7 @@
 use crate::data_lab::{
     apply_history_start_year, build_decision_from_m1, build_decision_from_m1_quotes, display_path,
-    load_bound_broker, load_data_source, load_quote_sidecar, trim_market_history_to_year,
+    load_bound_broker, load_data_source, load_quote_sidecar, trim_market_history_to_dates,
+    trim_market_history_to_year,
 };
 use crate::databank::{
     DesktopState, EvolveArtifact, install_live_databank_artifact, verify_artifact,
@@ -190,6 +191,13 @@ pub struct DiscoverRequest {
     sealed_fraction: Option<f64>,
     /// Broker-local calendar year of the first bar kept (`2016` or `2020`).
     history_start_year: Option<u16>,
+    /// Optional broker-local inclusive date bounds. A dated timeline takes
+    /// precedence over the legacy calendar-year shortcut.
+    history_start_date: Option<String>,
+    history_end_date: Option<String>,
+    /// Ordered, adjacent, non-overlapping SQX-style research windows.
+    #[serde(default)]
+    data_range_parts: Vec<DataRangePartRequest>,
     /// After Discover checkpoints, shrink Holding and battery remaining names.
     #[serde(default)]
     factory_after_discover: Option<bool>,
@@ -199,6 +207,15 @@ pub struct DiscoverRequest {
     factory_target_databank: Option<usize>,
     #[serde(default)]
     factory_max_correlation: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataRangePartRequest {
+    id: String,
+    kind: String,
+    start_date: String,
+    end_date: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1737,6 +1754,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             .sealed_fraction
             .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
         normalize_split_fractions(validation, sealed)?;
+        if !request.data_range_parts.is_empty() {
+            range_schedule_contract(&request.data_range_parts)?;
+        }
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     if !run_until_stopped && request.generations == 0 {
@@ -1817,6 +1837,9 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.validation_fraction.is_some(),
             request.sealed_fraction.is_some(),
             request.history_start_year.is_some(),
+            request.history_start_date.is_some(),
+            request.history_end_date.is_some(),
+            !request.data_range_parts.is_empty(),
         ]
         .into_iter()
         .any(|configured| configured)
@@ -1827,6 +1850,88 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn validate_range_parts(parts: &[DataRangePartRequest]) -> Result<(), String> {
+    let mut previous_end: Option<i64> = None;
+    for part in parts {
+        if part.start_date.trim().is_empty() && part.end_date.trim().is_empty() {
+            continue;
+        }
+        if part.start_date.trim().is_empty() || part.end_date.trim().is_empty() {
+            return Err(format!("range '{}' needs both a start and end date", part.id));
+        }
+        if !matches!(part.kind.as_str(), "training" | "validation" | "holdout") {
+            return Err(format!("unknown data range kind '{}'", part.kind));
+        }
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|e| e.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|e| e.to_string())?;
+        if start >= end {
+            return Err(format!("range '{}' has an invalid date order", part.id));
+        }
+        if previous_end.is_some_and(|previous| start < previous) {
+            return Err("data range parts must be ordered and non-overlapping".into());
+        }
+        previous_end = Some(end);
+    }
+    Ok(())
+}
+
+struct RangeScheduleContract {
+    start_date: String,
+    end_date: String,
+    validation_fraction: f64,
+    sealed_fraction: f64,
+}
+
+/// Convert the editable timeline into the split contract used by Discover.
+/// Training and validation may alternate; all holdout rows remain outside
+/// selection and are only represented in the saved manifest.
+fn range_schedule_contract(
+    parts: &[DataRangePartRequest],
+) -> Result<Option<RangeScheduleContract>, String> {
+    let dated = parts
+        .iter()
+        .filter(|part| {
+            !part.start_date.trim().is_empty() || !part.end_date.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    if dated.is_empty() {
+        return Ok(None);
+    }
+    validate_range_parts(parts)?;
+    let mut validation_ms = 0i64;
+    let mut sealed_ms = 0i64;
+    let mut total_ms = 0i64;
+    let mut previous_end = None;
+    for part in &dated {
+        let start = quantforge_data::history_date_cutoff_ms("UTC", &part.start_date)
+            .map_err(|error| error.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms("UTC", &part.end_date)
+            .map_err(|error| error.to_string())?;
+        if previous_end.is_some_and(|previous| start != previous) {
+            return Err("active data range parts must be adjacent; close gaps or remove unused parts".into());
+        }
+        previous_end = Some(end);
+        total_ms += end - start;
+        match part.kind.as_str() {
+            "training" => {}
+            "validation" => validation_ms += end - start,
+            "holdout" => sealed_ms += end - start,
+            _ => unreachable!("range kinds were validated above"),
+        }
+    }
+    if validation_ms == 0 || sealed_ms == 0 || total_ms <= validation_ms + sealed_ms {
+        return Err("schedule needs IST training, ISV validation, and at least one sealed OOS part".into());
+    }
+    Ok(Some(RangeScheduleContract {
+        start_date: dated[0].start_date.clone(),
+        end_date: dated[dated.len() - 1].end_date.clone(),
+        validation_fraction: validation_ms as f64 / total_ms as f64,
+        sealed_fraction: sealed_ms as f64 / total_ms as f64,
+    }))
 }
 
 /// Locate the canonical bid/ask M1 sidecar written beside an imported MT5
@@ -1875,7 +1980,7 @@ fn metadata_is_canonical_bid_ask(metadata: Option<&quantforge_data::Mt5ExportMet
 }
 
 fn run_discovery(
-    request: DiscoverRequest,
+    mut request: DiscoverRequest,
     job: &Arc<RwLock<DiscoverJobView>>,
     live_artifact: &Arc<RwLock<Option<EvolveArtifact>>>,
     paused: &Arc<AtomicBool>,
@@ -1883,6 +1988,17 @@ fn run_discovery(
 ) -> Result<(), String> {
     let clock = ActiveClock::new();
     clock.begin_evaluation_session(0);
+    if request.mode == DiscoverMode::New {
+        if let Some(schedule) = range_schedule_contract(&request.data_range_parts)? {
+            // Dated schedules are authoritative. Keep the outer window exact
+            // and derive the legacy fractions only for components that still
+            // expect them in the stored recipe.
+            request.history_start_date = Some(schedule.start_date);
+            request.history_end_date = Some(schedule.end_date);
+            request.validation_fraction = Some(schedule.validation_fraction);
+            request.sealed_fraction = Some(schedule.sealed_fraction);
+        }
+    }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     let soft_budget = request.generations;
 
@@ -1928,6 +2044,15 @@ fn run_discovery(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
+    if request.history_start_date.is_some() || request.history_end_date.is_some() {
+        trim_market_history_to_dates(
+            &mut loaded.dataset,
+            &mut m1.dataset,
+            quote_dataset.as_mut(),
+            request.history_start_date.as_deref(),
+            request.history_end_date.as_deref(),
+        )?;
+    }
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -2058,20 +2183,43 @@ fn run_discovery(
             "this archive was created while OOS1 validation was disabled; start a new run to reserve and validate OOS1 without changing the historical experiment".into(),
         );
     }
-    let development_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then(|| {
-            if oos1_enabled {
-                development_partition(&search_decision, validation_fraction, sealed_fraction)
-            } else {
-                unsealed_partition(&search_decision, validation_fraction, sealed_fraction)
-            }
-        })
-        .transpose()?;
-    let oos1_dataset = (promotion_split || request.mode == DiscoverMode::Continue)
-        .then_some(())
-        .filter(|_| oos1_enabled)
-        .map(|_| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
-        .transpose()?;
+    let persisted_parts = continued_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.manifest.recipe.config.get("data_range_parts"))
+        .and_then(|value| serde_json::from_value::<Vec<DataRangePartRequest>>(value.clone()).ok())
+        .unwrap_or_default();
+    let timeline_parts = if request.data_range_parts.is_empty() {
+        persisted_parts
+    } else {
+        request.data_range_parts.clone()
+    };
+    let has_dated_timeline = timeline_parts.iter().any(|part| {
+        !part.start_date.trim().is_empty() && !part.end_date.trim().is_empty()
+    });
+    let (development_dataset, oos1_dataset) = if has_dated_timeline {
+        validate_schedule_coverage(&search_decision, &timeline_parts)?;
+        (
+            Some(schedule_partition_dataset(&search_decision, &timeline_parts, "training")?),
+            Some(schedule_partition_dataset(&search_decision, &timeline_parts, "validation")?),
+        )
+    } else {
+        (
+            (promotion_split || request.mode == DiscoverMode::Continue)
+                .then(|| {
+                    if oos1_enabled {
+                        development_partition(&search_decision, validation_fraction, sealed_fraction)
+                    } else {
+                        unsealed_partition(&search_decision, validation_fraction, sealed_fraction)
+                    }
+                })
+                .transpose()?,
+            (promotion_split || request.mode == DiscoverMode::Continue)
+                .then_some(())
+                .filter(|_| oos1_enabled)
+                .map(|_| oos1_partition(&search_decision, validation_fraction, sealed_fraction))
+                .transpose()?,
+        )
+    };
     let new_dataset = development_dataset.as_ref().unwrap_or(&search_decision);
     // Development alone drives search and breeding. When reserved, OOS1 is
     // opened only after the full Development battery; OOS2 is never materialized.
@@ -2866,6 +3014,9 @@ fn build_discover_artifact(
         ("validation_fraction".into(), json!(validation_fraction)),
         ("oos1_pick_enabled".into(), json!(validation_fraction > 0.0)),
         ("sealed_fraction".into(), json!(sealed_fraction)),
+        ("history_start_date".into(), json!(request.history_start_date)),
+        ("history_end_date".into(), json!(request.history_end_date)),
+        ("data_range_parts".into(), json!(request.data_range_parts)),
         (
             "stopped_early".into(),
             json!(stop_was_early(
@@ -3232,6 +3383,84 @@ fn unsealed_partition(
     .map_err(|error| error.to_string())?;
     let end = plan.development.bar_count + plan.validation.bar_count;
     slice_partition(dataset, 0, end)
+}
+
+fn schedule_partition_dataset(
+    dataset: &BarDataset,
+    parts: &[DataRangePartRequest],
+    kind: &str,
+) -> Result<BarDataset, String> {
+    let ranges = parts
+        .iter()
+        .filter(|part| part.kind == kind)
+        .map(|part| {
+            let start = quantforge_data::history_date_cutoff_ms(
+                &dataset.source_timezone,
+                &part.start_date,
+            )
+            .map_err(|error| error.to_string())?;
+            let end = quantforge_data::history_end_exclusive_cutoff_ms(
+                &dataset.source_timezone,
+                &part.end_date,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((start, end))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if ranges.is_empty() {
+        return Err(format!("timeline has no {kind} part"));
+    }
+    let bars = dataset
+        .bars
+        .iter()
+        .filter(|bar| ranges.iter().any(|(start, end)| bar.timestamp_ms >= *start && bar.timestamp_ms < *end))
+        .cloned()
+        .collect::<Vec<_>>();
+    if bars.is_empty() {
+        return Err(format!("timeline {kind} part contains no decision bars"));
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: dataset.delimiter,
+        source_timezone: dataset.source_timezone.clone(),
+        bars,
+    })
+}
+
+fn validate_schedule_coverage(
+    dataset: &BarDataset,
+    parts: &[DataRangePartRequest],
+) -> Result<(), String> {
+    let first = dataset.bars.first().map(|bar| bar.timestamp_ms).unwrap_or(0);
+    let last = dataset.bars.last().map(|bar| bar.timestamp_ms).unwrap_or(0);
+    for part in parts.iter().filter(|part| {
+        !part.start_date.trim().is_empty() || !part.end_date.trim().is_empty()
+    }) {
+        let start = quantforge_data::history_date_cutoff_ms(
+            &dataset.source_timezone,
+            &part.start_date,
+        )
+        .map_err(|error| error.to_string())?;
+        let end = quantforge_data::history_end_exclusive_cutoff_ms(
+            &dataset.source_timezone,
+            &part.end_date,
+        )
+        .map_err(|error| error.to_string())?;
+        if !dataset
+            .bars
+            .iter()
+            .any(|bar| bar.timestamp_ms >= start && bar.timestamp_ms < end)
+        {
+            return Err(format!(
+                "timeline part '{}' has no decision bars in the selected data window (available timestamps {}..{}); adjust the range or import earlier history",
+                part.id, first, last
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -3948,6 +4177,38 @@ mod tests {
         assert_eq!(automatic_factory_target(false, Some(0)), None);
     }
 
+    #[test]
+    fn timeline_accepts_alternating_training_and_validation_parts() {
+        let parts = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2016-01-04".into(), end_date: "2018-06-30".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2018-07-01".into(), end_date: "2019-12-31".into() },
+            DataRangePartRequest { id: "IST2".into(), kind: "training".into(), start_date: "2020-01-01".into(), end_date: "2022-06-30".into() },
+            DataRangePartRequest { id: "ISV2".into(), kind: "validation".into(), start_date: "2022-07-01".into(), end_date: "2023-12-31".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2024-01-01".into(), end_date: "2025-12-31".into() },
+        ];
+        let schedule = range_schedule_contract(&parts).expect("valid schedule").expect("dated");
+        assert_eq!(schedule.start_date, "2016-01-04");
+        assert_eq!(schedule.end_date, "2025-12-31");
+        assert!(schedule.validation_fraction > 0.0);
+        assert!(schedule.sealed_fraction > 0.0);
+    }
+
+    #[test]
+    fn timeline_rejects_overlaps_and_gaps() {
+        let overlap = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2020-01-01".into(), end_date: "2020-06-30".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2020-06-30".into(), end_date: "2020-12-31".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2021-01-01".into(), end_date: "2021-06-30".into() },
+        ];
+        assert!(range_schedule_contract(&overlap).is_err());
+        let gap = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2020-01-01".into(), end_date: "2020-06-30".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2020-07-02".into(), end_date: "2020-12-31".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2021-01-01".into(), end_date: "2021-06-30".into() },
+        ];
+        assert!(range_schedule_contract(&gap).is_err());
+    }
+
     fn fixture(name: &str) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
@@ -4047,6 +4308,9 @@ mod tests {
             validation_fraction: None,
             sealed_fraction: None,
             history_start_year: None,
+            history_start_date: None,
+            history_end_date: None,
+            data_range_parts: Vec::new(),
             factory_after_discover: None,
             factory_queue_limit: None,
             factory_target_databank: None,

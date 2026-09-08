@@ -693,11 +693,23 @@ export interface DiscoverRequest {
   sealedFraction: number | null;
   /** Broker-local calendar year of the first bar kept (2016 or 2020). */
   historyStartYear: number | null;
+  /** Optional exact inclusive dates used by the editable SQX-style timeline. */
+  historyStartDate: string | null;
+  historyEndDate: string | null;
+  /** Ordered, adjacent, non-overlapping IST/ISV/OOS windows. */
+  dataRangeParts: DataRangePart[];
   /** After Discover checkpoints, shrink Holding and battery remaining names. */
   factoryAfterDiscover: boolean | null;
   factoryQueueLimit: number | null;
   factoryTargetDatabank: number | null;
   factoryMaxCorrelation: number | null;
+}
+
+export interface DataRangePart {
+  id: string;
+  kind: "training" | "validation" | "holdout";
+  startDate: string;
+  endDate: string;
 }
 
 export interface SavedDiscoverProfile {

@@ -1227,6 +1227,53 @@ pub(crate) fn trim_market_history_to_year(
     Ok(removed)
 }
 
+/// Trim all bound streams to one inclusive broker-local date window. The
+/// explicit dates used by the Discover timeline are converted to an exclusive
+/// next-day cutoff so the final selected day is not lost.
+pub(crate) fn trim_market_history_to_dates(
+    decision: &mut BarDataset,
+    m1: &mut BarDataset,
+    quotes: Option<&mut QuoteBarDataset>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<usize, String> {
+    let timezone = if !m1.source_timezone.trim().is_empty() {
+        &m1.source_timezone
+    } else {
+        &decision.source_timezone
+    };
+    let start_ms = start_date
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| quantforge_data::history_date_cutoff_ms(timezone, value))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let end_ms = end_date
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| quantforge_data::history_end_exclusive_cutoff_ms(timezone, value))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if start_ms.zip(end_ms).is_some_and(|(start, end)| start >= end) {
+        return Err("history start date must be before or equal to the end date".into());
+    }
+    let mut removed = 0;
+    let mut quotes = quotes;
+    if let Some(start_ms) = start_ms {
+        removed += m1.trim_before_timestamp_ms(start_ms).map_err(|e| e.to_string())?;
+        decision.trim_before_timestamp_ms(start_ms).map_err(|e| e.to_string())?;
+        if let Some(quotes) = quotes.as_deref_mut() {
+            quotes.trim_before_timestamp_ms(start_ms).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(end_ms) = end_ms {
+        removed += m1.trim_at_or_after_timestamp_ms(end_ms).map_err(|e| e.to_string())?;
+        decision.trim_at_or_after_timestamp_ms(end_ms).map_err(|e| e.to_string())?;
+        if let Some(quotes) = quotes.as_deref_mut() {
+            quotes.trim_at_or_after_timestamp_ms(end_ms).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(removed)
+}
+
 /// Load a bid/ask quote sidecar in the clock used by its bound M1 pack.
 /// Imported packs are normalized to UTC; the capture EA writes raw MT5
 /// server-wall timestamps and therefore needs the metadata timezone mapping.

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { splitTimelinePart, timelinePreset } from "./timeline";
 import { ResearchPortfolio } from "./ResearchPortfolio";
 import {
   assembleEvidence,
@@ -72,6 +73,7 @@ import type {
   AssembleEvidenceRequest,
   DatabankWorkspace,
   DataLabView,
+  DataRangePart,
   MarketFolderImportView,
   DeployRequest,
   DeployView,
@@ -118,6 +120,35 @@ import type {
   VaultView,
   WorkspaceName,
 } from "./types";
+
+function timelineDay(value: string): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function timelineDate(value: number): string {
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+function timelineWeight(part: DataRangePart): number {
+  const start = timelineDay(part.startDate);
+  const end = timelineDay(part.endDate);
+  return start !== null && end !== null && end >= start ? Math.round((end - start) / 86400000) + 1 : 1;
+}
+
+function timelinePercent(part: DataRangePart, all: DataRangePart[]): number {
+  const total = all.reduce((sum, item) => sum + timelineWeight(item), 0);
+  return total > 0 ? Math.round((timelineWeight(part) / total) * 100) : 0;
+}
+
+function automaticRangeNames(parts: DataRangePart[]): DataRangePart[] {
+  let training = 0; let validation = 0; let holdout = 0;
+  return parts.map((part) => ({
+    ...part,
+    id: part.kind === "training" ? (training++ === 0 ? "IST" : `IST${training}`) : part.kind === "validation" ? `ISV${++validation}` : `OOS${++holdout}`,
+  }));
+}
 
 async function writeClipboardText(value: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
@@ -3749,7 +3780,15 @@ function DiscoverWorkspace({
     factoryTargetDatabank: 0,
     factoryMaxCorrelation: 0.5,
     ...preset,
+    historyStartDate: preset.historyStartDate ?? null,
+    historyEndDate: preset.historyEndDate ?? null,
+    dataRangeParts: preset.dataRangeParts ?? [
+      { id: "IST", kind: "training", startDate: "", endDate: "" },
+      { id: "ISV1", kind: "validation", startDate: "", endDate: "" },
+      { id: "OOS1", kind: "holdout", startDate: "", endDate: "" },
+    ],
   }));
+  const [timelineDrag, setTimelineDrag] = useState<number | null>(null);
   const [discoverProfiles, setDiscoverProfiles] = useState<SavedDiscoverProfile[]>([]);
   const [selectedDiscoverProfileId, setSelectedDiscoverProfileId] = useState("");
   const [discoverProfileName, setDiscoverProfileName] = useState("My Discover profile");
@@ -4033,6 +4072,9 @@ function DiscoverWorkspace({
             validationFraction: null,
             sealedFraction: null,
             historyStartYear: null,
+            historyStartDate: null,
+            historyEndDate: null,
+            dataRangeParts: [],
           }
         : sourceBoundForm;
       const started = await startDiscover(request);
@@ -4170,6 +4212,60 @@ function DiscoverWorkspace({
         ...(current.universalGrammar ?? DEFAULT_UNIVERSAL_GRAMMAR),
         [key]: value,
       },
+    }));
+  }
+
+  function moveTimelineBoundary(event: React.PointerEvent<HTMLElement>) {
+    if (timelineDrag === null) return;
+    const parts = form.dataRangeParts ?? [];
+    if (timelineDrag >= parts.length - 1) return;
+    const bounds = parts.flatMap((part) => [timelineDay(part.startDate), timelineDay(part.endDate)]).filter((value): value is number => value !== null);
+    const fallbackMin = Date.UTC(form.historyStartYear ?? 2016, 0, 1);
+    const fallbackMax = Date.now();
+    const min = bounds.length ? Math.min(...bounds) : fallbackMin;
+    const max = bounds.length ? Math.max(...bounds) + 86400000 : fallbackMax;
+    if (max <= min) return;
+    const timeline = event.currentTarget.classList.contains("range-timeline")
+      ? event.currentTarget
+      : event.currentTarget.closest(".range-timeline");
+    if (!timeline) return;
+    const rect = timeline.getBoundingClientRect();
+    const ratio = Math.max(0.01, Math.min(0.99, (event.clientX - rect.left) / rect.width));
+    const requestedBoundary = Math.round((min + ratio * (max - min)) / 86400000) * 86400000;
+    const leftStart = timelineDay(parts[timelineDrag].startDate) ?? min;
+    const rightEnd = timelineDay(parts[timelineDrag + 1]?.endDate ?? "") ?? max - 86400000;
+    const boundary = Math.max(leftStart + 86400000, Math.min(rightEnd, requestedBoundary));
+    setForm((current) => ({
+      ...current,
+      dataRangeParts: current.dataRangeParts.map((part, index) => index === timelineDrag
+        ? { ...part, endDate: timelineDate(boundary - 86400000) }
+        : index === timelineDrag + 1
+          ? { ...part, startDate: timelineDate(boundary) }
+          : part),
+    }));
+  }
+
+  function applyRangePreset(preset: "60/20/20" | "alternating" | "50/20/10/20") {
+    const weights = preset === "alternating" ? [30, 10, 30, 10, 20] : preset === "60/20/20" ? [60, 20, 20] : [50, 20, 10, 20];
+    const kinds: DataRangePart["kind"][] = preset === "alternating"
+      ? ["training", "validation", "training", "validation", "holdout"]
+      : preset === "60/20/20"
+        ? ["training", "validation", "holdout"]
+        : ["training", "validation", "holdout", "holdout"];
+    const start = form.historyStartDate || form.dataRangeParts[0]?.startDate || `${form.historyStartYear ?? 2016}-01-01`;
+    const end = form.historyEndDate || form.dataRangeParts.at(-1)?.endDate || timelineDate(Date.now());
+    const parts = timelinePreset(kinds, weights, start, end);
+    if (!parts.length) {
+      onError("Choose a valid history window before applying a timeline preset.");
+      return;
+    }
+    setForm((current) => ({
+      ...current,
+      dataRangeParts: automaticRangeNames(parts),
+      historyStartDate: start,
+      historyEndDate: end,
+      validationFraction: weights.reduce((sum, weight, index) => sum + (kinds[index] === "validation" ? weight : 0), 0) / 100,
+      sealedFraction: weights.reduce((sum, weight, index) => sum + (kinds[index] === "holdout" ? weight : 0), 0) / 100,
     }));
   }
 
@@ -4531,6 +4627,33 @@ function DiscoverWorkspace({
                 ? "Drops bars before 1 Jan 2020 broker time from the 2016 pack. IS and sealed OOS fractions are taken on the remaining history."
                 : "Uses the full ICMarkets 2016–present pack. Continue runs keep the year sealed in the databank."}
             </p>
+            <section className="range-parts-editor">
+              <div className="section-heading"><p className="eyebrow">▣ &nbsp; Research timeline</p><span>Ordered, non-overlapping broker-local windows</span></div>
+              <p className="immutable-note">Choose any IST / ISV / OOS sequence. IST trains the search, ISV validates it, and OOS remains sealed for later reporting. The dated schedule is saved in the profile and run manifest.</p>
+              <div className="range-presets">
+                <button type="button" onClick={() => applyRangePreset("60/20/20")}>IST / ISV / OOS</button>
+                <button type="button" onClick={() => applyRangePreset("alternating")}>IST / ISV / IST / ISV / OOS</button>
+                <button type="button" onClick={() => applyRangePreset("50/20/10/20")}>IST / ISV / OOS / OOS</button>
+                <span>Customize below · drag dividers to resize</span>
+              </div>
+              <div className="range-timeline" aria-label="Research schedule timeline" onPointerMove={moveTimelineBoundary} onPointerUp={() => setTimelineDrag(null)} onPointerCancel={() => setTimelineDrag(null)} onLostPointerCapture={() => setTimelineDrag(null)}>
+                {(form.dataRangeParts ?? []).map((part, index) => <div className={`range-timeline-segment ${part.kind}`} style={{ flexGrow: timelineWeight(part) }} key={`timeline-${part.id}-${index}`}>
+                  <strong>{part.id}</strong>
+                  {index < form.dataRangeParts.length - 1 && <button type="button" className="timeline-handle" aria-label={`Drag boundary after ${part.id}`} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setTimelineDrag(index); }} title="Drag to resize this phase" />}
+                </div>)}
+              </div>
+              <div className="range-timeline-legend"><span><i className="training-dot" /> IST · training</span><span><i className="validation-dot" /> ISV · validation</span><span><i className="holdout-dot" /> OOS · sealed</span></div>
+              <div className="range-column-headings"><span>Part</span><span>Type</span><span>Start</span><span>End</span><span>%</span><span /></div>
+              {(form.dataRangeParts ?? []).map((part, index) => <div className="range-part-row" key={part.id + index}>
+                <span className="range-part-id">{part.id}<button type="button" className="range-split" title="Split this period into two" disabled={!part.startDate || !part.endDate || timelineWeight(part) < 2} onClick={() => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames(splitTimelinePart(current.dataRangeParts, index)) }))}>Split</button></span>
+                <select value={part.kind} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames(current.dataRangeParts.map((item, i) => i === index ? { ...item, kind: event.target.value as DataRangePart["kind"] } : item)) }))}><option value="training">IST · Training</option><option value="validation">ISV · Validation</option><option value="holdout">OOS · Sealed holdout</option></select>
+                <input type="date" min={index > 0 && form.dataRangeParts[index - 1].endDate ? timelineDate((timelineDay(form.dataRangeParts[index - 1].endDate) ?? 0) + 86400000) : undefined} max={part.endDate || undefined} value={part.startDate} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts.map((item, i) => i === index ? { ...item, startDate: event.target.value } : item) }))} />
+                <input type="date" min={part.startDate || undefined} max={index < form.dataRangeParts.length - 1 && form.dataRangeParts[index + 1].startDate ? timelineDate((timelineDay(form.dataRangeParts[index + 1].startDate) ?? 0) - 86400000) : undefined} value={part.endDate} onChange={(event) => setForm((current) => ({ ...current, dataRangeParts: current.dataRangeParts.map((item, i) => i === index ? { ...item, endDate: event.target.value } : item) }))} />
+                <span className="range-percent">{timelinePercent(part, form.dataRangeParts ?? [])}%</span><button type="button" className="range-delete" aria-label={`Remove ${part.id}`} disabled={form.dataRangeParts.length <= 3} onClick={() => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames(current.dataRangeParts.filter((_, i) => i !== index)) }))}>×</button>
+              </div>)}
+              <button type="button" className="secondary" onClick={() => setForm((current) => ({ ...current, dataRangeParts: automaticRangeNames([...current.dataRangeParts, { id: "", kind: "holdout", startDate: "", endDate: "" }]) }))}>+ Add range part</button>
+              <small>Parts must cover one continuous window. Leave this schedule blank to use the legacy percentage split fields below.</small>
+            </section>
             <p className="immutable-note">M15 and H4 are built directly from the selected M1 export, keeping decision candles aligned with execution chronology. Orders are still checked against M1 for fidelity.</p>
             <details className="advanced-settings">
               <summary>Bound paths (auto-filled from symbol)</summary>
