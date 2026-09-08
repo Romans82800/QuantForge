@@ -347,6 +347,20 @@ const DEFAULT_UNIVERSAL_GRAMMAR = {
   maximumShift: 3,
 };
 
+const STRATEGY_TEMPLATE_OPTIONS = [
+  ["trend_pullback", "Trend pullback", "EMA/SMA structure and retracement"],
+  ["momentum_burst", "Momentum burst", "RSI/ROC thrust and continuation"],
+  ["donchian_breakout", "Donchian breakout", "Range expansion and channel breaks"],
+  ["mean_reversion_band", "Mean reversion", "Band and oscillator fades"],
+  ["zscore_reversion", "Z-score reversion", "Statistical close extremes"],
+  ["session_orb", "Session ORB", "Opening-range breakouts"],
+  ["impulse_candle", "Impulse candle", "Body/range thrust patterns"],
+  ["vol_squeeze_break", "Volatility squeeze", "Compression then expansion"],
+  ["supply_demand_reclaim", "Supply/demand reclaim", "Swing-zone reclaim setups"],
+  ["sweep_reclaim", "Sweep reclaim", "Liquidity sweep and recovery"],
+  ["universal", "Universal grammar", "All typed factors; widest search"],
+] as const;
+
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceName>("Home");
   const [workspace, setWorkspace] = useState<DatabankWorkspace | null>(null);
@@ -3780,6 +3794,7 @@ function DiscoverWorkspace({
     factoryTargetDatabank: 0,
     factoryMaxCorrelation: 0.5,
     ...preset,
+    strategyTemplates: preset.strategyTemplates?.length ? preset.strategyTemplates : ["universal"],
     historyStartDate: preset.historyStartDate ?? null,
     historyEndDate: preset.historyEndDate ?? null,
     dataRangeParts: preset.dataRangeParts ?? [
@@ -3928,6 +3943,7 @@ function DiscoverWorkspace({
       mode: "new",
       databankPath: "",
       promotionSplit: true,
+      strategyTemplates: saved.strategyTemplates?.length ? saved.strategyTemplates : ["universal"],
       searchRanges: normalizeSearchRanges(saved.searchRanges ?? DEFAULT_SEARCH_RANGES),
     }));
     setSelectedDiscoverProfileId(profile.id);
@@ -4009,6 +4025,7 @@ function DiscoverWorkspace({
             correlationThreshold: null,
             noveltyWeight: null,
             seed: null,
+            strategyTemplates: [],
             runMode: null,
             generalIslandCount: null,
             refinementIslandCount: null,
@@ -4394,6 +4411,31 @@ function DiscoverWorkspace({
                   <label className="check-field discover-split"><input type="checkbox" checked={form.allowFixedPipStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowFixedPipStops: event.target.checked }))} /><span>Fixed-pip SL/TP pair <small>(FX only; sampled alongside ATR/R using the bound symbol’s pip size)</small></span></label>
                   <label className="check-field discover-split"><input type="checkbox" checked={form.allowIndicatorExitRules ?? false} onChange={(event) => setForm((current) => ({ ...current, allowIndicatorExitRules: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Indicator exit rule <small>(research only; turning it on leaves the constrained lane)</small></span></label>
                   <label className="check-field discover-split"><input type="checkbox" checked={form.allowTimeStops ?? false} onChange={(event) => setForm((current) => ({ ...current, allowTimeStops: event.target.checked, slTpOnlyExits: event.target.checked ? false : current.slTpOnlyExits, simpleExits: event.target.checked ? false : current.simpleExits }))} /><span>Exit after N bars <small>(research only; turning it on leaves the constrained lane)</small></span></label>
+                </div>
+              </section>
+              <section className="production-recipe-card strategy-template-card">
+                <div className="production-recipe-heading">
+                  <div><p className="eyebrow">Search families</p><h3>Choose strategy templates</h3></div>
+                  <span className="recipe-badge">saved with recipe</span>
+                </div>
+                <p className="recipe-summary">Each selected template receives an equal, deterministic share of new candidates. Pick focused families for a cleaner hypothesis, or keep Universal for the broadest search. This changes discovery seeds and breeding structure only; it does not change trading rules or robustness gates.</p>
+                <div className="template-picker-actions">
+                  <button type="button" className="secondary" onClick={() => update("strategyTemplates", STRATEGY_TEMPLATE_OPTIONS.map(([id]) => id))}>Use all templates</button>
+                  <button type="button" className="secondary" onClick={() => update("strategyTemplates", ["universal"])}>Universal only</button>
+                  <span>{(form.strategyTemplates?.length ?? 0)} selected</span>
+                </div>
+                <div className="strategy-template-grid" role="group" aria-label="Strategy templates">
+                  {STRATEGY_TEMPLATE_OPTIONS.map(([id, label, note]) => {
+                    const checked = (form.strategyTemplates ?? ["universal"]).includes(id);
+                    return <label className={`strategy-template-option ${checked ? "selected" : ""}`} key={id}>
+                      <input type="checkbox" checked={checked} onChange={() => setForm((current) => {
+                        const selected = current.strategyTemplates?.length ? current.strategyTemplates : ["universal"];
+                        const next = checked ? selected.filter((value) => value !== id) : [...selected, id];
+                        return { ...current, strategyTemplates: next.length ? next : ["universal"] };
+                      })} />
+                      <span><strong>{label}</strong><small>{note}</small></span>
+                    </label>;
+                  })}
                 </div>
               </section>
               <div className="hypothesis-strip">
@@ -5354,6 +5396,7 @@ function DiscoverContractSummary({
         <SummaryLine label="History start" value={String(form.historyStartYear ?? 2016)} />
         <SummaryLine label="Entry conditions" value={grammar ? `${grammar.minimumEntryConditions}–${grammar.maximumEntryConditions}` : "—"} />
         <SummaryLine label="Exit conditions" value={grammar ? `${grammar.minimumExitConditions}–${grammar.maximumExitConditions}` : "—"} />
+        <SummaryLine label="Strategy templates" value={(form.strategyTemplates?.length ? form.strategyTemplates : ["universal"]).map((value) => STRATEGY_TEMPLATE_OPTIONS.find(([id]) => id === value)?.[1] ?? value).join(", ")} />
         <SummaryLine label="Closed-bar shifts" value={grammar ? `${grammar.minimumShift}–${grammar.maximumShift}` : "—"} />
         <SummaryLine
           label="Parameter ranges"
@@ -6617,7 +6660,7 @@ function EliteInspector({
   );
 }
 
-function PartitionEquityChart({
+function PartitionEquityChartLegacy({
   view,
   busy,
   researchGrade,
@@ -6757,6 +6800,127 @@ function PartitionEquityChart({
         )}
         <Kpi label={twoWay ? "Holdout expectancy (R)" : "OOS2 expectancy (R)"} value={formatNumber(view.oos2Expectancy / 1000, 2)} note="display only · not a gate" />
         <Kpi label="Bars" value={twoWay ? `${formatNumber(view.isBars)} / ${formatNumber(view.oos2Bars)}` : `${formatNumber(view.isBars)} / ${formatNumber(view.oos1Bars)} / ${formatNumber(view.oos2Bars)}`} note={twoWay ? "Development / Holdout · databank split" : "Development / OOS1 / OOS2 · databank split"} />
+      </div>
+    </section>
+  );
+}
+
+function PartitionEquityChart({
+  view,
+  busy,
+  researchGrade,
+  m1FidelityVerified,
+  large = false,
+}: {
+  view: PartitionEquityView | null;
+  busy: boolean;
+  researchGrade: boolean;
+  m1FidelityVerified: boolean;
+  large?: boolean;
+}) {
+  const [sample, setSample] = useState<"full" | "training" | "validation" | "holdout">("full");
+  if (busy && !view) {
+    return <div className="partition-equity loading">Replaying the stored timeline and full M1 equity…</div>;
+  }
+  if (!view || view.points.length < 2) {
+    return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
+  }
+
+  const segments = view.segments?.length
+    ? view.segments
+    : [
+        { id: "Development", kind: "training", startTimestampMs: view.points[0].timestampMs, endTimestampMs: view.isEndTimestampMs, bars: view.isBars, trades: view.isTrades, expectancy: view.isExpectancy, returnPercent: view.isReturnPercent },
+        { id: "OOS1", kind: "validation", startTimestampMs: view.isEndTimestampMs, endTimestampMs: view.oos1EndTimestampMs, bars: view.oos1Bars, trades: view.oos1Trades, expectancy: view.oos1Expectancy, returnPercent: view.oos1ReturnPercent },
+        { id: "OOS2", kind: "holdout", startTimestampMs: view.oos1EndTimestampMs, endTimestampMs: view.oos2EndTimestampMs, bars: view.oos2Bars, trades: view.oos2Trades, expectancy: view.oos2Expectancy, returnPercent: view.oos2ReturnPercent },
+      ];
+  const selectedSegments = sample === "full" ? segments : segments.filter((segment) => segment.kind === sample);
+  const selectedStart = selectedSegments[0]?.startTimestampMs ?? view.points[0].timestampMs;
+  const selectedEnd = selectedSegments.at(-1)?.endTimestampMs ?? view.points.at(-1)!.timestampMs;
+  const chartPoints = sample === "full"
+    ? view.points
+    : view.points.filter((point) => point.timestampMs >= selectedStart && point.timestampMs <= selectedEnd);
+  const points = chartPoints.length >= 2 ? chartPoints : view.points;
+  const width = large ? 1000 : 520;
+  const height = large ? 340 : 300;
+  const pad = 18;
+  const equities = points.map((point) => point.equity);
+  const min = Math.min(...equities);
+  const max = Math.max(...equities);
+  const span = Math.max(max - min, 1e-9);
+  const t0 = points[0].timestampMs;
+  const t1 = points.at(-1)!.timestampMs;
+  const tSpan = Math.max(t1 - t0, 1);
+  const xAt = (timestamp: number) => Math.max(pad, Math.min(width - pad, pad + ((timestamp - t0) / tSpan) * (width - pad * 2)));
+  const yAt = (equity: number) => height - pad - ((equity - min) / span) * (height - pad * 2);
+  const path = points.map((point, index) => `${index === 0 ? "M" : "L"}${xAt(point.timestampMs).toFixed(1)} ${yAt(point.equity).toFixed(1)}`).join(" ");
+  const firstX = xAt(points[0].timestampMs);
+  const lastX = xAt(points.at(-1)!.timestampMs);
+  const chartBottom = height - pad;
+  const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
+  const gradientId = large ? "equity-area-large" : "equity-area-small";
+  const horizontalGuides = [0, 1, 2, 3, 4];
+  const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
+  const totalBars = segments.reduce((sum, segment) => sum + segment.bars, 0);
+  const kindLabel = (kind: string) => kind === "training" ? "IST" : kind === "validation" ? "ISV" : "OOS";
+  const kindClass = (kind: string) => kind === "training" ? "region-is" : kind === "validation" ? "region-oos1" : "region-oos2";
+  const splitNote = `${view.executionEngine} · ${segments.length} saved phases · ${totalBars.toLocaleString()} bars · display only`;
+
+  return (
+    <section className={large ? "partition-equity large" : "partition-equity"}>
+      <div className="partition-equity-head">
+        <div>
+          <p className="eyebrow">M1-chronology full-run equity</p>
+          <small>{splitNote}{researchGrade && !m1FidelityVerified ? " · research recheck; not an external parity pass" : ""}</small>
+        </div>
+        <div className="partition-equity-scale">
+          <label className="partition-sample-select">View
+            <select value={sample} onChange={(event) => setSample(event.target.value as typeof sample)}>
+              <option value="full">Full timeline</option>
+              {segments.some((segment) => segment.kind === "training") && <option value="training">IST · training</option>}
+              {segments.some((segment) => segment.kind === "validation") && <option value="validation">ISV · validation</option>}
+              {segments.some((segment) => segment.kind === "holdout") && <option value="holdout">OOS · sealed holdout</option>}
+            </select>
+          </label>
+          <span>${formatNumber(Math.max(...equities), 0)} peak</span>
+          <span>${formatNumber(Math.min(...equities), 0)} trough</span>
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="partition-equity-svg" role="img" aria-label="Full equity curve with all saved timeline splits">
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#35d4bd" stopOpacity=".30" />
+            <stop offset="68%" stopColor="#1eae9a" stopOpacity=".08" />
+            <stop offset="100%" stopColor="#1eae9a" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {horizontalGuides.map((guide) => {
+          const y = pad + (guide / 4) * (height - pad * 2);
+          const value = max - (guide / 4) * span;
+          return <g key={`h-${guide}`}><line x1={pad} y1={y} x2={width - pad} y2={y} className="chart-grid-line" />{large && <text x={width - pad - 4} y={y - 4} textAnchor="end" className="chart-axis-label">${formatNumber(value, 0)}</text>}</g>;
+        })}
+        {verticalGuides.map((guide) => {
+          const fraction = guide / 6;
+          const x = pad + fraction * (width - pad * 2);
+          const timestamp = t0 + fraction * tSpan;
+          return <g key={`v-${guide}`}><line x1={x} y1={pad} x2={x} y2={height - pad} className="chart-grid-line vertical" />{large && <text x={x} y={height - 4} textAnchor={guide === 0 ? "start" : guide === 6 ? "end" : "middle"} className="chart-axis-label">{new Date(timestamp).getUTCFullYear()}</text>}</g>;
+        })}
+        {segments.map((segment) => {
+          const startX = xAt(segment.startTimestampMs);
+          const endX = xAt(segment.endTimestampMs);
+          const active = sample === "full" || segment.kind === sample;
+          return <g key={`${segment.id}-${segment.startTimestampMs}`} opacity={active ? 1 : 0.28}>
+            <rect x={startX} y={pad} width={Math.max(0, endX - startX)} height={height - pad * 2} className={kindClass(segment.kind)} />
+            {startX > pad + 0.5 && <line x1={startX} y1={pad} x2={startX} y2={height - pad} className="divider" />}
+            <text x={Math.min(width - pad - 4, startX + 6)} y={pad + 14} className="region-label">{segment.id} · {kindLabel(segment.kind)}</text>
+          </g>;
+        })}
+        <path d={areaPath} fill={`url(#${gradientId})`} className="equity-area" />
+        <path d={path} className="equity-path" />
+        <circle cx={lastX} cy={yAt(points.at(-1)!.equity)} r={large ? 3.2 : 2.5} className="equity-endpoint" />
+      </svg>
+      <div className="partition-kpis segment-kpis">
+        {segments.map((segment) => <Kpi key={`kpi-${segment.id}-${segment.startTimestampMs}`} label={`${segment.id} · ${kindLabel(segment.kind)}`} value={`${formatNumber(segment.expectancy / 1000, 3)}R`} note={`${formatNumber(segment.trades)} trades · ${formatNumber(segment.returnPercent, 2)}% return · ${formatNumber(segment.bars)} bars`} />)}
+        <Kpi label="Full run" value={`${formatNumber(view.fullRunReturnPercent, 2)}%`} note={`${formatNumber(view.fullRunTrades)} trades · ${formatNumber(view.fullRunMaxDrawdownPercent, 2)}% max drawdown`} />
       </div>
     </section>
   );

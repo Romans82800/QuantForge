@@ -62,6 +62,16 @@ pub(crate) struct LoadedDatabank {
     pub(crate) m1_metadata_path: Option<String>,
     pub(crate) validation_fraction: f64,
     pub(crate) sealed_fraction: f64,
+    pub(crate) timeline_parts: Vec<TimelinePart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TimelinePart {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) start_date: String,
+    pub(crate) end_date: String,
 }
 
 #[derive(Debug, Clone)]
@@ -357,12 +367,26 @@ pub struct PartitionEquityPoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PartitionEquitySegment {
+    id: String,
+    kind: String,
+    start_timestamp_ms: i64,
+    end_timestamp_ms: i64,
+    bars: usize,
+    trades: usize,
+    expectancy: f64,
+    return_percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartitionEquityView {
     fingerprint: String,
     strategy_id: String,
     execution_engine: String,
     initial_balance: f64,
     points: Vec<PartitionEquityPoint>,
+    segments: Vec<PartitionEquitySegment>,
     is_end_timestamp_ms: i64,
     oos1_end_timestamp_ms: i64,
     oos2_end_timestamp_ms: i64,
@@ -549,6 +573,13 @@ fn install_databank_artifact(
     workspace.broker_path = broker.clone();
     let validation_fraction = manifest_fraction(&artifact, "validation_fraction", 0.2);
     let sealed_fraction = manifest_fraction(&artifact, "sealed_fraction", 0.2);
+    let timeline_parts = artifact
+        .manifest
+        .recipe
+        .config
+        .get("data_range_parts")
+        .and_then(|value| serde_json::from_value::<Vec<TimelinePart>>(value.clone()).ok())
+        .unwrap_or_default();
     *state
         .loaded
         .write()
@@ -563,6 +594,7 @@ fn install_databank_artifact(
         m1_metadata_path,
         validation_fraction,
         sealed_fraction,
+        timeline_parts,
     });
     Ok(workspace)
 }
@@ -836,6 +868,7 @@ pub async fn get_elite_partition_equity(
             loaded.validation_fraction,
             loaded.sealed_fraction,
             loaded.bank.config.history_start_year,
+            loaded.timeline_parts.clone(),
         )
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -850,6 +883,7 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
+            timeline_parts,
         ) = snapshot;
         partition_equity_for_elite(
             &elite,
@@ -862,6 +896,7 @@ pub async fn get_elite_partition_equity(
             validation_fraction,
             sealed_fraction,
             history_start_year,
+            &timeline_parts,
         )
     })
     .await
@@ -1355,6 +1390,7 @@ fn partition_equity_for_elite(
     validation_fraction: f64,
     sealed_fraction: f64,
     history_start_year: u16,
+    timeline_parts: &[TimelinePart],
 ) -> Result<PartitionEquityView, String> {
     let mut loaded = crate::data_lab::load_data_source(source, metadata_path, None)?;
     // Prefer full decision history. If the databank was built on an IS-only
@@ -1376,6 +1412,15 @@ fn partition_equity_for_elite(
         quote_dataset.as_mut(),
         history_start_year,
     )?;
+    if let Some((start_date, end_date)) = timeline_outer_dates(timeline_parts) {
+        crate::data_lab::trim_market_history_to_dates(
+            &mut loaded.dataset,
+            &mut m1.dataset,
+            quote_dataset.as_mut(),
+            Some(&start_date),
+            Some(&end_date),
+        )?;
+    }
     if let Some(quotes) = quote_dataset.as_ref() {
         quotes
             .validate_against(&m1.dataset)
@@ -1428,6 +1473,22 @@ fn partition_equity_for_elite(
     let oos1_end = plan.validation.end_timestamp_ms_exclusive;
     let oos2_end = plan.sealed_final.end_timestamp_ms_exclusive;
 
+    let segments = timeline_segments(
+        timeline_parts,
+        &decision_dataset,
+        &result.trades,
+        &result.equity,
+        scout.initial_balance,
+        plan.development.start_timestamp_ms,
+        is_end,
+        oos1_end,
+        oos2_end,
+    )?;
+    let segment_boundaries = segments
+        .iter()
+        .flat_map(|segment| [segment.start_timestamp_ms, segment.end_timestamp_ms])
+        .collect::<Vec<_>>();
+
     let is_trades: Vec<_> = result
         .trades
         .iter()
@@ -1450,7 +1511,7 @@ fn partition_equity_for_elite(
     let oos1_ratio = (is_expectancy > 0.0 && oos1_expectancy.is_finite())
         .then_some(oos1_expectancy / is_expectancy);
 
-    let points = downsample_equity(&result.equity, 480, is_end, oos1_end);
+    let points = downsample_equity(&result.equity, 480, &segment_boundaries);
     let trades: Vec<TradeRowView> = result
         .trades
         .iter()
@@ -1474,6 +1535,7 @@ fn partition_equity_for_elite(
         execution_engine: result.engine.clone(),
         initial_balance: scout.initial_balance,
         points,
+        segments,
         is_end_timestamp_ms: is_end,
         oos1_end_timestamp_ms: oos1_end,
         oos2_end_timestamp_ms: oos2_end,
@@ -1525,6 +1587,90 @@ fn mean_expectancy(trades: &[&quantforge_eval::Trade]) -> f64 {
     trades.iter().map(|trade| trade.net_profit).sum::<f64>() / trades.len() as f64
 }
 
+fn timeline_segments(
+    timeline_parts: &[TimelinePart],
+    decision_dataset: &BarDataset,
+    trades: &[quantforge_eval::Trade],
+    equity: &[quantforge_eval::EquityPoint],
+    initial_balance: f64,
+    development_start: i64,
+    is_end: i64,
+    oos1_end: i64,
+    oos2_end: i64,
+) -> Result<Vec<PartitionEquitySegment>, String> {
+    let dated = !timeline_parts.is_empty()
+        && timeline_parts.iter().all(|part| {
+            !part.id.trim().is_empty()
+                && !part.kind.trim().is_empty()
+                && !part.start_date.trim().is_empty()
+                && !part.end_date.trim().is_empty()
+        });
+    let boundaries = if dated {
+        timeline_parts
+            .iter()
+            .map(|part| {
+                let start = quantforge_data::history_date_cutoff_ms(
+                    &decision_dataset.source_timezone,
+                    &part.start_date,
+                )
+                .map_err(|error| error.to_string())?;
+                let end = quantforge_data::history_end_exclusive_cutoff_ms(
+                    &decision_dataset.source_timezone,
+                    &part.end_date,
+                )
+                .map_err(|error| error.to_string())?;
+                if start >= end {
+                    return Err(format!(
+                        "timeline part {} ends before it starts",
+                        part.id
+                    ));
+                }
+                Ok((part.id.clone(), part.kind.clone(), start, end))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        vec![
+            ("Development".into(), "training".into(), development_start, is_end),
+            ("OOS1".into(), "validation".into(), is_end, oos1_end),
+            ("OOS2".into(), "holdout".into(), oos1_end, oos2_end),
+        ]
+    };
+
+    let mut segments = Vec::with_capacity(boundaries.len());
+    for (id, kind, start, end) in boundaries {
+        let segment_trades: Vec<_> = trades
+            .iter()
+            .filter(|trade| {
+                trade.entry_timestamp_ms >= start && trade.entry_timestamp_ms < end
+            })
+            .collect();
+        segments.push(PartitionEquitySegment {
+            id,
+            kind,
+            start_timestamp_ms: start,
+            end_timestamp_ms: end,
+            bars: decision_dataset
+                .bars
+                .iter()
+                .filter(|bar| bar.timestamp_ms >= start && bar.timestamp_ms < end)
+                .count(),
+            trades: segment_trades.len(),
+            expectancy: mean_expectancy(&segment_trades),
+            return_percent: segment_return(equity, initial_balance, Some(start), Some(end)),
+        });
+    }
+    Ok(segments)
+}
+
+fn timeline_outer_dates(timeline_parts: &[TimelinePart]) -> Option<(String, String)> {
+    let first = timeline_parts.first()?;
+    let last = timeline_parts.last()?;
+    if first.start_date.trim().is_empty() || last.end_date.trim().is_empty() {
+        return None;
+    }
+    Some((first.start_date.clone(), last.end_date.clone()))
+}
+
 fn segment_return(
     equity: &[quantforge_eval::EquityPoint],
     initial_balance: f64,
@@ -1559,8 +1705,7 @@ fn segment_return(
 fn downsample_equity(
     equity: &[quantforge_eval::EquityPoint],
     target: usize,
-    is_end: i64,
-    oos1_end: i64,
+    boundaries: &[i64],
 ) -> Vec<PartitionEquityPoint> {
     if equity.is_empty() {
         return Vec::new();
@@ -1577,19 +1722,14 @@ fn downsample_equity(
     let mut keep = std::collections::BTreeSet::new();
     keep.insert(0);
     keep.insert(equity.len() - 1);
-    if let Some(index) = equity
-        .iter()
-        .position(|point| point.timestamp_ms >= is_end)
-        .map(|index| index.saturating_sub(1))
-    {
-        keep.insert(index);
-    }
-    if let Some(index) = equity
-        .iter()
-        .position(|point| point.timestamp_ms >= oos1_end)
-        .map(|index| index.saturating_sub(1))
-    {
-        keep.insert(index);
+    for boundary in boundaries {
+        if let Some(index) = equity
+            .iter()
+            .position(|point| point.timestamp_ms >= *boundary)
+            .map(|index| index.saturating_sub(1))
+        {
+            keep.insert(index);
+        }
     }
     let step = ((equity.len() - 1) as f64 / (target.saturating_sub(1) as f64)).max(1.0);
     let mut cursor = 0.0;

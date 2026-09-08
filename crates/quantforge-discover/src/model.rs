@@ -578,6 +578,11 @@ pub struct DiscoverConfig {
     /// entry conditions, how many exit conditions, and the closed-bar shifts.
     #[serde(default)]
     pub universal_grammar: UniversalGrammarConfig,
+    /// Strategy families used for deterministic seed allocation. An empty
+    /// value is normalized to Universal by the desktop request layer; the
+    /// default keeps older archives behaviourally compatible.
+    #[serde(default = "default_strategy_families")]
+    pub strategy_families: Vec<SearchFamily>,
     /// Fast Scout vs Full Harvest knobs applied at start.
     #[serde(default)]
     pub run_mode: DiscoverRunMode,
@@ -799,6 +804,10 @@ fn default_trial_budget_warning() -> u64 {
     TRIAL_BUDGET_WARNING
 }
 
+fn default_strategy_families() -> Vec<SearchFamily> {
+    vec![SearchFamily::Universal]
+}
+
 fn default_oos1_expectancy_retention() -> f64 {
     0.7
 }
@@ -979,6 +988,7 @@ impl Default for DiscoverConfig {
             structural_mutation_probability: 0.18,
             seed: 42,
             universal_grammar: UniversalGrammarConfig::default(),
+            strategy_families: default_strategy_families(),
             run_mode: DiscoverRunMode::FullHarvest,
             early_stop_pot_elites: None,
             target_databank_elites: None,
@@ -1178,6 +1188,11 @@ impl DiscoverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DiscoverError> {
+        if self.strategy_families.is_empty() {
+            return Err(DiscoverError::InvalidConfig(
+                "strategy_families must contain at least one template".into(),
+            ));
+        }
         if !(self.allow_market_entries || self.allow_stop_entries || self.allow_limit_entries) {
             return Err(DiscoverError::InvalidConfig(
                 "enable at least one entry order kind: market, stop or limit".into(),

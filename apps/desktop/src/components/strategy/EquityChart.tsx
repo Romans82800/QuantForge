@@ -141,7 +141,7 @@ export function PartitionEquityChart({
   m1FidelityVerified: boolean;
   large?: boolean;
 }) {
-  const [sample, setSample] = useState<"full" | "is" | "oos1" | "oos2">("full");
+  const [sample, setSample] = useState<"full" | "training" | "validation" | "holdout">("full");
 
   if (busy && !view) {
     return <div className="partition-equity loading">Replaying full IS / OOS1 / OOS2 equity…</div>;
@@ -151,15 +151,17 @@ export function PartitionEquityChart({
     return <div className="partition-equity empty">Equity unavailable for this elite.</div>;
   }
 
-  const points = sample === "full"
-    ? view.points
-    : view.points.filter((point) => (
-      sample === "is"
-        ? point.timestampMs < view.isEndTimestampMs
-        : sample === "oos1"
-          ? point.timestampMs >= view.isEndTimestampMs && point.timestampMs < view.oos1EndTimestampMs
-          : point.timestampMs >= view.oos1EndTimestampMs
-    ));
+  const segments = view.segments?.length
+    ? view.segments
+    : [
+        { id: "Development", kind: "training", startTimestampMs: view.points[0].timestampMs, endTimestampMs: view.isEndTimestampMs, bars: view.isBars, trades: view.isTrades, expectancy: view.isExpectancy, returnPercent: view.isReturnPercent },
+        { id: "OOS1", kind: "validation", startTimestampMs: view.isEndTimestampMs, endTimestampMs: view.oos1EndTimestampMs, bars: view.oos1Bars, trades: view.oos1Trades, expectancy: view.oos1Expectancy, returnPercent: view.oos1ReturnPercent },
+        { id: "OOS2", kind: "holdout", startTimestampMs: view.oos1EndTimestampMs, endTimestampMs: view.oos2EndTimestampMs, bars: view.oos2Bars, trades: view.oos2Trades, expectancy: view.oos2Expectancy, returnPercent: view.oos2ReturnPercent },
+      ];
+  const selected = sample === "full" ? segments : segments.filter((segment) => segment.kind === sample);
+  const start = selected[0]?.startTimestampMs ?? view.points[0].timestampMs;
+  const end = selected.at(-1)?.endTimestampMs ?? view.points.at(-1)!.timestampMs;
+  const points = sample === "full" ? view.points : view.points.filter((point) => point.timestampMs >= start && point.timestampMs <= end);
 
   const chartPoints = points.length >= 2 ? points : view.points;
   const width = large ? 1000 : 520;
@@ -184,19 +186,12 @@ export function PartitionEquityChart({
   const chartBottom = height - pad;
   const areaPath = `${path} L${lastX.toFixed(1)} ${chartBottom} L${firstX.toFixed(1)} ${chartBottom} Z`;
 
-  const isX = xAt(view.isEndTimestampMs);
-  const oos1X = xAt(view.oos1EndTimestampMs);
   const gradientId = large ? "equity-area-large" : "equity-area-small";
 
   const horizontalGuides = [0, 1, 2, 3, 4];
   const verticalGuides = [0, 1, 2, 3, 4, 5, 6];
-  const totalBars = view.isBars + view.oos1Bars + view.oos2Bars;
-  const isPct = totalBars > 0 ? Math.round((view.isBars / totalBars) * 100) : 0;
-  const oos2Pct = totalBars > 0 ? Math.round((view.oos2Bars / totalBars) * 100) : 0;
-  const twoWay = view.oos1Bars === 0;
-  const splitNote = twoWay
-    ? `${view.executionEngine} · Development ${isPct}% · Holdout ${oos2Pct}% (display only)`
-    : `${view.executionEngine} · Development ${isPct}% · OOS1 ${Math.round((view.oos1Bars / Math.max(totalBars, 1)) * 100)}% · OOS2 ${oos2Pct}% (display only)`;
+  const splitNote = `${view.executionEngine} · ${segments.length} saved phases · display only`;
+  const kindLabel = (kind: string) => kind === "training" ? "IST" : kind === "validation" ? "ISV" : "OOS";
 
   return (
     <section className={large ? "partition-equity large" : "partition-equity"}>
@@ -210,16 +205,16 @@ export function PartitionEquityChart({
         </div>
         <div className="partition-equity-scale" style={{ display: 'flex', gap: '16px', alignItems: 'center', fontSize: '13px' }}>
           <label className="partition-sample-select" style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            Sample
+            View
             <select
               value={sample}
               onChange={(event) => setSample(event.target.value as typeof sample)}
               style={{ padding: '4px', borderRadius: '4px', background: 'var(--bg-inset)', border: '1px solid var(--border)', color: 'var(--fg)' }}
             >
-              <option value="full">Full (IS + OOS)</option>
-              <option value="is">IS</option>
-              <option value="oos1">OOS 1</option>
-              <option value="oos2">OOS 2</option>
+              <option value="full">Full timeline</option>
+              {segments.some((segment) => segment.kind === "training") && <option value="training">IST · training</option>}
+              {segments.some((segment) => segment.kind === "validation") && <option value="validation">ISV · validation</option>}
+              {segments.some((segment) => segment.kind === "holdout") && <option value="holdout">OOS · sealed holdout</option>}
             </select>
           </label>
           <span style={{ color: 'var(--positive)' }}>${formatNumber(max, 0)} peak</span>
@@ -256,14 +251,17 @@ export function PartitionEquityChart({
           );
         })}
 
-        {sample === "full" && (
-          <>
-            <line x1={isX} y1={pad} x2={isX} y2={height - pad} stroke="var(--negative)" strokeWidth="1.5" strokeDasharray="4 4" />
-            <line x1={oos1X} y1={pad} x2={oos1X} y2={height - pad} stroke="var(--negative)" strokeWidth="1.5" strokeDasharray="4 4" />
-            <text x={isX - 8} y={pad + 12} fill="var(--fg-dim)" fontSize="10px" textAnchor="end">IS end</text>
-            <text x={oos1X - 8} y={pad + 12} fill="var(--fg-dim)" fontSize="10px" textAnchor="end">OOS1 end</text>
-          </>
-        )}
+        {segments.map((segment) => {
+          const startX = xAt(segment.startTimestampMs);
+          const endX = xAt(segment.endTimestampMs);
+          const active = sample === "full" || segment.kind === sample;
+          const regionClass = segment.kind === "training" ? "region-is" : segment.kind === "validation" ? "region-oos1" : "region-oos2";
+          return <g key={`${segment.id}-${segment.startTimestampMs}`} opacity={active ? 1 : 0.28}>
+            <rect x={startX} y={pad} width={Math.max(0, endX - startX)} height={height - pad * 2} className={regionClass} />
+            {startX > pad + 0.5 && <line x1={startX} y1={pad} x2={startX} y2={height - pad} stroke="var(--negative)" strokeWidth="1.5" strokeDasharray="4 4" />}
+            <text x={Math.min(width - pad - 4, startX + 6)} y={pad + 12} fill="var(--fg-dim)" fontSize="10px">{segment.id} · {kindLabel(segment.kind)}</text>
+          </g>;
+        })}
 
         <path d={areaPath} fill={`url(#${gradientId})`} />
         <path d={path} fill="none" stroke="var(--accent)" strokeWidth="1.5" />

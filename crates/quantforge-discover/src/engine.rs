@@ -38,6 +38,14 @@ const PROMOTION_OVERFLOW_CAPACITY: usize = 2048;
 /// After breeding unlocks, cap random seeding so more batch slots breed from pot parents.
 const POST_BREED_RANDOM_FILL_CAP: f64 = 0.40;
 
+fn selected_strategy_family(config: &DiscoverConfig, sequence: u64) -> SearchFamily {
+    config
+        .strategy_families
+        .get((sequence as usize) % config.strategy_families.len().max(1))
+        .copied()
+        .unwrap_or(SearchFamily::Universal)
+}
+
 enum CandidateOutcome {
     CoarseRejected,
     AmbiguousRejected,
@@ -1454,12 +1462,17 @@ fn generate_initial_population(config: &DiscoverConfig) -> Vec<StrategyIr> {
     (0..config.initial_candidates)
         .map(|index| {
             let island_id = index % config.effective_island_count();
+            let family = selected_strategy_family(config, index as u64);
             let mut rng = rng_for(config.seed, 99, index as u64);
             let mut seeded = build_seed(
-                SearchFamily::Universal,
+                family,
                 &mut rng,
                 format!("i{island_id}-seed-{index}"),
-                config.universal_grammar.maximum_entry_conditions.max(1),
+                if family == SearchFamily::Universal {
+                    config.universal_grammar.maximum_entry_conditions.max(1)
+                } else {
+                    family.spec().max_atoms
+                },
                 true,
                 config.market_entries_only(),
                 &config.universal_grammar,
@@ -1832,13 +1845,18 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
             let sequence = generation
                 .wrapping_mul(1_000_000)
                 .wrapping_add(index as u64);
+            let family = selected_strategy_family(&bank.config, sequence);
             let mut rng = rng_for(bank.config.seed, generation + 10, index as u64);
             let fresh_seed = |rng: &mut ChaCha8Rng| {
                 let mut seeded = build_seed(
-                    SearchFamily::Universal,
+                    family,
                     rng,
                     format!("i{island_id}-g{generation}-{index}"),
-                    max_atoms,
+                    if family == SearchFamily::Universal {
+                        max_atoms
+                    } else {
+                        family.spec().max_atoms
+                    },
                     true,
                     market_only,
                     &bank.config.universal_grammar,
@@ -1898,7 +1916,7 @@ fn breed_generation(bank: &Databank, generation: u64) -> Vec<StrategyIr> {
                 bank.config.structural_mutation_probability,
                 sequence,
                 false,
-                SearchFamily::Universal,
+                SearchFamily::from_style(classify_family(&crossed)),
                 &bank.config.universal_grammar,
             );
             child.id = format!("i{island_id}-g{generation}-{index}");
@@ -2455,6 +2473,7 @@ mod tests {
             seed: 1234,
             run_mode: crate::DiscoverRunMode::FullHarvest,
             universal_grammar: crate::model::UniversalGrammarConfig::default(),
+            strategy_families: vec![SearchFamily::Universal],
             target_databank_elites: None,
             early_stop_pot_elites: None,
             trial_budget_warning: crate::TRIAL_BUDGET_WARNING,
@@ -2540,6 +2559,18 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn selected_strategy_templates_cycle_deterministically() {
+        let mut config = config();
+        config.strategy_families = vec![
+            SearchFamily::DonchianBreakout,
+            SearchFamily::MeanReversionBand,
+        ];
+        assert_eq!(selected_strategy_family(&config, 0), SearchFamily::DonchianBreakout);
+        assert_eq!(selected_strategy_family(&config, 1), SearchFamily::MeanReversionBand);
+        assert_eq!(selected_strategy_family(&config, 2), SearchFamily::DonchianBreakout);
     }
 
     #[test]

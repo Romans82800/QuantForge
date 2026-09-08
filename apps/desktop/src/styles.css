@@ -225,6 +225,7 @@ main { min-width: 0; }
 .partition-equity-svg .equity-path { fill: none; stroke: #7fd4cb; stroke-width: 1.8; }
 .partition-equity-svg .region-label { fill: #8aa0b2; font-size: 10px; }
 .partition-kpis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 10px 12px 12px; }
+.segment-kpis { grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); }
 .inspector-wide { min-width: 0; }
 .main-grid { grid-template-columns: minmax(560px, 1fr) minmax(380px, 0.95fr); }
 
@@ -436,6 +437,17 @@ main { min-width: 0; }
 .production-module-grid .check-field { grid-column: auto; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: 4px; background: #0a1016; }
 .production-module-grid .check-field span { display: grid; gap: 3px; }
 .production-module-grid .check-field small { color: #647586; font-size: 8px; line-height: 1.35; }
+.strategy-template-card { background: linear-gradient(145deg, #0d171e, #0b1319); }
+.template-picker-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.template-picker-actions > span { margin-left: auto; color: #78cfc3; font: 600 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.strategy-template-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; }
+.strategy-template-option { min-height: 56px; padding: 10px; display: flex; align-items: flex-start; gap: 9px; border: 1px solid #253844; border-radius: 6px; background: #0a1117; cursor: pointer; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
+.strategy-template-option:hover { border-color: #3a7775; transform: translateY(-1px); }
+.strategy-template-option.selected { border-color: #2f958b; background: linear-gradient(145deg, #102522, #0d171d); box-shadow: inset 0 0 0 1px rgba(49, 208, 182, .08); }
+.strategy-template-option input { margin-top: 2px; accent-color: #31d0b6; }
+.strategy-template-option span { display: grid; gap: 4px; }
+.strategy-template-option strong { color: #d9e6e8; font-size: 10px; font-weight: 600; }
+.strategy-template-option small { color: #718491; font-size: 8px; line-height: 1.35; }
 .recipe-badge { flex: 0 0 auto; padding: 5px 7px; color: #8bd4ca; border: 1px solid #346763; background: #102421; font-size: 7px; text-transform: uppercase; letter-spacing: .1em; }
 .family-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .family-chip { padding: 7px 10px; color: #7d8c9b; border: 1px solid #2d3945; background: #0a1016; font-size: 9px; letter-spacing: .04em; cursor: pointer; }

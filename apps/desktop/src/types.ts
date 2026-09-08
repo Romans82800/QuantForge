@@ -63,12 +63,24 @@ export interface PartitionEquityPoint {
   equity: number;
 }
 
+export interface PartitionEquitySegment {
+  id: string;
+  kind: "training" | "validation" | "holdout" | string;
+  startTimestampMs: number;
+  endTimestampMs: number;
+  bars: number;
+  trades: number;
+  expectancy: number;
+  returnPercent: number;
+}
+
 export interface PartitionEquityView {
   fingerprint: string;
   strategyId: string;
   executionEngine: string;
   initialBalance: number;
   points: PartitionEquityPoint[];
+  segments: PartitionEquitySegment[];
   isEndTimestampMs: number;
   oos1EndTimestampMs: number;
   oos2EndTimestampMs: number;
@@ -620,6 +632,8 @@ export interface DiscoverRequest {
   noveltyWeight: number | null;
   seed: number | null;
   universalGrammar: UniversalGrammarConfig | null;
+  /** Selected deterministic strategy templates; Universal is the legacy default. */
+  strategyTemplates: string[];
   runMode: DiscoverRunModeId | null;
   generalIslandCount: number | null;
   refinementIslandCount: number | null;

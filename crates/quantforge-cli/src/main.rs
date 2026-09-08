@@ -5664,6 +5664,7 @@ fn new_discover_config(args: &EvolveArgs) -> Result<DiscoverConfig, Box<dyn Erro
         structural_mutation_probability: args.structural_mutation_probability.unwrap_or(0.18),
         seed: args.seed.unwrap_or(42),
         universal_grammar,
+        strategy_families: vec![quantforge_discover::SearchFamily::Universal],
         run_mode: parse_cli_run_mode(&args.run_mode)?,
         early_stop_pot_elites: None,
         target_databank_elites: None,

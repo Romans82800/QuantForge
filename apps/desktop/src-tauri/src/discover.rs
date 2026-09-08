@@ -15,6 +15,7 @@ use quantforge_discover::{
     DiscoverRunMode, GateConfig, PackSymbol, SearchRangeProfile, TimeframeAblationConfig,
     TimeframeAblationReport, TimeframeBakeoffConfig, TimeframeBakeoffReport, TimeframeGateConfig,
     TimeframeRollingWindow, UniversalGrammarConfig, new_databank,
+    SearchFamily,
     run_condition_bakeoff as evolve_condition_bakeoff,
     run_timeframe_ablation as evolve_timeframe_ablation,
     run_timeframe_bakeoff as evolve_timeframe_bakeoff,
@@ -169,6 +170,9 @@ pub struct DiscoverRequest {
     /// Family-free entry/exit cardinality and completed-bar shift bounds
     /// (entry 2..=4, exit 1..=3). This is the only grammar selector.
     universal_grammar: Option<UniversalGrammarConfig>,
+    /// Explicit strategy templates. Empty preserves the legacy Universal grammar.
+    #[serde(default)]
+    strategy_templates: Vec<String>,
     /// `fast_scout`, `full_harvest`, `quota_harvest`, or `high_performance_islands`.
     run_mode: Option<String>,
     general_island_count: Option<usize>,
@@ -1747,16 +1751,31 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             quantforge_data::normalize_history_start_year(year)
                 .map_err(|error| error.to_string())?;
         }
-        let validation = request
-            .validation_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
-        let sealed = request
-            .sealed_fraction
-            .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
-        normalize_split_fractions(validation, sealed)?;
         if !request.data_range_parts.is_empty() {
-            range_schedule_contract(&request.data_range_parts)?;
+            // A dated SQX-style timeline is authoritative. Do not validate stale
+            // percentage fields from an older saved profile before deriving the
+            // actual validation and sealed fractions from the schedule.
+            if let Some(schedule) = range_schedule_contract(&request.data_range_parts)? {
+                normalize_split_fractions(schedule.validation_fraction, schedule.sealed_fraction)?;
+            } else {
+                let validation = request
+                    .validation_fraction
+                    .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
+                let sealed = request
+                    .sealed_fraction
+                    .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
+                normalize_split_fractions(validation, sealed)?;
+            }
+        } else {
+            let validation = request
+                .validation_fraction
+                .unwrap_or(quantforge_quality::DEFAULT_VALIDATION_FRACTION);
+            let sealed = request
+                .sealed_fraction
+                .unwrap_or(quantforge_quality::DEFAULT_SEALED_FRACTION);
+            normalize_split_fractions(validation, sealed)?;
         }
+        parse_strategy_templates(&request.strategy_templates)?;
     }
     let run_until_stopped = request.run_until_stopped.unwrap_or(true);
     if !run_until_stopped && request.generations == 0 {
@@ -1780,6 +1799,7 @@ fn validate_request(request: &DiscoverRequest) -> Result<(), String> {
             request.novelty_weight.is_some(),
             request.seed.is_some(),
             request.universal_grammar.is_some(),
+            !request.strategy_templates.is_empty(),
             request.run_mode.is_some(),
             request.early_stop_pot_elites.is_some(),
             request.minimum_trades.is_some(),
@@ -2193,6 +2213,12 @@ fn run_discovery(
     } else {
         request.data_range_parts.clone()
     };
+    // Carry the original dated schedule forward when a continuation request
+    // intentionally omits mutable form fields. Otherwise the next checkpoint
+    // would silently fall back to the legacy three-way chart.
+    if request.data_range_parts.is_empty() && !timeline_parts.is_empty() {
+        request.data_range_parts = timeline_parts.clone();
+    }
     let has_dated_timeline = timeline_parts.iter().any(|part| {
         !part.start_date.trim().is_empty() && !part.end_date.trim().is_empty()
     });
@@ -3612,6 +3638,39 @@ fn parse_run_mode(value: &str) -> Option<quantforge_discover::DiscoverRunMode> {
     }
 }
 
+fn parse_strategy_templates(values: &[String]) -> Result<Vec<SearchFamily>, String> {
+    let values = if values.is_empty() {
+        vec!["universal".to_owned()]
+    } else {
+        values.to_vec()
+    };
+    let mut families = Vec::new();
+    for value in values {
+        let normalized = value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+        let family = match normalized.as_str() {
+            "trend_pullback" | "trend" => SearchFamily::TrendPullback,
+            "momentum_burst" | "momentum" => SearchFamily::MomentumBurst,
+            "donchian_breakout" | "donchian" => SearchFamily::DonchianBreakout,
+            "mean_reversion_band" | "mean_reversion" => SearchFamily::MeanReversionBand,
+            "zscore_reversion" | "z_score_reversion" | "zscore" => SearchFamily::ZScoreReversion,
+            "session_orb" | "orb" => SearchFamily::SessionOrb,
+            "impulse_candle" | "impulse" => SearchFamily::ImpulseCandle,
+            "vol_squeeze_break" | "volatility_squeeze" | "squeeze" => SearchFamily::VolSqueezeBreak,
+            "supply_demand_reclaim" | "supply_demand" => SearchFamily::SupplyDemandReclaim,
+            "sweep_reclaim" | "sweep" => SearchFamily::SweepReclaim,
+            "universal" | "universal_grammar" => SearchFamily::Universal,
+            _ => return Err(format!("unknown strategy template '{value}'")),
+        };
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    Ok(families)
+}
+
 fn broker_symbol_from_path(path: &str) -> Option<String> {
     Path::new(path)
         .file_name()
@@ -3655,6 +3714,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
             commission = 0.0;
         }
     }
+    let strategy_families = parse_strategy_templates(&request.strategy_templates)?;
     Ok(DiscoverConfig {
         initial_candidates: request.initial_candidates.unwrap_or(500),
         batch_size: request.batch_size.unwrap_or(200),
@@ -3664,6 +3724,7 @@ fn new_config(request: &DiscoverRequest) -> Result<DiscoverConfig, String> {
         structural_mutation_probability: 0.18,
         seed: request.seed.unwrap_or(42),
         universal_grammar,
+        strategy_families,
         run_mode: request
             .run_mode
             .as_deref()
@@ -4194,6 +4255,32 @@ mod tests {
     }
 
     #[test]
+    fn dated_timeline_is_authoritative_over_stale_percentage_fields() {
+        let directory = tempdir().expect("temp directory");
+        let mut request = request(directory.path().join("fresh-bank.json").display().to_string());
+        request.validation_fraction = Some(0.9);
+        request.sealed_fraction = Some(0.9);
+        request.data_range_parts = vec![
+            DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2016-01-04".into(), end_date: "2020-12-31".into() },
+            DataRangePartRequest { id: "ISV1".into(), kind: "validation".into(), start_date: "2021-01-01".into(), end_date: "2022-12-31".into() },
+            DataRangePartRequest { id: "OOS1".into(), kind: "holdout".into(), start_date: "2023-01-01".into(), end_date: "2024-12-31".into() },
+        ];
+        validate_request(&request).expect("valid dated schedule must ignore stale fractions");
+    }
+
+    #[test]
+    fn strategy_template_aliases_are_normalized_and_deduplicated() {
+        let parsed = parse_strategy_templates(&[
+            "Trend Pullback".into(),
+            "trend_pullback".into(),
+            "universal".into(),
+        ])
+        .expect("known template aliases");
+        assert_eq!(parsed, vec![SearchFamily::TrendPullback, SearchFamily::Universal]);
+        assert_eq!(parse_strategy_templates(&["not-a-template".into()]).unwrap_err(), "unknown strategy template 'not-a-template'");
+    }
+
+    #[test]
     fn timeline_rejects_overlaps_and_gaps() {
         let overlap = vec![
             DataRangePartRequest { id: "IST".into(), kind: "training".into(), start_date: "2020-01-01".into(), end_date: "2020-06-30".into() },
@@ -4290,6 +4377,7 @@ mod tests {
             multi_symbol_minimum_pass: Some(0),
             pack_data_dir: None,
             universal_grammar: None,
+            strategy_templates: Vec::new(),
             run_mode: Some("full_harvest".into()),
             general_island_count: None,
             refinement_island_count: None,
