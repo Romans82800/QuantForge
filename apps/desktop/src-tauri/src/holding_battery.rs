@@ -6,7 +6,7 @@ use crate::data_lab::{
 };
 use crate::databank::{
     DesktopState, EvolveArtifact, HoldingBatteryRequest, infer_quote_sidecar_path,
-    persist_bank_file, persist_loaded_bank, reload_workspace_from_path, slice_bars,
+    TimelinePart, persist_bank_file, persist_loaded_bank, reload_workspace_from_path, slice_bars,
 };
 use quantforge_core::ContentHash;
 use quantforge_data::{
@@ -16,7 +16,8 @@ use quantforge_data::{
 use quantforge_discover::{
     Databank, Elite, GateResult, ProductionLaneConfig, ProductionLaneReplay, ProductionLaneReport,
     RobustnessEvidence, apply_holding_daily_corr_shrink, daily_pnl_from_trades,
-    holding_factory_score, promote_selected_holding_without_robustness, run_production_lane,
+    TimelineValidationPair, holding_factory_score, promote_selected_holding_without_robustness,
+    run_production_lane,
 };
 use quantforge_eval::{IndicatorBufferCache, evaluate_strategy_cached};
 use quantforge_quality::DataSplitPlan;
@@ -1159,6 +1160,151 @@ fn shrink_holding_snapshot(
     Ok(())
 }
 
+fn reconstruct_archive_decision(
+    snapshot: &ArchiveSnapshot,
+    exported_decision: &BarDataset,
+    m1: &BarDataset,
+    quotes: Option<&QuoteBarDataset>,
+    broker_point: f64,
+) -> Result<(&'static str, BarDataset), String> {
+    let timeframe = crate::databank::archive_decision_timeframe(
+        &snapshot.artifact,
+        Path::new(&snapshot.databank_path),
+    );
+    let decision = match timeframe {
+        "H1" => match quotes {
+            Some(quotes) => build_decision_from_m1_quotes(
+                m1,
+                Some(exported_decision),
+                quotes,
+                broker_point,
+            ),
+            None => build_decision_from_m1(m1, Some(exported_decision)),
+        },
+        "M15" | "H4" => {
+            let interval_ms = if timeframe == "M15" { 900_000 } else { 14_400_000 };
+            match quotes {
+                Some(quotes) => build_timeframe_from_m1_with_quotes(
+                    m1,
+                    quotes,
+                    broker_point,
+                    interval_ms,
+                    None,
+                )
+                .map_err(|error| error.to_string()),
+                None => build_timeframe_from_m1(m1, interval_ms, None)
+                    .map_err(|error| error.to_string()),
+            }
+        }
+        _ => unreachable!("archive timeframe is normalized to H1, M15, or H4"),
+    }
+    .map_err(|error| format!("cannot reconstruct {timeframe} from M1: {error}"))?;
+    Ok((timeframe, decision))
+}
+
+fn archived_timeline_parts(snapshot: &ArchiveSnapshot) -> Result<Vec<TimelinePart>, String> {
+    snapshot
+        .artifact
+        .manifest
+        .recipe
+        .config
+        .get("data_range_parts")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("timeline saved in this archive is invalid: {error}"))
+        .map(|parts: Option<Vec<TimelinePart>>| parts.unwrap_or_default())
+}
+
+fn timeline_part_bounds(
+    decision: &BarDataset,
+    part: &TimelinePart,
+) -> Result<(i64, i64), String> {
+    let start = quantforge_data::history_date_cutoff_ms(
+        &decision.source_timezone,
+        &part.start_date,
+    )
+    .map_err(|error| error.to_string())?;
+    let end = quantforge_data::history_end_exclusive_cutoff_ms(
+        &decision.source_timezone,
+        &part.end_date,
+    )
+    .map_err(|error| error.to_string())?;
+    if start >= end {
+        return Err(format!("timeline part '{}' has an invalid date range", part.id));
+    }
+    Ok((start, end))
+}
+
+fn timeline_partition_dataset(
+    decision: &BarDataset,
+    parts: &[TimelinePart],
+    kind: &str,
+) -> Result<BarDataset, String> {
+    let ranges = parts
+        .iter()
+        .filter(|part| part.kind == kind)
+        .map(|part| timeline_part_bounds(decision, part))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ranges.is_empty() {
+        return Err(format!("timeline has no {kind} part"));
+    }
+    let bars = decision
+        .bars
+        .iter()
+        .filter(|bar| {
+            ranges
+                .iter()
+                .any(|(start, end)| bar.timestamp_ms >= *start && bar.timestamp_ms < *end)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if bars.is_empty() {
+        return Err(format!("timeline {kind} parts contain no decision bars"));
+    }
+    Ok(BarDataset {
+        data_hash: bar_content_hash(&bars),
+        source_rows: bars.len(),
+        duplicate_rows_removed: 0,
+        input_was_sorted: true,
+        delimiter: decision.delimiter,
+        source_timezone: decision.source_timezone.clone(),
+        bars,
+    })
+}
+
+fn timeline_validation_pairs(
+    decision: &BarDataset,
+    parts: &[TimelinePart],
+) -> Result<Vec<TimelineValidationPair>, String> {
+    let mut pairs = Vec::new();
+    for (index, validation) in parts.iter().enumerate().filter(|(_, part)| part.kind == "validation") {
+        let training = parts
+            .get(index.saturating_sub(1))
+            .filter(|part| part.kind == "training")
+            .ok_or_else(|| {
+                format!(
+                    "ISV '{}' must directly follow an IST. Reorder the timeline so every validation block has its training block immediately before it.",
+                    validation.id
+                )
+            })?;
+        let (training_start, training_end) = timeline_part_bounds(decision, training)?;
+        let (validation_start, validation_end) = timeline_part_bounds(decision, validation)?;
+        if training_end != validation_start {
+            return Err(format!(
+                "IST '{}' and ISV '{}' must be adjacent in the saved timeline",
+                training.id, validation.id
+            ));
+        }
+        pairs.push(TimelineValidationPair {
+            label: format!("{}→{}", training.id, validation.id),
+            training: slice_dataset_by_time(decision, training_start, training_end)?,
+            validation: slice_dataset_by_time(decision, validation_start, validation_end)?,
+        });
+    }
+    Ok(pairs)
+}
+
 fn run_battery_job(
     job: Arc<RwLock<BatteryJobView>>,
     stop: Arc<AtomicBool>,
@@ -1193,82 +1339,90 @@ fn run_battery_job(
         .map(|path| load_quote_sidecar(&path, m1.metadata.as_ref()))
         .transpose()
         .map_err(|error| format!("cannot load bid/ask quote sidecar: {error}"))?;
-    // Rebuild the selected timeframe from the bound M1 chronology. The source
-    // file supplies the H1 grid only; H4 archives commonly retain an H1 source
-    // path for display, so its bars can never be used blindly for promotion.
+    // Rebuild the exact decision timeframe from the bound M1 chronology. The
+    // archive hash is the authority: H1 uses its exported grid, while M15/H4
+    // are rebuilt directly from M1 exactly as Discover created them.
     trim_market_history_to_year(
         &mut decision_source.dataset,
         &mut m1.dataset,
         quote_dataset.as_mut(),
         snapshot.artifact.databank.config.history_start_year,
     )?;
-    let h1 = match quote_dataset.as_ref() {
-        Some(quotes) => build_decision_from_m1_quotes(
-            &m1.dataset,
-            Some(&decision_source.dataset),
-            quotes,
-            broker.point,
-        ),
-        None => build_decision_from_m1(&m1.dataset, Some(&decision_source.dataset)),
-    }
-    .map_err(|error| format!("cannot reconstruct H1 from M1: {error}"))?;
-    let h1_plan =
-        DataSplitPlan::chronological(&h1, snapshot.validation_fraction, snapshot.sealed_fraction)
-            .map_err(|error| error.to_string())?;
-    let h1_development = slice_bars(&h1, 0, h1_plan.development.bar_count)?;
-    let (decision_timeframe, development, development_end) = if h1_development.data_hash
-        == snapshot.artifact.databank.data_hash
-    {
-        let end = h1
-            .bars
-            .get(h1_plan.development.bar_count)
-            .map(|bar| bar.timestamp_ms)
-            .ok_or_else(|| "H1 split has no later validation/sealed boundary".to_owned())?;
-        ("H1", h1_development, end)
+    let (decision_timeframe, decision) = reconstruct_archive_decision(
+        &snapshot,
+        &decision_source.dataset,
+        &m1.dataset,
+        quote_dataset.as_ref(),
+        broker.point,
+    )?;
+    let timeline_parts = archived_timeline_parts(&snapshot)?;
+    let has_dated_timeline = timeline_parts.iter().all(|part| {
+        !part.id.trim().is_empty()
+            && !part.kind.trim().is_empty()
+            && !part.start_date.trim().is_empty()
+            && !part.end_date.trim().is_empty()
+    }) && !timeline_parts.is_empty();
+    let (development, validation_pairs, unsealed_end) = if has_dated_timeline {
+        let development = timeline_partition_dataset(&decision, &timeline_parts, "training")?;
+        let validation_pairs = timeline_validation_pairs(&decision, &timeline_parts)?;
+        let unsealed_end = timeline_parts
+            .iter()
+            .filter(|part| part.kind != "holdout")
+            .map(|part| timeline_part_bounds(&decision, part).map(|(_, end)| end))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "timeline has no unsealed decision window".to_owned())?;
+        (development, validation_pairs, unsealed_end)
     } else {
-        let h4 = match quote_dataset.as_ref() {
-            Some(quotes) => build_timeframe_from_m1_with_quotes(
-                &m1.dataset,
-                quotes,
-                broker.point,
-                14_400_000,
-                None,
-            ),
-            None => build_timeframe_from_m1(&m1.dataset, 14_400_000, None),
-        }
-        .map_err(|error| format!("cannot reconstruct H4 from M1: {error}"))?;
-        let h4_plan = DataSplitPlan::chronological(
-            &h4,
+        let plan = DataSplitPlan::chronological(
+            &decision,
             snapshot.validation_fraction,
             snapshot.sealed_fraction,
         )
         .map_err(|error| error.to_string())?;
-        let h4_development = slice_bars(&h4, 0, h4_plan.development.bar_count)?;
-        if h4_development.data_hash == snapshot.artifact.databank.data_hash {
-            let end = h4
-                .bars
-                .get(h4_plan.development.bar_count)
-                .map(|bar| bar.timestamp_ms)
-                .ok_or_else(|| "H4 split has no later validation/sealed boundary".to_owned())?;
-            ("H4", h4_development, end)
-        } else {
-            return Err(format!(
-                "This Holding archive is not bound to the reconstructed H1 or H4 Development data (archive {}, H1 {}, H4 {}). Nothing was evaluated or promoted.",
-                snapshot.artifact.databank.data_hash,
-                h1_development.data_hash,
-                h4_development.data_hash,
-            ));
+        let development = slice_bars(&decision, 0, plan.development.bar_count)?;
+        let validation = (plan.validation.bar_count > 0)
+            .then(|| {
+                slice_bars(
+                    &decision,
+                    plan.development.bar_count,
+                    plan.development.bar_count + plan.validation.bar_count,
+                )
+            })
+            .transpose()?;
+        let mut pairs = Vec::new();
+        if let Some(validation) = validation {
+            pairs.push(TimelineValidationPair {
+                label: "IST→ISV1".into(),
+                training: development.clone(),
+                validation,
+            });
         }
+        let end_index = plan.development.bar_count + plan.validation.bar_count;
+        let unsealed_end = decision
+            .bars
+            .get(end_index)
+            .map(|bar| bar.timestamp_ms)
+            .or_else(|| decision.bars.last().map(|bar| bar.timestamp_ms))
+            .ok_or_else(|| format!("{decision_timeframe} partition is empty"))?;
+        (development, pairs, unsealed_end)
     };
+    if development.data_hash != snapshot.artifact.databank.data_hash {
+        return Err(format!(
+            "This Holding archive is not bound to the reconstructed {decision_timeframe} Development data (archive {}, reconstructed {}). Nothing was evaluated or promoted.",
+            snapshot.artifact.databank.data_hash, development.data_hash,
+        ));
+    }
     let development_start = development
         .bars
         .first()
         .map(|bar| bar.timestamp_ms)
-        .ok_or_else(|| "H4 Development partition is empty".to_owned())?;
-    let m1_development = slice_dataset_by_time(&m1.dataset, development_start, development_end)?;
+        .ok_or_else(|| format!("{decision_timeframe} Development partition is empty"))?;
+    let m1_development = slice_dataset_by_time(&m1.dataset, development_start, unsealed_end)?;
     let quote_development = quote_dataset
         .as_ref()
-        .map(|quotes| slice_quotes_by_time(quotes, development_start, development_end));
+        .map(|quotes| slice_quotes_by_time(quotes, development_start, unsealed_end));
     // Older Holding archives bind the complete M1 execution stream. This is
     // safe: the judge receives Development decision bars only and iterates its
     // M1 cursor only through those decision-bar intervals. Newer archives may
@@ -1376,7 +1530,7 @@ fn run_battery_job(
                 &mut snapshot.artifact.databank,
                 &hash,
                 &development,
-                None,
+                &validation_pairs,
                 &m1_owned,
                 quote_for_battery.as_ref(),
                 &broker,

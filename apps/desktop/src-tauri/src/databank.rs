@@ -2038,6 +2038,16 @@ fn run_holding_battery_sync(
     } else {
         m1_eval
     };
+    let validation_pairs = oos1
+        .as_ref()
+        .map(|validation| {
+            vec![quantforge_discover::TimelineValidationPair {
+                label: "IST→ISV1".into(),
+                training: development.clone(),
+                validation: validation.clone(),
+            }]
+        })
+        .unwrap_or_default();
 
     let mut promoted = 0usize;
     let mut rejected = Vec::new();
@@ -2058,7 +2068,7 @@ fn run_holding_battery_sync(
             bank,
             &target,
             &development,
-            oos1.as_ref(),
+            &validation_pairs,
             m1_battery,
             quote_dataset.as_ref(),
             &broker,

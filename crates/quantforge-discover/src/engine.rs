@@ -958,7 +958,7 @@ impl std::fmt::Display for HoldingBatteryReject {
             Self::Robustness(reject) => write!(f, "{reject}"),
             Self::DepositGate => write!(f, "deposit gates"),
             Self::DevelopmentExpectancy => write!(f, "Development expectancy floor"),
-            Self::Oos1 => write!(f, "OOS1 retention"),
+            Self::Oos1 => write!(f, "ISV retention"),
             Self::DatabankDeposit(decision) => write!(f, "Databank deposit: {decision:?}"),
             Self::Evaluation(message) => write!(f, "evaluation: {message}"),
         }
@@ -1054,6 +1054,19 @@ pub struct HoldingBatteryResult {
     pub fingerprint: quantforge_core::ContentHash,
     pub decision: DepositDecision,
     pub elite: Elite,
+}
+
+/// One chronological IST → ISV pair from an editable research timeline.
+///
+/// A multi-window schedule must validate each ISV against the IST immediately
+/// before it. Collapsing all training windows into one dataset and all
+/// validations into another can let a strong validation window hide a failed
+/// one, which is not the contract users set in the timeline editor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineValidationPair {
+    pub label: String,
+    pub training: BarDataset,
+    pub validation: BarDataset,
 }
 
 /// Outcome of the non-gating full-battery audit. The candidate remains in
@@ -1175,7 +1188,7 @@ pub fn run_holding_battery_and_promote(
     bank: &mut Databank,
     fingerprint: &quantforge_core::ContentHash,
     dataset: &BarDataset,
-    oos1_dataset: Option<&BarDataset>,
+    validation_pairs: &[TimelineValidationPair],
     m1_dataset: &BarDataset,
     quote_dataset: Option<&QuoteBarDataset>,
     broker: &SymbolSpecification,
@@ -1235,40 +1248,135 @@ pub fn run_holding_battery_and_promote(
         robustness: outcome.evidence,
     };
 
-    if let Some(oos1) = oos1_dataset {
-        let Some(oos1_start_ms) = oos1.bars.first().map(|bar| bar.timestamp_ms) else {
-            return Err(HoldingBatteryReject::Evaluation(
-                "OOS1 validation partition is empty".into(),
-            ));
+    if !validation_pairs.is_empty() {
+        let judge = JudgeConfig {
+            initial_balance: robustness.initial_balance,
+            costs: robustness.costs.clone(),
+            allow_execution_gaps: false,
+            indicator_engine: robustness.indicator_engine,
+            entry_window: robustness.entry_window,
         };
-        let validation_decision = join_datasets(dataset, oos1);
-        let validation = evaluate_strategy_m1_with_optional_quotes(
-            &elite.strategy,
-            &validation_decision,
-            m1_dataset,
-            quote_dataset,
-            broker,
-            &JudgeConfig {
-                initial_balance: robustness.initial_balance,
-                costs: robustness.costs.clone(),
-                allow_execution_gaps: false,
-                indicator_engine: robustness.indicator_engine,
-                entry_window: robustness.entry_window,
-            },
-        )
-        .map_err(|error| {
-            HoldingBatteryReject::Evaluation(format!("M1 OOS1 validation replay failed: {error}"))
-        })?;
-        let oos1_expectancy = expectancy_from(&validation.trades, oos1_start_ms);
-        if !passes_oos1_pick(
-            development_expectancy,
-            oos1_expectancy,
-            bank.config.oos1_expectancy_retention,
-        ) {
+        let mut total_validation_profit = 0.0;
+        let mut total_validation_trades = 0usize;
+        let mut worst_ratio = f64::INFINITY;
+        let mut pair_gates = Vec::with_capacity(validation_pairs.len());
+        let mut all_passed = true;
+
+        for pair in validation_pairs {
+            let training_start = pair
+                .training
+                .bars
+                .first()
+                .map(|bar| bar.timestamp_ms)
+                .ok_or_else(|| {
+                    HoldingBatteryReject::Evaluation(format!(
+                        "{} IST partition is empty",
+                        pair.label
+                    ))
+                })?;
+            let validation_start = pair
+                .validation
+                .bars
+                .first()
+                .map(|bar| bar.timestamp_ms)
+                .ok_or_else(|| {
+                    HoldingBatteryReject::Evaluation(format!(
+                        "{} ISV partition is empty",
+                        pair.label
+                    ))
+                })?;
+            let validation_end = pair
+                .validation
+                .bars
+                .last()
+                .map(|bar| bar.timestamp_ms)
+                .ok_or_else(|| {
+                    HoldingBatteryReject::Evaluation(format!(
+                        "{} ISV partition is empty",
+                        pair.label
+                    ))
+                })?;
+            let decision = join_datasets(&pair.training, &pair.validation);
+            let replay = evaluate_strategy_m1_with_optional_quotes(
+                &elite.strategy,
+                &decision,
+                m1_dataset,
+                quote_dataset,
+                broker,
+                &judge,
+            )
+            .map_err(|error| {
+                HoldingBatteryReject::Evaluation(format!(
+                    "{} M1 ISV replay failed: {error}",
+                    pair.label
+                ))
+            })?;
+            let training_expectancy = expectancy_for(&replay.trades, |entry| {
+                entry >= training_start && entry < validation_start
+            });
+            let validation_expectancy = expectancy_for(&replay.trades, |entry| {
+                entry >= validation_start && entry <= validation_end
+            });
+            let validation_trades = replay
+                .trades
+                .iter()
+                .filter(|trade| {
+                    trade.entry_timestamp_ms >= validation_start
+                        && trade.entry_timestamp_ms <= validation_end
+                })
+                .collect::<Vec<_>>();
+            total_validation_profit += validation_trades
+                .iter()
+                .map(|trade| trade.net_profit)
+                .sum::<f64>();
+            total_validation_trades += validation_trades.len();
+            let ratio = if training_expectancy > 0.0 {
+                validation_expectancy / training_expectancy
+            } else {
+                f64::NEG_INFINITY
+            };
+            worst_ratio = worst_ratio.min(ratio);
+            let passed = passes_oos1_pick(
+                training_expectancy,
+                validation_expectancy,
+                bank.config.oos1_expectancy_retention,
+            );
+            all_passed &= passed;
+            pair_gates.push(GateResult {
+                name: format!("isv_retention_{}", pair.label),
+                passed,
+                detail: format!(
+                    "{} IST {:.4}R → ISV {:.4}R · {:.3}× retention; required ≥{:.3}×.",
+                    pair.label,
+                    training_expectancy / crate::FIXED_RISK_PER_TRADE,
+                    validation_expectancy / crate::FIXED_RISK_PER_TRADE,
+                    ratio,
+                    bank.config.oos1_expectancy_retention,
+                ),
+            });
+        }
+
+        let aggregate_expectancy = (total_validation_trades > 0)
+            .then_some(total_validation_profit / total_validation_trades as f64)
+            .unwrap_or(0.0);
+        let ratio = worst_ratio.is_finite().then_some(worst_ratio);
+        if !all_passed {
+            if let Some(holding) = bank
+                .holding
+                .iter_mut()
+                .find(|entry| &entry.structural_fingerprint == fingerprint)
+            {
+                holding.oos1_expectancy = Some(aggregate_expectancy);
+                holding.oos1_expectancy_ratio = ratio;
+                holding
+                    .gate_results
+                    .retain(|gate| !gate.name.starts_with("isv_retention_"));
+                holding.gate_results.extend(pair_gates);
+            }
             return Err(HoldingBatteryReject::Oos1);
         }
-        candidate.oos1_expectancy = Some(oos1_expectancy);
-        candidate.oos1_expectancy_ratio = Some(oos1_expectancy / development_expectancy);
+        candidate.oos1_expectancy = Some(aggregate_expectancy);
+        candidate.oos1_expectancy_ratio = ratio;
         candidate.gate_results = build_gate_results(
             development_expectancy,
             candidate.oos1_expectancy,
@@ -1280,6 +1388,7 @@ pub fn run_holding_battery_and_promote(
             candidate.deflated_trade_sharpe,
             bank.config.minimum_deflated_trade_sharpe,
         );
+        candidate.gate_results.extend(pair_gates);
     }
 
     let decision = deposit_to_databank(bank, candidate)

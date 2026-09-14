@@ -23,7 +23,7 @@ pub use bakeoff::{
 };
 pub use engine::{
     EvolutionSession, HoldingBatteryAuditResult, HoldingBatteryReject, HoldingBatteryResult,
-    HoldingBypassResult,
+    HoldingBypassResult, TimelineValidationPair,
     audit_holding_battery,
     continue_evolution, continue_evolution_with_pack, evolve_new, evolve_new_with_pack,
     evolve_new_with_pack_and_quotes, holding_factory_score, new_databank,
